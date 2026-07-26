@@ -53,11 +53,15 @@ them would corrupt the value; if so, put them on their own line.
 <optional body>
                                               <- blank line
 <optional single-line footers>
-Co-authored-by: Claude <model> <noreply@anthropic.com>
+Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
 ```
 
 The final block is the trailer block: one `Token: value` per line, no blank lines
 inside it, `Co-authored-by:` last.
+
+`Opus 5` above stands in for whichever model you are — see
+[Required co-author footer](#required-co-author-footer). The rest of the line is
+literal: copy it exactly, angle brackets and all.
 
 ## Types
 
@@ -226,13 +230,51 @@ spec; everything else is case-insensitive.
 Every message you produce MUST end with, as the last line:
 
 ```
-Co-authored-by: Claude <model> <noreply@anthropic.com>
+Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
 ```
 
-where `<model>` is the display name of the model writing the message — e.g.
-`Co-authored-by: Claude Opus 5 <noreply@anthropic.com>` or
-`Co-authored-by: Claude Fable 5 <noreply@anthropic.com>`. Use the model you are
-actually running as; do not hardcode a name from an example.
+**Exactly one thing on that line varies: `Opus 5`.** Everything else — the token,
+`Claude`, and `<noreply@anthropic.com>` in its angle brackets — is literal text,
+character for character.
+
+Write your **display name**: the human-readable name, capitalised, words separated by
+spaces, *no angle brackets around it*. Never the API model ID. The ID is the
+hyphenated lowercase string like `claude-opus-5`; it is what you call yourself to an
+API, not what you sign a commit as.
+
+| You are running as | Sign as |
+| --- | --- |
+| `claude-opus-5` | `Co-authored-by: Claude Opus 5 <noreply@anthropic.com>` |
+| `claude-sonnet-5` | `Co-authored-by: Claude Sonnet 5 <noreply@anthropic.com>` |
+| `claude-fable-5` | `Co-authored-by: Claude Fable 5 <noreply@anthropic.com>` |
+| `claude-haiku-4-5-20251001` | `Co-authored-by: Claude Haiku 4.5 <noreply@anthropic.com>` |
+
+Use the model you are actually running as. Do not copy a name from the table or an
+example just because it is written there — find your own row.
+
+Rejected, and why each is wrong:
+
+```
+Co-authored-by: Claude <claude-opus-5> <noreply@anthropic.com>
+```
+Two angle-bracket groups, and the API model ID where the display name belongs. This
+is the mistake that actually happens: the name slot used to be written `<model>`, and
+the brackets get carried through the substitution along with the ID. **If your line
+has two `<…>` groups, it is wrong.** Delete the brackets around the name.
+
+```
+Co-authored-by: Claude <noreply@anthropic.com>
+```
+Display name dropped entirely. Which model wrote it is the point of the trailer.
+
+```
+Co-authored-by: Claude Opus 5 <claude@anthropic.com>
+```
+Invented address. The email is always `noreply@anthropic.com`.
+
+Before you display the message, read the last line back and check it against this
+shape: `Co-authored-by:` + space + `Claude` + space + your display name + space +
+`<noreply@anthropic.com>` + end of line. One `<`, one `>`, both around the email.
 
 ## Examples
 
@@ -330,5 +372,10 @@ Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
 - [ ] Breaking change marked with `!` and/or an uppercase `BREAKING-CHANGE:` notice
 - [ ] Final block is all single-line `Token: value` trailers — no wrapped values, no
       `Token #value`, no blank lines inside it
-- [ ] `Co-authored-by: Claude <model> <noreply@anthropic.com>` is the last line
+- [ ] The last line is `Co-authored-by:`, then `Claude`, then your display name with
+      no brackets around it, then `<noreply@anthropic.com>`
+- [ ] That line contains exactly one `<` and one `>`, both around the email — no
+      hyphenated API model ID such as `<claude-opus-5>` anywhere on it
+- [ ] The display name is the model you are actually running as, not one copied from
+      an example or the table
 - [ ] You did not run `git commit`

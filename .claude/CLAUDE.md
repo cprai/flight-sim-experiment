@@ -10,7 +10,9 @@ Committing is the user's action.
 files, display a ready-to-copy commit message in a fenced code block, following the
 rules in the `git-commit-message` skill (`.claude/skills/git-commit-message/SKILL.md`):
 Conventional Commits format, the git 50/72 rule, and a trailing
-`Co-authored-by: Claude <model> <noreply@anthropic.com>` footer.
+`Co-authored-by: Claude Opus 5 <noreply@anthropic.com>` footer — with your own
+display name in place of `Opus 5`, spelled as words and *not* wrapped in angle
+brackets, never the API model ID.
 
 **The git history is this project's design record.** Write detailed bodies: why the
 change was made, alternatives rejected and why, constraints, evidence, and
