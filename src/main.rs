@@ -2,6 +2,7 @@ mod camera;
 mod controls;
 mod renderer;
 mod scene;
+mod terrain;
 
 use std::sync::Arc;
 use std::time::Instant;

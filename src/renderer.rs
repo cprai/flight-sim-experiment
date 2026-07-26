@@ -3,7 +3,7 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use crate::camera::Camera;
-use crate::scene::Scene;
+use crate::scene::{Scene, create_depth_view};
 
 /// Owns the GPU device and swapchain for a single window, and the scene it draws.
 pub struct Renderer {
@@ -12,6 +12,8 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// Sized to match the swapchain, so it is rebuilt whenever that is.
+    depth: wgpu::TextureView,
     scene: Scene,
 }
 
@@ -42,9 +44,9 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("device"),
                 required_features: wgpu::Features::empty(),
-                // Keep the limits conservative so the app also runs on WebGL/older GPUs.
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                    .using_resolution(adapter.limits()),
+                // The WebGPU baseline, which every GPU on the target platforms clears.
+                // Nothing here needs an optional feature yet, so none are requested.
+                required_limits: wgpu::Limits::default(),
                 ..Default::default()
             })
             .await?;
@@ -70,7 +72,8 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let scene = Scene::new(&device, format, aspect_ratio(&config));
+        let depth = create_depth_view(&device, config.width, config.height);
+        let scene = Scene::new(&device, format, aspect_ratio(&config))?;
 
         Ok(Self {
             window,
@@ -78,6 +81,7 @@ impl Renderer {
             device,
             queue,
             config,
+            depth,
             scene,
         })
     }
@@ -102,6 +106,9 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        // A depth attachment has to match the colour target's dimensions exactly,
+        // so it cannot outlive the old swapchain size.
+        self.depth = create_depth_view(&self.device, width, height);
         // Without this the projection would stretch the scene to fit the new
         // viewport instead of widening the field of view.
         self.scene.camera.aspect = aspect_ratio(&self.config);
@@ -138,8 +145,8 @@ impl Renderer {
                 label: Some("frame"),
             });
 
-        self.scene.upload_camera(&self.queue);
-        self.scene.draw(&mut encoder, &view);
+        self.scene.update(&self.queue);
+        self.scene.draw(&mut encoder, &view, &self.depth);
 
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);

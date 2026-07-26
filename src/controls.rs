@@ -4,12 +4,18 @@ use winit::keyboard::KeyCode;
 use crate::camera::Camera;
 
 /// Base translation speed, in metres per second.
-const MOVE_SPEED: f32 = 50.0;
+///
+/// Terrain now spans tens of kilometres, so this is set to a cruising speed
+/// rather than a walking one; anything slower makes crossing the map a chore.
+const MOVE_SPEED: f32 = 200.0;
 
 /// Factor applied to [`MOVE_SPEED`] while shift is held. Rotation is
 /// deliberately left alone: the boost is for covering ground, and speeding the
 /// mouse up at the same time would make the view impossible to aim.
-const BOOST_FACTOR: f32 = 6.0;
+///
+/// Fast enough to reposition across a whole dataset in under a minute, which is
+/// what you want when inspecting how the terrain resolves at different ranges.
+const BOOST_FACTOR: f32 = 10.0;
 
 /// Rotation per unit of raw mouse movement, in radians.
 const LOOK_SENSITIVITY: f32 = 0.0025;

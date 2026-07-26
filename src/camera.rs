@@ -1,4 +1,4 @@
-use glam::{EulerRot, Mat4, Quat, Vec3};
+use glam::{EulerRot, Mat4, Quat, Vec2, Vec3};
 
 /// A perspective camera placed and oriented in world space.
 ///
@@ -18,8 +18,8 @@ pub struct Camera {
     pub fov_y: f32,
     /// Viewport width divided by height.
     pub aspect: f32,
+    /// Distance to the near plane. There is no far plane; see [`Camera::projection`].
     pub z_near: f32,
-    pub z_far: f32,
 }
 
 impl Camera {
@@ -29,9 +29,32 @@ impl Camera {
             orientation,
             fov_y: 60f32.to_radians(),
             aspect,
-            z_near: 0.1,
-            z_far: 10_000.0,
+            z_near: 1.0,
         }
+    }
+
+    /// A starting viewpoint that takes in a whole terrain of the given size.
+    ///
+    /// Sits over the middle of the terrain's southern edge looking north, high
+    /// enough above its tallest point that the far edge stays comfortably
+    /// inside the frustum. Everything is derived from the terrain that was
+    /// loaded, so this places the camera sensibly whatever the data covers.
+    pub fn overlooking(extent: Vec2, highest: f32, aspect: f32) -> Self {
+        // A fraction of the terrain's own size, so the viewpoint scales with it
+        // rather than being tuned to one dataset.
+        const CLEARANCE: f32 = 0.08;
+        const PITCH_DEGREES: f32 = -8.0;
+
+        let position = Vec3::new(
+            0.0,
+            highest + CLEARANCE * extent.max_element(),
+            extent.y * 0.5,
+        );
+        Self::new(
+            position,
+            Self::from_yaw_pitch_roll(0.0, PITCH_DEGREES.to_radians(), 0.0),
+            aspect,
+        )
     }
 
     /// Builds an orientation from aviation-style angles, in radians.
@@ -57,12 +80,20 @@ impl Camera {
     }
 
     /// View space -> clip space, in wgpu's NDC convention: Y-up, depth in 0..1.
+    ///
+    /// Depth is reversed -- the near plane maps to 1 and infinity to 0 -- and there
+    /// is no far plane at all. Terrain spans tens of kilometres with kilometres of
+    /// relief, and a conventional projection cannot resolve that: depth precision
+    /// falls off as the square of distance, leaving hundreds of metres of
+    /// quantization at the far end of the view. Reversing the range makes the stored
+    /// value proportional to `1/z`, which is exactly where a float depth buffer's
+    /// exponent puts its resolution, so precision stays roughly constant with
+    /// distance. Pair this with a `Depth32Float` buffer and a `Greater` compare.
     pub fn projection(&self) -> Mat4 {
-        glam::camera::rh::proj::directx::perspective(
+        glam::camera::rh::proj::directx::perspective_infinite_reverse(
             self.fov_y,
             self.aspect,
             self.z_near,
-            self.z_far,
         )
     }
 
@@ -119,10 +150,43 @@ mod tests {
         let ndc = project(&camera, Vec3::new(0.0, 0.0, -100.0));
         assert!(ndc.x.abs() < 1e-5, "expected centered, got {ndc}");
         assert!(ndc.y.abs() < 1e-5, "expected centered, got {ndc}");
-        // wgpu clip space has the near plane at z = 0 and the far plane at 1.
         assert!(
             (0.0..=1.0).contains(&ndc.z),
             "expected in depth range, got {ndc}"
+        );
+    }
+
+    #[test]
+    fn depth_is_reversed_with_the_near_plane_at_one() {
+        let camera = camera_at_origin();
+
+        // The near plane sits at the top of the range, not the bottom.
+        let at_near = project(&camera, Vec3::new(0.0, 0.0, -camera.z_near));
+        assert!(
+            (at_near.z - 1.0).abs() < 1e-5,
+            "near plane should map to 1, got {at_near}"
+        );
+
+        // ... so nearer geometry has the *greater* depth value, which is what the
+        // `Greater` depth compare in the pipeline relies on.
+        let near = project(&camera, Vec3::new(0.0, 0.0, -100.0)).z;
+        let far = project(&camera, Vec3::new(0.0, 0.0, -10_000.0)).z;
+        assert!(near > far, "expected reversed depth, got {near} then {far}");
+    }
+
+    #[test]
+    fn very_distant_geometry_is_not_clipped() {
+        let camera = camera_at_origin();
+        // No far plane, so terrain hundreds of kilometres out still projects into
+        // the depth range instead of vanishing at an arbitrary cutoff.
+        let ndc = project(&camera, Vec3::new(0.0, 0.0, -200_000.0));
+        assert!(
+            (0.0..=1.0).contains(&ndc.z),
+            "distant point should survive clipping, got {ndc}"
+        );
+        assert!(
+            ndc.z > 0.0,
+            "depth should not have collapsed to 0, got {ndc}"
         );
     }
 
