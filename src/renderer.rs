@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
+use crate::camera::Camera;
 use crate::scene::Scene;
 
 /// Owns the GPU device and swapchain for a single window, and the scene it draws.
@@ -83,6 +84,14 @@ impl Renderer {
 
     pub fn window(&self) -> &Window {
         &self.window
+    }
+
+    pub fn camera(&self) -> &Camera {
+        &self.scene.camera
+    }
+
+    pub fn camera_mut(&mut self) -> &mut Camera {
+        &mut self.scene.camera
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
