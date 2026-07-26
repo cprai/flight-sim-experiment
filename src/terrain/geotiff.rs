@@ -205,6 +205,17 @@ impl Georeferencing {
         }
     }
 
+    /// World XZ of the first and last samples the raster holds.
+    ///
+    /// Ground outside this is not described by the data at all, so it is where
+    /// the terrain has to stop.
+    pub fn data_bounds(&self) -> ((f64, f64), (f64, f64)) {
+        (
+            self.world_of_texel(0, 0.0, 0.0),
+            self.world_of_texel(0, f64::from(self.width - 1), f64::from(self.height - 1)),
+        )
+    }
+
     /// Which texel of the full-resolution raster covers a world position.
     ///
     /// The inverse of [`Georeferencing::world_of_texel`] at level 0, and

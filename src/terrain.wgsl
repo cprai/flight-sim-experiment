@@ -40,6 +40,11 @@ struct Terrain {
     morph_band: f32,
     // Side length of a level's grid in quads, as a float for the morph maths.
     grid_quads: f32,
+    // World XZ of the outermost samples the raster actually holds. Rings reach
+    // past this, and everything they cover out there is invented by clamping to
+    // the border, so it is cut away rather than drawn.
+    data_min: vec2<f32>,
+    data_max: vec2<f32>,
 };
 
 @group(1) @binding(0) var<uniform> terrain: Terrain;
@@ -69,6 +74,9 @@ struct VertexOut {
     @location(3) @interpolate(flat) coarse_level: u32,
     // How far this vertex has been blended into the coarser level.
     @location(4) morph: f32,
+    // Ground position, carried so the fragment stage can tell whether it is
+    // standing on real data.
+    @location(5) ground: vec2<f32>,
 };
 
 // Wraps a window coordinate onto the texel that currently holds it.
@@ -163,11 +171,24 @@ fn vs_main(vertex: VertexIn, instance: InstanceIn) -> VertexOut {
     out.level = level;
     out.coarse_level = coarse_level;
     out.morph = morph;
+    out.ground = ground;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    // Rings are sized to reach past the raster so that the camera always has a
+    // level coarse enough to cover the horizon, which means their outer parts
+    // hang over ground the dataset says nothing about. Reads out there clamp to
+    // the border texel, so drawing them would smear the edge row outwards as a
+    // plateau that looks like terrain but is not. Cut it at the last real
+    // sample instead. Discarding rather than culling whole triangles keeps the
+    // boundary exactly on the data's edge instead of a quad away from it, which
+    // at the coarsest level is hundreds of metres.
+    if (any(in.ground < terrain.data_min) || any(in.ground > terrain.data_max)) {
+        discard;
+    }
+
     // The colour raster is imagery whose own lighting and shadows are already
     // in the pixels, so it is shown as-is rather than lit a second time.
     let fine = textureSampleLevel(colours, colour_sampler, in.colour_uv, in.level, 0.0);

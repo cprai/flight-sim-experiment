@@ -53,6 +53,8 @@ struct TerrainUniform {
     window_mask: u32,
     morph_band: f32,
     grid_quads: f32,
+    data_min: [f32; 2],
+    data_max: [f32; 2],
 }
 
 /// A height raster and a matching colour raster, drawn as a geometry clipmap.
@@ -382,12 +384,15 @@ impl Terrain {
         let window = self.config.window_texels();
 
         let levels = self.origins.len();
+        let (data_min, data_max) = self.placement.data_bounds();
         let mut uniform = TerrainUniform {
             levels: [LevelUniform::default(); MAX_LEVELS],
             level_count: levels as u32,
             window_mask: window - 1,
             morph_band: self.config.morph_band,
             grid_quads: self.config.grid_quads() as f32,
+            data_min: [data_min.0 as f32, data_min.1 as f32],
+            data_max: [data_max.0 as f32, data_max.1 as f32],
         };
 
         // Every window's new position is settled before any of them is
@@ -505,7 +510,33 @@ impl Terrain {
 
     /// Rebuilds the instance buffer and the draw ranges that index it.
     fn rebuild_patches(&mut self, queue: &wgpu::Queue) {
-        let patches = mesh::patches(&self.config, &self.origins);
+        // Rings reach beyond the raster, and the fragment stage cuts away
+        // whatever falls outside it. A patch lying wholly out there would have
+        // every one of its fragments thrown away, so drop it here instead and
+        // never rasterize it at all. The saving is largest exactly where it
+        // matters: a coarse ring viewed from over a corner of the data.
+        let (data_min, data_max) = self.placement.data_bounds();
+        let patches: Vec<mesh::Patch> = mesh::patches(&self.config, &self.origins)
+            .into_iter()
+            .filter(|patch| {
+                let level = patch.level as usize;
+                let scale = f64::from(1u32 << level);
+                let (near_x, near_z) = self.placement.world_of_texel(
+                    patch.level,
+                    f64::from(self.origins[level].x + patch.origin.x as i32),
+                    f64::from(self.origins[level].y + patch.origin.y as i32),
+                );
+                let size = patch.kind.size_quads(&self.config);
+                let far_x = near_x + f64::from(size.x) * scale * self.placement.metres_per_texel_x;
+                let far_z = near_z + f64::from(size.y) * scale * self.placement.metres_per_texel_z;
+
+                far_x >= data_min.0
+                    && near_x <= data_max.0
+                    && far_z >= data_min.1
+                    && near_z <= data_max.1
+            })
+            .collect();
+
         let instances: Vec<PatchInstance> = patches
             .iter()
             .map(|patch| PatchInstance {

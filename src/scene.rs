@@ -657,12 +657,18 @@ mod tests {
 
     #[test]
     fn no_sky_shows_through_the_joins_between_levels() {
-        // Looking straight down from high enough that terrain fills the frame
-        // several ring boundaries out. A T-junction between two levels would
-        // let the sky through as a pinhole or a hairline.
+        // Looking straight down, across a ring boundary. A T-junction between
+        // two levels would let the sky through as a pinhole or a hairline.
+        //
+        // The altitude is chosen so the frame stays well inside the raster even
+        // at its corners: terrain below the camera's own height projects
+        // outwards, so the ground visible at the frame edge comes from further
+        // out than the frustum's footprint alone suggests. Straying past the
+        // data would show sky for the honest reason that the terrain ends
+        // there, and mask the seams this is looking for.
         let (heights, colours) = rugged();
         let pixels = render(heights, colours, |camera| {
-            camera.position = Vec3::new(70.0, 3000.0, -110.0);
+            camera.position = Vec3::new(70.0, 2000.0, -110.0);
             camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
         });
 
@@ -676,6 +682,59 @@ mod tests {
             "{} pixels of sky came through the terrain, first at {:?}",
             holes.len(),
             holes.first()
+        );
+    }
+
+    #[test]
+    fn the_terrain_stops_at_the_edge_of_the_data() {
+        // Clipmap rings deliberately reach past the raster so there is always a
+        // level coarse enough to cover the horizon. Out there every read clamps
+        // to the border texel, which would otherwise draw the edge row smeared
+        // outwards as a plateau indistinguishable from real ground.
+        //
+        // Flat ground, so that a point's screen position depends only on where
+        // it is: over rough terrain a tall peak inside the raster projects onto
+        // the same pixel as a spot outside it, and the two cannot be told apart.
+        let mut camera = None;
+        let pixels = render(vec![0.0; (RASTER * RASTER) as usize], flat_ground(), |c| {
+            // High enough that the raster's edge sits well inside the frame.
+            c.position = Vec3::new(0.0, 6000.0, 0.0);
+            c.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+            camera = Some(*c);
+        });
+        let camera = camera.expect("camera captured");
+        let at = |world: Vec3| {
+            let (x, y) = to_pixels(camera.view_projection(), world, SIZE, SIZE);
+            pixel(&pixels, x.round() as u32, y.round() as u32)
+        };
+
+        let ((min_x, min_z), (max_x, max_z)) = placement().data_bounds();
+        let (min_x, min_z) = (min_x as f32, min_z as f32);
+        let (max_x, max_z) = (max_x as f32, max_z as f32);
+
+        // Sampled at ground level, where a point's screen position does not
+        // depend on the terrain's own height.
+        for corner in [
+            Vec3::new(min_x, 0.0, min_z),
+            Vec3::new(max_x, 0.0, min_z),
+            Vec3::new(min_x, 0.0, max_z),
+            Vec3::new(max_x, 0.0, max_z),
+        ] {
+            let outside = corner + Vec3::new(corner.x.signum(), 0.0, corner.z.signum()) * 150.0;
+            assert!(
+                is_sky(at(outside)),
+                "{outside} lies beyond the raster but was drawn as terrain: {:?}",
+                at(outside)
+            );
+        }
+
+        // ... and the data itself is still drawn right up to its edge, so this
+        // has not simply clipped the terrain away.
+        let inside = Vec3::new(max_x - 150.0, 0.0, max_z - 150.0);
+        assert!(
+            !is_sky(at(inside)),
+            "{inside} is inside the raster but was cut away: {:?}",
+            at(inside)
         );
     }
 
