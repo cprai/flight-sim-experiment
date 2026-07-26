@@ -523,7 +523,9 @@ name = "flight-sim"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "env_logger",
+ "glam",
  "log",
  "pollster",
  "wgpu",
@@ -630,6 +632,12 @@ dependencies = [
  "log",
  "xml-rs",
 ]
+
+[[package]]
+name = "glam"
+version = "0.33.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f22fb22f065b308be0d8724e3706c7fa3fc2a6c7d6899df4cad7860e7a75436"
 
 [[package]]
 name = "glow"

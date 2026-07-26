@@ -1,4 +1,6 @@
+mod camera;
 mod renderer;
+mod scene;
 
 use std::sync::Arc;
 

@@ -4,7 +4,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
 env_logger = "0.11.11"
+glam = "0.33.2"
 log = "0.4.33"
 pollster = "1.0.1"
 wgpu = "30.0.0"
