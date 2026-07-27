@@ -154,9 +154,20 @@ taking it on faith:
   `see b20fdb7 "Render a triangle in a winit window with wgpu"`.
 
 Put a bare URL on its own line and leave it unwrapped — a broken URL is useless, and
-this is the one accepted exception to the 72-column limit. Short, single-line
-references may go in the footer block as `Ref: <value>`; anything longer or needing
-explanation goes in the body next to the claim it supports.
+this is the one accepted exception to the 72-column limit.
+
+**Every reference belongs in the body, next to the claim it supports.** Never put a
+citation in the trailer block — not as `Ref:`, and not as `See:`, `Source:`,
+`Link:`, or any other invented token. A citation stranded at the bottom is a
+dangling pointer: it establishes that a source exists but not which sentence it
+backs or what was taken from it, so the reader has to guess at the connection the
+author already knew. Inline, the claim and its evidence stand or fall together, and
+a later editor who rewrites the claim can see the citation that goes with it.
+
+Issue trailers are the exception, and they are not references: `Closes: #123` and
+`Fixes: JIRA-456` are instructions to a tracker, parsed by tooling, and they stay in
+the footer block. The test is whether the line does something mechanical — if it
+only tells a human where to read more, it is a citation and goes in the body.
 
 Never cite something you did not actually consult, and never invent a plausible-
 looking URL. An unverifiable citation is worse than none.
@@ -219,6 +230,9 @@ spec; everything else is case-insensitive.
 - Tokens use hyphens instead of spaces (`Reviewed-by`, `Acked-by`, `BREAKING-CHANGE`).
 - Reference issues with a colon: `Closes: #123`, `Fixes: JIRA-456`. The spec also
   permits the `Token #value` form, but git does not parse it — do not use it.
+- **No source citations in the block.** `Ref:`, `See:`, `Source:`, and the like do
+  not belong here; a citation goes in the body beside the claim it supports. See
+  [References](#references). Issue trailers are not citations and do stay.
 - The spec allows a footer value to span lines, ending at the next valid token. Never
   do that in the final block: a wrapped value is not a trailer line and kills the
   block. Put long prose in a paragraph above the trailer block instead.
@@ -302,10 +316,10 @@ Alternatives considered:
 This assumes the camera-relative origin shift already in place;
 without it the rings lose precision past roughly 50 km out.
 
-Ring count of 5 is from Asirvatham & Hoppe, who report it as the
-point where popping stops being visible at 60 fps.
+Ring count of 5 is from Asirvatham & Hoppe, "Terrain Rendering
+Using GPU-Based Geometry Clipmaps", GPU Gems 2 ch. 2 — they report
+it as the point where popping stops being visible at 60 fps.
 
-Ref: GPU Gems 2 ch. 2, Asirvatham & Hoppe
 Closes: #118
 Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
 ```
@@ -367,6 +381,8 @@ Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
 - [ ] Constraints, assumptions, stopgaps, and known limitations are stated
 - [ ] Evidence included — numbers, failing case, or the verifying command
 - [ ] Sources cited, and every citation is one you actually consulted
+- [ ] Every citation sits in the body next to its claim — no `Ref:` or other
+      source trailer in the footer block
 - [ ] Durable reasoning from the session carried over as standalone prose
 - [ ] No secrets, credentials, or "as discussed" references to the conversation
 - [ ] Breaking change marked with `!` and/or an uppercase `BREAKING-CHANGE:` notice
