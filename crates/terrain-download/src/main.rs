@@ -13,6 +13,12 @@
 //! 500 km blocks it added 9 km2 and 1 km2 -- because both products derive from
 //! the same surveys. The percentages printed at the end say exactly how much
 //! each contributed.
+//!
+//! Colour comes from somewhere else entirely: annual cloud-free Sentinel-2
+//! composites, which are already mosaicked and need no scene picking or cloud
+//! masking here. They are published on a different grid at a different
+//! resolution, so the two products share the requested box and the code that
+//! places pixels in it, but little else.
 
 mod bbox;
 mod coverage;
@@ -30,12 +36,21 @@ use clap::Parser;
 use bbox::{LatLon, LatLonBox, OutputGrid};
 use project::Projector;
 use resample::Canvas;
-use source::{SourceRaster, Window};
+use source::{RasterSpec, SourceRaster, Window};
 use stac::{Product, Resolution};
 use write::Provenance;
 
-/// The output is sampled at the finest resolution the source offers.
-const OUTPUT_METRES_PER_PIXEL: f64 = 1.0;
+/// Elevation is sampled at the finest resolution HRDEM offers.
+const ELEVATION_METRES_PER_PIXEL: f64 = 1.0;
+
+/// Colour is sampled at the mosaics' own resolution rather than the elevation's.
+///
+/// Their pixels are 19.1 m of Web Mercator, which is about 12.4 m of ground at
+/// fifty degrees north; ten metres keeps a little headroom without pretending
+/// to detail that is not there. The two products deliberately do not match:
+/// `is_co_registered_with` compares the ground each covers, not their pixel
+/// counts, so a coarse colour raster pairs with a fine elevation one.
+const COLOUR_METRES_PER_PIXEL: f64 = 10.0;
 
 #[derive(Parser, Debug)]
 #[command(about = "Fetch HRDEM elevation for a bounding box as a GeoTIFF", long_about = None)]
@@ -56,9 +71,21 @@ struct Arguments {
     #[arg(short, long, value_name = "PATH")]
     output: PathBuf,
 
-    /// Which surface to fetch: the bare ground, or the top of what the sensor saw.
+    /// What to fetch: bare ground, the top of what the sensor saw, or colour.
     #[arg(long, value_enum, default_value = "dtm")]
     product: Product,
+
+    /// Which year's cloud-free imagery to use, for `--product albedo`.
+    #[arg(long, default_value_t = 2023, value_name = "YEAR")]
+    imagery_year: u16,
+
+    /// Root of the Earth Search API, used to locate imagery tiles.
+    #[arg(
+        long,
+        default_value = "https://earth-search.aws.element84.com/v1",
+        value_name = "URL"
+    )]
+    earth_search_root: String,
 
     /// Proceed without asking, however little of the box is covered.
     #[arg(short = 'y', long)]
@@ -107,12 +134,17 @@ async fn run(arguments: Arguments) -> Result<()> {
     );
 
     let box_ = LatLonBox::from_corners(arguments.from, arguments.to)?;
-    let grid = OutputGrid::cover(box_, OUTPUT_METRES_PER_PIXEL)?;
+    let metres = if arguments.product.is_elevation() {
+        ELEVATION_METRES_PER_PIXEL
+    } else {
+        COLOUR_METRES_PER_PIXEL
+    };
+    let grid = OutputGrid::cover(box_, metres)?;
 
     anyhow::ensure!(
         grid.pixel_count() <= arguments.max_pixels,
-        "the box needs {} x {} = {} pixels at {OUTPUT_METRES_PER_PIXEL} m, over the \
-         --max-pixels limit of {}; about {:.3} degrees on its shorter side would fit",
+        "the box needs {} x {} = {} pixels at {metres} m, over the --max-pixels \
+         limit of {}; about {:.3} degrees on its shorter side would fit",
         grid.width,
         grid.height,
         grid.pixel_count(),
@@ -121,7 +153,7 @@ async fn run(arguments: Arguments) -> Result<()> {
     );
 
     log::info!(
-        "{} x {} pixels covering {:.6},{:.6} to {:.6},{:.6}",
+        "{} x {} pixels at {metres} m covering {:.6},{:.6} to {:.6},{:.6}",
         grid.width,
         grid.height,
         box_.south,
@@ -130,11 +162,16 @@ async fn run(arguments: Arguments) -> Result<()> {
         box_.east
     );
 
-    let projector = Projector::new()?;
     let client = reqwest::Client::builder()
         .user_agent(concat!("terrain-download/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building the HTTP client")?;
+
+    if arguments.product == Product::Albedo {
+        return fetch_albedo(&arguments, &client, box_, &grid).await;
+    }
+
+    let projector = Projector::new(project::EPSG_LAMBERT)?;
 
     // Both mosaics are opened up front: the coverage estimate has to know what
     // the fallback could contribute before anything is downloaded.
@@ -156,7 +193,14 @@ async fn run(arguments: Arguments) -> Result<()> {
 
         let mut opened = Vec::new();
         for item in items {
-            opened.push(SourceRaster::open(&client, item).await?);
+            let spec = RasterSpec {
+                epsg: u32::from(project::EPSG_LAMBERT),
+                metres_per_pixel: resolution.metres(),
+                bands: 1,
+                fallback_nodata: ELEVATION_NODATA,
+                empty_tile_limit: source::ELEVATION_EMPTY_TILE_LIMIT,
+            };
+            opened.push(SourceRaster::open(&client, item, spec).await?);
         }
         rasters.push(opened);
     }
@@ -167,7 +211,7 @@ async fn run(arguments: Arguments) -> Result<()> {
         !fine.is_empty() || !coarse.is_empty(),
         "no published {} raster covers that box; HRDEM only exists over surveyed \
          areas of Canada",
-        arguments.product.asset_key()
+        arguments.product.label()
     );
 
     // Every raster declares -32767, but reading it rather than assuming keeps
@@ -188,6 +232,7 @@ async fn run(arguments: Arguments) -> Result<()> {
         fine_extent.max_x,
         fine_extent.max_y,
         Resolution::OneMetre.metres(),
+        1,
         nodata,
     )?;
     estimate.bytes = fine.iter().map(|r| r.bytes_for(&fine_window)).sum();
@@ -210,7 +255,7 @@ async fn run(arguments: Arguments) -> Result<()> {
         return Ok(());
     }
 
-    let mut canvas = Canvas::new(&grid, nodata)?;
+    let mut canvas = Canvas::new(&grid, 1, nodata)?;
     let mut downloaded = 0;
 
     for raster in &fine {
@@ -233,6 +278,7 @@ async fn run(arguments: Arguments) -> Result<()> {
                 holes.max_x,
                 holes.max_y,
                 coarse_metres,
+                1,
                 nodata,
             )?;
             for raster in &coarse {
@@ -246,7 +292,12 @@ async fn run(arguments: Arguments) -> Result<()> {
         }
     }
 
-    write::write_geotiff(&arguments.output, &grid, &canvas.samples, nodata)?;
+    write::write_geotiff(
+        &arguments.output,
+        &grid,
+        &canvas.with_provenance_band(),
+        nodata,
+    )?;
 
     let tally = canvas.tally();
     let (one, two, none) = tally.percentages();
@@ -261,6 +312,96 @@ async fn run(arguments: Arguments) -> Result<()> {
 
     Ok(())
 }
+
+/// The value HRDEM uses for ground it has no measurement of.
+const ELEVATION_NODATA: f32 = -32767.0;
+
+/// Fetches cloud-free Sentinel-2 colour for the box.
+///
+/// Much shorter than the elevation path because the compositing has already
+/// been done upstream: there is one mosaic per grid square, no second
+/// resolution to fall back to, and no cloud to reason about.
+async fn fetch_albedo(
+    arguments: &Arguments,
+    client: &reqwest::Client,
+    box_: LatLonBox,
+    grid: &OutputGrid,
+) -> Result<()> {
+    anyhow::ensure!(
+        stac::MOSAIC_YEARS.contains(&arguments.imagery_year),
+        "only {:?} have published mosaics, not {}",
+        stac::MOSAIC_YEARS,
+        arguments.imagery_year
+    );
+
+    let projector = Projector::new(project::EPSG_WEB_MERCATOR)?;
+    let tiles = stac::find_mosaic_tiles(client, &arguments.earth_search_root, box_).await?;
+    log::info!("imagery grid squares: {}", tiles.join(", "));
+
+    // The mosaics are Web Mercator, whose pixels are metres of projection
+    // rather than metres of ground -- 19.1 of them is about 12.4 m of ground
+    // at this latitude. The size is asserted rather than read, so a change of
+    // zoom level upstream fails loudly instead of silently mis-placing pixels.
+    let mut rasters = Vec::new();
+    for tile in &tiles {
+        let href = stac::mosaic_href(tile, arguments.imagery_year);
+        let item = stac::SourceItem {
+            id: format!("{tile} {}", arguments.imagery_year),
+            href,
+        };
+        let spec = RasterSpec {
+            epsg: u32::from(project::EPSG_WEB_MERCATOR),
+            metres_per_pixel: MOSAIC_PIXEL_METRES,
+            bands: 3,
+            // No threshold: a coastal mosaic tile that is a few percent land
+            // compresses smaller than some blank ones, so guessing by size
+            // would discard the shoreline.
+            fallback_nodata: 0.0,
+            empty_tile_limit: 0,
+        };
+        rasters.push(SourceRaster::open(client, item, spec).await?);
+    }
+
+    let extent = resample::projected_extent(grid, &projector, MOSAIC_PIXEL_METRES)?;
+    let mut window = Window::covering(
+        extent.min_x,
+        extent.min_y,
+        extent.max_x,
+        extent.max_y,
+        MOSAIC_PIXEL_METRES,
+        3,
+        0.0,
+    )?;
+
+    let bytes: u64 = rasters.iter().map(|r| r.bytes_for(&window)).sum();
+    println!("Estimated download: {}", coverage::describe_bytes(bytes));
+
+    let mut downloaded = 0;
+    for raster in &rasters {
+        downloaded += raster.fill(&mut window, arguments.concurrency).await?;
+    }
+
+    let mut canvas = Canvas::new(grid, 3, 0.0)?;
+    canvas.fill_from(grid, &projector, &window, Provenance::FILLED)?;
+    drop(window);
+
+    write::write_rgb_geotiff(&arguments.output, grid, canvas.values())?;
+
+    let tally = canvas.tally();
+    let (covered, _, none) = tally.percentages();
+    println!("Wrote {}", arguments.output.display());
+    println!(
+        "  {} x {} pixels, {} downloaded",
+        grid.width,
+        grid.height,
+        coverage::describe_bytes(downloaded)
+    );
+    println!("  {covered:.2}% imagery, {none:.2}% no data");
+    Ok(())
+}
+
+/// The Web Mercator pixel size the Sentinel-2 mosaics are published at.
+const MOSAIC_PIXEL_METRES: f64 = 19.109_257_071_294_063;
 
 /// The shorter side a box could have and still fit within a pixel budget.
 ///

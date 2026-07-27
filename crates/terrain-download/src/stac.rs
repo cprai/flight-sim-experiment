@@ -22,7 +22,8 @@ use crate::bbox::LatLonBox;
 /// The projection every HRDEM mosaic item is published in.
 pub const EXPECTED_EPSG: u32 = 3979;
 
-/// Which of the two elevation surfaces to fetch.
+/// What to fetch. The first two are elevation from HRDEM, the third is imagery
+/// from a different provider entirely.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 pub enum Product {
     /// Digital terrain model: the bare ground, with vegetation and buildings
@@ -30,14 +31,31 @@ pub enum Product {
     Dtm,
     /// Digital surface model: the top of whatever the sensor saw.
     Dsm,
+    /// Cloud-free Sentinel-2 colour imagery, for the terrain's surface.
+    Albedo,
 }
 
 impl Product {
-    /// The key this product appears under in an item's asset map.
-    pub fn asset_key(self) -> &'static str {
+    /// The key an elevation product appears under in an item's asset map.
+    ///
+    /// Albedo has none: it does not come from the HRDEM catalogue at all.
+    pub fn asset_key(self) -> Option<&'static str> {
+        match self {
+            Self::Dtm => Some("dtm"),
+            Self::Dsm => Some("dsm"),
+            Self::Albedo => None,
+        }
+    }
+
+    pub fn is_elevation(self) -> bool {
+        matches!(self, Self::Dtm | Self::Dsm)
+    }
+
+    pub fn label(self) -> &'static str {
         match self {
             Self::Dtm => "dtm",
             Self::Dsm => "dsm",
+            Self::Albedo => "albedo",
         }
     }
 }
@@ -82,7 +100,6 @@ impl Resolution {
 pub struct SourceItem {
     pub id: String,
     pub href: String,
-    pub resolution: Resolution,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +123,9 @@ struct Feature {
 struct Properties {
     #[serde(rename = "proj:epsg")]
     epsg: Option<u32>,
+    /// Earth Search tags each scene with its Sentinel-2 grid square.
+    #[serde(rename = "grid:code")]
+    grid_code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -184,13 +204,16 @@ fn read_feature(
         None => bail!("item {} does not say which projection it uses", feature.id),
     }
 
-    let Some(asset) = feature.assets.get(product.asset_key()) else {
+    let key = product
+        .asset_key()
+        .expect("only elevation products search this catalogue");
+    let Some(asset) = feature.assets.get(key) else {
         // Expected, not exceptional: the satellite-derived northern blocks of
         // the two-metre mosaic publish a surface model and no terrain model.
         log::info!(
             "{} has no {} asset, so it contributes no {} data",
             feature.id,
-            product.asset_key(),
+            key,
             resolution.label()
         );
         return Ok(None);
@@ -199,8 +222,108 @@ fn read_feature(
     Ok(Some(SourceItem {
         id: feature.id.clone(),
         href: asset.href.clone(),
-        resolution,
     }))
+}
+
+/// Where the cloud-free Sentinel-2 mosaics live.
+///
+/// These are Earth Genome's annual composites on Source Cooperative. They are
+/// the only cloud-free Sentinel-2 mosaics that can be read anonymously: the
+/// Copernicus Data Space global mosaics are better data -- native ten metre,
+/// quarterly, in the satellite's own UTM zone -- but their assets are `s3://`
+/// URIs behind an account, and the download endpoint answers 401 without a
+/// token.
+///
+/// The price of anonymity is resolution. These are reprojected to Web Mercator
+/// at 19.1 m, which at fifty degrees north is about 12.4 m of ground, and they
+/// have already been resampled once before this tool touches them.
+pub const MOSAIC_ROOT: &str = "https://data.source.coop/earthgenome/sentinel2-temporal-mosaics";
+
+/// The years published. Nothing more recent exists.
+pub const MOSAIC_YEARS: [u16; 2] = [2022, 2023];
+
+/// Roughly 45 km, in degrees of latitude. The mosaics are cut on the Sentinel-2
+/// military grid, whose squares are 100 km, so sampling at least this finely
+/// cannot step over one.
+const MGRS_SAMPLE_SPACING_DEGREES: f64 = 0.4;
+
+/// Caps the discovery queries for an unreasonably large box.
+const MAX_MGRS_QUERIES: usize = 64;
+
+/// The URL of one mosaic tile's true-colour image.
+pub fn mosaic_href(tile: &str, year: u16) -> String {
+    format!(
+        "{MOSAIC_ROOT}/{tile}_{year}-01-01_{}-01-01/TCI.tif",
+        year + 1
+    )
+}
+
+/// Finds which Sentinel-2 grid squares cover the box.
+///
+/// The mosaics are published per grid square but carry no catalogue of their
+/// own -- there is no `catalog.json` to read -- so the squares are discovered
+/// from Earth Search, which does catalogue the underlying scenes and tags each
+/// with a `grid:code`. Points across the box are queried rather than the box
+/// itself, because a single search returns whichever scenes the service feels
+/// like returning first and they can all belong to one square.
+pub async fn find_mosaic_tiles(
+    client: &reqwest::Client,
+    earth_search_root: &str,
+    box_: LatLonBox,
+) -> Result<Vec<String>> {
+    let steps = |span: f64| ((span / MGRS_SAMPLE_SPACING_DEGREES).ceil() as usize).max(1);
+    let (across, down) = (steps(box_.width_degrees()), steps(box_.height_degrees()));
+    anyhow::ensure!(
+        across * (down + 1) <= MAX_MGRS_QUERIES,
+        "that box spans too much ground to locate its imagery tiles ({} queries)",
+        across * down
+    );
+
+    let mut tiles: Vec<String> = Vec::new();
+    for row in 0..=down {
+        for column in 0..=across {
+            let longitude = box_.west + box_.width_degrees() * (column as f64 / across as f64);
+            let latitude = box_.south + box_.height_degrees() * (row as f64 / down as f64);
+
+            let url = format!(
+                "{}/search?collections=sentinel-2-l2a&limit=1&bbox={:.9},{:.9},{:.9},{:.9}",
+                earth_search_root.trim_end_matches('/'),
+                longitude - 1e-6,
+                latitude - 1e-6,
+                longitude + 1e-6,
+                latitude + 1e-6
+            );
+            let body = client
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("requesting {url}"))?
+                .error_for_status()
+                .with_context(|| format!("requesting {url}"))?
+                .text()
+                .await
+                .with_context(|| format!("reading the response to {url}"))?;
+            let page: FeatureCollection = serde_json::from_str(&body)
+                .with_context(|| format!("parsing the Earth Search response from {url}"))?;
+
+            for feature in &page.features {
+                if let Some(code) = feature.properties.grid_code.as_deref() {
+                    // Earth Search writes it as `MGRS-10UDV`; the mosaics are
+                    // named by the bare square.
+                    let square = code.strip_prefix("MGRS-").unwrap_or(code).to_string();
+                    if !tiles.contains(&square) {
+                        tiles.push(square);
+                    }
+                }
+            }
+        }
+    }
+
+    anyhow::ensure!(
+        !tiles.is_empty(),
+        "no Sentinel-2 grid square covers that box"
+    );
+    Ok(tiles)
 }
 
 #[cfg(test)]
@@ -270,7 +393,6 @@ mod tests {
             items[0].href,
             "https://example.invalid/2_4-mosaic-1m-dtm.tif"
         );
-        assert_eq!(items[0].resolution, Resolution::OneMetre);
     }
 
     #[test]

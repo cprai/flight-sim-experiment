@@ -63,6 +63,17 @@ pub enum Provenance {
 }
 
 impl Provenance {
+    /// Marks a pixel as filled where there is only one source to fill it from.
+    ///
+    /// The colour raster has no provenance band -- it comes from one mosaic --
+    /// but the canvas still tracks which pixels are done. Reusing the first
+    /// tier says that without adding a variant that would change what the
+    /// elevation band means.
+    pub const FILLED: Self = Self::OneMetre;
+
+    /// The value this takes in the written band. Tests compare against it; the
+    /// writer itself widens the stored byte.
+    #[cfg(test)]
     pub fn as_f32(self) -> f32 {
         self as u8 as f32
     }
@@ -107,6 +118,104 @@ fn geo_key_directory() -> Vec<u16> {
     directory
 }
 
+/// Writes the placement tags every output shares.
+///
+/// `extra_samples` says how many bands beyond the first are auxiliary rather
+/// than colour, so a reader does not mistake them for alpha.
+fn write_placement<W, K, C>(
+    image: &mut tiff::encoder::ImageEncoder<'_, W, C, K>,
+    grid: &OutputGrid,
+    extra_samples: usize,
+    nodata: Option<f32>,
+) -> Result<()>
+where
+    W: std::io::Write + std::io::Seek,
+    K: tiff::encoder::TiffKind,
+    C: ColorType,
+{
+    let directory = image.encoder();
+
+    if extra_samples > 0 {
+        directory
+            .write_tag(
+                Tag::Unknown(TAG_EXTRA_SAMPLES),
+                &vec![0u16; extra_samples][..],
+            )
+            .context("writing ExtraSamples")?;
+    }
+    directory
+        .write_tag(
+            Tag::Unknown(TAG_MODEL_PIXEL_SCALE),
+            &[grid.degrees_per_pixel_x, grid.degrees_per_pixel_y, 0.0][..],
+        )
+        .context("writing ModelPixelScale")?;
+    directory
+        .write_tag(
+            Tag::Unknown(TAG_MODEL_TIEPOINT),
+            &[0.0, 0.0, 0.0, grid.box_.west, grid.box_.north, 0.0][..],
+        )
+        .context("writing ModelTiepoint")?;
+    directory
+        .write_tag(
+            Tag::Unknown(TAG_GEO_KEY_DIRECTORY),
+            &geo_key_directory()[..],
+        )
+        .context("writing the GeoKeyDirectory")?;
+    directory
+        .write_tag(Tag::Unknown(TAG_GEO_ASCII_PARAMS), "NAD83(CSRS)|")
+        .context("writing GeoAsciiParams")?;
+    if let Some(nodata) = nodata {
+        directory
+            .write_tag(Tag::Unknown(TAG_GDAL_NODATA), format!("{nodata}").as_str())
+            .context("writing GDAL_NODATA")?;
+    }
+    Ok(())
+}
+
+/// Writes the colour raster: three bands of eight-bit sRGB.
+///
+/// This is the layout `load_colours` in the simulator already reads -- it
+/// normalises bytes to 0..1 and treats them as sRGB-encoded, which is exactly
+/// what Sentinel-2's true-colour composite is.
+pub fn write_rgb_geotiff(path: &Path, grid: &OutputGrid, samples: &[f32]) -> Result<()> {
+    let expected = (grid.width as usize)
+        .checked_mul(grid.height as usize)
+        .and_then(|n| n.checked_mul(3))
+        .context("the output raster does not fit in memory")?;
+    anyhow::ensure!(
+        samples.len() == expected,
+        "expected {expected} interleaved samples for a {} x {} raster, got {}",
+        grid.width,
+        grid.height,
+        samples.len()
+    );
+
+    let bytes: Vec<u8> = samples
+        .iter()
+        .map(|&v| v.round().clamp(0.0, 255.0) as u8)
+        .collect();
+
+    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut encoder = TiffEncoder::new(BufWriter::new(file))
+        .with_context(|| format!("starting {}", path.display()))?
+        .with_compression(Compression::Deflate(DeflateLevel::Balanced));
+
+    let mut image = encoder
+        .new_image::<tiff::encoder::colortype::RGB8>(grid.width, grid.height)
+        .context("starting the image")?;
+    image
+        .rows_per_strip(ROWS_PER_STRIP)
+        .context("setting the strip height")?;
+
+    // Black is the mosaic's own nodata, and it survives into the output.
+    write_placement(&mut image, grid, 0, Some(0.0))?;
+
+    image
+        .write_data(&bytes)
+        .with_context(|| format!("writing pixels to {}", path.display()))?;
+    Ok(())
+}
+
 /// Writes the elevation and provenance bands to `path`.
 ///
 /// `samples` is interleaved: elevation, provenance, elevation, provenance, and
@@ -136,41 +245,9 @@ pub fn write_geotiff(path: &Path, grid: &OutputGrid, samples: &[f32], nodata: f3
         .rows_per_strip(ROWS_PER_STRIP)
         .context("setting the strip height")?;
 
-    {
-        let directory = image.encoder();
-
-        // Band two is auxiliary, not alpha; without this a reader is entitled
-        // to treat it as coverage and composite with it.
-        directory
-            .write_tag(Tag::Unknown(TAG_EXTRA_SAMPLES), &[0u16][..])
-            .context("writing ExtraSamples")?;
-        directory
-            .write_tag(
-                Tag::Unknown(TAG_MODEL_PIXEL_SCALE),
-                &[grid.degrees_per_pixel_x, grid.degrees_per_pixel_y, 0.0][..],
-            )
-            .context("writing ModelPixelScale")?;
-        directory
-            .write_tag(
-                Tag::Unknown(TAG_MODEL_TIEPOINT),
-                &[0.0, 0.0, 0.0, grid.box_.west, grid.box_.north, 0.0][..],
-            )
-            .context("writing ModelTiepoint")?;
-        directory
-            .write_tag(
-                Tag::Unknown(TAG_GEO_KEY_DIRECTORY),
-                &geo_key_directory()[..],
-            )
-            .context("writing the GeoKeyDirectory")?;
-        directory
-            .write_tag(Tag::Unknown(TAG_GEO_ASCII_PARAMS), "NAD83(CSRS)|")
-            .context("writing GeoAsciiParams")?;
-        // One value, applied to both bands. Harmless for provenance, which only
-        // ever takes 0, 1 or 2.
-        directory
-            .write_tag(Tag::Unknown(TAG_GDAL_NODATA), format!("{nodata}").as_str())
-            .context("writing GDAL_NODATA")?;
-    }
+    // Band two is auxiliary, not alpha; without ExtraSamples a reader is
+    // entitled to treat it as coverage and composite with it.
+    write_placement(&mut image, grid, 1, Some(nodata))?;
 
     image
         .write_data(samples)

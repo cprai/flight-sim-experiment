@@ -97,13 +97,19 @@ pub fn projected_extent(
     })
 }
 
-/// The output raster being filled in, as interleaved elevation and provenance.
+/// The output raster being filled in.
+///
+/// Data bands and the record of where each pixel came from are held apart
+/// rather than interleaved, because the two products want them differently: the
+/// elevation raster ships provenance as a second band, while the imagery has a
+/// single source and only needs it to know which pixels are still holes.
 pub struct Canvas {
     pub width: u32,
     pub height: u32,
-    /// Elevation, provenance, elevation, provenance, ... row-major from the
-    /// north-west corner.
-    pub samples: Vec<f32>,
+    pub bands: usize,
+    nodata: f32,
+    values: Vec<f32>,
+    provenance: Vec<u8>,
 }
 
 /// What each source contributed, as a count of output pixels.
@@ -135,44 +141,65 @@ impl Tally {
 }
 
 impl Canvas {
-    pub fn new(grid: &OutputGrid, nodata: f32) -> Result<Self> {
-        let count = (grid.width as usize)
+    pub fn new(grid: &OutputGrid, bands: usize, nodata: f32) -> Result<Self> {
+        anyhow::ensure!(bands >= 1, "a canvas needs at least one band");
+        let pixels = (grid.width as usize)
             .checked_mul(grid.height as usize)
-            .and_then(|n| n.checked_mul(2))
+            .context("the output raster does not fit in memory")?;
+        let count = pixels
+            .checked_mul(bands)
             .context("the output raster does not fit in memory")?;
 
-        let mut samples = Vec::new();
-        samples
+        let mut values = Vec::new();
+        values
             .try_reserve_exact(count)
             .context("the output raster does not fit in memory")?;
-        for _ in 0..count / 2 {
-            samples.push(nodata);
-            samples.push(Provenance::Missing.as_f32());
-        }
+        values.resize(count, nodata);
+
+        let mut provenance = Vec::new();
+        provenance
+            .try_reserve_exact(pixels)
+            .context("the output raster does not fit in memory")?;
+        provenance.resize(pixels, Provenance::Missing as u8);
 
         Ok(Self {
             width: grid.width,
             height: grid.height,
-            samples,
+            bands,
+            nodata,
+            values,
+            provenance,
         })
     }
 
     fn is_filled(&self, index: usize) -> bool {
-        self.samples[index * 2 + 1] != Provenance::Missing.as_f32()
+        self.provenance[index] != Provenance::Missing as u8
     }
 
-    fn set(&mut self, index: usize, elevation: f32, provenance: Provenance) {
-        self.samples[index * 2] = elevation;
-        self.samples[index * 2 + 1] = provenance.as_f32();
+    /// The data bands, interleaved, row-major from the north-west corner.
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
+
+    /// Interleaves the single data band with provenance, which is the layout
+    /// the two-band elevation GeoTIFF is written from.
+    pub fn with_provenance_band(&self) -> Vec<f32> {
+        debug_assert_eq!(self.bands, 1);
+        let mut out = Vec::with_capacity(self.values.len() * 2);
+        for (value, &source) in self.values.iter().zip(self.provenance.iter()) {
+            out.push(*value);
+            out.push(f32::from(source));
+        }
+        out
     }
 
     /// Counts what each source ended up contributing.
     pub fn tally(&self) -> Tally {
         let mut tally = Tally::default();
-        for pair in self.samples.chunks_exact(2) {
-            if pair[1] == Provenance::OneMetre.as_f32() {
+        for &source in &self.provenance {
+            if source == Provenance::OneMetre as u8 {
                 tally.one_metre += 1;
-            } else if pair[1] == Provenance::TwoMetre.as_f32() {
+            } else if source == Provenance::TwoMetre as u8 {
                 tally.two_metre += 1;
             } else {
                 tally.missing += 1;
@@ -183,9 +210,7 @@ impl Canvas {
 
     /// Whether any pixel is still waiting for a value.
     pub fn has_holes(&self) -> bool {
-        self.samples
-            .chunks_exact(2)
-            .any(|pair| pair[1] == Provenance::Missing.as_f32())
+        self.provenance.contains(&(Provenance::Missing as u8))
     }
 
     /// Fills every pixel this window can supply, leaving the rest alone.
@@ -200,7 +225,15 @@ impl Canvas {
         window: &Window,
         provenance: Provenance,
     ) -> Result<u64> {
+        anyhow::ensure!(
+            window.bands == self.bands,
+            "the source has {} bands but the output has {}",
+            window.bands,
+            self.bands
+        );
+
         let mut row = vec![(0.0f64, 0.0f64); self.width as usize];
+        let mut sample = vec![self.nodata; self.bands];
         let mut filled = 0;
 
         for y in 0..self.height {
@@ -225,8 +258,10 @@ impl Canvas {
                 if self.is_filled(index) {
                     continue;
                 }
-                if let Some(elevation) = window.sample(metres_x, metres_y) {
-                    self.set(index, elevation, provenance);
+                if window.sample_into(metres_x, metres_y, &mut sample) {
+                    let at = index * self.bands;
+                    self.values[at..at + self.bands].copy_from_slice(&sample);
+                    self.provenance[index] = provenance as u8;
                     filled += 1;
                 }
             }
@@ -333,6 +368,7 @@ mod tests {
             extent.max_x,
             extent.max_y,
             metres_per_pixel,
+            1,
             NODATA,
         )
         .expect("failed to allocate");
@@ -341,7 +377,7 @@ mod tests {
             for x in 0..window.width {
                 let metres_x = window.origin_x + (f64::from(x) + 0.5) * metres_per_pixel;
                 let metres_y = window.origin_y - (f64::from(y) + 0.5) * metres_per_pixel;
-                window.set_for_test(x, y, value(metres_x, metres_y));
+                window.set_for_test(x, y, &[value(metres_x, metres_y)]);
             }
         }
         window
@@ -380,7 +416,7 @@ mod tests {
     /// boundary finds nothing more. Pinned so the next test means something.
     #[test]
     fn west_of_the_central_meridian_the_corners_already_bound_the_box() {
-        let projector = Projector::new().expect("failed to build");
+        let projector = Projector::new(crate::project::EPSG_LAMBERT).expect("failed to build");
         let box_ = LatLonBox::from_corners(
             LatLon {
                 latitude: 49.0,
@@ -411,7 +447,7 @@ mod tests {
     /// Taking corners alone would leave that strip unfetched.
     #[test]
     fn a_box_straddling_the_central_meridian_bows_past_its_corners() {
-        let projector = Projector::new().expect("failed to build");
+        let projector = Projector::new(crate::project::EPSG_LAMBERT).expect("failed to build");
         let box_ = LatLonBox::from_corners(
             LatLon {
                 latitude: 49.0,
@@ -444,7 +480,7 @@ mod tests {
     #[test]
     fn a_fresh_canvas_is_all_holes() {
         let grid = small_grid(100.0);
-        let canvas = Canvas::new(&grid, NODATA).expect("failed to allocate");
+        let canvas = Canvas::new(&grid, 1, NODATA).expect("failed to allocate");
         let tally = canvas.tally();
         assert_eq!(tally.one_metre, 0);
         assert_eq!(tally.two_metre, 0);
@@ -454,11 +490,11 @@ mod tests {
 
     #[test]
     fn a_covering_window_fills_every_pixel_once() {
-        let projector = Projector::new().expect("failed to build");
+        let projector = Projector::new(crate::project::EPSG_LAMBERT).expect("failed to build");
         let grid = small_grid(20.0);
         let window = window_over(&grid, &projector, 20.0, |_, _| 500.0);
 
-        let mut canvas = Canvas::new(&grid, NODATA).expect("failed to allocate");
+        let mut canvas = Canvas::new(&grid, 1, NODATA).expect("failed to allocate");
         let filled = canvas
             .fill_from(&grid, &projector, &window, Provenance::OneMetre)
             .expect("failed to fill");
@@ -469,7 +505,7 @@ mod tests {
         assert_eq!(tally.one_metre, grid.pixel_count());
         assert_eq!(tally.missing, 0);
 
-        for pair in canvas.samples.chunks_exact(2) {
+        for pair in canvas.with_provenance_band().chunks_exact(2) {
             assert!((pair[0] - 500.0).abs() < 1e-3, "{}", pair[0]);
         }
     }
@@ -478,7 +514,7 @@ mod tests {
     /// metre pass left behind, and the provenance band says which is which.
     #[test]
     fn two_metre_data_fills_only_the_holes_left_by_one_metre() {
-        let projector = Projector::new().expect("failed to build");
+        let projector = Projector::new(crate::project::EPSG_LAMBERT).expect("failed to build");
         let grid = small_grid(20.0);
 
         // One metre covers only the western half, by easting.
@@ -491,7 +527,7 @@ mod tests {
         });
         let coarse = window_over(&grid, &projector, 40.0, |_, _| 900.0);
 
-        let mut canvas = Canvas::new(&grid, NODATA).expect("failed to allocate");
+        let mut canvas = Canvas::new(&grid, 1, NODATA).expect("failed to allocate");
         canvas
             .fill_from(&grid, &projector, &fine, Provenance::OneMetre)
             .expect("failed to fill");
@@ -513,7 +549,7 @@ mod tests {
         assert_eq!(tally.total(), grid.pixel_count());
 
         // Every pixel holds the value of whichever source claimed it.
-        for pair in canvas.samples.chunks_exact(2) {
+        for pair in canvas.with_provenance_band().chunks_exact(2) {
             if pair[1] == Provenance::OneMetre.as_f32() {
                 assert!((pair[0] - 100.0).abs() < 1e-3, "{}", pair[0]);
             } else {
@@ -524,11 +560,11 @@ mod tests {
 
     #[test]
     fn pixels_no_source_covers_stay_missing() {
-        let projector = Projector::new().expect("failed to build");
+        let projector = Projector::new(crate::project::EPSG_LAMBERT).expect("failed to build");
         let grid = small_grid(20.0);
         let empty = window_over(&grid, &projector, 20.0, |_, _| NODATA);
 
-        let mut canvas = Canvas::new(&grid, NODATA).expect("failed to allocate");
+        let mut canvas = Canvas::new(&grid, 1, NODATA).expect("failed to allocate");
         let filled = canvas
             .fill_from(&grid, &projector, &empty, Provenance::OneMetre)
             .expect("failed to fill");
@@ -536,7 +572,7 @@ mod tests {
         assert_eq!(filled, 0);
         let tally = canvas.tally();
         assert_eq!(tally.missing, grid.pixel_count());
-        for pair in canvas.samples.chunks_exact(2) {
+        for pair in canvas.with_provenance_band().chunks_exact(2) {
             assert_eq!(pair[0], NODATA);
             assert_eq!(pair[1], Provenance::Missing.as_f32());
         }
@@ -558,11 +594,11 @@ mod tests {
 
     #[test]
     fn the_hole_extent_is_none_once_everything_is_filled() {
-        let projector = Projector::new().expect("failed to build");
+        let projector = Projector::new(crate::project::EPSG_LAMBERT).expect("failed to build");
         let grid = small_grid(20.0);
         let window = window_over(&grid, &projector, 20.0, |_, _| 500.0);
 
-        let mut canvas = Canvas::new(&grid, NODATA).expect("failed to allocate");
+        let mut canvas = Canvas::new(&grid, 1, NODATA).expect("failed to allocate");
         assert!(
             canvas
                 .hole_extent(&grid, &projector, 2.0)

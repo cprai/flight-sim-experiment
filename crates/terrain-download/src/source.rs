@@ -20,58 +20,70 @@ use async_tiff::metadata::TiffMetadataReader;
 use async_tiff::metadata::cache::ReadaheadMetadataCache;
 use async_tiff::reader::ReqwestReader;
 
-use crate::stac::{EXPECTED_EPSG, SourceItem};
+use crate::stac::SourceItem;
 
 /// A 512 x 512 block of 32-bit floats that is entirely nodata compresses, with
 /// LZW and no predictor, to this many bytes. Verified identical across all four
 /// published products.
 const EMPTY_TILE_BYTES: u64 = 3994;
 
-/// Byte counts at or below this are taken to mean a tile holds no data.
+/// Byte counts at or below this mean an HRDEM tile holds nothing but nodata.
 ///
 /// Twice the observed size, to allow for a producer whose encoder differs
 /// slightly. There is a wide gap to land in: the smallest tile of real terrain
 /// seen in the mosaic is 118 139 bytes, fifteen times this limit.
-const EMPTY_TILE_LIMIT: u64 = EMPTY_TILE_BYTES * 2;
+pub const ELEVATION_EMPTY_TILE_LIMIT: u64 = EMPTY_TILE_BYTES * 2;
 
 /// Whether a tile's compressed size says it holds nothing but nodata.
 ///
-/// Zero is how GDAL records a block it never wrote. Everything else relies on
-/// an all-nodata tile being a constant, which LZW crushes to a size no tile of
-/// real terrain comes close to.
-fn is_empty_byte_count(bytes: u64) -> bool {
-    bytes <= EMPTY_TILE_LIMIT
+/// Zero always counts: that is how a sparse block is recorded, and there are no
+/// bytes to fetch either way. Above that the judgement is the caller's, because
+/// it depends entirely on the raster. An all-nodata HRDEM tile is a constant
+/// that LZW crushes to 3994 bytes while real terrain never compresses below
+/// 118 139, so a threshold between them is safe. Imagery has no such gap --
+/// see `RasterSpec::empty_tile_limit`.
+fn is_empty_byte_count(bytes: u64, limit: u64) -> bool {
+    bytes == 0 || bytes <= limit
 }
 
-/// A rectangle of the EPSG:3979 grid held in memory at one resolution.
+/// A rectangle of one projected grid, held in memory.
 ///
 /// The origin is the *edge* of the north-west pixel, not its centre, because
 /// these rasters are area-sampled. That distinction is what makes the one-metre
-/// and two-metre grids line up correctly: they share an origin edge but their
-/// pixel centres sit half a metre apart, and every lookup here goes through
-/// ground metres rather than pixel indices so the offset never has to be
-/// applied by hand.
+/// and two-metre elevation grids line up correctly: they share an origin edge
+/// but their pixel centres sit half a metre apart, and every lookup here goes
+/// through ground metres rather than pixel indices so the offset never has to
+/// be applied by hand.
+///
+/// Samples are held interleaved and always as `f32`, whatever the source stored.
+/// Imagery arrives as bytes and is widened on the way in, which costs four times
+/// the memory but means one interpolation path serves elevation and colour alike
+/// -- and the arithmetic has to happen in floating point regardless.
 pub struct Window {
     pub origin_x: f64,
     pub origin_y: f64,
     pub metres_per_pixel: f64,
     pub width: u32,
     pub height: u32,
+    pub bands: usize,
     pub nodata: f32,
     pixels: Vec<f32>,
 }
 
 impl Window {
     /// Allocates a window covering at least the given extent in metres, snapped
-    /// outwards to the resolution's own grid.
+    /// outwards to the source's own grid.
     pub fn covering(
         min_x: f64,
         min_y: f64,
         max_x: f64,
         max_y: f64,
         metres_per_pixel: f64,
+        bands: usize,
         nodata: f32,
     ) -> Result<Self> {
+        ensure!(bands >= 1, "a window needs at least one band");
+
         let origin_x = (min_x / metres_per_pixel).floor() * metres_per_pixel;
         let origin_y = (max_y / metres_per_pixel).ceil() * metres_per_pixel;
         let width = ((max_x - origin_x) / metres_per_pixel).ceil().max(1.0);
@@ -86,7 +98,14 @@ impl Window {
         let height = height as u32;
         let count = (width as usize)
             .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(bands))
             .context("the source window does not fit in memory")?;
+
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(count)
+            .context("the source window does not fit in memory")?;
+        pixels.resize(count, nodata);
 
         Ok(Self {
             origin_x,
@@ -94,24 +113,39 @@ impl Window {
             metres_per_pixel,
             width,
             height,
+            bands,
             nodata,
-            pixels: vec![nodata; count],
+            pixels,
         })
     }
 
     /// Writes one pixel directly, so tests can build a window without a server.
     #[cfg(test)]
-    pub fn set_for_test(&mut self, x: u32, y: u32, value: f32) {
-        self.pixels[(y as usize) * (self.width as usize) + x as usize] = value;
+    pub fn set_for_test(&mut self, x: u32, y: u32, values: &[f32]) {
+        let at = ((y as usize) * (self.width as usize) + x as usize) * self.bands;
+        self.pixels[at..at + self.bands].copy_from_slice(values);
     }
 
-    /// Samples the window at a point in projected metres, bilinearly.
+    /// Whether the pixel at a flat index is nodata in every band.
     ///
-    /// Returns `None` if the point falls outside the window or if any of the
+    /// All bands rather than any: imagery declares nodata as black across the
+    /// whole pixel, and a single zero channel is an ordinary dark colour.
+    fn is_nodata(&self, at: usize) -> bool {
+        self.pixels[at..at + self.bands]
+            .iter()
+            .all(|&v| v == self.nodata)
+    }
+
+    /// Samples the window at a point in projected metres, bilinearly, writing
+    /// one value per band into `out`.
+    ///
+    /// Returns `false` if the point falls outside the window or if any of the
     /// four pixels the interpolation needs is nodata. Refusing to interpolate
     /// across a hole keeps invented values from creeping one pixel into every
     /// gap, at the cost of eroding the edge of real coverage by the same pixel.
-    pub fn sample(&self, x: f64, y: f64) -> Option<f32> {
+    pub fn sample_into(&self, x: f64, y: f64, out: &mut [f32]) -> bool {
+        debug_assert_eq!(out.len(), self.bands);
+
         // Position in pixel-centre space: 0.0 is the centre of pixel 0.
         let fx = (x - self.origin_x) / self.metres_per_pixel - 0.5;
         let fy = (self.origin_y - y) / self.metres_per_pixel - 0.5;
@@ -119,30 +153,66 @@ impl Window {
         let x0 = fx.floor();
         let y0 = fy.floor();
         if x0 < 0.0 || y0 < 0.0 {
-            return None;
+            return false;
         }
         let x0 = x0 as u32;
         let y0 = y0 as u32;
         if x0 + 1 >= self.width || y0 + 1 >= self.height {
-            return None;
+            return false;
         }
 
         let tx = fx - f64::from(x0);
         let ty = fy - f64::from(y0);
-        let row = |y: u32| (y as usize) * (self.width as usize);
-
-        let a = self.pixels[row(y0) + x0 as usize];
-        let b = self.pixels[row(y0) + x0 as usize + 1];
-        let c = self.pixels[row(y0 + 1) + x0 as usize];
-        let d = self.pixels[row(y0 + 1) + x0 as usize + 1];
-        if a == self.nodata || b == self.nodata || c == self.nodata || d == self.nodata {
-            return None;
+        let at = |x: u32, y: u32| ((y as usize) * (self.width as usize) + x as usize) * self.bands;
+        let corners = [
+            at(x0, y0),
+            at(x0 + 1, y0),
+            at(x0, y0 + 1),
+            at(x0 + 1, y0 + 1),
+        ];
+        if corners.iter().any(|&c| self.is_nodata(c)) {
+            return false;
         }
 
-        let top = f64::from(a) + (f64::from(b) - f64::from(a)) * tx;
-        let bottom = f64::from(c) + (f64::from(d) - f64::from(c)) * tx;
-        Some((top + (bottom - top) * ty) as f32)
+        for (band, value) in out.iter_mut().enumerate() {
+            let a = f64::from(self.pixels[corners[0] + band]);
+            let b = f64::from(self.pixels[corners[1] + band]);
+            let c = f64::from(self.pixels[corners[2] + band]);
+            let d = f64::from(self.pixels[corners[3] + band]);
+            let top = a + (b - a) * tx;
+            let bottom = c + (d - c) * tx;
+            *value = (top + (bottom - top) * ty) as f32;
+        }
+        true
     }
+}
+
+/// What a source raster is expected to look like, so the header can be checked
+/// against it rather than against one hard-coded product.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RasterSpec {
+    /// The projection the raster must declare.
+    pub epsg: u32,
+    /// Ground sample distance in metres, which is also its pixel scale.
+    pub metres_per_pixel: f64,
+    /// How many samples each pixel carries.
+    pub bands: usize,
+    /// The value to treat as absent, if the file does not say.
+    ///
+    /// HRDEM declares `-32767` in a GDAL_NODATA tag; the Sentinel-2 mosaics
+    /// record their nodata only in STAC, so it has to be supplied here.
+    pub fallback_nodata: f32,
+    /// Compressed size at or below which a tile is assumed to be all nodata
+    /// and skipped without fetching.
+    ///
+    /// Zero disables the guess, leaving only genuinely absent blocks skipped.
+    /// That is the right setting whenever empty and nearly-empty tiles are not
+    /// cleanly separable by size. The Sentinel-2 mosaics are such a case: an
+    /// all-black 256-pixel tile deflates to 213 bytes, but a coastal tile that
+    /// is 0.22% land and the rest ocean comes to 723, and one 5% land to 6850.
+    /// Any threshold high enough to catch the empties would throw away the
+    /// shoreline.
+    pub empty_tile_limit: u64,
 }
 
 /// One opened remote raster, ready to be asked for tiles.
@@ -160,12 +230,18 @@ pub struct SourceRaster {
     /// Northing of the northern edge of row 0.
     tie_y: f64,
     metres_per_pixel: f64,
+    bands: usize,
+    empty_tile_limit: u64,
 }
 
 impl SourceRaster {
     /// Opens the raster's header and checks it is the shape everything
     /// downstream assumes.
-    pub async fn open(client: &reqwest::Client, item: SourceItem) -> Result<Self> {
+    pub async fn open(
+        client: &reqwest::Client,
+        item: SourceItem,
+        spec: RasterSpec,
+    ) -> Result<Self> {
         let url = reqwest::Url::parse(&item.href)
             .with_context(|| format!("{} has an unusable href {}", item.id, item.href))?;
         let reader = ReqwestReader::new(client.clone(), url);
@@ -186,17 +262,16 @@ impl SourceRaster {
             .with_context(|| format!("reading the header of {}", item.href))?
             .with_context(|| format!("{} has no image directory", item.href))?;
 
-        let metres_per_pixel = item.resolution.metres();
-        let raster = Self::validated(item, ifd, reader, metres_per_pixel)?;
-        Ok(raster)
+        Self::validated(item, ifd, reader, spec)
     }
 
     fn validated(
         item: SourceItem,
         ifd: ImageFileDirectory,
         reader: ReqwestReader,
-        metres_per_pixel: f64,
+        spec: RasterSpec,
     ) -> Result<Self> {
+        let metres_per_pixel = spec.metres_per_pixel;
         let describe = |what: &str| format!("{} {what}", item.id);
 
         let (tile_width, tile_height) = match (ifd.tile_width(), ifd.tile_height()) {
@@ -205,11 +280,12 @@ impl SourceRaster {
         };
 
         ensure!(
-            ifd.samples_per_pixel() == 1,
+            usize::from(ifd.samples_per_pixel()) == spec.bands,
             "{}",
             describe(&format!(
-                "has {} bands, but an elevation raster should have one",
-                ifd.samples_per_pixel()
+                "has {} bands, but {} were expected",
+                ifd.samples_per_pixel(),
+                spec.bands
             ))
         );
 
@@ -218,10 +294,11 @@ impl SourceRaster {
             .and_then(|keys| keys.projected_type)
             .map(u32::from);
         ensure!(
-            projected == Some(EXPECTED_EPSG),
+            projected == Some(spec.epsg),
             "{}",
             describe(&format!(
-                "declares projection {projected:?}, not EPSG:{EXPECTED_EPSG}"
+                "declares projection {projected:?}, not EPSG:{}",
+                spec.epsg
             ))
         );
 
@@ -253,12 +330,15 @@ impl SourceRaster {
             describe("ties a point other than its own origin, which is unsupported")
         );
 
-        let nodata_text = ifd
-            .gdal_nodata()
-            .with_context(|| describe("declares no nodata value, so gaps cannot be told apart"))?;
-        let nodata: f32 = nodata_text.trim().parse().with_context(|| {
-            describe(&format!("has an unreadable nodata value {nodata_text:?}"))
-        })?;
+        // HRDEM states its nodata in the file; the Sentinel-2 mosaics leave the
+        // tag off and declare it in STAC instead, so fall back to the spec.
+        let nodata: f32 = match ifd.gdal_nodata() {
+            Some(text) => text
+                .trim()
+                .parse()
+                .with_context(|| describe(&format!("has an unreadable nodata value {text:?}")))?,
+            None => spec.fallback_nodata,
+        };
 
         let (tiles_across, tiles_down) = ifd
             .tile_count()
@@ -275,6 +355,8 @@ impl SourceRaster {
             tie_x: tiepoint[3],
             tie_y: tiepoint[4],
             metres_per_pixel,
+            bands: spec.bands,
+            empty_tile_limit: spec.empty_tile_limit,
             ifd,
         })
     }
@@ -287,7 +369,7 @@ impl SourceRaster {
     /// compressed size without fetching it.
     fn tile_is_empty(&self, index: usize) -> bool {
         match self.ifd.tile_byte_counts().and_then(|c| c.get(index)) {
-            Some(&bytes) => is_empty_byte_count(bytes),
+            Some(&bytes) => is_empty_byte_count(bytes, self.empty_tile_limit),
             // An absent entry cannot be fetched either way.
             None => true,
         }
@@ -403,14 +485,19 @@ impl SourceRaster {
                     .with_context(|| {
                         format!("decoding tile ({tile_x}, {tile_y}) of {}", self.item.id)
                     })?;
-                let async_tiff::TypedArray::Float32(values) = array.data() else {
-                    bail!(
-                        "{} holds {:?} samples, but elevations should be 32-bit floats",
+                // Elevation arrives as floats and imagery as bytes; both are
+                // widened to f32 so one blit and one interpolator serve each.
+                let values: Vec<f32> = match array.data() {
+                    async_tiff::TypedArray::Float32(v) => v.clone(),
+                    async_tiff::TypedArray::UInt8(v) => v.iter().map(|&b| f32::from(b)).collect(),
+                    async_tiff::TypedArray::UInt16(v) => v.iter().map(|&b| f32::from(b)).collect(),
+                    other => bail!(
+                        "{} holds {:?} samples, which this tool cannot read",
                         self.item.id,
-                        array.data_type()
-                    );
+                        std::mem::discriminant(other)
+                    ),
                 };
-                self.blit(window, tile_x, tile_y, values);
+                self.blit(window, tile_x, tile_y, &values);
             }
 
             done += chunk.len();
@@ -426,6 +513,8 @@ impl SourceRaster {
     /// they each pad their edge with nodata, and writing it would punch a hole
     /// through the neighbour's real data.
     fn blit(&self, window: &mut Window, tile_x: usize, tile_y: usize, values: &[f32]) {
+        debug_assert_eq!(window.bands, self.bands);
+        let bands = self.bands;
         let tile_width = self.tile_width as usize;
         let tile_height = self.tile_height as usize;
         let first_column = tile_x * tile_width;
@@ -459,11 +548,16 @@ impl SourceRaster {
                 if target_x < 0 || target_x >= i64::from(window.width) {
                     continue;
                 }
-                let value = values[row * tile_width + column];
-                if value == self.nodata {
+                let from = (row * tile_width + column) * bands;
+                let sample = &values[from..from + bands];
+                // Skip nodata rather than write it. Where two mosaic blocks
+                // overlap they each pad their edge with it, and writing it
+                // would punch a hole through the neighbour's real data.
+                if sample.iter().all(|&v| v == self.nodata) {
                     continue;
                 }
-                window.pixels[target_row + target_x as usize] = value;
+                let to = (target_row + target_x as usize) * bands;
+                window.pixels[to..to + bands].copy_from_slice(sample);
             }
         }
     }
@@ -473,7 +567,13 @@ impl SourceRaster {
 mod tests {
     use super::*;
 
-    /// A window whose pixels can be written directly, for testing `sample`.
+    /// Samples a single-band window, for the tests written before bands existed.
+    fn sample_one(window: &Window, x: f64, y: f64) -> Option<f32> {
+        let mut out = [0.0f32];
+        window.sample_into(x, y, &mut out).then_some(out[0])
+    }
+
+    /// A window whose pixels can be written directly, for testing sampling.
     fn window_with(metres_per_pixel: f64, width: u32, height: u32, values: &[f32]) -> Window {
         let mut window = Window::covering(
             0.0,
@@ -481,6 +581,7 @@ mod tests {
             f64::from(width) * metres_per_pixel,
             0.0,
             metres_per_pixel,
+            1,
             -32767.0,
         )
         .expect("failed to allocate");
@@ -491,7 +592,7 @@ mod tests {
 
     #[test]
     fn a_window_snaps_outwards_to_its_own_grid() {
-        let window = Window::covering(-1000.5, 499.25, -900.5, 600.75, 2.0, -32767.0)
+        let window = Window::covering(-1000.5, 499.25, -900.5, 600.75, 2.0, 1, -32767.0)
             .expect("failed to allocate");
         assert_eq!(window.origin_x, -1002.0);
         assert_eq!(window.origin_y, 602.0);
@@ -506,33 +607,33 @@ mod tests {
     fn sampling_a_pixel_centre_returns_that_pixel() {
         let window = window_with(1.0, 2, 2, &[10.0, 20.0, 30.0, 40.0]);
         // Centre of pixel (0, 0) is half a metre in from the origin edge.
-        let value = window.sample(0.5, -0.5).expect("expected a sample");
+        let value = sample_one(&window, 0.5, -0.5).expect("expected a sample");
         assert!((value - 10.0).abs() < 1e-6, "{value}");
     }
 
     #[test]
     fn sampling_between_pixels_interpolates() {
         let window = window_with(1.0, 2, 2, &[0.0, 10.0, 0.0, 10.0]);
-        let value = window.sample(1.0, -0.5).expect("expected a sample");
+        let value = sample_one(&window, 1.0, -0.5).expect("expected a sample");
         assert!((value - 5.0).abs() < 1e-6, "{value}");
     }
 
     #[test]
     fn a_hole_in_any_corner_refuses_the_sample() {
         let window = window_with(1.0, 2, 2, &[10.0, 20.0, 30.0, -32767.0]);
-        assert_eq!(window.sample(1.0, -1.0), None);
+        assert_eq!(sample_one(&window, 1.0, -1.0), None);
         // ...and the same window away from the hole is still unusable, because
         // every interior point of a 2x2 window touches all four pixels.
-        assert_eq!(window.sample(0.6, -0.6), None);
+        assert_eq!(sample_one(&window, 0.6, -0.6), None);
     }
 
     #[test]
     fn sampling_outside_the_window_returns_nothing() {
         let window = window_with(1.0, 2, 2, &[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(window.sample(-5.0, -0.5), None);
-        assert_eq!(window.sample(0.5, 5.0), None);
+        assert_eq!(sample_one(&window, -5.0, -0.5), None);
+        assert_eq!(sample_one(&window, 0.5, 5.0), None);
         // The outer half-pixel has no second pixel to interpolate towards.
-        assert_eq!(window.sample(0.1, -0.5), None);
+        assert_eq!(sample_one(&window, 0.1, -0.5), None);
     }
 
     /// The two mosaics share an origin edge but not their pixel centres: a
@@ -557,15 +658,38 @@ mod tests {
     /// tiles seen in a scan of tile rows 940 to 950 of the British Columbia
     /// block.
     #[test]
-    fn an_all_nodata_tile_is_recognised_by_its_compressed_size() {
-        assert!(is_empty_byte_count(0), "a sparse block holds no data");
-        assert!(is_empty_byte_count(EMPTY_TILE_BYTES));
+    fn an_all_nodata_elevation_tile_is_recognised_by_its_compressed_size() {
+        let limit = ELEVATION_EMPTY_TILE_LIMIT;
+        assert!(
+            is_empty_byte_count(0, limit),
+            "a sparse block holds no data"
+        );
+        assert!(is_empty_byte_count(EMPTY_TILE_BYTES, limit));
 
         for real in [118_139, 380_423, 593_849, 689_583, 1_085_450] {
             assert!(
-                !is_empty_byte_count(real),
+                !is_empty_byte_count(real, limit),
                 "{real} bytes is a tile of real terrain"
             );
         }
+    }
+
+    /// Sizes measured from a real Sentinel-2 mosaic tile. Only the 213-byte
+    /// tile is genuinely blank; the rest are coastline, mostly ocean nodata
+    /// with a sliver of land. Reusing the elevation threshold here would throw
+    /// every one of them away, which is why the limit belongs to the spec.
+    #[test]
+    fn imagery_tiles_are_not_guessed_at_from_their_size() {
+        for bytes in [213, 723, 812, 2_549, 3_617, 4_570, 5_194, 6_276, 6_850] {
+            assert!(
+                !is_empty_byte_count(bytes, 0),
+                "{bytes} bytes must be fetched rather than assumed empty"
+            );
+            assert!(
+                is_empty_byte_count(bytes, ELEVATION_EMPTY_TILE_LIMIT),
+                "{bytes} bytes shows why the elevation threshold cannot be reused"
+            );
+        }
+        assert!(is_empty_byte_count(0, 0), "a sparse block is still skipped");
     }
 }
