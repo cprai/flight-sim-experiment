@@ -58,10 +58,15 @@ const MOSAIC_PIXEL_METRES: f64 = 19.109_257_071_294_063;
 
 /// How many tiles square a block of elevation is filled in.
 ///
-/// Eight tiles is 4096 texels, 67 MB as `f32`, plus a source window of much the
-/// same size. Blocks are what bound the tool's memory: nothing ever holds more
-/// than one, so a box a hundred times larger costs a hundred times the time and
-/// none of the memory.
+/// Eight tiles is 4096 texels, 67 MB as `f32`, and is the tool's largest
+/// allocation: nothing ever holds more than one block, so a box a hundred times
+/// larger costs a hundred times the time and none of the memory.
+///
+/// Smaller blocks were tried and are worse on both counts. Source tiles are
+/// fetched per block, and one that straddles a block boundary is fetched once
+/// per block it touches: halving the block to four tiles took the same download
+/// from 298.3 MiB to 365.1 MiB and made it slower, while peak memory did not
+/// improve because the canvas is not what bounds it.
 const ELEVATION_BLOCK_TILES: u32 = 8;
 
 /// How many tiles square a block of colour is filled in.
@@ -275,6 +280,23 @@ async fn fetch_elevation(
         return Ok(());
     }
 
+    // The one-metre mosaic is copied into the canvas tile by tile rather than
+    // interpolated, which is only sound if its pixels land on the output's own
+    // texels. Checked once, against the whole extent: every block's origin is a
+    // tile origin, so they all share this lattice.
+    let base = extent.grid(0);
+    for raster in &fine {
+        let (west, north) = raster.origin();
+        anyhow::ensure!(
+            base.aligns_with(west, north, raster.metres_per_pixel()),
+            "{} sits at ({west}, {north}) with {} m pixels, which is not the \
+             output's metre lattice; EPSG:3979 output assumes HRDEM's integer-metre \
+             grid, so this product would have to be resampled rather than copied",
+            raster.item.id,
+            raster.metres_per_pixel()
+        );
+    }
+
     let grid = extent.tile_grid();
     let blocks = extent.blocks(0, ELEVATION_BLOCK_TILES);
     let mut tally = Tally::default();
@@ -282,29 +304,35 @@ async fn fetch_elevation(
     let mut written = 0;
     let mut samples = Vec::new();
 
+    // One canvas for the whole run: the first block is the largest, so its
+    // buffers fit every block after it. Scoped so it is dropped before the mip
+    // pass, which has no use for it and wants the room.
+    let first = blocks.first().context("the extent covers no tiles")?;
+    let mut canvas = Canvas::new(first.grid, 1, nodata)?;
+
     for (index, block) in blocks.iter().enumerate() {
         log::info!("block {}/{}", index + 1, blocks.len());
-        let mut canvas = Canvas::new(block.grid, 1, nodata)?;
+        canvas.reset(block.grid)?;
 
-        if !fine.is_empty() {
-            let source = resample::source_extent(&block.grid, None, Resolution::OneMetre.metres())?;
-            let mut window = Window::covering(
-                source.min_x,
-                source.min_y,
-                source.max_x,
-                source.max_y,
-                Resolution::OneMetre.metres(),
-                1,
-                nodata,
-            )?;
-            for raster in &fine {
-                downloaded += raster.fill(&mut window, arguments.concurrency).await?;
-            }
-            canvas.fill_from(&window, None, Provenance::OneMetre)?;
+        // No window: each source tile is copied into the canvas as it decodes
+        // and dropped straight after, so the block's source pixels are never
+        // resident all at once. The extent carries no bilinear margin either,
+        // because nothing is being interpolated -- and a margin would drag in a
+        // whole extra ring of source tiles around every block.
+        let ground = block.grid.extent();
+        for raster in &fine {
+            downloaded += raster
+                .stream(ground, arguments.concurrency, |patch| {
+                    canvas.absorb(patch, Provenance::OneMetre);
+                })
+                .await?;
         }
 
         // Two-metre tiles are fetched only for ground the one-metre pass could
-        // not fill, which is usually none of it.
+        // not fill, which is usually none of it. They are half the output's
+        // resolution, so they do have to be interpolated, and interpolation
+        // needs the pixels either side of each sample point -- more than one
+        // tile carries. That pass keeps its window.
         if canvas.has_holes() && !coarse.is_empty() {
             let coarse_metres = Resolution::TwoMetre.metres();
             if let Some(holes) = canvas.hole_extent(None, coarse_metres)? {
@@ -328,6 +356,7 @@ async fn fetch_elevation(
         written += write_block(root, &grid, block, &canvas, 0, nodata, &mut samples)?;
     }
 
+    drop((canvas, samples));
     written += mip::build_levels(root, extent, 0, 1, nodata)?;
     extent
         .manifest(arguments.product.label(), 0, 1, nodata)
@@ -411,6 +440,9 @@ async fn fetch_albedo(
     let mut written = 0;
     let mut samples = Vec::new();
 
+    let first = blocks.first().context("the extent covers no tiles")?;
+    let mut canvas = Canvas::new(first.grid, 3, 0.0)?;
+
     for (index, block) in blocks.iter().enumerate() {
         log::info!("block {}/{}", index + 1, blocks.len());
         let source = resample::source_extent(&block.grid, Some(&projector), MOSAIC_PIXEL_METRES)?;
@@ -427,7 +459,7 @@ async fn fetch_albedo(
             downloaded += raster.fill(&mut window, arguments.concurrency).await?;
         }
 
-        let mut canvas = Canvas::new(block.grid, 3, 0.0)?;
+        canvas.reset(block.grid)?;
         canvas.fill_from(&window, Some(&projector), Provenance::FILLED)?;
         drop(window);
 
@@ -443,6 +475,7 @@ async fn fetch_albedo(
         )?;
     }
 
+    drop((canvas, samples));
     written += mip::build_levels(root, extent, COLOUR_BASE_LEVEL, 3, 0.0)?;
     extent
         .manifest(arguments.product.label(), COLOUR_BASE_LEVEL, 3, 0.0)
@@ -467,6 +500,10 @@ async fn fetch_albedo(
 /// patchy coverage from costing a megabyte per empty square kilometre -- and it
 /// is how the renderer learns there is no data there, since it treats a missing
 /// file as a hole.
+///
+/// One scratch buffer serves every tile. Writing them across a thread pool was
+/// tried and gained nothing measurable -- a megabyte into the page cache is not
+/// where the time goes -- while giving every worker its own copy of that buffer.
 fn write_block(
     root: &Path,
     grid: &TileGrid,

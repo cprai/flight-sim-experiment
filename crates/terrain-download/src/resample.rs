@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use terrain_tiles::TILE_SIZE;
 
 use crate::project::Projector;
-use crate::source::Window;
+use crate::source::{Patch, Window};
 
 /// A rectangle of ground, in one CRS's metres.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -114,6 +114,27 @@ impl Grid {
 
     pub fn texel_count(&self) -> u64 {
         u64::from(self.width) * u64::from(self.height)
+    }
+
+    /// Whether pixels of `metres_per_pixel`, laid out from (`west`, `north`),
+    /// land exactly on this grid's texels.
+    ///
+    /// When they do, a source tile can be copied straight into the canvas and
+    /// never needs staging in a window at all. This is the case the whole
+    /// choice of EPSG:3979 was made for: HRDEM sits on an integer-metre lattice
+    /// and the tile grid's boundaries are multiples of 512 m, so an output
+    /// texel centre falls precisely on a source pixel centre.
+    ///
+    /// A thousandth of a texel is the tolerance, because both origins are
+    /// snapped to whole metres -- a real alignment is exact and anything else
+    /// is far away.
+    pub fn aligns_with(&self, west: f64, north: f64, metres_per_pixel: f64) -> bool {
+        if metres_per_pixel != self.metres_per_texel {
+            return false;
+        }
+        let columns = (self.west - west) / metres_per_pixel;
+        let rows = (north - self.north) / metres_per_pixel;
+        (columns - columns.round()).abs() <= 1e-3 && (rows - rows.round()).abs() <= 1e-3
     }
 }
 
@@ -231,32 +252,50 @@ pub struct Canvas {
 impl Canvas {
     pub fn new(grid: Grid, bands: usize, nodata: f32) -> Result<Self> {
         anyhow::ensure!(bands >= 1, "a canvas needs at least one band");
+        let mut canvas = Self {
+            grid,
+            bands,
+            nodata,
+            values: Vec::new(),
+            provenance: Vec::new(),
+        };
+        canvas.reset(grid)?;
+        Ok(canvas)
+    }
+
+    /// Points the canvas at another block, clearing it and keeping its buffers.
+    ///
+    /// Every block of a download is the same size but for the last in a row or
+    /// column, so the allocation made for the first serves all of them.
+    ///
+    /// Reuse matters more than it looks. Allocating a fresh canvas per block
+    /// meant handing back tens of megabytes to whichever allocator arena the
+    /// dropping thread belonged to, and glibc does not readily return those to
+    /// the kernel: peak RSS climbed with every block -- 231, 247, 257, 267 MiB
+    /// across a four-block download -- even though only one canvas was ever
+    /// live. Running the same binary under `MALLOC_ARENA_MAX=2` came out 64 MiB
+    /// lower, which is what identified the cause.
+    pub fn reset(&mut self, grid: Grid) -> Result<()> {
         let texels = (grid.width as usize)
             .checked_mul(grid.height as usize)
             .context("the block does not fit in memory")?;
         let count = texels
-            .checked_mul(bands)
+            .checked_mul(self.bands)
             .context("the block does not fit in memory")?;
 
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(count)
+        self.grid = grid;
+        self.values.clear();
+        self.values
+            .try_reserve(count)
             .context("the block does not fit in memory")?;
-        values.resize(count, nodata);
+        self.values.resize(count, self.nodata);
 
-        let mut provenance = Vec::new();
-        provenance
-            .try_reserve_exact(texels)
+        self.provenance.clear();
+        self.provenance
+            .try_reserve(texels)
             .context("the block does not fit in memory")?;
-        provenance.resize(texels, Provenance::Missing as u8);
-
-        Ok(Self {
-            grid,
-            bands,
-            nodata,
-            values,
-            provenance,
-        })
+        self.provenance.resize(texels, Provenance::Missing as u8);
+        Ok(())
     }
 
     fn is_filled(&self, index: usize) -> bool {
@@ -291,26 +330,61 @@ impl Canvas {
         self.provenance.contains(&(Provenance::Missing as u8))
     }
 
-    /// Whether the window is drawn on exactly the same lattice as this canvas.
+    /// Copies one decoded source tile straight in, and returns how many texels
+    /// it filled.
     ///
-    /// When it is, an output texel centre falls precisely on a source pixel
-    /// centre and the value can be copied. This is not only faster: bilinear
-    /// interpolation refuses a sample whose four neighbours include a hole, so
+    /// Only for sources on this canvas's own lattice -- [`Grid::aligns_with`]
+    /// is the test, and the caller is expected to have made it. Taking tiles
+    /// one at a time is what keeps source pixels out of memory: the tile is
+    /// dropped the moment this returns, where staging a whole block in a window
+    /// first held a second copy of everything the block covered.
+    ///
+    /// Copying is also more correct than interpolating, not merely faster.
+    /// Bilinear refuses any sample whose four neighbours include a hole, so
     /// interpolating an aligned grid would erode a texel of real data from the
-    /// edge of every gap for no reason at all.
-    fn aligned_offset(&self, window: &Window) -> Option<(i64, i64)> {
-        if window.metres_per_pixel != self.grid.metres_per_texel {
-            return None;
-        }
+    /// edge of every gap for nothing.
+    ///
+    /// Texels that already have a value are left alone, which is what makes a
+    /// later pass a fallback rather than an overwrite.
+    pub fn absorb(&mut self, patch: &Patch, provenance: Provenance) -> u64 {
+        debug_assert_eq!(self.bands, patch.bands);
+        debug_assert!(
+            self.grid
+                .aligns_with(patch.west, patch.north, patch.metres_per_pixel)
+        );
+
         let metres = self.grid.metres_per_texel;
-        let columns = (self.grid.west - window.origin_x) / metres;
-        let rows = (window.origin_y - self.grid.north) / metres;
-        // A thousandth of a texel: the two origins are each snapped to whole
-        // metres, so a real alignment is exact and anything else is far off.
-        if (columns - columns.round()).abs() > 1e-3 || (rows - rows.round()).abs() > 1e-3 {
-            return None;
+        let column_offset = ((patch.west - self.grid.west) / metres).round() as i64;
+        let row_offset = ((self.grid.north - patch.north) / metres).round() as i64;
+        let mut filled = 0;
+
+        for row in 0..patch.height {
+            let y = row_offset + row as i64;
+            if y < 0 || y >= i64::from(self.grid.height) {
+                continue;
+            }
+            let first = (y as usize) * (self.grid.width as usize);
+
+            for column in 0..patch.width {
+                let x = column_offset + column as i64;
+                if x < 0 || x >= i64::from(self.grid.width) {
+                    continue;
+                }
+                let index = first + x as usize;
+                if self.is_filled(index) {
+                    continue;
+                }
+                let Some(sample) = patch.texel(column, row) else {
+                    continue;
+                };
+                let at = index * self.bands;
+                self.values[at..at + self.bands].copy_from_slice(sample);
+                self.provenance[index] = provenance as u8;
+                filled += 1;
+            }
         }
-        Some((columns.round() as i64, rows.round() as i64))
+
+        filled
     }
 
     /// Fills every texel this window can supply, leaving the rest alone.
@@ -332,12 +406,6 @@ impl Canvas {
             window.bands,
             self.bands
         );
-
-        if projector.is_none()
-            && let Some(offset) = self.aligned_offset(window)
-        {
-            return Ok(self.copy_from(window, offset, provenance));
-        }
 
         let mut row = vec![(0.0f64, 0.0f64); self.grid.width as usize];
         let mut sample = vec![self.nodata; self.bands];
@@ -376,40 +444,6 @@ impl Canvas {
         }
 
         Ok(filled)
-    }
-
-    /// Copies straight across when the two grids share a lattice.
-    fn copy_from(&mut self, window: &Window, offset: (i64, i64), provenance: Provenance) -> u64 {
-        let (column_offset, row_offset) = offset;
-        let mut filled = 0;
-
-        for y in 0..self.grid.height {
-            let source_row = row_offset + i64::from(y);
-            if source_row < 0 || source_row >= i64::from(window.height) {
-                continue;
-            }
-            let first = (y as usize) * (self.grid.width as usize);
-
-            for x in 0..self.grid.width {
-                let index = first + x as usize;
-                if self.is_filled(index) {
-                    continue;
-                }
-                let source_column = column_offset + i64::from(x);
-                if source_column < 0 || source_column >= i64::from(window.width) {
-                    continue;
-                }
-                let Some(sample) = window.texel_at(source_column as u32, source_row as u32) else {
-                    continue;
-                };
-                let at = index * self.bands;
-                self.values[at..at + self.bands].copy_from_slice(sample);
-                self.provenance[index] = provenance as u8;
-                filled += 1;
-            }
-        }
-
-        filled
     }
 
     /// The extent, in the source's metres, of the texels still unfilled.
@@ -622,22 +656,72 @@ mod tests {
         }
     }
 
+    /// A patch of source pixels laid on part of a grid, whose values come from
+    /// `value` applied to each pixel's centre in metres.
+    fn patch_over(
+        grid: &Grid,
+        column: usize,
+        row: usize,
+        size: usize,
+        value: impl Fn(f64, f64) -> f32,
+    ) -> Patch {
+        let metres = grid.metres_per_texel;
+        let west = grid.west + column as f64 * metres;
+        let north = grid.north - row as f64 * metres;
+        let mut values = Vec::with_capacity(size * size);
+        for y in 0..size {
+            for x in 0..size {
+                values.push(value(
+                    west + (x as f64 + 0.5) * metres,
+                    north - (y as f64 + 0.5) * metres,
+                ));
+            }
+        }
+        Patch {
+            west,
+            north,
+            metres_per_pixel: metres,
+            width: size,
+            height: size,
+            stride: size,
+            bands: 1,
+            nodata: NODATA,
+            values,
+        }
+    }
+
+    /// HRDEM's integer-metre lattice against the tile grid's 512 m boundaries,
+    /// which is the case the direct copy exists for.
+    #[test]
+    fn a_source_on_whole_metres_aligns_with_the_output() {
+        let grid = grid(1.0, 64, 64);
+        assert!(grid.aligns_with(-2_000_000.0, 1_000_000.0, 1.0));
+        // Half a metre off is not alignment.
+        assert!(!grid.aligns_with(-1_999_999.5, 1_000_000.0, 1.0));
+        // Nor is the right lattice at the wrong pixel size: a two-metre source
+        // has to be interpolated onto a one-metre grid.
+        assert!(!grid.aligns_with(-2_000_000.0, 1_000_000.0, 2.0));
+    }
+
     /// The claim the whole choice of EPSG:3979 rests on: a one-metre source on
     /// the output's own lattice is copied, not interpolated, so the values come
     /// out bit for bit identical to what the mosaic holds.
     #[test]
-    fn an_aligned_source_is_copied_exactly() {
+    fn an_aligned_patch_is_copied_exactly() {
         let grid = grid(1.0, 64, 64);
         // A ramp with plenty of bits set, so an interpolation that happened to
         // land near the right answer would still differ.
         let value = |x: f64, y: f64| (x * 0.317_209_886 + y * 0.577_215_664) as f32;
-        let window = window_over(&grid, 1.0, value);
 
         let mut canvas = Canvas::new(grid, 1, NODATA).expect("failed to allocate");
-        canvas
-            .fill_from(&window, None, Provenance::OneMetre)
-            .expect("failed to fill");
+        let mut filled = 0;
+        // Four patches, as the four source tiles covering the block would be.
+        for (column, row) in [(0, 0), (32, 0), (0, 32), (32, 32)] {
+            let patch = patch_over(&grid, column, row, 32, value);
+            filled += canvas.absorb(&patch, Provenance::OneMetre);
+        }
 
+        assert_eq!(filled, grid.texel_count());
         for y in 0..grid.height {
             for x in 0..grid.width {
                 let (metres_x, metres_y) = grid.centre_of(x, y);
@@ -648,10 +732,10 @@ mod tests {
         }
     }
 
-    /// A misaligned source falls back to interpolating, and the two paths agree
-    /// where there are no holes to disagree about.
+    /// A source that is not on the output's lattice is interpolated instead,
+    /// and the two routes agree where there are no holes to disagree about.
     #[test]
-    fn a_half_texel_offset_falls_back_to_interpolating() {
+    fn a_half_texel_offset_has_to_be_interpolated() {
         // The window snaps its own origin to whole pixels, so the offset has to
         // be put on the canvas: a block half a metre east of the source lattice.
         let source = grid(1.0, 32, 32);
@@ -660,9 +744,12 @@ mod tests {
             west: source.west + 0.5,
             ..source
         };
+        assert!(
+            !grid.aligns_with(window.origin_x, window.origin_y, window.metres_per_pixel),
+            "should not align"
+        );
 
         let mut canvas = Canvas::new(grid, 1, NODATA).expect("failed to allocate");
-        assert!(canvas.aligned_offset(&window).is_none(), "should not align");
         canvas
             .fill_from(&window, None, Provenance::OneMetre)
             .expect("failed to fill");
@@ -672,28 +759,97 @@ mod tests {
     }
 
     /// Copying rather than interpolating is what keeps the texel next to a hole.
-    /// Bilinear refuses any sample with a nodata neighbour, so the slow path
-    /// would eat a one-texel border around every gap.
+    /// Bilinear refuses any sample with a nodata neighbour, so routing an
+    /// aligned source through the window would eat a one-texel border around
+    /// every gap for nothing.
     #[test]
-    fn copying_does_not_erode_the_texels_beside_a_hole() {
+    fn absorbing_does_not_erode_the_texels_beside_a_hole() {
         let grid = grid(1.0, 32, 32);
         let hole = grid.centre_of(16, 16);
-        let window = window_over(&grid, 1.0, |x, y| {
+        let holed = |x: f64, y: f64| {
             if (x - hole.0).abs() < 0.5 && (y - hole.1).abs() < 0.5 {
                 NODATA
             } else {
                 42.0
             }
-        });
+        };
 
         let mut canvas = Canvas::new(grid, 1, NODATA).expect("failed to allocate");
-        canvas
-            .fill_from(&window, None, Provenance::OneMetre)
-            .expect("failed to fill");
-
+        canvas.absorb(&patch_over(&grid, 0, 0, 32, holed), Provenance::OneMetre);
         let tally = canvas.tally();
         assert_eq!(tally.missing, 1, "only the hole itself should be missing");
         assert_eq!(tally.one_metre, grid.texel_count() - 1);
+
+        // The same data through the window loses a ring around the hole, which
+        // is what the direct path is avoiding.
+        let mut interpolated = Canvas::new(grid, 1, NODATA).expect("failed to allocate");
+        interpolated
+            .fill_from(&window_over(&grid, 1.0, holed), None, Provenance::OneMetre)
+            .expect("failed to fill");
+        // An aligned sample point lands on a pixel centre, so the hole is a
+        // corner of the 2x2 the interpolation reads rather than its middle: the
+        // texels lost are the hole and the three to its north and west.
+        assert_eq!(
+            interpolated.tally().missing,
+            4,
+            "bilinear should refuse the hole and the three texels sharing its corner"
+        );
+    }
+
+    /// A later pass fills only what the first left behind, whichever route each
+    /// took: the one-metre mosaic is absorbed and the two-metre one interpolated.
+    #[test]
+    fn an_absorbed_patch_is_not_overwritten_by_a_later_pass() {
+        let grid = grid(1.0, 64, 64);
+        let midpoint = grid.west + f64::from(grid.width) * 0.5;
+
+        let mut canvas = Canvas::new(grid, 1, NODATA).expect("failed to allocate");
+        let patch = patch_over(
+            &grid,
+            0,
+            0,
+            64,
+            |x, _| {
+                if x < midpoint { 100.0 } else { NODATA }
+            },
+        );
+        let absorbed = canvas.absorb(&patch, Provenance::OneMetre);
+        assert!(absorbed > 0 && absorbed < grid.texel_count());
+
+        canvas
+            .fill_from(
+                &window_over(&grid, 2.0, |_, _| 900.0),
+                None,
+                Provenance::TwoMetre,
+            )
+            .expect("failed to fill");
+
+        let tally = canvas.tally();
+        assert_eq!(tally.one_metre, absorbed, "one metre was overwritten");
+        assert_eq!(tally.missing, 0, "two metre should have covered the rest");
+    }
+
+    /// Nothing outside a patch is touched, so tiles of a block can be absorbed
+    /// in any order and a patch hanging off the edge is clipped rather than
+    /// wrapping.
+    #[test]
+    fn a_patch_only_writes_where_it_lands() {
+        let grid = grid(1.0, 32, 32);
+        let mut canvas = Canvas::new(grid, 1, NODATA).expect("failed to allocate");
+
+        // Placed so that only its south-east quadrant overlaps the canvas.
+        let mut patch = patch_over(&grid, 0, 0, 8, |_, _| 7.0);
+        patch.west -= 4.0;
+        patch.north += 4.0;
+        assert_eq!(canvas.absorb(&patch, Provenance::OneMetre), 16);
+
+        for y in 0..grid.height {
+            for x in 0..grid.width {
+                let got = canvas.values()[(y as usize) * (grid.width as usize) + x as usize];
+                let inside = x < 4 && y < 4;
+                assert_eq!(got, if inside { 7.0 } else { NODATA }, "texel {x},{y}");
+            }
+        }
     }
 
     /// The heart of the fallback: two metre data only reaches texels the one

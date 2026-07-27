@@ -19,6 +19,7 @@ use async_tiff::decoder::DecoderRegistry;
 use async_tiff::metadata::TiffMetadataReader;
 use async_tiff::metadata::cache::ReadaheadMetadataCache;
 use async_tiff::reader::ReqwestReader;
+use futures::StreamExt;
 
 use crate::resample::MetreExtent;
 use crate::stac::SourceItem;
@@ -45,6 +46,48 @@ pub const ELEVATION_EMPTY_TILE_LIMIT: u64 = EMPTY_TILE_BYTES * 2;
 /// see `RasterSpec::empty_tile_limit`.
 fn is_empty_byte_count(bytes: u64, limit: u64) -> bool {
     bytes == 0 || bytes <= limit
+}
+
+/// One decoded source tile, in the raster's own pixel lattice.
+///
+/// This is the only shape source pixels are ever held in. It exists between the
+/// moment a tile finishes decoding and the moment whatever is consuming it has
+/// taken what it needs, and its buffer is handed straight to the next tile --
+/// so the resident set is one source tile rather than a copy of everything the
+/// block covers.
+pub struct Patch {
+    /// Easting of the western edge of this patch's column 0.
+    pub west: f64,
+    /// Northing of the northern edge of its row 0.
+    pub north: f64,
+    pub metres_per_pixel: f64,
+    /// Columns that are part of the raster.
+    ///
+    /// Fewer than `stride` in the last tile of a row: a COG pads its edge tiles
+    /// out to a full tile, and that padding is not ground.
+    pub width: usize,
+    /// Rows that are part of the raster, for the same reason.
+    pub height: usize,
+    /// Columns per row as stored, which is the tile width.
+    pub stride: usize,
+    pub bands: usize,
+    pub nodata: f32,
+    /// Interleaved samples, `stride` columns per row.
+    pub values: Vec<f32>,
+}
+
+impl Patch {
+    /// One pixel's bands, or `None` where it is nodata.
+    ///
+    /// Nodata is reported rather than returned so that callers skip it instead
+    /// of writing it. Where two mosaic blocks overlap they each pad their edge
+    /// with nodata, and writing it would punch a hole through the neighbour's
+    /// real data.
+    pub fn texel(&self, x: usize, y: usize) -> Option<&[f32]> {
+        let at = (y * self.stride + x) * self.bands;
+        let sample = &self.values[at..at + self.bands];
+        (!sample.iter().all(|&v| v == self.nodata)).then_some(sample)
+    }
 }
 
 /// A rectangle of one projected grid, held in memory.
@@ -147,19 +190,37 @@ impl Window {
             .all(|&v| v == self.nodata)
     }
 
-    /// One pixel's bands, or `None` if it is nodata.
+    /// Copies one decoded source tile into the window.
     ///
-    /// The direct read behind the copy path in `resample`, used when the output
-    /// grid and this window share a lattice so there is nothing to interpolate.
-    pub fn texel_at(&self, x: u32, y: u32) -> Option<&[f32]> {
-        if x >= self.width || y >= self.height {
-            return None;
+    /// The patch carries its own ground position, so the window does not need
+    /// to know which raster it came from -- which is what lets several mosaic
+    /// blocks fill one window without any of them being held open.
+    pub fn absorb(&mut self, patch: &Patch) {
+        debug_assert_eq!(self.bands, patch.bands);
+        debug_assert_eq!(self.metres_per_pixel, patch.metres_per_pixel);
+
+        let offset_x = ((patch.west - self.origin_x) / self.metres_per_pixel).round() as i64;
+        let offset_y = ((self.origin_y - patch.north) / self.metres_per_pixel).round() as i64;
+
+        for row in 0..patch.height {
+            let target_y = offset_y + row as i64;
+            if target_y < 0 || target_y >= i64::from(self.height) {
+                continue;
+            }
+            let target_row = (target_y as usize) * (self.width as usize);
+
+            for column in 0..patch.width {
+                let target_x = offset_x + column as i64;
+                if target_x < 0 || target_x >= i64::from(self.width) {
+                    continue;
+                }
+                let Some(sample) = patch.texel(column, row) else {
+                    continue;
+                };
+                let to = (target_row + target_x as usize) * self.bands;
+                self.pixels[to..to + self.bands].copy_from_slice(sample);
+            }
         }
-        let at = ((y as usize) * (self.width as usize) + x as usize) * self.bands;
-        if self.is_nodata(at) {
-            return None;
-        }
-        Some(&self.pixels[at..at + self.bands])
     }
 
     /// Samples the window at a point in projected metres, bilinearly, writing
@@ -486,10 +547,41 @@ impl SourceRaster {
             .sum()
     }
 
-    /// Fetches this raster's contribution to `window` and returns the number of
-    /// bytes downloaded.
-    pub async fn fill(&self, window: &mut Window, batch: usize) -> Result<u64> {
-        let wanted = self.tiles_for(window.extent());
+    /// Where the raster's north-west corner sits, in projected metres.
+    pub fn origin(&self) -> (f64, f64) {
+        (self.tie_x, self.tie_y)
+    }
+
+    pub fn metres_per_pixel(&self) -> f64 {
+        self.metres_per_pixel
+    }
+
+    /// Fetches this raster's contribution to an extent, handing each tile to
+    /// `sink` as it decodes and dropping it as soon as `sink` returns.
+    ///
+    /// Returns the number of bytes downloaded.
+    ///
+    /// `concurrency` range requests are kept in flight at once. That is the
+    /// whole speed story of this module: `async-tiff`'s `ReqwestReader` does not
+    /// override `AsyncFileReader::get_byte_ranges`, and the trait's default
+    /// implementation awaits the ranges strictly one after another, so before
+    /// this every tile of a download paid a full round trip on its own.
+    ///
+    /// Tiles are decoded on this thread as they arrive rather than across a
+    /// thread pool. Decoding a batch on all cores was tried and made no
+    /// difference to wall clock -- a download of this shape is bound by the
+    /// network, not by LZW -- while multiplying the resident set by the number
+    /// of threads holding a tile at once.
+    ///
+    /// Memory is bounded by `concurrency`, not by the size of the extent: one
+    /// decoded tile exists at a time, and its buffer is reused by the next.
+    pub async fn stream(
+        &self,
+        extent: MetreExtent,
+        concurrency: usize,
+        mut sink: impl FnMut(&Patch),
+    ) -> Result<u64> {
+        let wanted = self.tiles_for(extent);
         if wanted.is_empty() {
             return Ok(0);
         }
@@ -497,100 +589,96 @@ impl SourceRaster {
         let registry = DecoderRegistry::default();
         let mut downloaded = 0;
         let mut done = 0;
+        let mut samples = Vec::new();
 
-        for chunk in wanted.chunks(batch.max(1)) {
-            let tiles = self
-                .ifd
-                .fetch_tiles(chunk, &self.reader)
-                .await
+        let mut arrivals = futures::stream::iter(
+            wanted
+                .iter()
+                .map(|&(x, y)| self.ifd.fetch_tile(x, y, &self.reader)),
+        )
+        .buffer_unordered(concurrency.max(1));
+
+        while let Some(tile) = arrivals.next().await {
+            let tile = tile
                 .map_err(|e| anyhow::anyhow!("{e}"))
-                .with_context(|| format!("fetching tiles from {}", self.item.id))?;
+                .with_context(|| format!("fetching a tile of {}", self.item.id))?;
+            downloaded += self.tile_bytes(tile.y() * self.tiles_across + tile.x());
 
-            for tile in tiles {
-                let (tile_x, tile_y) = (tile.x(), tile.y());
-                downloaded += self.tile_bytes(tile_y * self.tiles_across + tile_x);
+            let patch = self.decode(tile, &registry, samples)?;
+            sink(&patch);
+            // Take the buffer back for the next tile, so a block's worth of
+            // tiles costs one allocation rather than one each.
+            samples = patch.values;
 
-                let array = tile
-                    .decode(&registry)
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-                    .with_context(|| {
-                        format!("decoding tile ({tile_x}, {tile_y}) of {}", self.item.id)
-                    })?;
-                // Elevation arrives as floats and imagery as bytes; both are
-                // widened to f32 so one blit and one interpolator serve each.
-                let values: Vec<f32> = match array.data() {
-                    async_tiff::TypedArray::Float32(v) => v.clone(),
-                    async_tiff::TypedArray::UInt8(v) => v.iter().map(|&b| f32::from(b)).collect(),
-                    async_tiff::TypedArray::UInt16(v) => v.iter().map(|&b| f32::from(b)).collect(),
-                    other => bail!(
-                        "{} holds {:?} samples, which this tool cannot read",
-                        self.item.id,
-                        std::mem::discriminant(other)
-                    ),
-                };
-                self.blit(window, tile_x, tile_y, &values);
+            done += 1;
+            if done % 64 == 0 {
+                log::debug!("{}: {done}/{} tiles", self.item.id, wanted.len());
             }
-
-            done += chunk.len();
-            log::debug!("{}: {done}/{} tiles", self.item.id, wanted.len());
         }
 
         Ok(downloaded)
     }
 
-    /// Copies one decoded tile into the window.
-    ///
-    /// Nodata is skipped rather than written. Where two mosaic blocks overlap
-    /// they each pad their edge with nodata, and writing it would punch a hole
-    /// through the neighbour's real data.
-    fn blit(&self, window: &mut Window, tile_x: usize, tile_y: usize, values: &[f32]) {
-        debug_assert_eq!(window.bands, self.bands);
-        let bands = self.bands;
-        let tile_width = self.tile_width as usize;
-        let tile_height = self.tile_height as usize;
-        let first_column = tile_x * tile_width;
-        let first_row = tile_y * tile_height;
+    /// Decompresses one tile into a patch placed on the raster's own lattice.
+    fn decode(
+        &self,
+        tile: async_tiff::Tile,
+        registry: &DecoderRegistry,
+        mut values: Vec<f32>,
+    ) -> Result<Patch> {
+        let (tile_x, tile_y) = (tile.x(), tile.y());
+        let array = tile
+            .decode(registry)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("decoding tile ({tile_x}, {tile_y}) of {}", self.item.id))?;
 
-        // Where this tile's north-west corner sits in the window.
-        let offset_x = ((self.tie_x - window.origin_x) / self.metres_per_pixel).round() as i64
-            + first_column as i64;
-        let offset_y = ((window.origin_y - self.tie_y) / self.metres_per_pixel).round() as i64
-            + first_row as i64;
-
-        let image_width = self.ifd.image_width() as usize;
-        let image_height = self.ifd.image_height() as usize;
-
-        for row in 0..tile_height {
-            // Tiles are padded out to a full tile even at the image edge.
-            if first_row + row >= image_height {
-                break;
-            }
-            let target_y = offset_y + row as i64;
-            if target_y < 0 || target_y >= i64::from(window.height) {
-                continue;
-            }
-            let target_row = (target_y as usize) * (window.width as usize);
-
-            for column in 0..tile_width {
-                if first_column + column >= image_width {
-                    break;
-                }
-                let target_x = offset_x + column as i64;
-                if target_x < 0 || target_x >= i64::from(window.width) {
-                    continue;
-                }
-                let from = (row * tile_width + column) * bands;
-                let sample = &values[from..from + bands];
-                // Skip nodata rather than write it. Where two mosaic blocks
-                // overlap they each pad their edge with it, and writing it
-                // would punch a hole through the neighbour's real data.
-                if sample.iter().all(|&v| v == self.nodata) {
-                    continue;
-                }
-                let to = (target_row + target_x as usize) * bands;
-                window.pixels[to..to + bands].copy_from_slice(sample);
-            }
+        // Elevation arrives as floats and imagery as bytes; both are widened to
+        // f32 so one blit and one interpolator serve each. Extending a cleared
+        // buffer rather than collecting a new one is what lets the pool recycle
+        // it: after the first batch these never allocate again.
+        values.clear();
+        match array.data() {
+            async_tiff::TypedArray::Float32(v) => values.extend_from_slice(v),
+            async_tiff::TypedArray::UInt8(v) => values.extend(v.iter().map(|&b| f32::from(b))),
+            async_tiff::TypedArray::UInt16(v) => values.extend(v.iter().map(|&b| f32::from(b))),
+            other => bail!(
+                "{} holds {:?} samples, which this tool cannot read",
+                self.item.id,
+                std::mem::discriminant(other)
+            ),
         }
+
+        let first_column = tile_x * self.tile_width as usize;
+        let first_row = tile_y * self.tile_height as usize;
+        Ok(Patch {
+            west: self.tie_x + first_column as f64 * self.metres_per_pixel,
+            north: self.tie_y - first_row as f64 * self.metres_per_pixel,
+            metres_per_pixel: self.metres_per_pixel,
+            // Edge tiles are padded out to a full tile; the padding is not part
+            // of the raster and must not reach the output.
+            width: (self.ifd.image_width() as usize)
+                .saturating_sub(first_column)
+                .min(self.tile_width as usize),
+            height: (self.ifd.image_height() as usize)
+                .saturating_sub(first_row)
+                .min(self.tile_height as usize),
+            stride: self.tile_width as usize,
+            bands: self.bands,
+            nodata: self.nodata,
+            values,
+        })
+    }
+
+    /// Fetches this raster's contribution to `window`.
+    ///
+    /// The staging step for sources that have to be interpolated: the window
+    /// holds enough neighbouring pixels for bilinear sampling, which a single
+    /// tile does not. Sources drawn on the output's own lattice skip it and go
+    /// straight into the canvas.
+    pub async fn fill(&self, window: &mut Window, concurrency: usize) -> Result<u64> {
+        let extent = window.extent();
+        self.stream(extent, concurrency, |patch| window.absorb(patch))
+            .await
     }
 }
 

@@ -15,6 +15,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use terrain_tiles::{Srgb8, TILE_SIZE, Texel, Tile, TileGrid};
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 
@@ -81,6 +82,20 @@ fn read_tile(path: &Path, bands: usize) -> Result<Option<DecodingResult>> {
 /// Half a tile: the side of the quadrant one child fills in its parent.
 const HALF: usize = (TILE_SIZE / 2) as usize;
 
+/// How many tiles to reduce at once.
+///
+/// This is the only phase of a download that is bound by the CPU rather than by
+/// the network, so it is the only one worth a thread pool -- and it is a phase
+/// that grows with the box: the box `assets/dem.tiff` covers needs about 57 000
+/// tiles reduced, against the 81 of a single-tile test box.
+///
+/// Capped rather than taken from the core count because each worker holds five
+/// tiles at once -- four children and the parent it is building, about five
+/// megabytes -- so the resident set is this number times that. Letting it run
+/// on all 24 cores of the machine this was measured on cost about 100 MiB of
+/// peak RSS and saved under a second.
+const REDUCE_THREADS: usize = 4;
+
 /// Builds every level above `base_level`, reading children back off disk.
 ///
 /// Returns how many tiles were written.
@@ -93,19 +108,45 @@ pub fn build_levels(
 ) -> Result<u64> {
     let grid = extent.tile_grid();
     let mut written = 0;
+    log::info!("building levels {}..={}", base_level + 1, extent.max_level);
+
+    // A pool of its own rather than rayon's global one, so the bound is
+    // explicit here and nothing else in the tool acquires a thread pool it has
+    // no use for.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(REDUCE_THREADS)
+        .build()
+        .context("building the thread pool for the mip pass")?;
 
     for level in (base_level + 1)..=extent.max_level {
         let (first, across, down) = extent.tile_range(level);
-        let mut level_written = 0;
 
-        for row in 0..down {
-            for column in 0..across {
-                let tile = Tile::new(first.x + column as i32, first.y + row as i32);
-                if reduce_tile(root, &grid, level, tile, bands, nodata)? {
-                    level_written += 1;
-                }
-            }
-        }
+        // Levels have to be built in order -- a tile is made of the four below
+        // it -- but within a level every tile is independent: distinct children
+        // to read, a distinct file to write, and no tile is a child of two
+        // parents. So a level is reduced in parallel. This is most of the work
+        // at the bottom of a large pyramid, where level 1 alone reduces a
+        // quarter as many tiles as the base level holds.
+        let tiles: Vec<Tile> = (0..down)
+            .flat_map(|row| {
+                (0..across)
+                    .map(move |column| Tile::new(first.x + column as i32, first.y + row as i32))
+            })
+            .collect();
+
+        let level_written: u64 = pool
+            .install(|| {
+                tiles
+                    .into_par_iter()
+                    .map(|tile| {
+                        Ok(u64::from(reduce_tile(
+                            root, &grid, level, tile, bands, nodata,
+                        )?))
+                    })
+                    .collect::<Result<Vec<u64>>>()
+            })?
+            .iter()
+            .sum();
 
         log::info!(
             "level {level}: wrote {level_written} of {} tiles",
