@@ -737,10 +737,12 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "clap",
  "env_logger",
  "glam",
  "log",
  "pollster",
+ "terrain-tiles",
  "tiff",
  "wgpu",
  "winit",
@@ -2845,8 +2847,19 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "terrain-tiles",
  "tiff",
  "tokio",
+]
+
+[[package]]
+name = "terrain-tiles"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

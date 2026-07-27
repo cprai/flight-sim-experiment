@@ -18,5 +18,6 @@ proj4rs = { version = "0.1.10", default-features = false, features = [
 reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+terrain-tiles = { path = "../terrain-tiles" }
 tiff = { version = "0.11", default-features = false, features = ["deflate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
