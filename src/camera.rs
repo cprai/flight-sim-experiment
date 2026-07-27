@@ -43,18 +43,20 @@ impl Camera {
         // A fraction of the terrain's own size, so the viewpoint scales with it
         // rather than being tuned to one dataset.
         const CLEARANCE: f32 = 0.08;
-        const PITCH_DEGREES: f32 = -8.0;
 
         let position = Vec3::new(
             0.0,
             highest + CLEARANCE * extent.max_element(),
             extent.y * 0.5,
         );
-        Self::new(
-            position,
-            Self::from_yaw_pitch_roll(0.0, PITCH_DEGREES.to_radians(), 0.0),
-            aspect,
-        )
+        // Aim at the far edge of the data rather than at a fixed angle. A fixed
+        // pitch frames one dataset and misses every other: it puts the centre of
+        // the view a fixed multiple of the eye height away, which was most of the
+        // way across a raster covering ninety kilometres and several times past
+        // the end of one covering eight. How much ground a run holds is now
+        // whatever box was downloaded, so the angle has to follow it.
+        let pitch = -(position.y / extent.y.max(f32::EPSILON)).atan();
+        Self::new(position, Self::from_yaw_pitch_roll(0.0, pitch, 0.0), aspect)
     }
 
     /// Builds an orientation from aviation-style angles, in radians.

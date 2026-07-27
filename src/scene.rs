@@ -856,5 +856,21 @@ mod tests {
                 "{corner} projects outside the view at {ndc}"
             );
         }
+
+        // ... and the middle of the view lands on the terrain rather than
+        // beyond it. Having the corners in shot is not enough on its own: they
+        // can sit along the very bottom edge with the rest of the frame sky,
+        // which is what a pitch that does not follow the extent produces.
+        let forward = camera.orientation * Vec3::NEG_Z;
+        assert!(forward.y < 0.0, "the view must slope downwards");
+        let ground = camera.position + forward * (-camera.position.y / forward.y);
+        assert!(
+            (-extent.y * 0.5..=extent.y * 0.5).contains(&ground.z),
+            "the centre of the view meets the ground at z {}, outside the \
+             terrain's {}..{}",
+            ground.z,
+            -extent.y * 0.5,
+            extent.y * 0.5
+        );
     }
 }
