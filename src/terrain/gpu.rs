@@ -2,14 +2,17 @@
 
 use std::ops::Range;
 
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use glam::{IVec2, UVec2, Vec2, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::terrain::clipmap::{ClipmapConfig, exposed_regions, split_across_seam, window_origin};
 use crate::terrain::geotiff::Georeferencing;
 use crate::terrain::mesh::{self, PatchKind};
-use crate::terrain::pyramid::{Pyramid, RasterSource, Srgb8, load_colours, load_heights};
+use crate::terrain::pyramid::{RasterSource, Srgb8};
+use crate::terrain::tiles::TileStore;
 
 /// Must match `MAX_LEVELS` in the shader.
 const MAX_LEVELS: usize = 16;
@@ -61,8 +64,8 @@ struct TerrainUniform {
 pub struct Terrain {
     config: ClipmapConfig,
     placement: Georeferencing,
-    heights: Pyramid<f32>,
-    colours: Pyramid<Srgb8>,
+    heights: Box<dyn RasterSource>,
+    colours: Box<dyn RasterSource>,
     height_range: (f32, f32),
 
     /// One window origin per level, in that level's own texel coordinates.
@@ -87,28 +90,52 @@ pub struct Terrain {
 }
 
 impl Terrain {
-    /// Loads both rasters from disk and builds the clipmap around them.
-    pub fn from_files(
+    /// Opens both tile pyramids and builds the clipmap around them.
+    ///
+    /// `root` holds one directory per product. Nothing is decoded here beyond
+    /// two manifests -- the tiles themselves are read a window at a time while
+    /// drawing, which is what keeps residency independent of how much ground the
+    /// pyramid covers.
+    pub fn from_tiles(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         camera_layout: &wgpu::BindGroupLayout,
         config: ClipmapConfig,
-        height_path: &str,
-        colour_path: &str,
+        root: &Path,
     ) -> Result<Self> {
-        let started = std::time::Instant::now();
-        let heights = load_heights(height_path)?;
-        let colours = load_colours(colour_path)?;
-        log::info!(
-            "decoded {}x{} terrain rasters in {:.2?}",
-            heights.placement.width,
-            heights.placement.height,
-            started.elapsed()
+        let elevation = crate::terrain::ELEVATION_PRODUCTS
+            .iter()
+            .map(|product| root.join(product))
+            .find(|directory| directory.is_dir())
+            .with_context(|| {
+                format!(
+                    "{} holds no {} directory",
+                    root.display(),
+                    crate::terrain::ELEVATION_PRODUCTS.join(" or ")
+                )
+            })?;
+        let colour = root.join(crate::terrain::COLOUR_PRODUCT);
+
+        let heights = TileStore::<f32>::open(&elevation)?;
+        let colours = TileStore::<Srgb8>::open(&colour)?;
+
+        // Structural rather than approximate: both manifests come from one
+        // download over one snapped extent, so they either describe the same
+        // ground exactly or one of them is from a different run.
+        anyhow::ensure!(
+            heights.manifest().covers_same_ground_as(colours.manifest()),
+            "{} and {} do not cover the same ground",
+            elevation.display(),
+            colour.display()
         );
 
-        anyhow::ensure!(
-            heights.placement.is_co_registered_with(&colours.placement),
-            "the height and colour rasters do not cover the same ground"
+        let placement = heights.placement();
+        log::info!(
+            "terrain: {} x {} texels at {} m, levels up to {}",
+            placement.width,
+            placement.height,
+            heights.manifest().base_metres_per_texel,
+            heights.manifest().max_level()
         );
 
         Ok(Self::new(
@@ -116,9 +143,9 @@ impl Terrain {
             format,
             camera_layout,
             config,
-            heights.placement,
-            heights.pyramid,
-            colours.pyramid,
+            placement,
+            Box::new(heights),
+            Box::new(colours),
         ))
     }
 
@@ -128,8 +155,8 @@ impl Terrain {
         camera_layout: &wgpu::BindGroupLayout,
         config: ClipmapConfig,
         placement: Georeferencing,
-        heights: Pyramid<f32>,
-        colours: Pyramid<Srgb8>,
+        heights: Box<dyn RasterSource>,
+        colours: Box<dyn RasterSource>,
     ) -> Self {
         let raster = UVec2::new(placement.width, placement.height);
         let available = heights.level_count().min(colours.level_count());
@@ -337,7 +364,7 @@ impl Terrain {
             cache: None,
         });
 
-        let height_range = heights.value_range();
+        let height_range = Self::coarsest_height_range(heights.as_ref(), &placement);
         let window_bytes = (window * window) as usize;
         Self {
             config,
@@ -506,6 +533,44 @@ impl Terrain {
         self.colours
             .read_rect(level, piece.origin(), size, &mut self.staging[..bytes]);
         copy(&self.colour_texture, 4, &self.staging[..bytes]);
+    }
+
+    /// The lowest and highest elevation in the coarsest level of the pyramid.
+    ///
+    /// Read from the top rather than the base: the coarsest level is one or two
+    /// tiles rather than the whole dataset, and every texel in it is a box filter of
+    /// everything beneath, so the range is representative without anything being
+    /// scanned that is not already resident for a moment. Peaks are averaged down a
+    /// little, which only matters for framing the camera at startup -- the one thing
+    /// this is used for.
+    fn coarsest_height_range(source: &dyn RasterSource, placement: &Georeferencing) -> (f32, f32) {
+        let level = source.level_count().saturating_sub(1);
+        let size = UVec2::new(
+            (placement.width >> level).max(1),
+            (placement.height >> level).max(1),
+        );
+
+        let mut heights = vec![0f32; (size.x as usize) * (size.y as usize)];
+        source.read_rect(
+            level,
+            IVec2::ZERO,
+            size,
+            bytemuck::cast_slice_mut(&mut heights),
+        );
+
+        let range = heights
+            .iter()
+            .filter(|height| **height > crate::terrain::NODATA_BELOW)
+            .fold(
+                (f32::INFINITY, f32::NEG_INFINITY),
+                |(low, high), &height| (low.min(height), high.max(height)),
+            );
+        // Ground with no data anywhere is legal; sea level is as good a frame as any.
+        if range.0.is_finite() {
+            range
+        } else {
+            (0.0, 0.0)
+        }
     }
 
     /// Rebuilds the instance buffer and the draw ranges that index it.

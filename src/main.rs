@@ -4,9 +4,11 @@ mod renderer;
 mod scene;
 mod terrain;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use clap::Parser;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId, KeyEvent, MouseButton, WindowEvent};
@@ -17,8 +19,22 @@ use winit::window::{Window, WindowId};
 use crate::controls::FlyController;
 use crate::renderer::Renderer;
 
+/// Where the terrain comes from.
+///
+/// The pyramid is far too large to carry in the repository -- a box a few
+/// kilometres square is hundreds of megabytes -- so there is no default path to
+/// fall back on. `terrain-download` writes one; this points at it.
+#[derive(Parser, Debug)]
+#[command(about = "Fly over terrain streamed from a tile pyramid", long_about = None)]
+struct Arguments {
+    /// Directory holding the tile pyramid, with a subdirectory per product.
+    #[arg(short, long, value_name = "DIR")]
+    terrain: PathBuf,
+}
+
 struct App {
     display: OwnedDisplayHandle,
+    terrain: PathBuf,
     renderer: Option<Renderer>,
     controls: FlyController,
     /// When the last frame was drawn, for the timestep the controls integrate over.
@@ -26,9 +42,10 @@ struct App {
 }
 
 impl App {
-    fn new(display: OwnedDisplayHandle) -> Self {
+    fn new(display: OwnedDisplayHandle, terrain: PathBuf) -> Self {
         Self {
             display,
+            terrain,
             renderer: None,
             controls: FlyController::default(),
             last_frame: Instant::now(),
@@ -55,7 +72,7 @@ impl ApplicationHandler for App {
             }
         };
 
-        match pollster::block_on(Renderer::new(window, self.display.clone())) {
+        match pollster::block_on(Renderer::new(window, self.display.clone(), &self.terrain)) {
             Ok(renderer) => {
                 self.controls = FlyController::new(renderer.camera());
                 self.last_frame = Instant::now();
@@ -143,10 +160,12 @@ fn main() -> anyhow::Result<()> {
     )
     .init();
 
+    let arguments = Arguments::parse();
+
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(event_loop.owned_display_handle());
+    let mut app = App::new(event_loop.owned_display_handle(), arguments.terrain);
     event_loop.run_app(&mut app)?;
 
     Ok(())

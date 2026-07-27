@@ -153,6 +153,14 @@ impl Georeferencing {
         })
     }
 
+    /// The raster's north-west corner in the file's own coordinates.
+    ///
+    /// Only used to check a tile against the manifest that claims to describe
+    /// it; placement itself goes through the world origin at the raster centre.
+    pub fn origin(&self) -> [f64; 2] {
+        self.origin
+    }
+
     /// The raster's ground size in metres, east-west then north-south.
     pub fn world_extent(&self) -> (f64, f64) {
         (
@@ -187,6 +195,23 @@ impl Georeferencing {
             (col * texels + c - f64::from(self.width) * 0.5) * self.metres_per_texel_x,
             (row * texels + c - f64::from(self.height) * 0.5) * self.metres_per_texel_z,
         )
+    }
+
+    /// A placement on a projected grid in metres, from a tile pyramid's manifest.
+    ///
+    /// Tiles are not read through [`Georeferencing::read`] the way a single
+    /// raster is: the pyramid is many files and its placement lives in the
+    /// manifest beside them, so it is built directly. `PixelIsArea` to match
+    /// what the tiles themselves are written with.
+    pub fn projected(width: u32, height: u32, metres_per_texel: f64, origin: [f64; 2]) -> Self {
+        Self {
+            width,
+            height,
+            metres_per_texel_x: metres_per_texel,
+            metres_per_texel_z: metres_per_texel,
+            centre_offset: 0.5,
+            origin,
+        }
     }
 
     /// A square, north-up placement with square texels, for tests.
@@ -226,33 +251,6 @@ impl Georeferencing {
             world_x / self.metres_per_texel_x + f64::from(self.width) * 0.5 - self.centre_offset,
             world_z / self.metres_per_texel_z + f64::from(self.height) * 0.5 - self.centre_offset,
         )
-    }
-
-    /// Whether two rasters cover the same ground, whatever their resolutions.
-    ///
-    /// Resolution deliberately does not have to match. Elevation and colour
-    /// come from different sources at whatever detail each was surveyed at --
-    /// one-metre LiDAR against ten-metre satellite imagery, say -- and the
-    /// clipmap samples them as separate textures, so each keeps its own size.
-    /// What must agree is the ground: both are placed by their own
-    /// georeferencing, and a raster covering a different area would texture the
-    /// terrain with the wrong scenery.
-    ///
-    /// The tolerance is a texel of the coarser raster, because a coarse raster
-    /// cannot represent an arbitrary box exactly: its extent is a whole number
-    /// of texels, so cutting it to the same ground as a fine one leaves it up
-    /// to half a texel short or long. A texel covers that for both.
-    pub fn is_co_registered_with(&self, other: &Self) -> bool {
-        if self.origin != other.origin {
-            return false;
-        }
-
-        let (width, height) = self.world_extent();
-        let (other_width, other_height) = other.world_extent();
-        let tolerance_x = self.metres_per_texel_x.max(other.metres_per_texel_x);
-        let tolerance_z = self.metres_per_texel_z.max(other.metres_per_texel_z);
-
-        (width - other_width).abs() <= tolerance_x && (height - other_height).abs() <= tolerance_z
     }
 }
 
@@ -707,156 +705,6 @@ pub(crate) mod tests {
         assert!(
             read_placement(&bytes).is_err(),
             "should refuse unknown units"
-        );
-    }
-
-    /// Reads the placement of the rasters actually on disk.
-    ///
-    /// Ignored by default because the assets are not in version control. Run it
-    /// with `cargo test -- --ignored --nocapture` after swapping the data to
-    /// confirm the two files line up and the derived scale looks sane; the
-    /// numbers are printed rather than asserted so this stays independent of
-    /// whichever dataset is currently installed.
-    #[test]
-    #[ignore = "requires the raster assets, which are not in version control"]
-    fn the_installed_rasters_are_co_registered() {
-        let read = |path: &str| {
-            let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
-            let mut decoder = Decoder::new(std::io::BufReader::new(file))
-                .unwrap_or_else(|e| panic!("{path}: {e}"));
-            Georeferencing::read(&mut decoder).unwrap_or_else(|e| panic!("{path}: {e:#}"))
-        };
-
-        let height = read(crate::terrain::HEIGHT_RASTER_PATH);
-        let colour = read(crate::terrain::COLOUR_RASTER_PATH);
-
-        for (label, placement) in [("height", &height), ("colour", &colour)] {
-            let (extent_x, extent_z) = placement.world_extent();
-            eprintln!(
-                "{label}: {}x{} texels, {:.3} x {:.3} m per texel, {:.2} x {:.2} km",
-                placement.width,
-                placement.height,
-                placement.metres_per_texel_x,
-                placement.metres_per_texel_z,
-                extent_x / 1000.0,
-                extent_z / 1000.0,
-            );
-            assert!(placement.width > 0 && placement.height > 0);
-            assert!(placement.metres_per_texel_x > 0.0 && placement.metres_per_texel_z > 0.0);
-        }
-
-        assert!(
-            height.is_co_registered_with(&colour),
-            "the height and colour rasters must cover the same ground:\n{height:?}\n{colour:?}"
-        );
-    }
-
-    #[test]
-    fn rasters_covering_different_ground_are_not_co_registered() {
-        let placement = geographic_raster();
-
-        let shifted_bytes = synthetic_geotiff(
-            WIDTH,
-            HEIGHT,
-            &[0.001, 0.002, 0.0],
-            // Same size and resolution, but a degree further east.
-            &[0.0, 0.0, 0.0, 11.0, 45.0, 0.0],
-            &geographic_keys(),
-        );
-        let shifted = read_placement(&shifted_bytes).expect("failed to read placement");
-
-        assert!(placement.is_co_registered_with(&placement));
-        assert!(
-            !placement.is_co_registered_with(&shifted),
-            "rasters at different origins must not be treated as aligned"
-        );
-    }
-
-    /// The case the colour pipeline depends on: elevation surveyed at one
-    /// resolution paired with imagery at another, over identical ground.
-    #[test]
-    fn the_same_ground_at_a_coarser_resolution_is_co_registered() {
-        let fine = geographic_raster();
-
-        // A tenth the texels, each ten times the size: the same box.
-        let coarse_bytes = synthetic_geotiff(
-            WIDTH / 10,
-            HEIGHT / 10,
-            &[0.01, 0.02, 0.0],
-            &[0.0, 0.0, 0.0, 10.0, 45.0, 0.0],
-            &geographic_keys(),
-        );
-        let coarse = read_placement(&coarse_bytes).expect("failed to read placement");
-
-        assert_ne!(fine.width, coarse.width, "the test needs differing sizes");
-        assert!(
-            fine.is_co_registered_with(&coarse),
-            "same ground at a different resolution must pair:\n{fine:?}\n{coarse:?}"
-        );
-        assert!(coarse.is_co_registered_with(&fine), "and symmetrically");
-    }
-
-    /// The tolerance itself, which the factor-of-ten case above never reaches
-    /// because its extents come out exactly equal.
-    ///
-    /// A coarse raster's extent is a whole number of its own texels, so cut to
-    /// the same ground as a fine one it lands slightly short or long. Here the
-    /// fine raster spans 0.020 degrees and the coarse one 3 texels of 0.007,
-    /// or 0.021 -- adrift by a seventh of a coarse texel, which must still
-    /// pair. A fourth texel puts it at 0.028, adrift by more than a whole one,
-    /// which must not.
-    #[test]
-    fn an_extent_within_one_coarse_texel_still_pairs() {
-        let fine = geographic_raster();
-
-        let coarse_of = |columns: u32| {
-            let bytes = synthetic_geotiff(
-                columns,
-                3,
-                &[0.007, 0.02, 0.0],
-                &[0.0, 0.0, 0.0, 10.0, 45.0, 0.0],
-                &geographic_keys(),
-            );
-            read_placement(&bytes).expect("failed to read placement")
-        };
-
-        let near = coarse_of(3);
-        let far = coarse_of(4);
-
-        // The near case really is inexact, or this would prove nothing.
-        assert_ne!(
-            fine.world_extent().0,
-            near.world_extent().0,
-            "the test needs the extents to actually differ"
-        );
-        assert!(
-            fine.is_co_registered_with(&near),
-            "a seventh of a texel adrift must pair:\n{fine:?}\n{near:?}"
-        );
-        assert!(
-            !fine.is_co_registered_with(&far),
-            "more than a texel adrift must not pair:\n{fine:?}\n{far:?}"
-        );
-    }
-
-    /// Relaxing the resolution check must not also relax the extent one.
-    #[test]
-    fn the_same_origin_covering_less_ground_is_not_co_registered() {
-        let full = geographic_raster();
-
-        // Same origin and texel size, but half as wide, so it stops short.
-        let cropped_bytes = synthetic_geotiff(
-            WIDTH / 2,
-            HEIGHT,
-            &[0.001, 0.002, 0.0],
-            &[0.0, 0.0, 0.0, 10.0, 45.0, 0.0],
-            &geographic_keys(),
-        );
-        let cropped = read_placement(&cropped_bytes).expect("failed to read placement");
-
-        assert!(
-            !full.is_co_registered_with(&cropped),
-            "a raster covering half the ground must not pair:\n{full:?}\n{cropped:?}"
         );
     }
 }

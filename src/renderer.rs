@@ -21,6 +21,7 @@ impl Renderer {
     pub async fn new(
         window: Arc<Window>,
         display: winit::event_loop::OwnedDisplayHandle,
+        terrain_root: &std::path::Path,
     ) -> anyhow::Result<Self> {
         let size = window.inner_size();
 
@@ -73,7 +74,7 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let depth = create_depth_view(&device, config.width, config.height);
-        let scene = Scene::new(&device, format, aspect_ratio(&config))?;
+        let scene = Scene::new(&device, format, aspect_ratio(&config), terrain_root)?;
 
         Ok(Self {
             window,

@@ -76,16 +76,20 @@ pub struct Scene {
 }
 
 impl Scene {
-    /// Loads the terrain rasters from disk and frames the camera on them.
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, aspect: f32) -> Result<Self> {
+    /// Opens the terrain tile pyramid and frames the camera on it.
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        aspect: f32,
+        terrain_root: &std::path::Path,
+    ) -> Result<Self> {
         let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
-        let terrain = Terrain::from_files(
+        let terrain = Terrain::from_tiles(
             device,
             format,
             &camera_layout,
             ClipmapConfig::default(),
-            crate::terrain::HEIGHT_RASTER_PATH,
-            crate::terrain::COLOUR_RASTER_PATH,
+            terrain_root,
         )?;
         Ok(Self::assemble(
             camera_buffer,
@@ -329,8 +333,8 @@ mod tests {
                     camera_layout,
                     test_config(),
                     placement(),
-                    Pyramid::build(Level::new(RASTER, RASTER, heights)),
-                    Pyramid::build(Level::new(RASTER, RASTER, colours)),
+                    Box::new(Pyramid::build(Level::new(RASTER, RASTER, heights))),
+                    Box::new(Pyramid::build(Level::new(RASTER, RASTER, colours))),
                 )
             },
             1.0,
@@ -469,6 +473,45 @@ mod tests {
         );
     }
 
+    /// Tiles with nothing under them are never written, so a survey's ragged
+    /// edge arrives as nodata in the middle of the raster rather than only at
+    /// its border. Without the shader's test those texels would draw as a pit
+    /// thirty kilometres deep; with it the sky shows through instead.
+    #[test]
+    fn a_hole_in_the_middle_of_the_data_is_cut_out_rather_than_drawn() {
+        const NODATA: f32 = -32767.0;
+
+        let with_hole = |hole: bool| {
+            let mut heights = vec![0.0f32; (RASTER * RASTER) as usize];
+            if hole {
+                for row in 56..72 {
+                    for col in 56..72 {
+                        heights[(row * RASTER + col) as usize] = NODATA;
+                    }
+                }
+            }
+            heights
+        };
+        let count_sky = |pixels: &[u8]| {
+            (0..SIZE)
+                .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+                .filter(|&(x, y)| is_sky(pixel(pixels, x, y)))
+                .count()
+        };
+
+        let solid = count_sky(&render(with_hole(false), flat_ground(), straight_down));
+        assert_eq!(
+            solid, 0,
+            "looking straight down at unbroken ground should show no sky"
+        );
+
+        let punched = count_sky(&render(with_hole(true), flat_ground(), straight_down));
+        assert!(
+            punched > 200,
+            "the hole should show sky through it, got {punched} pixels"
+        );
+    }
+
     #[test]
     fn a_near_ridge_hides_what_is_behind_it() {
         // Two plateaus across the view. The far one is low enough that the
@@ -556,13 +599,15 @@ mod tests {
         );
     }
 
-    /// Renders the rasters actually on disk and writes the frame out.
+    /// Renders a real tile pyramid and writes the frame out.
     ///
-    /// Ignored because the assets are not in version control, and because this
-    /// is a look-at-it check rather than an assertion. Run it with
-    /// `cargo test --release -- --ignored dump_installed` and open the file.
+    /// Ignored because no pyramid is in version control -- one covering a few
+    /// kilometres is hundreds of megabytes -- and because this is a look-at-it
+    /// check rather than an assertion. Run it with
+    /// `FLIGHT_SIM_TERRAIN=/tmp/terrain cargo test --release -- --ignored dump_installed`
+    /// and open the file.
     #[test]
-    #[ignore = "requires the raster assets, which are not in version control"]
+    #[ignore = "requires a tile pyramid, which is not in version control"]
     fn dump_installed_terrain() {
         const WIDE: u32 = 960;
         const TALL: u32 = 540;
@@ -587,8 +632,12 @@ mod tests {
         let depth = create_depth_view(&device, WIDE, TALL);
 
         let started = std::time::Instant::now();
-        let mut scene = Scene::new(&device, format, WIDE as f32 / TALL as f32)
-            .expect("failed to load the installed terrain");
+        let root = std::path::PathBuf::from(
+            std::env::var("FLIGHT_SIM_TERRAIN")
+                .expect("set FLIGHT_SIM_TERRAIN to a directory terrain-download wrote"),
+        );
+        let mut scene = Scene::new(&device, format, WIDE as f32 / TALL as f32, &root)
+            .expect("failed to open the terrain pyramid");
         eprintln!("built the scene in {:.2?}", started.elapsed());
         eprintln!("camera opens at {}", scene.camera.position);
         scene.update(&queue);

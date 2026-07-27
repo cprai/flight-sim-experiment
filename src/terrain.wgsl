@@ -77,7 +77,33 @@ struct VertexOut {
     // Ground position, carried so the fragment stage can tell whether it is
     // standing on real data.
     @location(5) ground: vec2<f32>,
+    // Non-zero if any texel this vertex was built from is a hole.
+    //
+    // Interpolated rather than flat, so it is non-zero across the whole of any
+    // triangle touching a hole and the fragment stage cuts the lot. Cutting the
+    // whole triangle is the conservative reading -- part of it does cover ground
+    // nothing is known about -- and it matches how the data's outer edge is
+    // already handled.
+    @location(6) nodata: f32,
 };
+
+// Elevations below this are the raster's nodata rather than ground.
+//
+// HRDEM writes -32767. The exact value is not worth passing in: the deepest
+// ground on Earth is a small fraction of this, so anything below it is a hole
+// however the producer chose to spell it. Kept in step with `NODATA_BELOW` in
+// `src/terrain/mod.rs`.
+const NODATA_BELOW: f32 = -30000.0;
+
+// A height and the worst of the texels that went into it.
+struct Sample {
+    height: f32,
+    // The lowest texel sampled. Interpolating first would bury a hole: three
+    // real metres averaged with one -32767 comes out around -7800, which is far
+    // below any ground but nowhere near the nodata value, so a test on the
+    // result alone would let it through.
+    lowest: f32,
+}
 
 // Wraps a window coordinate onto the texel that currently holds it.
 fn window_texel(level: u32, w: vec2<i32>) -> vec2<i32> {
@@ -96,20 +122,20 @@ fn height_at(level: u32, w: vec2<i32>) -> f32 {
 // approximation. On the outer boundary -- where the blend reaches the coarser
 // level completely -- one weight is always 0, so the result lies on the coarse
 // level's own edge and the two surfaces meet with no crack.
-fn height_bilinear(level: u32, w: vec2<f32>) -> f32 {
+fn height_bilinear(level: u32, w: vec2<f32>) -> Sample {
     let base = vec2<i32>(floor(w));
     let f = fract(w);
-    let top = mix(
-        height_at(level, base),
-        height_at(level, base + vec2<i32>(1, 0)),
-        f.x,
-    );
-    let bottom = mix(
-        height_at(level, base + vec2<i32>(0, 1)),
-        height_at(level, base + vec2<i32>(1, 1)),
-        f.x,
-    );
-    return mix(top, bottom, f.y);
+    let a = height_at(level, base);
+    let b = height_at(level, base + vec2<i32>(1, 0));
+    let c = height_at(level, base + vec2<i32>(0, 1));
+    let d = height_at(level, base + vec2<i32>(1, 1));
+    let top = mix(a, b, f.x);
+    let bottom = mix(c, d, f.x);
+
+    var sample: Sample;
+    sample.height = mix(top, bottom, f.y);
+    sample.lowest = min(min(a, b), min(c, d));
+    return sample;
 }
 
 // How far into the coarser level a vertex has blended: 0 across most of a ring,
@@ -157,11 +183,23 @@ fn vs_main(vertex: VertexIn, instance: InstanceIn) -> VertexOut {
     }
 
     var height = height_at(level, w);
+    var lowest = height;
     var coarse_uv = vec2<f32>(0.0);
     if (morph > 0.0) {
         let coarse_w = info.coarse_offset + wf * 0.5;
-        height = mix(height, height_bilinear(coarse_level, coarse_w), morph);
+        let coarse = height_bilinear(coarse_level, coarse_w);
+        height = mix(height, coarse.height, morph);
+        lowest = min(lowest, coarse.lowest);
         coarse_uv = colour_uv(coarse_level, coarse_w);
+    }
+
+    // A hole's vertex is flattened to sea level rather than left at -32767.
+    // Every fragment of its triangles is discarded either way, but a vertex
+    // thirty kilometres underground would stretch them across the whole scene
+    // and cost a great deal of rasterization to throw away.
+    let hole = lowest < NODATA_BELOW;
+    if (hole) {
+        height = 0.0;
     }
 
     var out: VertexOut;
@@ -172,6 +210,7 @@ fn vs_main(vertex: VertexIn, instance: InstanceIn) -> VertexOut {
     out.coarse_level = coarse_level;
     out.morph = morph;
     out.ground = ground;
+    out.nodata = select(0.0, 1.0, hole);
     return out;
 }
 
@@ -186,6 +225,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // boundary exactly on the data's edge instead of a quad away from it, which
     // at the coarsest level is hundreds of metres.
     if (any(in.ground < terrain.data_min) || any(in.ground > terrain.data_max)) {
+        discard;
+    }
+
+    // Holes inside the data are as real as the edge of it. Tiles with nothing
+    // under them are never written, so a survey's ragged boundary and the water
+    // it stops at both arrive as nodata rather than as ground.
+    if (in.nodata > 0.0) {
         discard;
     }
 
