@@ -333,6 +333,16 @@ fn channel_count<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<usize> {
         ColorType::Gray(_) => 1,
         ColorType::RGB(_) => 3,
         ColorType::RGBA(_) | ColorType::CMYK(_) => 4,
+        // Anything the named types do not cover, which for a height field is
+        // usually elevation plus something alongside it -- `terrain-download`
+        // writes a second band recording which source each texel came from.
+        // Only band zero is read, so the extras cost nothing but their bytes.
+        // Zero is rejected because the callers stride by this, and a stride of
+        // zero panics rather than failing cleanly.
+        ColorType::Multiband { num_samples: 0, .. } => {
+            bail!("raster claims to have no bands at all")
+        }
+        ColorType::Multiband { num_samples, .. } => usize::from(num_samples),
         other => bail!("raster has unsupported colour type {other:?}"),
     })
 }
@@ -448,6 +458,99 @@ mod tests {
     fn the_value_range_spans_the_full_resolution_level() {
         let pyramid = Pyramid::build(Level::new(2, 2, vec![-7.5f32, 0.0, 3.0, 12.25]));
         assert_eq!(pyramid.value_range(), (-7.5, 12.25));
+    }
+
+    /// A height raster carrying a second band alongside the elevation, which is
+    /// the shape `terrain-download` writes: band zero is the height in metres,
+    /// band one records which source it came from.
+    ///
+    /// The `tiff` crate has no two-sample colour type, but the trait is public,
+    /// so the missing one is declared here the same way the downloader declares
+    /// it. Both sides being spelled out separately is deliberate: this test is
+    /// checking that the loader accepts the format, not that the two crates
+    /// share a definition.
+    struct Gray32FloatPlusOne;
+
+    impl tiff::encoder::colortype::ColorType for Gray32FloatPlusOne {
+        type Inner = f32;
+        const TIFF_VALUE: tiff::tags::PhotometricInterpretation =
+            tiff::tags::PhotometricInterpretation::BlackIsZero;
+        const BITS_PER_SAMPLE: &'static [u16] = &[32, 32];
+        const SAMPLE_FORMAT: &'static [tiff::tags::SampleFormat] =
+            &[tiff::tags::SampleFormat::IEEEFP; 2];
+
+        fn horizontal_predict(_: &[f32], _: &mut Vec<f32>) {
+            unreachable!("written without a predictor")
+        }
+    }
+
+    fn two_band_geotiff(width: u32, height: u32) -> Vec<u8> {
+        use std::io::Cursor;
+
+        use tiff::encoder::TiffEncoder;
+        use tiff::tags::Tag;
+
+        let mut buffer = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut buffer).expect("failed to start encoding");
+            let mut image = encoder
+                .new_image::<Gray32FloatPlusOne>(width, height)
+                .expect("failed to start image");
+            image.rows_per_strip(2).expect("failed to set strip height");
+            {
+                let directory = image.encoder();
+                directory
+                    .write_tag(Tag::Unknown(33550), &[0.001f64, 0.002, 0.0][..])
+                    .expect("failed to write pixel scale");
+                directory
+                    .write_tag(
+                        Tag::Unknown(33922),
+                        &[0.0f64, 0.0, 0.0, 10.0, 45.0, 0.0][..],
+                    )
+                    .expect("failed to write tiepoint");
+                // Geographic, area pixels, degrees.
+                directory
+                    .write_tag(
+                        Tag::Unknown(34735),
+                        &[
+                            1u16, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2054, 0, 1, 9102,
+                        ][..],
+                    )
+                    .expect("failed to write geo keys");
+            }
+
+            let mut samples = Vec::with_capacity((width * height * 2) as usize);
+            for i in 0..width * height {
+                samples.push(100.0 + i as f32);
+                samples.push(1.0);
+            }
+            image.write_data(&samples).expect("failed to write pixels");
+        }
+        buffer.into_inner()
+    }
+
+    #[test]
+    fn a_height_raster_with_a_second_band_loads_its_elevations() {
+        let (width, height) = (4u32, 4u32);
+        let path =
+            std::env::temp_dir().join(format!("flight-sim-two-band-{}.tiff", std::process::id()));
+        std::fs::write(&path, two_band_geotiff(width, height)).expect("failed to write");
+
+        let loaded = load_heights(path.to_str().expect("non-UTF-8 temp path"))
+            .expect("a two-band height raster should load");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.placement.width, width);
+        assert_eq!(loaded.placement.height, height);
+
+        // Band one is dropped; only the elevations survive.
+        let level = loaded.pyramid.level(0);
+        for y in 0..height {
+            for x in 0..width {
+                let expected = 100.0 + (y * width + x) as f32;
+                assert_eq!(level.get(x, y), expected, "texel ({x}, {y})");
+            }
+        }
     }
 
     /// Decodes the rasters actually on disk, end to end.
