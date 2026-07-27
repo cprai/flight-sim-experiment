@@ -228,10 +228,31 @@ impl Georeferencing {
         )
     }
 
-    /// Whether two rasters cover exactly the same ground at the same resolution,
-    /// so that one can texture the other without resampling.
+    /// Whether two rasters cover the same ground, whatever their resolutions.
+    ///
+    /// Resolution deliberately does not have to match. Elevation and colour
+    /// come from different sources at whatever detail each was surveyed at --
+    /// one-metre LiDAR against ten-metre satellite imagery, say -- and the
+    /// clipmap samples them as separate textures, so each keeps its own size.
+    /// What must agree is the ground: both are placed by their own
+    /// georeferencing, and a raster covering a different area would texture the
+    /// terrain with the wrong scenery.
+    ///
+    /// The tolerance is a texel of the coarser raster, because a coarse raster
+    /// cannot represent an arbitrary box exactly: its extent is a whole number
+    /// of texels, so cutting it to the same ground as a fine one leaves it up
+    /// to half a texel short or long. A texel covers that for both.
     pub fn is_co_registered_with(&self, other: &Self) -> bool {
-        self == other
+        if self.origin != other.origin {
+            return false;
+        }
+
+        let (width, height) = self.world_extent();
+        let (other_width, other_height) = other.world_extent();
+        let tolerance_x = self.metres_per_texel_x.max(other.metres_per_texel_x);
+        let tolerance_z = self.metres_per_texel_z.max(other.metres_per_texel_z);
+
+        (width - other_width).abs() <= tolerance_x && (height - other_height).abs() <= tolerance_z
     }
 }
 
@@ -748,6 +769,94 @@ pub(crate) mod tests {
         assert!(
             !placement.is_co_registered_with(&shifted),
             "rasters at different origins must not be treated as aligned"
+        );
+    }
+
+    /// The case the colour pipeline depends on: elevation surveyed at one
+    /// resolution paired with imagery at another, over identical ground.
+    #[test]
+    fn the_same_ground_at_a_coarser_resolution_is_co_registered() {
+        let fine = geographic_raster();
+
+        // A tenth the texels, each ten times the size: the same box.
+        let coarse_bytes = synthetic_geotiff(
+            WIDTH / 10,
+            HEIGHT / 10,
+            &[0.01, 0.02, 0.0],
+            &[0.0, 0.0, 0.0, 10.0, 45.0, 0.0],
+            &geographic_keys(),
+        );
+        let coarse = read_placement(&coarse_bytes).expect("failed to read placement");
+
+        assert_ne!(fine.width, coarse.width, "the test needs differing sizes");
+        assert!(
+            fine.is_co_registered_with(&coarse),
+            "same ground at a different resolution must pair:\n{fine:?}\n{coarse:?}"
+        );
+        assert!(coarse.is_co_registered_with(&fine), "and symmetrically");
+    }
+
+    /// The tolerance itself, which the factor-of-ten case above never reaches
+    /// because its extents come out exactly equal.
+    ///
+    /// A coarse raster's extent is a whole number of its own texels, so cut to
+    /// the same ground as a fine one it lands slightly short or long. Here the
+    /// fine raster spans 0.020 degrees and the coarse one 3 texels of 0.007,
+    /// or 0.021 -- adrift by a seventh of a coarse texel, which must still
+    /// pair. A fourth texel puts it at 0.028, adrift by more than a whole one,
+    /// which must not.
+    #[test]
+    fn an_extent_within_one_coarse_texel_still_pairs() {
+        let fine = geographic_raster();
+
+        let coarse_of = |columns: u32| {
+            let bytes = synthetic_geotiff(
+                columns,
+                3,
+                &[0.007, 0.02, 0.0],
+                &[0.0, 0.0, 0.0, 10.0, 45.0, 0.0],
+                &geographic_keys(),
+            );
+            read_placement(&bytes).expect("failed to read placement")
+        };
+
+        let near = coarse_of(3);
+        let far = coarse_of(4);
+
+        // The near case really is inexact, or this would prove nothing.
+        assert_ne!(
+            fine.world_extent().0,
+            near.world_extent().0,
+            "the test needs the extents to actually differ"
+        );
+        assert!(
+            fine.is_co_registered_with(&near),
+            "a seventh of a texel adrift must pair:\n{fine:?}\n{near:?}"
+        );
+        assert!(
+            !fine.is_co_registered_with(&far),
+            "more than a texel adrift must not pair:\n{fine:?}\n{far:?}"
+        );
+    }
+
+    /// Relaxing the resolution check must not also relax the extent one.
+    #[test]
+    fn the_same_origin_covering_less_ground_is_not_co_registered() {
+        let full = geographic_raster();
+
+        // Same origin and texel size, but half as wide, so it stops short.
+        let cropped_bytes = synthetic_geotiff(
+            WIDTH / 2,
+            HEIGHT,
+            &[0.001, 0.002, 0.0],
+            &[0.0, 0.0, 0.0, 10.0, 45.0, 0.0],
+            &geographic_keys(),
+        );
+        let cropped = read_placement(&cropped_bytes).expect("failed to read placement");
+
+        assert!(
+            !full.is_co_registered_with(&cropped),
+            "a raster covering half the ground must not pair:\n{full:?}\n{cropped:?}"
         );
     }
 }
