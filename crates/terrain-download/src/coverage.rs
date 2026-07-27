@@ -23,8 +23,7 @@ use std::io::{IsTerminal, Write};
 
 use anyhow::{Context, Result};
 
-use crate::bbox::OutputGrid;
-use crate::project::Projector;
+use crate::extent::TileExtent;
 use crate::source::SourceRaster;
 
 /// Roughly how many points to test. Sampling rather than projecting every pixel
@@ -70,24 +69,27 @@ impl Estimate {
     }
 }
 
-/// Estimates coverage by testing a regular sample of the output grid.
+/// Estimates coverage by testing a regular sample of the output extent.
 ///
 /// A point counts as one-metre if any one-metre raster holds data there, then
 /// as two-metre on the same test, and otherwise as missing -- the same
 /// preference order the fill itself applies.
+///
+/// No projection is involved: the output is drawn on the mosaics' own grid, so
+/// a sample point's metres are already the metres the rasters are indexed by.
 pub fn estimate(
-    grid: &OutputGrid,
-    projector: &Projector,
+    extent: &TileExtent,
     fine: &[SourceRaster],
     coarse: &[SourceRaster],
 ) -> Result<Estimate> {
+    let grid = extent.grid(0);
+
     // One stride for both axes keeps the sample pattern square on the ground.
-    let stride = (grid.pixel_count() as f64 / TARGET_SAMPLES as f64)
+    let stride = (grid.texel_count() as f64 / TARGET_SAMPLES as f64)
         .sqrt()
         .ceil()
         .max(1.0) as u32;
 
-    let mut row = Vec::new();
     let mut estimate = Estimate {
         sampled: 0,
         one_metre: 0,
@@ -98,18 +100,9 @@ pub fn estimate(
 
     let mut y = 0;
     while y < grid.height {
-        let latitude = grid.latitude_of(y);
-        row.clear();
         let mut x = 0;
         while x < grid.width {
-            row.push((grid.longitude_of(x), latitude));
-            x += stride;
-        }
-        projector
-            .to_metres(&mut row)
-            .with_context(|| format!("projecting sample row {y}"))?;
-
-        for &(metres_x, metres_y) in &row {
+            let (metres_x, metres_y) = grid.centre_of(x, y);
             estimate.sampled += 1;
             if fine.iter().any(|r| r.has_data_at(metres_x, metres_y)) {
                 estimate.one_metre += 1;
@@ -118,8 +111,8 @@ pub fn estimate(
             } else {
                 estimate.missing += 1;
             }
+            x += stride;
         }
-
         y += stride;
     }
 

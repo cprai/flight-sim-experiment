@@ -20,6 +20,7 @@ use async_tiff::metadata::TiffMetadataReader;
 use async_tiff::metadata::cache::ReadaheadMetadataCache;
 use async_tiff::reader::ReqwestReader;
 
+use crate::resample::MetreExtent;
 use crate::stac::SourceItem;
 
 /// A 512 x 512 block of 32-bit floats that is entirely nodata compresses, with
@@ -119,6 +120,16 @@ impl Window {
         })
     }
 
+    /// The ground this window covers, edge to edge.
+    pub fn extent(&self) -> MetreExtent {
+        MetreExtent {
+            min_x: self.origin_x,
+            min_y: self.origin_y - f64::from(self.height) * self.metres_per_pixel,
+            max_x: self.origin_x + f64::from(self.width) * self.metres_per_pixel,
+            max_y: self.origin_y,
+        }
+    }
+
     /// Writes one pixel directly, so tests can build a window without a server.
     #[cfg(test)]
     pub fn set_for_test(&mut self, x: u32, y: u32, values: &[f32]) {
@@ -134,6 +145,21 @@ impl Window {
         self.pixels[at..at + self.bands]
             .iter()
             .all(|&v| v == self.nodata)
+    }
+
+    /// One pixel's bands, or `None` if it is nodata.
+    ///
+    /// The direct read behind the copy path in `resample`, used when the output
+    /// grid and this window share a lattice so there is nothing to interpolate.
+    pub fn texel_at(&self, x: u32, y: u32) -> Option<&[f32]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let at = ((y as usize) * (self.width as usize) + x as usize) * self.bands;
+        if self.is_nodata(at) {
+            return None;
+        }
+        Some(&self.pixels[at..at + self.bands])
     }
 
     /// Samples the window at a point in projected metres, bilinearly, writing
@@ -413,14 +439,19 @@ impl SourceRaster {
         Some((column, row))
     }
 
-    /// The tiles this raster would contribute to `window`, in row-major order
+    /// The tiles this raster would contribute to an extent, in row-major order
     /// so that neighbouring tiles merge into contiguous range requests.
-    fn tiles_for(&self, window: &Window) -> Vec<(usize, usize)> {
-        // The window's extent as pixel indices in this raster.
-        let left = (window.origin_x - self.tie_x) / self.metres_per_pixel;
-        let top = (self.tie_y - window.origin_y) / self.metres_per_pixel;
-        let right = left + f64::from(window.width);
-        let bottom = top + f64::from(window.height);
+    ///
+    /// Takes an extent rather than a window so that the download can be sized
+    /// before anything is allocated -- a window large enough to hold a whole
+    /// box no longer exists, and building one just to count bytes would defeat
+    /// the point of working block by block.
+    fn tiles_for(&self, extent: MetreExtent) -> Vec<(usize, usize)> {
+        // The extent as pixel indices in this raster.
+        let left = (extent.min_x - self.tie_x) / self.metres_per_pixel;
+        let top = (self.tie_y - extent.max_y) / self.metres_per_pixel;
+        let right = (extent.max_x - self.tie_x) / self.metres_per_pixel;
+        let bottom = (self.tie_y - extent.min_y) / self.metres_per_pixel;
 
         let clamp = |value: f64, limit: usize| value.max(0.0).min(limit as f64) as usize;
         let first_column = clamp(left.floor(), self.ifd.image_width() as usize);
@@ -447,9 +478,9 @@ impl SourceRaster {
         wanted
     }
 
-    /// Bytes that `fill` would download for this window.
-    pub fn bytes_for(&self, window: &Window) -> u64 {
-        self.tiles_for(window)
+    /// Bytes that `fill` would download for an extent.
+    pub fn bytes_for(&self, extent: MetreExtent) -> u64 {
+        self.tiles_for(extent)
             .into_iter()
             .map(|(tile_x, tile_y)| self.tile_bytes(tile_y * self.tiles_across + tile_x))
             .sum()
@@ -458,7 +489,7 @@ impl SourceRaster {
     /// Fetches this raster's contribution to `window` and returns the number of
     /// bytes downloaded.
     pub async fn fill(&self, window: &mut Window, batch: usize) -> Result<u64> {
-        let wanted = self.tiles_for(window);
+        let wanted = self.tiles_for(window.extent());
         if wanted.is_empty() {
             return Ok(0);
         }
