@@ -3,3 +3,20 @@ name = "terrain-download"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
+async-tiff = { version = "0.3", default-features = false, features = ["reqwest"] }
+clap = { version = "4.6", features = ["derive"] }
+env_logger = "0.11.11"
+log = "0.4.33"
+proj4rs = { version = "0.1.10", default-features = false, features = [
+    "crs-definitions",
+    "multi-thread",
+] }
+# Default features carry rustls, so there is no system OpenSSL to find. Left on
+# rather than pinned to a TLS backend, so async-tiff's own reqwest dependency
+# unifies with this one instead of building a second stack.
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiff = { version = "0.11", default-features = false, features = ["deflate"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
