@@ -12,7 +12,7 @@ use crate::terrain::clipmap::{
     ClipmapConfig, detail_base, exposed_regions, grid_origin, split_across_seam, window_origin,
 };
 use crate::terrain::geotiff::Georeferencing;
-use crate::terrain::maxima::Maxima;
+use crate::terrain::maxima::{Maxima, ceiling_half};
 use crate::terrain::mesh::{self, PatchKind};
 use crate::terrain::pyramid::{RasterSource, Resident, Srgb8};
 use crate::terrain::tiles::TileStore;
@@ -307,7 +307,11 @@ impl Terrain {
             mip_level_count: config.max_mip() + 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
+            // Half precision, which is worth three hundred megabytes at the
+            // widest window. `ceiling_half` rounds towards positive infinity so
+            // that a cell stays an upper bound on the ground under it; see the
+            // reasoning there.
+            format: wgpu::TextureFormat::R16Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::COPY_SRC,
@@ -879,20 +883,27 @@ impl Terrain {
         let size = piece.size();
         let texels = (size.x * size.y) as usize;
         let bytes = texels * size_of::<f32>();
-        let cells: &mut [f32] = bytemuck::cast_slice_mut(&mut self.staging[..bytes]);
         self.maxima.read_rect(
             self.heights.as_ref(),
             level,
             mip,
             piece.origin(),
             size,
-            cells,
+            bytemuck::cast_slice_mut(&mut self.staging[..bytes]),
         );
-        if VERTICAL_EXAGGERATION != 1.0 {
-            for cell in cells.iter_mut() {
-                *cell *= VERTICAL_EXAGGERATION;
-            }
+        // Narrowed in place, forwards, so that the half float for a cell is
+        // written over bytes the full-precision one has already been read out
+        // of. Two bytes never overtake four.
+        for cell in 0..texels {
+            let read = f32::from_le_bytes(
+                self.staging[cell * 4..cell * 4 + 4]
+                    .try_into()
+                    .expect("four bytes"),
+            );
+            let narrowed = ceiling_half(read * VERTICAL_EXAGGERATION).to_bits();
+            self.staging[cell * 2..cell * 2 + 2].copy_from_slice(&narrowed.to_le_bytes());
         }
+        let bytes = texels * size_of::<u16>();
 
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -908,7 +919,7 @@ impl Terrain {
             &self.staging[..bytes],
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(size.x * size_of::<f32>() as u32),
+                bytes_per_row: Some(size.x * size_of::<u16>() as u32),
                 rows_per_image: Some(size.y),
             },
             wgpu::Extent3d {
@@ -920,9 +931,14 @@ impl Terrain {
 
         // The coarsest depth is small enough to mirror whole, and mirroring it
         // from the same staging buffer at the same destination keeps it wrapped
-        // around the torus exactly as the texture is.
+        // around the torus exactly as the texture is. Read back out of the half
+        // floats rather than kept at full precision, so that the scalar the far
+        // field takes its early out from is the same bound the texture holds.
         if mip == self.config.max_mip() {
-            let cells: &[f32] = bytemuck::cast_slice(&self.staging[..bytes]);
+            let cells: Vec<f32> = bytemuck::cast_slice::<u8, u16>(&self.staging[..bytes])
+                .iter()
+                .map(|bits| half::f16::from_bits(*bits).to_f32())
+                .collect();
             let span = (self.config.window_texels >> mip) as usize;
             for row in 0..size.y as usize {
                 let from = row * size.x as usize;
@@ -1199,7 +1215,7 @@ mod tests {
 
         // Rows in a texture-to-buffer copy are padded to 256 bytes, which the
         // coarser mips of a 32-texel window are well short of.
-        let stride = |size: u32| (size * 4).div_ceil(256) * 256;
+        let stride = |size: u32| (size * 2).div_ceil(256) * 256;
         let readbacks: Vec<wgpu::Buffer> = (0..=config.max_mip())
             .map(|mip| {
                 let size = (window >> mip).max(1);
@@ -1263,13 +1279,19 @@ mod tests {
                     for i in 0..span {
                         let cell = base + IVec2::new(i, j);
                         let (x, y) = (cell.x.rem_euclid(span), cell.y.rem_euclid(span));
-                        let row: &[f32] = bytemuck::cast_slice(
-                            &layer[y as usize * stride..y as usize * stride + span as usize * 4],
+                        let row: &[u16] = bytemuck::cast_slice(
+                            &layer[y as usize * stride..y as usize * stride + span as usize * 2],
                         );
+                        let got = half::f16::from_bits(row[x as usize]).to_f32();
                         let want = cell_ceiling(terrain.heights.as_ref(), level, mip, cell);
-                        assert_eq!(
-                            row[x as usize], want,
-                            "level {level} mip {mip} cell {cell} landed at ({x}, {y})"
+                        // Half precision, rounded towards positive infinity, so
+                        // a cell is at or a little above the ground it covers
+                        // and never below it. Below would be a ridge a ray can
+                        // pass through; above only costs a descent.
+                        assert!(
+                            got >= want && got <= ceiling_half(want).to_f32(),
+                            "level {level} mip {mip} cell {cell} at ({x}, {y}) \
+                             holds {got} for ground at {want}"
                         );
                         checked += 1;
                     }

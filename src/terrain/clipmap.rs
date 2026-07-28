@@ -114,11 +114,12 @@ impl Default for ClipmapConfig {
             // moving the frame by 0.11 of 255; eight sheds only a twelfth, and
             // two starts to show where the ring blend and the march disagree.
             near_rings: 4.0,
-            // What a 4096 window costs on the raster this flies: seven levels
-            // of heights, colours and maxima. Sized to admit that rather than
-            // to any round number, because the window is the one knob worth
-            // spending memory on and the sizes it can take are powers of two --
-            // a budget between two of them buys nothing.
+            // Room for a 4096 window on the raster this flies, which is seven
+            // levels of heights, colours and maxima and comes to 1195 MiB.
+            // Sized to admit that rather than to any round number, because the
+            // window is the one knob worth spending memory on and the sizes it
+            // can take are powers of two -- a budget between two of them buys
+            // nothing.
             memory_budget: 1600 << 20,
             // 1080p at sixty degrees, replaced wherever a real viewport is
             // known.
@@ -197,14 +198,14 @@ impl ClipmapConfig {
     /// Bytes of texture a clipmap of this shape occupies.
     ///
     /// Heights and colours are four bytes a texel at full window size; the max
-    /// pyramid is a real mip chain, so it costs about a third again over its
-    /// own base.
+    /// pyramid is two bytes and a real mip chain, so it costs about a third
+    /// again over its own base.
     pub fn texture_bytes(&self, levels: u32) -> usize {
         let window = self.window_texels as usize;
         let mut per_level = window * window * (size_of::<f32>() + 4);
         for mip in 0..=self.max_mip() {
             let side = (window >> mip).max(1);
-            per_level += side * side * size_of::<f32>();
+            per_level += side * side * size_of::<u16>();
         }
         per_level * levels as usize
     }

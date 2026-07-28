@@ -765,6 +765,7 @@ dependencies = [
  "clap",
  "env_logger",
  "glam",
+ "half",
  "log",
  "pollster",
  "terrain-tiles",
