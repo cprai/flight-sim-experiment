@@ -9,7 +9,7 @@ use glam::{DVec2, IVec2, UVec2, Vec2, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::terrain::clipmap::{
-    ClipmapConfig, detail_base, exposed_regions, split_across_seam, window_origin,
+    ClipmapConfig, detail_base, exposed_regions, grid_origin, split_across_seam, window_origin,
 };
 use crate::terrain::geotiff::Georeferencing;
 use crate::terrain::mesh::{self, PatchKind};
@@ -30,7 +30,7 @@ const WORKGROUP: u32 = 8;
 ///
 /// A window is a power of two texels across, so this is just its exponent.
 const fn max_mip(config: &ClipmapConfig) -> u32 {
-    config.window_texels().trailing_zeros()
+    config.window_texels.trailing_zeros()
 }
 
 /// A grid vertex: nothing but its integer position within the shared grid.
@@ -72,11 +72,13 @@ struct TerrainUniform {
     data_max: [f32; 2],
     base_level: u32,
     base_morph: f32,
-    // These two land exactly in the padding the struct already carried, so its
-    // size is unchanged. Its alignment is that of its widest member, so that
-    // size has to stay a multiple of sixteen to match the shader's layout.
     near_radius: f32,
     max_mip: u32,
+    window_quads: f32,
+    grid_offset: f32,
+    // The struct's alignment is that of its widest member, so its size has to
+    // stay a multiple of sixteen to match the shader's layout.
+    padding: [u32; 2],
 }
 
 /// A height raster and a matching colour raster, drawn as a geometry clipmap.
@@ -230,7 +232,7 @@ impl Terrain {
         let raster = UVec2::new(placement.width, placement.height);
         let available = heights.level_count().min(colours.level_count());
         let level_count = config.level_count(raster, available).min(MAX_LEVELS as u32);
-        let window = config.window_texels();
+        let window = config.window_texels;
 
         let layers = wgpu::Extent3d {
             width: window,
@@ -695,7 +697,7 @@ impl Terrain {
     /// upload was asked for and not against the same GPU state twice.
     #[cfg(test)]
     pub fn window_heights(&self, level: u32) -> Vec<f32> {
-        let window = self.config.window_texels();
+        let window = self.config.window_texels;
         let mut heights = vec![0f32; (window * window) as usize];
         self.heights.read_rect(
             level,
@@ -715,7 +717,7 @@ impl Terrain {
         let camera_texels = self
             .placement
             .texel_of_world(f64::from(camera.x), f64::from(camera.z));
-        let window = self.config.window_texels();
+        let window = self.config.window_texels;
 
         let levels = self.origins.len();
         let coarsest = levels - 1;
@@ -774,6 +776,9 @@ impl Terrain {
             base_morph,
             near_radius: near_radius as f32,
             max_mip: max_mip(&self.config),
+            window_quads: self.config.window_quads() as f32,
+            grid_offset: self.config.margin() as f32,
+            padding: [0; 2],
         };
 
         for (level, &new) in placed.iter().enumerate() {
@@ -811,7 +816,7 @@ impl Terrain {
     /// origin carried on following the camera -- is refilled whole. There is
     /// nothing for an incremental update to keep in that case.
     fn refresh(&mut self, queue: &wgpu::Queue, level: usize, new: IVec2) {
-        let window = self.config.window_texels();
+        let window = self.config.window_texels;
         let regions = if self.filled[level] {
             exposed_regions(self.origins[level], new, window)
         } else {
@@ -842,7 +847,7 @@ impl Terrain {
     /// being drawn anyway.
     fn ground_height(&self, camera_texels: DVec2) -> f32 {
         let level = self.origins.len() - 1;
-        let window = self.config.window_texels() as i32;
+        let window = self.config.window_texels as i32;
         let texels = camera_texels / f64::from(1u32 << level);
         let offset =
             IVec2::new(texels.x.floor() as i32, texels.y.floor() as i32) - self.origins[level];
@@ -928,7 +933,7 @@ impl Terrain {
     /// exactly as the texture does and cannot drift out of step with it.
     fn mirror_ground(&mut self, size: UVec2, destination: UVec2, bytes: usize) {
         let heights: &[f32] = bytemuck::cast_slice(&self.staging[..bytes]);
-        let window = self.config.window_texels() as usize;
+        let window = self.config.window_texels as usize;
         for row in 0..size.y as usize {
             let source = row * size.x as usize;
             let target = (destination.y as usize + row) * window + destination.x as usize;
@@ -991,15 +996,22 @@ impl Terrain {
     /// Rebuilds the instance buffer and the draw ranges that index it.
     fn rebuild_patches(&mut self, queue: &wgpu::Queue, camera: Vec3, near_radius: f64) {
         let (data_min, data_max) = self.placement.data_bounds();
-        let patches: Vec<mesh::Patch> = mesh::patches(&self.config, &self.origins, self.detail.0)
+        // Patches are laid out in grid coordinates, which start a margin in from
+        // the window the textures are addressed in.
+        let grids: Vec<IVec2> = self
+            .origins
+            .iter()
+            .map(|origin| grid_origin(&self.config, *origin))
+            .collect();
+        let patches: Vec<mesh::Patch> = mesh::patches(&self.config, &grids, self.detail.0)
             .into_iter()
             .filter(|patch| {
                 let level = patch.level as usize;
                 let scale = f64::from(1u32 << level);
                 let (near_x, near_z) = self.placement.world_of_texel(
                     patch.level,
-                    f64::from(self.origins[level].x + patch.origin.x as i32),
-                    f64::from(self.origins[level].y + patch.origin.y as i32),
+                    f64::from(grids[level].x + patch.origin.x as i32),
+                    f64::from(grids[level].y + patch.origin.y as i32),
                 );
                 let size = patch.kind.size_quads(&self.config);
                 let far_x = near_x + f64::from(size.x) * scale * self.placement.metres_per_texel_x;
@@ -1082,7 +1094,7 @@ impl Terrain {
         // Levels below the base are neither uploaded nor drawn nor marched, so
         // there is nothing to bound. At altitude that is most of them.
         let layers = self.origins.len() as u32 - self.detail.0;
-        let window = self.config.window_texels();
+        let window = self.config.window_texels;
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("terrain pyramid pass"),
@@ -1145,6 +1157,7 @@ mod tests {
     fn test_config() -> ClipmapConfig {
         ClipmapConfig {
             block_verts: 8,
+            window_texels: 32,
             ..Default::default()
         }
     }
@@ -1242,7 +1255,7 @@ mod tests {
         let (device, queue) = crate::scene::test_device();
         let camera_layout = crate::scene::test_camera_layout(&device);
         let config = test_config();
-        let window = config.window_texels();
+        let window = config.window_texels;
 
         let mut terrain = Terrain::new(
             &device,

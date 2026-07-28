@@ -68,6 +68,16 @@ struct Terrain {
     near_radius: f32,
     // Coarsest mip of the max pyramid, where one texel covers a whole window.
     max_mip: u32,
+    // Side length of a level's window in quads, which is how far a ray may
+    // travel across a level before it is handed over to the level outside. The
+    // window is at least as wide as the grid and usually much wider: the mesh
+    // only draws the near disc, while the march is fed by whatever is resident.
+    window_quads: f32,
+    // How many texels of window lie outside the grid, on each side. The grid is
+    // centred in the window, so this is what turns a grid coordinate -- which is
+    // what the mesh's vertices carry -- into a window one.
+    grid_offset: f32,
+    padding: vec2<u32>,
 };
 
 @group(1) @binding(0) var<uniform> terrain: Terrain;
@@ -191,7 +201,12 @@ fn vs_main(vertex: VertexIn, instance: InstanceIn) -> VertexOut {
     let level = instance.level;
     let info = terrain.levels[level];
 
-    let w = vec2<i32>(vertex.grid + instance.origin);
+    // Grid coordinates, which is what the patch instances are laid out in, and
+    // window coordinates, which is what the textures are addressed in. They
+    // differ by the margin the grid sits inside the window by.
+    let g = vec2<i32>(vertex.grid + instance.origin);
+    let gf = vec2<f32>(g);
+    let w = g + vec2<i32>(i32(terrain.grid_offset));
     let wf = vec2<f32>(w);
     let ground = info.origin + wf * info.spacing;
 
@@ -200,7 +215,7 @@ fn vs_main(vertex: VertexIn, instance: InstanceIn) -> VertexOut {
     // the coarser surface, so the two meet -- and the pop that would otherwise
     // happen as a vertex crossed from one level to the next.
     let coarse_level = min(level + 1u, terrain.level_count - 1u);
-    var morph = morph_factor(wf);
+    var morph = morph_factor(gf);
     if (level == terrain.base_level) {
         // Whichever is further along: the ring's own outward blend, or the
         // altitude blend that is retiring this level altogether.
@@ -433,14 +448,15 @@ struct Hit {
 
 // Walks `dir` from `start` metres out until it meets the ground.
 //
-// Level selection is the clipmap's own rule rather than an approximation of it:
-// a point belongs to the finest level whose grid still contains it, which is
-// exactly the level whose ring the rasterizer would have drawn it with. The
-// march therefore reads the same data the mesh would have, and the radius the
-// two halves meet at costs no detail.
+// A point is read at the finest level whose *window* still contains it, which is
+// the finest data resident for it. Where the window is wider than the grid --
+// which is the usual case, since the mesh is only asked to cover the near disc
+// -- that is finer than the level the rasterizer would have drawn the same
+// ground with. The two agree wherever they overlap so long as the near radius
+// stays inside the base level's own grid.
 //
 // The level only ever coarsens along a ray. Distance from the eye grows with
-// `t`, every window is centred on the eye, so a ray that has left one grid
+// `t`, every window is centred on the eye, so a ray that has left one window
 // cannot re-enter it.
 fn march(eye: vec3<f32>, dir: vec3<f32>, start: f32) -> Hit {
     var out: Hit;
@@ -452,7 +468,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>, start: f32) -> Hit {
     // be stopped some other way. Keeping the bound finite is also what makes an
     // infinite `near_radius`, meaning "rasterize everything", fall straight out
     // as a miss on the first step.
-    let limit = start + length(terrain.grid_quads * terrain.levels[coarsest].spacing);
+    let limit = start + length(terrain.window_quads * terrain.levels[coarsest].spacing);
 
     var level = terrain.base_level;
     // The eye's position in the current level's window, and how many of its
@@ -478,7 +494,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>, start: f32) -> Hit {
         }
         let w = w0 + wd * t;
 
-        if (any(w < vec2<f32>(0.0)) || any(w > vec2<f32>(terrain.grid_quads))) {
+        if (any(w < vec2<f32>(0.0)) || any(w > vec2<f32>(terrain.window_quads))) {
             if (level >= coarsest) {
                 return out;
             }

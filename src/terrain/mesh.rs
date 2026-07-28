@@ -132,7 +132,7 @@ pub fn grid_indices(config: &ClipmapConfig) -> (Vec<u16>, Vec<std::ops::Range<u3
 
 /// Every patch to draw, given where each level's window has landed.
 ///
-/// `origins` holds one window origin per level, finest first, in each level's
+/// `origins` holds one grid origin per level, finest first, in each level's
 /// own texel coordinates. The trim's orientation is derived from those origins
 /// rather than recomputed from the camera, so the geometry cannot disagree with
 /// the windows it is drawn against.
@@ -233,20 +233,21 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::terrain::clipmap::window_origin;
+    use crate::terrain::clipmap::{grid_origin, window_origin};
     use glam::DVec2;
 
     fn config() -> ClipmapConfig {
         ClipmapConfig {
             block_verts: 8,
+            window_texels: 32,
             ..Default::default()
         }
     }
 
-    /// Window origins for every level, as the renderer would compute them.
+    /// Grid origins for every level, as the renderer would compute them.
     fn origins(config: &ClipmapConfig, camera: DVec2, levels: u32) -> Vec<IVec2> {
         (0..levels)
-            .map(|level| window_origin(config, level, camera))
+            .map(|level| grid_origin(config, window_origin(config, level, camera)))
             .collect()
     }
 

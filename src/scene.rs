@@ -347,6 +347,7 @@ mod tests {
     fn test_config() -> ClipmapConfig {
         ClipmapConfig {
             block_verts: 16,
+            window_texels: 64,
             ..Default::default()
         }
     }
@@ -398,6 +399,18 @@ mod tests {
         path: &[Vec3],
     ) -> (Vec<u8>, u32) {
         render_config(test_config(), heights, colours, aim, path)
+    }
+
+    /// The same clipmap with room around its grid.
+    ///
+    /// The mesh draws the same rings either way; the extra texels are there for
+    /// the far field, which reads whatever is resident rather than only what the
+    /// mesh covers. Anything the near field draws has to come out the same.
+    fn wide_config() -> ClipmapConfig {
+        ClipmapConfig {
+            window_texels: 128,
+            ..test_config()
+        }
     }
 
     /// The clipmap of [`test_config`] cut at a given radius.
@@ -710,44 +723,62 @@ mod tests {
         );
     }
 
+    /// Run against a window that just fits the grid and one with room to spare.
+    ///
+    /// Registration is what a margin could break: the vertex stage offsets grid
+    /// coordinates into window coordinates before reading either texture, so a
+    /// margin applied to the heights and not to the colours -- or to either and
+    /// not to the world position -- would slide the imagery off the ground it
+    /// belongs to. The wide window puts thirty-two texels between the grid and
+    /// the window's edge, so any such slip is far larger than a pixel.
     #[test]
     fn the_colour_raster_lands_where_the_georeferencing_puts_it() {
-        // A patch of a distinct colour, well away from the raster's centre so
-        // that getting the axes or the origin wrong would move it visibly.
-        let (patch_col, patch_row) = (32u32, 96u32);
-        let half = 8u32;
-        let mut colours = flat_ground();
-        for row in patch_row - half..patch_row + half {
-            for col in patch_col - half..patch_col + half {
-                colours[(row * RASTER + col) as usize] = RED;
+        for config in [test_config(), wide_config()] {
+            // A patch of a distinct colour, well away from the raster's centre
+            // so that getting the axes or the origin wrong would move it
+            // visibly.
+            let (patch_col, patch_row) = (32u32, 96u32);
+            let half = 8u32;
+            let mut colours = flat_ground();
+            for row in patch_row - half..patch_row + half {
+                for col in patch_col - half..patch_col + half {
+                    colours[(row * RASTER + col) as usize] = RED;
+                }
             }
+
+            let mut camera = None;
+            let (pixels, _) = render_config(
+                config,
+                vec![0.0; (RASTER * RASTER) as usize],
+                colours,
+                |c| {
+                    straight_down(c);
+                    camera = Some(*c);
+                },
+                &[],
+            );
+            let camera = camera.expect("camera captured");
+            let window = config.window_texels;
+
+            let centre = world_of(f64::from(patch_col), f64::from(patch_row));
+            let (x, y) = to_pixels(camera.view_projection(), centre, SIZE, SIZE);
+            let found = pixel(&pixels, x.round() as u32, y.round() as u32);
+
+            assert!(
+                found[0] > found[1] + 40 && found[0] > found[2] + 40,
+                "window {window}: expected the red patch at ({x:.0}, {y:.0}), got {found:?}"
+            );
+
+            // ... and the rest of the ground is still the background colour, so
+            // the patch has not simply been smeared over everything.
+            let elsewhere = world_of(f64::from(patch_col), f64::from(RASTER - patch_row));
+            let (x, y) = to_pixels(camera.view_projection(), elsewhere, SIZE, SIZE);
+            let found = pixel(&pixels, x.round() as u32, y.round() as u32);
+            assert!(
+                found[1] > found[0],
+                "window {window}: expected background at ({x:.0}, {y:.0}), got {found:?}"
+            );
         }
-
-        let mut camera = None;
-        let pixels = render(vec![0.0; (RASTER * RASTER) as usize], colours, |c| {
-            straight_down(c);
-            camera = Some(*c);
-        });
-        let camera = camera.expect("camera captured");
-
-        let centre = world_of(f64::from(patch_col), f64::from(patch_row));
-        let (x, y) = to_pixels(camera.view_projection(), centre, SIZE, SIZE);
-        let found = pixel(&pixels, x.round() as u32, y.round() as u32);
-
-        assert!(
-            found[0] > found[1] + 40 && found[0] > found[2] + 40,
-            "expected the red patch at ({x:.0}, {y:.0}), got {found:?}"
-        );
-
-        // ... and the rest of the ground is still the background colour, so the
-        // patch has not simply been smeared over everything.
-        let elsewhere = world_of(f64::from(patch_col), f64::from(RASTER - patch_row));
-        let (x, y) = to_pixels(camera.view_projection(), elsewhere, SIZE, SIZE);
-        let found = pixel(&pixels, x.round() as u32, y.round() as u32);
-        assert!(
-            found[1] > found[0],
-            "expected background at ({x:.0}, {y:.0}), got {found:?}"
-        );
     }
 
     /// Tiles with nothing under them are never written, so a survey's ragged

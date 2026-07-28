@@ -27,6 +27,19 @@ pub struct ClipmapConfig {
     /// The single knob that scales the triangle count, which grows with its
     /// square. Everything else about a level's size is derived from it.
     pub block_verts: u32,
+    /// Side length of a level's clip texture, in texels.
+    ///
+    /// At least one texel wider than the grid the mesh draws, so a central
+    /// difference at the last vertex still has a neighbour to read, and a power
+    /// of two so that wrapping around the torus is a bit mask.
+    ///
+    /// It is *not* tied to the grid, because the two answer different questions.
+    /// The grid says how many triangles a ring costs; the window says how much
+    /// ground is resident at each level, which is what decides how fine the
+    /// raymarched far field can be at a given distance. Widening the window
+    /// costs memory quadratically and no triangles at all, so the mesh keeps its
+    /// grid and sits in the middle of whatever window is affordable.
+    pub window_texels: u32,
     /// Fraction of a ring's outer edge over which it blends into the next level.
     pub morph_band: f32,
     /// How far out geometry is rasterized, in ring reaches of the base level.
@@ -49,6 +62,9 @@ impl Default for ClipmapConfig {
     fn default() -> Self {
         Self {
             block_verts: 64,
+            // Exactly one texel wider than the grid, so the mesh fills the
+            // window and the margin around it is zero.
+            window_texels: 256,
             morph_band: 0.25,
             // Chosen by measurement, not by feel: see the commit that set it.
             // Four reaches sheds a third of the geometry at low altitude while
@@ -78,13 +94,24 @@ impl ClipmapConfig {
         self.grid_verts() - 1
     }
 
-    /// Side length of a level's clip texture, in texels.
+    /// How many texels of window lie outside the grid, on each side.
     ///
-    /// One more than the grid needs, so that a central difference at the last
-    /// vertex still has a neighbour to read. A power of two, so wrapping around
-    /// the torus is a bit mask.
-    pub const fn window_texels(&self) -> u32 {
-        self.grid_verts() + 1
+    /// The grid sits in the middle of the window, so that the ground the mesh
+    /// draws and the ground the far field marches are both centred on the
+    /// camera. Always even, which is what keeps window origins even and the
+    /// level-to-level halving exact: `window_texels` and `grid_verts + 1` are
+    /// both powers of two, so their difference is a multiple of the smaller.
+    pub const fn margin(&self) -> u32 {
+        (self.window_texels - self.grid_verts() - 1) / 2
+    }
+
+    /// Side length of a level's window, in quads.
+    ///
+    /// One less than a naive count: the last texel has nothing beyond it to
+    /// make a quad with. This is how far a ray may travel across a level before
+    /// it has to be handed over to the level outside.
+    pub const fn window_quads(&self) -> u32 {
+        self.window_texels - 2
     }
 
     /// Side length of the hole a ring leaves for the next finer level, in quads.
@@ -118,7 +145,7 @@ impl ClipmapConfig {
     /// quiet rather than obvious: nothing looks broken standing still, and the
     /// symptom is distant ground arriving as the camera moves towards it.
     pub fn level_count(&self, raster: UVec2, available: u32) -> u32 {
-        let reach = f64::from(self.grid_quads()) * 0.5;
+        let reach = f64::from(self.window_quads()) * 0.5;
         let needed = f64::from(raster.max_element()) / reach;
         // Level `l` reaches `reach * 2^l` from the camera, so this is the first
         // `l` that reaches across the raster, plus one because levels are
@@ -212,13 +239,26 @@ impl Rect {
 /// what makes consecutive levels nest: halving an even number is exact, so a
 /// fine level's vertices always land on coarse-level sample positions and the
 /// blend between them has no seam to hide.
+///
+/// The margin is stepped back on top of the grid's own step, so that the grid
+/// lands in the middle of the window rather than in its corner. Both terms are
+/// even, so the origin still is.
 pub fn window_origin(config: &ClipmapConfig, level: u32, camera_texels: DVec2) -> IVec2 {
     let texels = camera_texels / f64::from(1u32 << level);
-    let step_back = 2 * config.ring_quads() as i32;
+    let step_back = 2 * config.ring_quads() as i32 + config.margin() as i32;
     IVec2::new(
         snap_axis(texels.x, step_back),
         snap_axis(texels.y, step_back),
     )
+}
+
+/// Where a level's *grid* starts, which is the margin in from its window.
+///
+/// The mesh is laid out in grid coordinates and the textures are addressed in
+/// window ones; this is the one place the two are related, so that neither the
+/// patch layout nor the culling has to know how wide a window happens to be.
+pub fn grid_origin(config: &ClipmapConfig, window: IVec2) -> IVec2 {
+    window + config.margin() as i32
 }
 
 fn snap_axis(camera: f64, step_back: i32) -> i32 {
@@ -353,7 +393,17 @@ mod tests {
     fn config() -> ClipmapConfig {
         ClipmapConfig {
             block_verts: 8,
+            window_texels: 32,
             ..Default::default()
+        }
+    }
+
+    /// The same clipmap with room around the grid, which is what the far field
+    /// is fed from. Everything the grid does must survive the margin.
+    fn wide() -> ClipmapConfig {
+        ClipmapConfig {
+            window_texels: 128,
+            ..config()
         }
     }
 
@@ -399,25 +449,26 @@ mod tests {
     /// tolerance.
     #[test]
     fn the_coarse_offset_moves_a_point_between_levels_exactly() {
-        let config = config();
-        for camera in camera_positions(200) {
-            for level in 0..6 {
-                let fine = window_origin(&config, level, camera);
-                let coarse = window_origin(&config, level + 1, camera);
-                let offset = (fine / 2 - coarse).as_dvec2();
+        for config in [config(), wide()] {
+            for camera in camera_positions(200) {
+                for level in 0..6 {
+                    let fine = window_origin(&config, level, camera);
+                    let coarse = window_origin(&config, level + 1, camera);
+                    let offset = (fine / 2 - coarse).as_dvec2();
 
-                // Every vertex of the finer grid, and the half-texel positions
-                // between them that a ray also lands on.
-                for step in 0..=2 * config.grid_quads() {
-                    let w = f64::from(step) * 0.5;
-                    // Where this window position sits in the raster, at each
-                    // level's own resolution.
-                    let texel = f64::from(fine.x) + w;
-                    assert_eq!(
-                        w * 0.5 + offset.x,
-                        texel / 2.0 - f64::from(coarse.x),
-                        "level {level} at w {w} from camera {camera}"
-                    );
+                    // Every vertex of the finer window, and the half-texel
+                    // positions between them that a ray also lands on.
+                    for step in 0..=2 * config.window_quads() {
+                        let w = f64::from(step) * 0.5;
+                        // Where this window position sits in the raster, at
+                        // each level's own resolution.
+                        let texel = f64::from(fine.x) + w;
+                        assert_eq!(
+                            w * 0.5 + offset.x,
+                            texel / 2.0 - f64::from(coarse.x),
+                            "level {level} at w {w} from camera {camera}"
+                        );
+                    }
                 }
             }
         }
@@ -453,51 +504,89 @@ mod tests {
     }
 
     #[test]
-    fn a_window_is_one_texel_wider_than_its_grid() {
-        let config = config();
-        assert_eq!(config.window_texels(), config.grid_verts() + 1);
-        // A power of two, so wrapping is a mask rather than a division.
-        assert!(config.window_texels().is_power_of_two());
+    fn a_window_holds_the_grid_with_an_even_margin_around_it() {
+        for config in [config(), wide(), ClipmapConfig::default()] {
+            // A power of two, so wrapping is a mask rather than a division.
+            assert!(config.window_texels.is_power_of_two());
+            // Room for the grid and for the extra texel a central difference at
+            // its last vertex reads.
+            assert!(config.window_texels > config.grid_verts());
+            assert_eq!(
+                2 * config.margin() + config.grid_verts() + 1,
+                config.window_texels,
+                "the margin has to be the same on both sides"
+            );
+            // Evenness is load bearing: an odd margin would make a window origin
+            // odd, and halving it on the way to the coarser level would stop
+            // being exact.
+            assert_eq!(config.margin() % 2, 0, "margin {}", config.margin());
+        }
+    }
+
+    /// The margin is room around the mesh, not a move of it.
+    ///
+    /// The vertex stage adds the margin to every grid coordinate before reading
+    /// a texture, so the ground a given vertex lands on has to be independent of
+    /// how wide the window it sits in happens to be. If it were not, widening
+    /// the window to feed the far field would shift the near field sideways.
+    #[test]
+    fn widening_the_window_does_not_move_the_grid() {
+        let (tight, wide) = (config(), wide());
+        for camera in camera_positions(200) {
+            for level in 0..6 {
+                let origin = |c: &ClipmapConfig| grid_origin(c, window_origin(c, level, camera));
+                assert_eq!(
+                    origin(&tight),
+                    origin(&wide),
+                    "level {level} at {camera}: the grid moved with the window"
+                );
+            }
+        }
     }
 
     #[test]
     fn window_origins_land_on_even_texels() {
-        let config = config();
-        for camera in camera_positions(200) {
-            for level in 0..6 {
-                let origin = window_origin(&config, level, camera);
-                assert_eq!(origin.x % 2, 0, "level {level} at {camera}: {origin}");
-                assert_eq!(origin.y % 2, 0, "level {level} at {camera}: {origin}");
+        for config in [config(), wide()] {
+            for camera in camera_positions(200) {
+                for level in 0..6 {
+                    let origin = window_origin(&config, level, camera);
+                    assert_eq!(origin.x % 2, 0, "level {level} at {camera}: {origin}");
+                    assert_eq!(origin.y % 2, 0, "level {level} at {camera}: {origin}");
+                }
             }
         }
     }
 
     #[test]
     fn each_level_nests_inside_the_next_with_at_most_one_quad_of_slack() {
-        let config = config();
-        let ring = config.ring_quads() as i32;
+        for config in [config(), wide()] {
+            // A fine window sits a ring's thickness inside the coarse one, plus
+            // half the margin: the margin is stepped back at both levels, and
+            // measuring the fine one on the coarse grid halves it.
+            let ring = config.ring_quads() as i32 + config.margin() as i32 / 2;
 
-        for camera in camera_positions(500) {
-            for level in 1..6 {
-                let coarse = window_origin(&config, level, camera);
-                let fine = window_origin(&config, level - 1, camera);
+            for camera in camera_positions(500) {
+                for level in 1..6 {
+                    let coarse = window_origin(&config, level, camera);
+                    let fine = window_origin(&config, level - 1, camera);
 
-                for axis in 0..2 {
-                    // Where the fine window starts, measured on the coarse grid.
-                    let offset = fine[axis] / 2 - coarse[axis];
-                    assert!(
-                        offset == ring || offset == ring + 1,
-                        "level {level} axis {axis} at {camera}: offset {offset}, \
-                         expected {ring} or {}",
-                        ring + 1
-                    );
+                    for axis in 0..2 {
+                        // Where the fine window starts, on the coarse lattice.
+                        let offset = fine[axis] / 2 - coarse[axis];
+                        assert!(
+                            offset == ring || offset == ring + 1,
+                            "level {level} axis {axis} at {camera}: offset {offset}, \
+                             expected {ring} or {}",
+                            ring + 1
+                        );
 
-                    // Which of the two it is depends only on the parity of the
-                    // camera's position on this level's lattice, which is what
-                    // selects the trim's orientation.
-                    let texels = camera[axis] / f64::from(1u32 << level);
-                    let parity = (texels.floor() as i32).rem_euclid(2);
-                    assert_eq!(offset - ring, parity, "parity should pick the offset");
+                        // Which of the two it is depends only on the parity of
+                        // the camera's position on this level's lattice, which
+                        // is what selects the trim's orientation.
+                        let texels = camera[axis] / f64::from(1u32 << level);
+                        let parity = (texels.floor() as i32).rem_euclid(2);
+                        assert_eq!(offset - ring, parity, "parity should pick the offset");
+                    }
                 }
             }
         }
@@ -505,24 +594,28 @@ mod tests {
 
     #[test]
     fn the_finer_footprint_stays_inside_the_hole() {
-        let config = config();
-        let ring = config.ring_quads() as i32;
-        let hole = config.hole_quads() as i32;
-        // A fine level covers half its quads on the coarse grid.
-        let footprint = config.grid_quads() as i32 / 2;
+        for config in [config(), wide()] {
+            // Measured between grids rather than windows: the hole a ring
+            // leaves is a fact about the mesh, and the margin around it is not
+            // part of it.
+            let ring = config.ring_quads() as i32;
+            let hole = config.hole_quads() as i32;
+            // A fine level covers half its quads on the coarse grid.
+            let footprint = config.grid_quads() as i32 / 2;
 
-        for camera in camera_positions(300) {
-            for level in 1..5 {
-                let coarse = window_origin(&config, level, camera);
-                let fine = window_origin(&config, level - 1, camera);
-                for axis in 0..2 {
-                    let start = fine[axis] / 2 - coarse[axis];
-                    assert!(
-                        start >= ring && start + footprint <= ring + hole,
-                        "footprint {start}..{} escapes the hole {ring}..{}",
-                        start + footprint,
-                        ring + hole
-                    );
+            for camera in camera_positions(300) {
+                for level in 1..5 {
+                    let coarse = grid_origin(&config, window_origin(&config, level, camera));
+                    let fine = grid_origin(&config, window_origin(&config, level - 1, camera));
+                    for axis in 0..2 {
+                        let start = fine[axis] / 2 - coarse[axis];
+                        assert!(
+                            start >= ring && start + footprint <= ring + hole,
+                            "footprint {start}..{} escapes the hole {ring}..{}",
+                            start + footprint,
+                            ring + hole
+                        );
+                    }
                 }
             }
         }
@@ -530,22 +623,23 @@ mod tests {
 
     #[test]
     fn the_camera_stays_near_the_middle_of_every_window() {
-        let config = config();
-        let half = f64::from(config.grid_quads()) * 0.5;
+        for config in [config(), wide()] {
+            let half = f64::from(config.window_quads()) * 0.5;
 
-        for camera in camera_positions(200) {
-            for level in 0..6 {
-                let origin = window_origin(&config, level, camera);
-                let texels = camera / f64::from(1u32 << level);
-                for axis in 0..2 {
-                    let offset = texels[axis] - f64::from(origin[axis]);
-                    // Within a couple of texels of centre; the snap to an even
-                    // lattice is the only thing that moves it off.
-                    assert!(
-                        (offset - half).abs() <= 2.0,
-                        "level {level} axis {axis}: camera {offset} from origin, \
-                         window centre at {half}"
-                    );
+            for camera in camera_positions(200) {
+                for level in 0..6 {
+                    let origin = window_origin(&config, level, camera);
+                    let texels = camera / f64::from(1u32 << level);
+                    for axis in 0..2 {
+                        let offset = texels[axis] - f64::from(origin[axis]);
+                        // Within a couple of texels of centre; the snap to an
+                        // even lattice is the only thing that moves it off.
+                        assert!(
+                            (offset - half).abs() <= 2.0,
+                            "level {level} axis {axis}: camera {offset} from origin, \
+                             window centre at {half}"
+                        );
+                    }
                 }
             }
         }
@@ -697,23 +791,26 @@ mod tests {
     /// camera moves and the rest of the dataset arrives at the horizon.
     #[test]
     fn enough_levels_are_used_to_reach_across_the_raster() {
-        let config = config();
-        let quads = config.grid_quads();
-        // What the coarsest level reaches from the camera: half its grid.
-        let reach_of = |levels: u32| quads / 2 * (1 << (levels - 1));
+        for config in [config(), wide()] {
+            let quads = config.window_quads();
+            // What the coarsest level reaches from the camera: half its window.
+            // The window rather than the grid, because the far field marches to
+            // the window's edge and it is the far field that draws the horizon.
+            let reach_of = |levels: u32| quads / 2 * (1 << (levels - 1));
 
-        for size in [1u32, quads / 2, quads, quads + 1, quads * 8, quads * 8 + 1] {
-            let levels = config.level_count(UVec2::splat(size), 32);
-            let reach = reach_of(levels);
-            assert!(
-                reach >= size,
-                "{levels} levels reach {reach} texels from the camera, \
-                 which has to see {size} to the far edge"
-            );
-            // ... and no more levels than that, so nothing is drawn twice over.
-            if levels > 1 {
-                let smaller = reach_of(levels - 1);
-                assert!(smaller < size, "{levels} levels is one more than needed");
+            for size in [1u32, quads / 2, quads, quads + 1, quads * 8, quads * 8 + 1] {
+                let levels = config.level_count(UVec2::splat(size), 32);
+                let reach = reach_of(levels);
+                assert!(
+                    reach >= size,
+                    "{levels} levels reach {reach} texels from the camera, \
+                     which has to see {size} to the far edge"
+                );
+                // ... and no more than that, so nothing is drawn twice over.
+                if levels > 1 {
+                    let smaller = reach_of(levels - 1);
+                    assert!(smaller < size, "{levels} levels is one more than needed");
+                }
             }
         }
     }
