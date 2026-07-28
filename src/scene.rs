@@ -926,12 +926,20 @@ mod tests {
             )
             .0,
         );
-        // Fewer pixels than the mesh cuts for the same hole, and that is
-        // expected: the raster stage throws away every triangle that touches
-        // nodata, while a ray only refuses the one quad it is standing in. Both
-        // are conservative, the march just less coarsely so.
+        // Sized, not merely present. The hole is sixteen texels of 30 m, so
+        // 480 m across; from 3000 m up, over a frame spanning 3464 m in 256
+        // pixels, it projects to about 35 pixels a side and so 1250 of them. A
+        // ray refuses the whole quad it is standing in whenever any corner is
+        // nodata, which at the level this is marched at widens the cut by one
+        // 120 m quad on each side, to about 44 pixels a side.
+        //
+        // The bound matters because both ways of getting this wrong land inside
+        // a loose one. Cutting nothing but the exact quads leaves the ground
+        // closing back over the hole, and cutting whatever the ray met after
+        // dropping through it -- which is what a hit reported from under the
+        // surface amounts to -- shrank this to 49 pixels.
         assert!(
-            punched > 100,
+            (1200..2600).contains(&punched),
             "the hole should show sky through it, got {punched} pixels"
         );
 

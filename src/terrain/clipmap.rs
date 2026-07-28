@@ -106,14 +106,23 @@ impl ClipmapConfig {
 
     /// How many levels are needed to cover a raster of this size.
     ///
-    /// The coarsest level has to span the whole raster, otherwise there would be
-    /// ground beyond the outermost ring with nothing to draw it. Capped at
-    /// `available`, the number of mip levels that actually exist.
+    /// The coarsest level has to reach the whole raster from wherever the camera
+    /// is standing, otherwise there is ground with nothing to draw it and the
+    /// horizon stops short of the data. Capped at `available`, the number of mip
+    /// levels that actually exist.
+    ///
+    /// That takes a grid *twice* the raster, not one that merely spans it. Every
+    /// window is centred on the camera, so half the grid is behind and a level
+    /// wide enough to cover the dataset covers only half of it from any given
+    /// spot. A camera at one edge has to see to the other. Getting this wrong is
+    /// quiet rather than obvious: nothing looks broken standing still, and the
+    /// symptom is distant ground arriving as the camera moves towards it.
     pub fn level_count(&self, raster: UVec2, available: u32) -> u32 {
-        let span = f64::from(self.grid_quads());
-        let needed = f64::from(raster.max_element()) / span;
-        // Level `l` covers `span * 2^l`, so this is the first `l` that reaches
-        // across the raster, plus one because levels are counted from zero.
+        let reach = f64::from(self.grid_quads()) * 0.5;
+        let needed = f64::from(raster.max_element()) / reach;
+        // Level `l` reaches `reach * 2^l` from the camera, so this is the first
+        // `l` that reaches across the raster, plus one because levels are
+        // counted from zero.
         let levels = needed.log2().ceil().max(0.0) as u32 + 1;
         levels.clamp(1, available.max(1))
     }
@@ -682,21 +691,28 @@ mod tests {
         assert_eq!(pieces[0].1, UVec2::new(2, 3));
     }
 
+    /// Reach is measured from the camera outwards, not across the grid, because
+    /// the camera stands in the middle of every window. A level that spans the
+    /// raster covers half of it from any one spot, which looks fine until the
+    /// camera moves and the rest of the dataset arrives at the horizon.
     #[test]
     fn enough_levels_are_used_to_reach_across_the_raster() {
         let config = config();
         let quads = config.grid_quads();
+        // What the coarsest level reaches from the camera: half its grid.
+        let reach_of = |levels: u32| quads / 2 * (1 << (levels - 1));
 
         for size in [1u32, quads / 2, quads, quads + 1, quads * 8, quads * 8 + 1] {
             let levels = config.level_count(UVec2::splat(size), 32);
-            let reach = quads * (1 << (levels - 1));
+            let reach = reach_of(levels);
             assert!(
                 reach >= size,
-                "{levels} levels reach {reach} texels, raster is {size}"
+                "{levels} levels reach {reach} texels from the camera, \
+                 which has to see {size} to the far edge"
             );
             // ... and no more levels than that, so nothing is drawn twice over.
             if levels > 1 {
-                let smaller = quads * (1 << (levels - 2));
+                let smaller = reach_of(levels - 1);
                 assert!(smaller < size, "{levels} levels is one more than needed");
             }
         }

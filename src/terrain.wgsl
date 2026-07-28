@@ -466,6 +466,11 @@ fn march(eye: vec3<f32>, dir: vec3<f32>, start: f32) -> Hit {
     // Whether the ray has advanced at all. Being under the ground before it has
     // means something quite different from being under it after.
     var moved = false;
+    // Whether the last thing the ray crossed was ground nothing is known about.
+    // A ray that drops through a hole comes up against the underside of the
+    // ground beside it, and has to be told apart from one that merely grazed a
+    // surface it was above the whole way.
+    var hole = false;
 
     for (var step = 0u; step < MAX_STEPS; step += 1u) {
         if (t >= limit) {
@@ -522,6 +527,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>, start: f32) -> Hit {
         // Ground nothing is known about is not ground. Cutting the whole quad
         // matches how the raster stage cuts any triangle touching a hole.
         if (min(enter.lowest, leave.lowest) < NODATA_BELOW) {
+            hole = true;
             t = exit + nudge;
             moved = true;
             mip = min(mip + 1u, terrain.max_mip);
@@ -529,10 +535,15 @@ fn march(eye: vec3<f32>, dir: vec3<f32>, start: f32) -> Hit {
         }
 
         if (eye.y + dir.y * t <= enter.height) {
-            if (!moved) {
-                // The ray began below the surface. Where it went in is behind
-                // the eye and cannot be found from here, and the ground over it
-                // is inside the near radius, so it belongs to the raster stage.
+            if (!moved || hole) {
+                // Either the ray began below the surface -- where it went in is
+                // behind the eye and cannot be found from here, and the ground
+                // over it is inside the near radius, so it belongs to the raster
+                // stage -- or it has just dropped through a hole and this is the
+                // underside of the ground beside it. Neither is a hit. Cutting
+                // the second is what makes a hole show sky rather than closing
+                // over with whatever the ray met next, which is how the raster
+                // stage treats one too.
                 return out;
             }
             // Otherwise the ray has grazed the surface within a hair of a cell
@@ -547,6 +558,11 @@ fn march(eye: vec3<f32>, dir: vec3<f32>, start: f32) -> Hit {
             out.w = w;
             return out;
         }
+
+        // Standing above measured ground, so whatever the ray crossed earlier is
+        // behind it now and cannot be what a later descent is coming up under.
+        hole = false;
+
         if (eye.y + dir.y * exit > leave.height) {
             // The ceiling allowed a hit somewhere in the cell; the surface
             // itself does not reach the ray.
