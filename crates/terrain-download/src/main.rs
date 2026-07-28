@@ -40,6 +40,7 @@ mod extent;
 mod mip;
 mod project;
 mod resample;
+mod retry;
 mod source;
 mod stac;
 mod write;

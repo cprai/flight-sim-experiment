@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::bbox::LatLonBox;
+use crate::retry;
 
 /// The projection every HRDEM mosaic item is published in.
 pub const EXPECTED_EPSG: u32 = 3979;
@@ -162,6 +163,26 @@ struct Link {
 /// Guards against a paging loop if the service ever returns a cyclic `next`.
 const MAX_PAGES: usize = 32;
 
+/// Fetches one catalogue response, retrying if the network was what failed.
+///
+/// These are a handful of requests at the very start of a run, so retrying them
+/// buys little time -- but a download is often left unattended for half an hour,
+/// and failing in the first second because a DNS lookup blinked is the most
+/// annoying way for that to be wasted.
+async fn get_text(client: &reqwest::Client, url: &str) -> Result<String> {
+    retry::retrying(url, retry::is_transient, || async {
+        client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await
+    })
+    .await
+    .with_context(|| format!("requesting {url}"))
+}
+
 /// Asks one collection which of its items carry `product` over `box_`.
 pub async fn find_items(
     client: &reqwest::Client,
@@ -179,16 +200,7 @@ pub async fn find_items(
 
     let mut items = Vec::new();
     for _ in 0..MAX_PAGES {
-        let body = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("requesting {url}"))?
-            .error_for_status()
-            .with_context(|| format!("requesting {url}"))?
-            .text()
-            .await
-            .with_context(|| format!("reading the response to {url}"))?;
+        let body = get_text(client, &url).await?;
 
         let page: FeatureCollection = serde_json::from_str(&body)
             .with_context(|| format!("parsing the STAC response from {url}"))?;
@@ -313,16 +325,7 @@ pub async fn find_mosaic_tiles(
                 longitude + 1e-6,
                 latitude + 1e-6
             );
-            let body = client
-                .get(&url)
-                .send()
-                .await
-                .with_context(|| format!("requesting {url}"))?
-                .error_for_status()
-                .with_context(|| format!("requesting {url}"))?
-                .text()
-                .await
-                .with_context(|| format!("reading the response to {url}"))?;
+            let body = get_text(client, &url).await?;
             let page: FeatureCollection = serde_json::from_str(&body)
                 .with_context(|| format!("parsing the Earth Search response from {url}"))?;
 

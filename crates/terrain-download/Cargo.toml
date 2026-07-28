@@ -23,4 +23,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 terrain-tiles = { path = "../terrain-tiles" }
 tiff = { version = "0.11", default-features = false, features = ["deflate"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# "time" is for the backoff between retries; see `retry`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+# Only so `retry`'s tests can build real error responses, and classify the
+# error type reqwest actually produces rather than a mock of it.
+http = "1"
+# "test-util" lets `retry`'s tests advance the clock instead of sleeping
+# through the backoff, which is otherwise the whole runtime of the suite.
+tokio = { version = "1", features = ["test-util"] }

@@ -22,6 +22,7 @@ use async_tiff::reader::ReqwestReader;
 use futures::StreamExt;
 
 use crate::resample::MetreExtent;
+use crate::retry;
 use crate::stac::SourceItem;
 
 /// A 512 x 512 block of 32-bit floats that is entirely nodata compresses, with
@@ -350,20 +351,26 @@ impl SourceRaster {
         let reader = ReqwestReader::new(client.clone(), url);
         let cache = ReadaheadMetadataCache::new(reader.clone());
 
-        let mut metadata = TiffMetadataReader::try_open(&cache)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .with_context(|| format!("opening {}", item.href))?;
-
+        // Opening and reading the first directory are retried as one unit, so
+        // the reader is rebuilt per attempt rather than resumed mid-way through
+        // a header it may have read only half of. It costs nothing: the
+        // readahead cache already holds whatever the previous attempt got.
+        //
         // Only the full-resolution image is wanted. Reading just the first
         // directory also avoids pulling the overviews' tile tables, which for
         // the one-metre blocks is another few megabytes of offsets.
-        let ifd = metadata
-            .read_next_ifd(&cache)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .with_context(|| format!("reading the header of {}", item.href))?
-            .with_context(|| format!("{} has no image directory", item.href))?;
+        let ifd = retry::retrying(
+            format_args!("reading the header of {}", item.href),
+            retry::is_transient_tiff,
+            || async {
+                let mut metadata = TiffMetadataReader::try_open(&cache).await?;
+                metadata.read_next_ifd(&cache).await
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("reading the header of {}", item.href))?
+        .with_context(|| format!("{} has no image directory", item.href))?;
 
         Self::validated(item, ifd, reader, spec)
     }
@@ -607,17 +614,12 @@ impl SourceRaster {
         let mut done = 0;
         let mut samples = Vec::new();
 
-        let mut arrivals = futures::stream::iter(
-            wanted
-                .iter()
-                .map(|&(x, y)| self.ifd.fetch_tile(x, y, &self.reader)),
-        )
-        .buffer_unordered(concurrency.max(1));
+        let mut arrivals =
+            futures::stream::iter(wanted.iter().map(|&(x, y)| self.fetch_tile(x, y)))
+                .buffer_unordered(concurrency.max(1));
 
         while let Some(tile) = arrivals.next().await {
-            let tile = tile
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .with_context(|| format!("fetching a tile of {}", self.item.id))?;
+            let tile = tile?;
             downloaded += self.tile_bytes(tile.y() * self.tiles_across + tile.x());
 
             let patch = self.decode(tile, &registry, samples)?;
@@ -633,6 +635,24 @@ impl SourceRaster {
         }
 
         Ok(downloaded)
+    }
+
+    /// Fetches one tile, trying again if the network rather than the file was
+    /// what failed.
+    ///
+    /// Retrying here rather than around the whole block is deliberate: a block
+    /// is up to a few hundred range requests and re-running it would refetch
+    /// every one of them, where the failure is almost always a single request
+    /// that would have succeeded a moment later.
+    async fn fetch_tile(&self, x: usize, y: usize) -> Result<async_tiff::Tile> {
+        retry::retrying(
+            format_args!("tile ({x}, {y}) of {}", self.item.id),
+            retry::is_transient_tiff,
+            || self.ifd.fetch_tile(x, y, &self.reader),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("fetching a tile of {}", self.item.id))
     }
 
     /// Decompresses one tile into a patch placed on the raster's own lattice.

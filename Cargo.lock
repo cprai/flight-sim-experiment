@@ -2888,6 +2888,7 @@ dependencies = [
  "clap",
  "env_logger",
  "futures",
+ "http",
  "log",
  "proj4rs",
  "rayon",
