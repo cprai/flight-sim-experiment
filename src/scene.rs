@@ -163,6 +163,10 @@ impl Scene {
         view: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) {
+        // Before the render pass, because a compute pass cannot be nested in one
+        // and what it builds is read while drawing.
+        self.terrain.build_pyramid(encoder);
+
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("scene pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -237,6 +241,34 @@ fn camera_binding(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::BindGroupLayout
     (buffer, layout, bind_group)
 }
 
+/// A headless device and queue for the offscreen tests.
+///
+/// Requests exactly what [`crate::renderer::Renderer`] does, so a test passing
+/// here is evidence the application will run on the same baseline rather than on
+/// whatever the test machine happens to offer.
+#[cfg(test)]
+pub fn test_device() -> (wgpu::Device, wgpu::Queue) {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .expect("no wgpu adapter available");
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("test device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .expect("failed to create device")
+}
+
+/// The camera bind group layout alone, for tests that build a terrain without a
+/// whole scene around it. The real one, so group 0 cannot drift out of step.
+#[cfg(test)]
+pub fn test_camera_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    camera_binding(device).1
+}
+
 /// Where a world point lands on screen, in pixels, with (0, 0) at the top left.
 ///
 /// Only used by tests, but it belongs next to the projection it inverts.
@@ -288,22 +320,6 @@ mod tests {
 
     fn flat_ground() -> Vec<Srgb8> {
         vec![GREEN; (RASTER * RASTER) as usize]
-    }
-
-    /// A headless device asking for the same limits the application does.
-    fn test_device() -> (wgpu::Device, wgpu::Queue) {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .expect("no wgpu adapter available");
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            ..Default::default()
-        }))
-        .expect("failed to create device")
     }
 
     /// Builds terrain from raw texels and renders one frame of it.
