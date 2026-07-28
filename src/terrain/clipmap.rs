@@ -88,6 +88,55 @@ impl ClipmapConfig {
     }
 }
 
+/// The finest level worth drawing when the camera is `distance` metres from the
+/// ground beneath it, and how far it has already blended into the level outside
+/// it.
+///
+/// Levels are nested rings centred on the camera, so a level's detail is chosen
+/// by how far away the ground it covers is: level `l`'s ring starts at
+/// `hole_quads / 2 * 2^l` texels out. Horizontally that falls out of the
+/// geometry for free, but a camera in the air is that far from the ground
+/// directly below it as well, and nothing in the ring layout knows it. Drawing
+/// the finest level from ten kilometres up spends full-resolution triangles --
+/// and a fine window's worth of tile reads -- on ground that covers a fraction
+/// of a pixel.
+///
+/// So the same rule is applied to the vertical: the level that would serve
+/// horizontal distance `distance` is the finest level worth drawing at altitude
+/// `distance`, and everything below it is dropped. Combined with the rings, a
+/// point at horizontal distance `r` ends up at `max(level_of(r),
+/// level_of(distance))`, which is within half a level of the `sqrt(r^2 + d^2)`
+/// an exact radial measure would give -- the same square-for-round
+/// approximation the rings themselves already make.
+///
+/// The fractional part is returned rather than rounded away: the caller blends
+/// the base level uniformly into the level outside it by that much, so by the
+/// time a level is dropped it is already drawing the coarser surface exactly and
+/// its disappearance is invisible. It is zero at the coarsest level, which has
+/// nothing outside it to blend towards.
+pub fn detail_base(
+    config: &ClipmapConfig,
+    metres_per_texel: f64,
+    distance: f64,
+    levels: u32,
+) -> (u32, f32) {
+    // Where level 0 hands over to level 1: the radius of the hole its ring
+    // leaves. Half a grid out, the next level has taken over regardless.
+    let handover = f64::from(config.hole_quads()) * 0.5 * metres_per_texel;
+    let coarsest = levels.saturating_sub(1);
+
+    let t = (distance / handover)
+        .max(1.0)
+        .log2()
+        .clamp(0.0, f64::from(coarsest));
+    let base = t.floor();
+    if base as u32 >= coarsest {
+        (coarsest, 0.0)
+    } else {
+        (base as u32, (t - base) as f32)
+    }
+}
+
 /// A rectangle of texels, in some level's own texel coordinates.
 ///
 /// Coordinates are signed because a window near the edge of the raster legally
@@ -563,5 +612,73 @@ mod tests {
         let config = config();
         assert_eq!(config.level_count(UVec2::splat(100_000), 4), 4);
         assert_eq!(config.level_count(UVec2::splat(1), 8), 1);
+    }
+
+    /// The distance at which level 0 hands over to level 1.
+    fn handover(config: &ClipmapConfig, metres_per_texel: f64) -> f64 {
+        f64::from(config.hole_quads()) * 0.5 * metres_per_texel
+    }
+
+    #[test]
+    fn every_level_survives_until_the_camera_is_its_own_radius_away() {
+        let config = config();
+        let reach = handover(&config, 10.0);
+
+        // On the ground and just below the handover, nothing is given up.
+        for distance in [0.0, 1.0, reach * 0.5, reach * 0.99] {
+            let (base, _) = detail_base(&config, 10.0, distance, 8);
+            assert_eq!(base, 0, "level 0 was dropped only {distance} m up");
+        }
+
+        // ... and past it, one level goes per doubling, the same schedule the
+        // rings follow outwards.
+        for level in 0..6u32 {
+            let distance = reach * f64::from(1u32 << level);
+            let (base, _) = detail_base(&config, 10.0, distance * 1.01, 8);
+            assert_eq!(base, level, "wrong level at {distance} m up");
+        }
+    }
+
+    #[test]
+    fn a_level_is_fully_blended_away_before_it_is_dropped() {
+        let config = config();
+        let reach = handover(&config, 10.0);
+
+        // Approaching a boundary from below, the level being retired is all but
+        // entirely blended into the one outside it; crossing it, the level that
+        // takes over starts from its own surface. The two describe the same
+        // shape, which is what makes the drop invisible.
+        let (below, below_morph) = detail_base(&config, 10.0, reach * 1.999, 8);
+        let (above, above_morph) = detail_base(&config, 10.0, reach * 2.001, 8);
+        assert_eq!((below, above), (0, 1));
+        assert!(below_morph > 0.999, "blend stopped short at {below_morph}");
+        assert!(above_morph < 0.001, "blend restarted at {above_morph}");
+    }
+
+    #[test]
+    fn the_coarsest_level_is_never_dropped_and_never_blends_outwards() {
+        let config = config();
+        let reach = handover(&config, 10.0);
+
+        // There is nothing outside the coarsest level to blend towards, so the
+        // ramp has to stop there however high the camera climbs.
+        for levels in 1..6u32 {
+            for distance in [reach * f64::from(1u32 << levels), 1.0e9] {
+                let (base, morph) = detail_base(&config, 10.0, distance, levels);
+                assert_eq!(base, levels - 1, "{levels} levels, {distance} m up");
+                assert_eq!(morph, 0.0, "the coarsest level blended outwards");
+            }
+        }
+    }
+
+    #[test]
+    fn a_finer_raster_gives_up_its_finest_level_sooner() {
+        let config = config();
+        // The same altitude is more levels' worth of distance over a raster
+        // whose texels are smaller, because the level it should be drawn at is
+        // measured in texels rather than metres.
+        let (coarse, _) = detail_base(&config, 40.0, 5_000.0, 12);
+        let (fine, _) = detail_base(&config, 5.0, 5_000.0, 12);
+        assert_eq!(fine, coarse + 3, "eight times finer is three levels sooner");
     }
 }

@@ -45,6 +45,17 @@ struct Terrain {
     // the border, so it is cut away rather than drawn.
     data_min: vec2<f32>,
     data_max: vec2<f32>,
+    // The finest level being drawn. Levels below it are dropped as the camera
+    // climbs away from the ground, so this is the innermost one and the one
+    // carrying the solid centre.
+    base_level: u32,
+    // How far the base level has been blended into the level outside it, on top
+    // of whatever its own position in the ring asks for. Rises to one as the
+    // camera climbs towards the altitude at which the base level is dropped, so
+    // that by the time it goes it is already drawing the coarser surface and its
+    // disappearance cannot be seen.
+    base_morph: f32,
+    padding: vec2<u32>,
 };
 
 @group(1) @binding(0) var<uniform> terrain: Terrain;
@@ -177,6 +188,11 @@ fn vs_main(vertex: VertexIn, instance: InstanceIn) -> VertexOut {
     // happen as a vertex crossed from one level to the next.
     let coarse_level = min(level + 1u, terrain.level_count - 1u);
     var morph = morph_factor(wf);
+    if (level == terrain.base_level) {
+        // Whichever is further along: the ring's own outward blend, or the
+        // altitude blend that is retiring this level altogether.
+        morph = max(morph, terrain.base_morph);
+    }
     if (coarse_level == level) {
         // The outermost ring has nothing to blend towards.
         morph = 0.0;

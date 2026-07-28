@@ -237,11 +237,11 @@ fn to_pixels(view_proj: glam::Mat4, point: glam::Vec3, width: u32, height: u32) 
 
 #[cfg(test)]
 mod tests {
-    use glam::{Vec2, Vec3};
+    use glam::{IVec2, UVec2, Vec2, Vec3};
 
     use super::*;
     use crate::terrain::geotiff::Georeferencing;
-    use crate::terrain::pyramid::{Level, Pyramid, Srgb8};
+    use crate::terrain::pyramid::{Level, Pyramid, RasterSource, Srgb8};
 
     /// Side of the offscreen render target.
     const SIZE: u32 = 256;
@@ -304,6 +304,21 @@ mod tests {
         aim: impl FnOnce(&mut Camera),
         path: &[Vec3],
     ) -> Vec<u8> {
+        render_probed(heights, colours, aim, path).0
+    }
+
+    /// As [`render_after`], but also reporting the base level the clipmap chose.
+    ///
+    /// The base level is how much detail the camera's height above the ground
+    /// bought: everything below it was dropped. A test that means to look at
+    /// more than one level has to say so, because a camera high enough leaves
+    /// only the coarsest and the test would pass on an empty promise.
+    fn render_probed(
+        heights: Vec<f32>,
+        colours: Vec<Srgb8>,
+        aim: impl FnOnce(&mut Camera),
+        path: &[Vec3],
+    ) -> (Vec<u8>, u32) {
         let (device, queue) = test_device();
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -390,7 +405,7 @@ mod tests {
             .expect("buffer not mapped")
             .to_vec();
         readback.unmap();
-        pixels
+        (pixels, scene.terrain.base_level())
     }
 
     fn pixel(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
@@ -727,6 +742,28 @@ mod tests {
         (heights, flat_ground())
     }
 
+    /// As [`rugged`], but painted rather than uniformly green.
+    ///
+    /// Looking straight down at flat colour, geometry is nearly invisible: the
+    /// frame is the same green wherever the surface happens to be. A test that
+    /// means to see which level drew a patch of ground needs the ground to look
+    /// different from place to place, so that both the shape and the texel it is
+    /// coloured from show up in the pixels.
+    fn rugged_painted() -> (Vec<f32>, Vec<Srgb8>) {
+        let (heights, _) = rugged();
+        let colours = (0..RASTER * RASTER)
+            .map(|i| {
+                let (x, y) = ((i % RASTER) as f32, (i / RASTER) as f32);
+                // A few texels per cycle: fine enough that a coarser level's
+                // averaging of it is plainly a different colour, coarse enough
+                // not to alias into noise that would drown the difference.
+                let wave = |f: f32| (128.0 + 110.0 * f.sin()) as u8;
+                Srgb8([wave(x * 0.7), wave(y * 0.6), wave((x + y) * 0.45), 255])
+            })
+            .collect();
+        (heights, colours)
+    }
+
     #[test]
     fn no_sky_shows_through_the_joins_between_levels() {
         // Looking straight down, across a ring boundary. A T-junction between
@@ -738,11 +775,24 @@ mod tests {
         // out than the frustum's footprint alone suggests. Straying past the
         // data would show sky for the honest reason that the terrain ends
         // there, and mask the seams this is looking for.
+        //
+        // It also has to stay under the height at which the finest level is
+        // dropped for being too far below the camera to be worth drawing --
+        // around 1060 m here, where the ground is a hundred-odd metres up and
+        // this small clipmap's finest level reaches only 480 m. Above that there
+        // are fewer levels left to have joins between, and the test would go
+        // quiet rather than fail. Hence the assertion on the base level below.
         let (heights, colours) = rugged();
-        let pixels = render(heights, colours, |camera| {
-            camera.position = Vec3::new(70.0, 2000.0, -110.0);
-            camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
-        });
+        let (pixels, base) = render_probed(
+            heights,
+            colours,
+            |camera| {
+                camera.position = Vec3::new(70.0, 900.0, -110.0);
+                camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+            },
+            &[],
+        );
+        assert_eq!(base, 0, "the frame under test has to hold every level");
 
         let holes: Vec<(u32, u32)> = (0..SIZE)
             .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
@@ -835,6 +885,22 @@ mod tests {
             })
             .collect();
 
+        assert_no_step_stands_out(&frames, 4.0);
+    }
+
+    /// Asserts that no one step between consecutive frames changed the picture
+    /// far more than its neighbours did, which is what a pop looks like.
+    ///
+    /// The frames are expected to come from a camera moving steadily, so the
+    /// change between any two of them is roughly the same. A level snapping into
+    /// place, or vanishing, shows up as a single outlier.
+    ///
+    /// `tolerance` is how many times the typical step the worst one is allowed
+    /// to be. How tight it can be depends on how evenly the sweep changes the
+    /// frame to begin with: a camera flying along sees the picture turn over
+    /// steadily and needs room, one climbing straight up mostly zooms and can be
+    /// held to much less.
+    fn assert_no_step_stands_out(frames: &[Vec<u8>], tolerance: f64) {
         let differences: Vec<f64> = frames
             .windows(2)
             .map(|pair| {
@@ -850,9 +916,162 @@ mod tests {
         let worst = differences.iter().copied().fold(0.0, f64::max);
         let typical = differences.iter().sum::<f64>() / differences.len() as f64;
         assert!(
-            worst < typical * 4.0 + 1.0,
+            worst < typical * tolerance + 1.0,
             "one step changed the frame far more than the others, which is what \
              a pop looks like: worst {worst:.2}, typical {typical:.2}, all {differences:?}"
+        );
+    }
+
+    /// Looks straight down from `altitude` over the same spot every time.
+    fn from_altitude(altitude: f32) -> impl FnOnce(&mut Camera) {
+        move |camera: &mut Camera| {
+            camera.position = Vec3::new(70.0, altitude, -110.0);
+            camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+        }
+    }
+
+    #[test]
+    fn climbing_away_from_the_ground_gives_up_the_finest_levels() {
+        // Levels are chosen by how far the ground they cover is from the camera,
+        // and a camera in the air is far from the ground directly below it as
+        // well as from the horizon. Drawing the finest level from high up spends
+        // full-resolution triangles on ground that covers a fraction of a pixel,
+        // and a fine window's worth of tile reads on fetching it.
+        let (heights, colours) = rugged();
+
+        let (_, low) = render_probed(heights.clone(), colours.clone(), from_altitude(900.0), &[]);
+        let (pixels, high) = render_probed(heights, colours, from_altitude(4000.0), &[]);
+
+        assert_eq!(low, 0, "close to the ground every level is worth drawing");
+        assert!(
+            high > low,
+            "climbing should have given up at least one level, still at {high}"
+        );
+
+        // ... and what the dropped levels used to draw is still drawn, by the
+        // level that took over. The middle of the frame is well inside the
+        // raster at this height; its edges are not, and the sky past the data is
+        // honest there.
+        let holes: Vec<(u32, u32)> = (SIZE / 4..SIZE * 3 / 4)
+            .flat_map(|y| (SIZE / 4..SIZE * 3 / 4).map(move |x| (x, y)))
+            .filter(|&(x, y)| is_sky(pixel(&pixels, x, y)))
+            .collect();
+        assert!(
+            holes.is_empty(),
+            "dropping the finest levels left {} pixels of sky, first at {:?}",
+            holes.len(),
+            holes.first()
+        );
+    }
+
+    #[test]
+    fn climbing_past_the_height_a_level_is_dropped_does_not_make_the_terrain_jump() {
+        // A level does not simply vanish when the camera gets far enough from
+        // the ground for it to stop being worth drawing: it is blended into the
+        // level outside it on the way up, so that by the time it goes it is
+        // already drawing that level's surface and colour exactly. Without the
+        // blend, the whole middle of the frame would snap to a coarser shape in
+        // one frame.
+        //
+        // The sweep spans the height where this clipmap's finest level goes,
+        // around 1060 m over the hundred-odd metres of ground below the camera.
+        let (heights, colours) = rugged_painted();
+        let probed: Vec<(Vec<u8>, u32)> = (0..13)
+            .map(|i| {
+                let altitude = 900.0 + f32::from(i as u16) * 30.0;
+                render_probed(
+                    heights.clone(),
+                    colours.clone(),
+                    from_altitude(altitude),
+                    &[],
+                )
+            })
+            .collect();
+
+        let first = probed.first().expect("frames rendered").1;
+        assert!(
+            probed.iter().any(|(_, base)| *base != first),
+            "the sweep never crossed the height a level is dropped at"
+        );
+
+        let frames: Vec<Vec<u8>> = probed.into_iter().map(|(pixels, _)| pixels).collect();
+        assert_no_step_stands_out(&frames, 2.0);
+    }
+
+    /// A raster source that notes which levels are read from it.
+    struct Counted {
+        inner: Box<dyn RasterSource>,
+        levels: std::rc::Rc<std::cell::RefCell<Vec<u32>>>,
+    }
+
+    impl RasterSource for Counted {
+        fn level_count(&self) -> u32 {
+            self.inner.level_count()
+        }
+
+        fn read_rect(&self, level: u32, origin: IVec2, size: UVec2, out: &mut [u8]) {
+            self.levels.borrow_mut().push(level);
+            self.inner.read_rect(level, origin, size, out);
+        }
+    }
+
+    #[test]
+    fn a_level_too_fine_to_draw_is_not_streamed_either() {
+        // The saving that matters most is not the triangles: it is the tiles.
+        // A window that is not drawn still follows the camera, and at altitude
+        // the camera covers ground fast, so leaving the finest levels streaming
+        // would keep reading detail nobody can see. They stop entirely instead,
+        // and are refilled whole when the camera comes back down to them --
+        // their textures having gone stale in the meantime.
+        let (device, queue) = test_device();
+        let (heights, colours) = rugged();
+        let reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        let mut scene = Scene::from_terrain(
+            &device,
+            |camera_layout| {
+                Terrain::new(
+                    &device,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                    camera_layout,
+                    test_config(),
+                    placement(),
+                    Box::new(Counted {
+                        inner: Box::new(Pyramid::build(Level::new(RASTER, RASTER, heights))),
+                        levels: reads.clone(),
+                    }),
+                    Box::new(Pyramid::build(Level::new(RASTER, RASTER, colours))),
+                )
+            },
+            1.0,
+        );
+
+        let mut read_levels = |at: Vec3| {
+            reads.borrow_mut().clear();
+            scene.camera.position = at;
+            scene.update(&queue);
+            let seen: std::collections::HashSet<u32> = reads.borrow().iter().copied().collect();
+            (seen, scene.terrain.base_level())
+        };
+
+        // High enough that the finest level is gone. Note this is the very first
+        // update, so nothing is resident and every level still being drawn has
+        // to be read in full -- what is missing is missing because it was
+        // dropped, not because it happened to have nothing new.
+        let (high, base) = read_levels(Vec3::new(70.0, 4000.0, -110.0));
+        assert!(base > 0, "the sweep needs an altitude that drops a level");
+        assert_eq!(
+            high.iter().copied().min(),
+            Some(base),
+            "levels below {base} should not have been streamed: read {high:?}"
+        );
+
+        // ... and coming back down brings them straight back.
+        let (low, base) = read_levels(Vec3::new(70.0, 900.0, -110.0));
+        assert_eq!(base, 0, "the descent has to reach the finest level again");
+        assert!(
+            low.contains(&0),
+            "the finest level did not come back on descent: read {low:?}"
         );
     }
 

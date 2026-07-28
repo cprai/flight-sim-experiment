@@ -1,8 +1,8 @@
 //! Laying out the patches of geometry that make up each clipmap level.
 //!
 //! Every level is drawn as a square ring one block thick, leaving a hole in the
-//! middle that the next finer level fills. Only the finest level has no hole to
-//! leave, so it gets a solid centre instead.
+//! middle that the next finer level fills. Only the finest level drawn has no
+//! hole to leave, so it gets a solid centre instead.
 //!
 //! Along one side a ring reads `block, block, seam, block, block`, where the
 //! two-quad seam is what makes the whole side an odd number of quads across.
@@ -36,7 +36,8 @@ pub enum PatchKind {
     TrimColumn,
     /// The flat arm of the same L.
     TrimRow,
-    /// Fills the hole of the finest level, which has nothing nested inside it.
+    /// Fills the hole of the finest level drawn, which has nothing nested
+    /// inside it.
     Centre,
 }
 
@@ -136,15 +137,21 @@ pub fn grid_indices(config: &ClipmapConfig) -> (Vec<u16>, Vec<std::ops::Range<u3
 /// rather than recomputed from the camera, so the geometry cannot disagree with
 /// the windows it is drawn against.
 ///
+/// `base` is the finest level worth drawing; anything below it is left out
+/// entirely. It is the base rather than level 0 that gets the solid centre,
+/// because being the innermost level is what "no finer level to leave a hole
+/// for" means -- level 0 is only ever the base when the camera is close enough
+/// to the ground to deserve it.
+///
 /// The result is grouped by kind, ready to upload as an instance buffer.
-pub fn patches(config: &ClipmapConfig, origins: &[IVec2]) -> Vec<Patch> {
+pub fn patches(config: &ClipmapConfig, origins: &[IVec2], base: u32) -> Vec<Patch> {
     let ring = config.ring_quads();
     let hole = config.hole_quads();
     let grid = config.grid_quads();
     let far = grid - ring;
 
     let mut patches = Vec::new();
-    for level in 0..origins.len() as u32 {
+    for level in base..origins.len() as u32 {
         // Where the blocks along one side start, with the seam between the
         // middle pair.
         let runs = [0, ring, 2 * ring + 2, 3 * ring + 2];
@@ -183,8 +190,9 @@ pub fn patches(config: &ClipmapConfig, origins: &[IVec2]) -> Vec<Patch> {
             });
         }
 
-        match level.checked_sub(1) {
-            // Nothing nested inside the finest level, so fill its hole outright.
+        match level.checked_sub(1).filter(|_| level > base) {
+            // Nothing nested inside the finest level drawn, so fill its hole
+            // outright.
             None => patches.push(Patch {
                 kind: PatchKind::Centre,
                 origin: UVec2::splat(ring),
@@ -299,7 +307,7 @@ mod tests {
         for step in 0..32 {
             let camera = DVec2::new(f64::from(step) * 0.25, f64::from(step) * 0.5);
             let origins = origins(&config, camera, levels);
-            let patches = patches(&config, &origins);
+            let patches = patches(&config, &origins, 0);
 
             for level in 1..levels {
                 let ring = covered(&config, &patches, level);
@@ -343,16 +351,57 @@ mod tests {
     fn the_finest_level_is_solid() {
         let config = config();
         let origins = origins(&config, DVec2::new(3.0, 7.0), 3);
-        let patches = patches(&config, &origins);
+        let patches = patches(&config, &origins, 0);
 
         assert_eq!(covered(&config, &patches, 0), whole_grid(&config));
+    }
+
+    #[test]
+    fn dropping_the_finest_levels_leaves_the_rest_tiling_the_grid_as_before() {
+        // What a camera high above the ground asks for: the levels below the
+        // base gone entirely, the base solid in their place, and every level
+        // outside it laid out exactly as it would have been.
+        let config = config();
+        let levels = 5;
+        let base = 2;
+
+        for step in 0..32 {
+            let camera = DVec2::new(f64::from(step) * 0.25, f64::from(step) * 0.5);
+            let origins = origins(&config, camera, levels);
+            let patches = patches(&config, &origins, base);
+
+            assert!(
+                patches.iter().all(|p| p.level >= base),
+                "a level below the base was still drawn at {camera}"
+            );
+            assert_eq!(
+                covered(&config, &patches, base),
+                whole_grid(&config),
+                "the base level left a hole for a level that is not drawn"
+            );
+
+            for level in base + 1..levels {
+                let ring = covered(&config, &patches, level);
+                let finer = finer_footprint(&config, &origins, level);
+                assert!(
+                    ring.is_disjoint(&finer),
+                    "level {level} overlaps at {camera}"
+                );
+                let union: HashSet<_> = ring.union(&finer).copied().collect();
+                assert_eq!(
+                    union,
+                    whole_grid(&config),
+                    "level {level} leaks at {camera}"
+                );
+            }
+        }
     }
 
     #[test]
     fn only_the_finest_level_has_a_centre_and_only_the_rest_have_trims() {
         let config = config();
         let origins = origins(&config, DVec2::new(1.0, 1.0), 4);
-        let patches = patches(&config, &origins);
+        let patches = patches(&config, &origins, 0);
 
         for level in 0..4u32 {
             let kinds: HashSet<_> = patches
@@ -370,7 +419,7 @@ mod tests {
     fn every_ring_is_built_from_twelve_blocks_and_four_seams() {
         let config = config();
         let origins = origins(&config, DVec2::ZERO, 3);
-        let patches = patches(&config, &origins);
+        let patches = patches(&config, &origins, 0);
 
         let count = |level: u32, kind: PatchKind| {
             patches
@@ -389,7 +438,7 @@ mod tests {
     fn patches_are_grouped_so_each_kind_is_one_draw_call() {
         let config = config();
         let origins = origins(&config, DVec2::new(5.0, 9.0), 5);
-        let patches = patches(&config, &origins);
+        let patches = patches(&config, &origins, 0);
 
         let mut runs: Vec<PatchKind> = Vec::new();
         for patch in &patches {
@@ -410,7 +459,7 @@ mod tests {
         let side = shared_grid_verts(&config);
         let origins = origins(&config, DVec2::new(2.0, 3.0), 4);
 
-        for patch in patches(&config, &origins) {
+        for patch in patches(&config, &origins, 0) {
             let size = patch.kind.size_quads(&config);
             assert!(size.x < side && size.y < side, "{patch:?} is too large");
             assert!(

@@ -5,10 +5,12 @@ use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use glam::{IVec2, UVec2, Vec2, Vec3};
+use glam::{DVec2, IVec2, UVec2, Vec2, Vec3};
 use wgpu::util::DeviceExt;
 
-use crate::terrain::clipmap::{ClipmapConfig, exposed_regions, split_across_seam, window_origin};
+use crate::terrain::clipmap::{
+    ClipmapConfig, detail_base, exposed_regions, split_across_seam, window_origin,
+};
 use crate::terrain::geotiff::Georeferencing;
 use crate::terrain::mesh::{self, PatchKind};
 use crate::terrain::pyramid::{RasterSource, Srgb8};
@@ -58,6 +60,11 @@ struct TerrainUniform {
     grid_quads: f32,
     data_min: [f32; 2],
     data_max: [f32; 2],
+    base_level: u32,
+    base_morph: f32,
+    // The struct's alignment is that of its widest member, so its size has to be
+    // a multiple of sixteen for the uniform layout to match the shader's.
+    padding: [u32; 2],
 }
 
 /// A height raster and a matching colour raster, drawn as a geometry clipmap.
@@ -70,8 +77,26 @@ pub struct Terrain {
 
     /// One window origin per level, in that level's own texel coordinates.
     origins: Vec<IVec2>,
-    /// Cleared until the first update has filled every window.
-    windows_filled: bool,
+    /// Whether each level's window holds the ground its origin claims.
+    ///
+    /// Per level rather than one flag for the lot, because a level dropped for
+    /// altitude stops being uploaded while its origin keeps following the
+    /// camera. When it comes back its texture holds ground from wherever it was
+    /// abandoned, which no incremental update can repair, so it is refilled
+    /// whole.
+    filled: Vec<bool>,
+    /// The finest level being drawn, and how far it has blended into the next.
+    detail: (u32, f32),
+    /// A CPU mirror of the coarsest level's height window.
+    ///
+    /// The clipmap's whole point is that the ground under the camera is already
+    /// resident, so height above terrain costs a copy of what `upload` is
+    /// passing through anyway rather than a read back out of the tile store --
+    /// which reopens and reparses a GeoTIFF per call and could not be asked
+    /// every frame. The coarsest level is the one mirrored because it is the one
+    /// level never dropped: the level chosen from this height must not depend on
+    /// data whose residency that choice controls.
+    ground: Vec<f32>,
     /// Reused between uploads so a moving camera allocates nothing.
     staging: Vec<u8>,
 
@@ -373,7 +398,9 @@ impl Terrain {
             colours,
             height_range,
             origins: vec![IVec2::ZERO; level_count as usize],
-            windows_filled: false,
+            filled: vec![false; level_count as usize],
+            detail: (0, 0.0),
+            ground: vec![0.0; window_bytes],
             staging: vec![0; window_bytes * size_of::<Srgb8>().max(size_of::<f32>())],
             height_texture,
             colour_texture,
@@ -402,6 +429,15 @@ impl Terrain {
         )
     }
 
+    /// The finest level currently being drawn.
+    ///
+    /// Zero on the ground, rising as the camera climbs away from the terrain and
+    /// the levels below it stop being worth their triangles.
+    #[cfg(test)]
+    pub fn base_level(&self) -> u32 {
+        self.detail.0
+    }
+
     /// Moves every level's window to follow the camera, uploading only the
     /// ground that has come into view since the last call.
     pub fn update(&mut self, queue: &wgpu::Queue, camera: Vec3) {
@@ -411,6 +447,48 @@ impl Terrain {
         let window = self.config.window_texels();
 
         let levels = self.origins.len();
+        let coarsest = levels - 1;
+
+        // Every window's new position is settled before any of them is
+        // described, because each level's morph needs to know where the level
+        // outside it ended up.
+        let placed: Vec<IVec2> = (0..levels as u32)
+            .map(|level| window_origin(&self.config, level, camera_texels))
+            .collect();
+
+        // The coarsest level is refreshed first, out of turn, because the height
+        // above terrain that decides how many of the finer levels are worth
+        // uploading at all is read back out of its window. Taking it from the one
+        // level that is never dropped keeps the decision independent of what the
+        // decision itself makes resident, and means the very first frame already
+        // has ground to measure against.
+        self.refresh(queue, coarsest, placed[coarsest]);
+        let ground = self.ground_height(camera_texels);
+        let metres_per_texel = self
+            .placement
+            .metres_per_texel_x
+            .min(self.placement.metres_per_texel_z);
+        self.detail = detail_base(
+            &self.config,
+            metres_per_texel,
+            f64::from(camera.y - ground),
+            levels as u32,
+        );
+        let (base, base_morph) = self.detail;
+
+        for (level, &new) in placed.iter().enumerate().take(coarsest) {
+            if level as u32 >= base {
+                self.refresh(queue, level, new);
+            } else {
+                // Dropped for altitude. Its origin still follows the camera, so
+                // that the level outside it can place its trim against a window
+                // that has not gone stale, but nothing is uploaded and whatever
+                // its texture holds is no longer the ground its origin claims.
+                self.origins[level] = new;
+                self.filled[level] = false;
+            }
+        }
+
         let (data_min, data_max) = self.placement.data_bounds();
         let mut uniform = TerrainUniform {
             levels: [LevelUniform::default(); MAX_LEVELS],
@@ -420,35 +498,12 @@ impl Terrain {
             grid_quads: self.config.grid_quads() as f32,
             data_min: [data_min.0 as f32, data_min.1 as f32],
             data_max: [data_max.0 as f32, data_max.1 as f32],
+            base_level: base,
+            base_morph,
+            padding: [0; 2],
         };
 
-        // Every window's new position is settled before any of them is
-        // described, because each level's morph needs to know where the level
-        // outside it ended up.
-        let placed: Vec<IVec2> = (0..levels as u32)
-            .map(|level| window_origin(&self.config, level, camera_texels))
-            .collect();
-
         for (level, &new) in placed.iter().enumerate() {
-            let regions = if self.windows_filled {
-                exposed_regions(self.origins[level], new, window)
-            } else {
-                // Nothing is resident yet, so every window is entirely new.
-                vec![crate::terrain::clipmap::Rect {
-                    x: new.x,
-                    y: new.y,
-                    width: window,
-                    height: window,
-                }]
-            };
-
-            for region in regions {
-                for (piece, destination) in split_across_seam(region, window) {
-                    self.upload(queue, level as u32, piece, destination);
-                }
-            }
-            self.origins[level] = new;
-
             let (origin_x, origin_z) =
                 self.placement
                     .world_of_texel(level as u32, f64::from(new.x), f64::from(new.y));
@@ -471,10 +526,65 @@ impl Terrain {
                 coarse_offset: [coarse_offset.x as f32, coarse_offset.y as f32],
             };
         }
-        self.windows_filled = true;
 
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
         self.rebuild_patches(queue);
+    }
+
+    /// Moves one level's window to `new`, uploading the ground that exposes.
+    ///
+    /// A level whose texture no longer matches its origin -- because it has
+    /// never been filled, or because it was dropped for altitude while its
+    /// origin carried on following the camera -- is refilled whole. There is
+    /// nothing for an incremental update to keep in that case.
+    fn refresh(&mut self, queue: &wgpu::Queue, level: usize, new: IVec2) {
+        let window = self.config.window_texels();
+        let regions = if self.filled[level] {
+            exposed_regions(self.origins[level], new, window)
+        } else {
+            vec![crate::terrain::clipmap::Rect {
+                x: new.x,
+                y: new.y,
+                width: window,
+                height: window,
+            }]
+        };
+
+        for region in regions {
+            for (piece, destination) in split_across_seam(region, window) {
+                self.upload(queue, level as u32, piece, destination);
+            }
+        }
+        self.origins[level] = new;
+        self.filled[level] = true;
+    }
+
+    /// The elevation of the ground under the camera, in world units.
+    ///
+    /// Read from the mirror of the coarsest level, so it is the ground averaged
+    /// over kilometres rather than the peak the camera happens to be over. That
+    /// is the right shape of answer for choosing a level that covers kilometres,
+    /// and where it is least accurate -- close to the ground, where the relief it
+    /// smooths away is a large fraction of the distance -- the finest level is
+    /// being drawn anyway.
+    fn ground_height(&self, camera_texels: DVec2) -> f32 {
+        let level = self.origins.len() - 1;
+        let window = self.config.window_texels() as i32;
+        let texels = camera_texels / f64::from(1u32 << level);
+        let offset =
+            IVec2::new(texels.x.floor() as i32, texels.y.floor() as i32) - self.origins[level];
+        let x = offset.x.rem_euclid(window) as usize;
+        let y = offset.y.rem_euclid(window) as usize;
+
+        let height = self.ground[y * window as usize + x];
+        // The camera can legally be over ground the raster says nothing about:
+        // past the edge of the survey, or over a hole in it. Sea level is the
+        // same fallback the terrain itself draws there.
+        if height > crate::terrain::NODATA_BELOW {
+            height
+        } else {
+            0.0
+        }
     }
 
     /// Copies one seam-free piece of a window into both clip textures.
@@ -528,11 +638,30 @@ impl Terrain {
             }
         }
         copy(&self.height_texture, 4, &self.staging[..bytes]);
+        if level as usize == self.origins.len() - 1 {
+            self.mirror_ground(size, destination, bytes);
+        }
 
         let bytes = texels * size_of::<Srgb8>();
         self.colours
             .read_rect(level, piece.origin(), size, &mut self.staging[..bytes]);
         copy(&self.colour_texture, 4, &self.staging[..bytes]);
+    }
+
+    /// Copies a just-uploaded piece of the coarsest window into the CPU mirror.
+    ///
+    /// Written from the same staging buffer, at the same destination, as the
+    /// texture copy immediately above it, so the mirror wraps around the torus
+    /// exactly as the texture does and cannot drift out of step with it.
+    fn mirror_ground(&mut self, size: UVec2, destination: UVec2, bytes: usize) {
+        let heights: &[f32] = bytemuck::cast_slice(&self.staging[..bytes]);
+        let window = self.config.window_texels() as usize;
+        for row in 0..size.y as usize {
+            let source = row * size.x as usize;
+            let target = (destination.y as usize + row) * window + destination.x as usize;
+            self.ground[target..target + size.x as usize]
+                .copy_from_slice(&heights[source..source + size.x as usize]);
+        }
     }
 
     /// The lowest and highest elevation in the coarsest level of the pyramid.
@@ -581,7 +710,7 @@ impl Terrain {
         // never rasterize it at all. The saving is largest exactly where it
         // matters: a coarse ring viewed from over a corner of the data.
         let (data_min, data_max) = self.placement.data_bounds();
-        let patches: Vec<mesh::Patch> = mesh::patches(&self.config, &self.origins)
+        let patches: Vec<mesh::Patch> = mesh::patches(&self.config, &self.origins, self.detail.0)
             .into_iter()
             .filter(|patch| {
                 let level = patch.level as usize;
