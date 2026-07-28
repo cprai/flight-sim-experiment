@@ -15,8 +15,9 @@ pub const COLOUR_PRODUCT: &str = "albedo";
 
 /// Any elevation below this means "no measurement here".
 ///
-/// HRDEM writes -32767 and the tiles carry it through, but the exact value is
-/// not worth threading from the manifest into the shader: the deepest ground on
-/// Earth is a fraction of this, so anything below it is a hole however the
-/// producer chose to spell it.
-pub const NODATA_BELOW: f32 = -30_000.0;
+/// Defined beside the filter that has to drop such texels when it builds a
+/// coarse level, rather than copied here: the renderer and the reduction have to
+/// agree on what a hole is or a level of the pyramid will quietly average some
+/// in. The shader carries its own copy, which cannot be shared and is marked to
+/// be kept in step.
+pub use terrain_tiles::NODATA_BELOW;

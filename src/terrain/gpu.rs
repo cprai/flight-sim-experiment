@@ -13,7 +13,7 @@ use crate::terrain::clipmap::{
 };
 use crate::terrain::geotiff::Georeferencing;
 use crate::terrain::mesh::{self, PatchKind};
-use crate::terrain::pyramid::{RasterSource, Srgb8};
+use crate::terrain::pyramid::{RasterSource, Resident, Srgb8};
 use crate::terrain::tiles::TileStore;
 
 /// Must match `MAX_LEVELS` in the shader.
@@ -201,14 +201,20 @@ impl Terrain {
             heights.manifest().max_level()
         );
 
+        // The downloader writes as many levels as it was asked for, which is
+        // rarely enough to span the whole raster: five here where seven are
+        // needed. Continuing the chain in memory is what lets the outermost ring
+        // -- and so the far field marched through it -- reach the edge of the
+        // data rather than a couple of kilometres of it.
+        let raster = UVec2::new(placement.width, placement.height);
         Ok(Self::new(
             device,
             format,
             camera_layout,
             config,
             placement,
-            Box::new(heights),
-            Box::new(colours),
+            Box::new(Resident::<f32>::over(Box::new(heights), raster)),
+            Box::new(Resident::<Srgb8>::over(Box::new(colours), raster)),
         ))
     }
 
@@ -931,16 +937,29 @@ impl Terrain {
         }
     }
 
-    /// The lowest and highest elevation in the coarsest level of the pyramid.
+    /// The lowest and highest elevation, read from a coarse level of the pyramid.
     ///
-    /// Read from the top rather than the base: the coarsest level is one or two
-    /// tiles rather than the whole dataset, and every texel in it is a box filter of
-    /// everything beneath, so the range is representative without anything being
-    /// scanned that is not already resident for a moment. Peaks are averaged down a
-    /// little, which only matters for framing the camera at startup -- the one thing
-    /// this is used for.
+    /// Read coarse rather than from the base: every texel of a coarse level is a
+    /// box filter of everything beneath it, so the range is representative without
+    /// anything being scanned that is not already cheap to fetch. Peaks are averaged
+    /// down a little, which only matters for framing the camera at startup -- the one
+    /// thing this is used for.
+    ///
+    /// The level is chosen by how much raster it leaves rather than by counting from
+    /// the top, because the top is now a single texel: [`Resident`] carries the chain
+    /// all the way down to one, and the mean of the whole dataset says nothing about
+    /// how high its mountains are.
     fn coarsest_height_range(source: &dyn RasterSource, placement: &Georeferencing) -> (f32, f32) {
-        let level = source.level_count().saturating_sub(1);
+        /// Side length to aim for. A quarter of a million texels is a fraction of a
+        /// megabyte to read and plenty of samples to take a range over.
+        const SAMPLES: u32 = 512;
+
+        let widest = placement.width.max(placement.height);
+        let level = widest
+            .div_ceil(SAMPLES)
+            .next_power_of_two()
+            .trailing_zeros()
+            .min(source.level_count().saturating_sub(1));
         let size = UVec2::new(
             (placement.width >> level).max(1),
             (placement.height >> level).max(1),

@@ -115,7 +115,8 @@ struct VertexOut {
 // HRDEM writes -32767. The exact value is not worth passing in: the deepest
 // ground on Earth is a small fraction of this, so anything below it is a hole
 // however the producer chose to spell it. Kept in step with `NODATA_BELOW` in
-// `src/terrain/mod.rs`.
+// `crates/terrain-tiles/src/texel.rs`, which is where the filter that drops
+// these texels when it builds a coarse level reads the same threshold.
 const NODATA_BELOW: f32 = -30000.0;
 
 // A height and the worst of the texels that went into it.

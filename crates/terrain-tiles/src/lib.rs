@@ -27,7 +27,9 @@ pub mod manifest;
 pub mod texel;
 
 pub use manifest::{COLOUR_BASE_LEVEL, Manifest};
-pub use texel::{COLOUR_IS_SRGB_ENCODED, Srgb8, Texel, linear_to_srgb, srgb_to_linear};
+pub use texel::{
+    COLOUR_IS_SRGB_ENCODED, NODATA_BELOW, Srgb8, Texel, linear_to_srgb, srgb_to_linear,
+};
 
 /// Side length of every tile, in texels, at every level.
 ///

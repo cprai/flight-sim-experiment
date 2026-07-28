@@ -15,15 +15,34 @@ use std::sync::LazyLock;
 /// washed out; flipping this is the whole fix.
 pub const COLOUR_IS_SRGB_ENCODED: bool = true;
 
+/// Elevations below this are a raster's nodata rather than ground.
+///
+/// HRDEM writes -32767 and other producers spell it differently, but the deepest
+/// ground on Earth is a small fraction of this, so anything below it is a hole
+/// however it was written. Kept in step with `NODATA_BELOW` in
+/// `src/terrain.wgsl`.
+pub const NODATA_BELOW: f32 = -30_000.0;
+
 /// A texel that knows how to combine with its neighbours to build a coarser mip.
 pub trait Texel: Copy + Default + bytemuck::Pod {
     /// Averages the one to four finer texels that a coarse texel covers.
     ///
     /// Fewer than four arrive at the edge of the data, where a neighbour is
     /// missing or holds nodata and the caller has dropped it. Callers must not
-    /// pass an empty slice; a coarse texel with no valid children is nodata and
-    /// is never written at all.
+    /// pass an empty slice; a coarse texel with no valid children is
+    /// [`Texel::NODATA`].
     fn box_filter(samples: &[Self]) -> Self;
+
+    /// Whether this texel means "nothing was measured here".
+    ///
+    /// Nodata has to be dropped before [`Texel::box_filter`] rather than
+    /// averaged into it. One -32767 among three real metres comes out around
+    /// -7800: far below any ground, but nowhere near the sentinel, so nothing
+    /// downstream recognises it as a hole and it draws as a pit instead.
+    fn is_nodata(&self) -> bool;
+
+    /// What a coarse texel holds when every one of its children was nodata.
+    const NODATA: Self;
 }
 
 impl Texel for f32 {
@@ -35,6 +54,12 @@ impl Texel for f32 {
         // and break the continuity the morph between levels depends on.
         samples.iter().sum::<f32>() / samples.len() as f32
     }
+
+    fn is_nodata(&self) -> bool {
+        *self < NODATA_BELOW
+    }
+
+    const NODATA: Self = -32767.0;
 }
 
 /// A colour texel, sRGB-encoded, in the RGBA order the GPU samples.
@@ -58,6 +83,15 @@ impl Texel for Srgb8 {
         let scale = 1.0 / samples.len() as f32;
         Self(std::array::from_fn(|i| linear_to_srgb(channels[i] * scale)))
     }
+
+    /// Imagery carries no sentinel, so black stands in for it: tiles with
+    /// nothing under them are written black, and ground that is genuinely this
+    /// dark is indistinguishable from no ground at all anyway.
+    fn is_nodata(&self) -> bool {
+        self.0[..3] == [0, 0, 0]
+    }
+
+    const NODATA: Self = Self([0, 0, 0, 255]);
 }
 
 /// Decoding is a per-texel cost over tens of millions of texels, and there are
