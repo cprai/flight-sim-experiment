@@ -100,14 +100,14 @@ impl Scene {
         viewport: UVec2,
         terrain_root: &std::path::Path,
     ) -> Result<Self> {
-        let base = ClipmapConfig::default();
-        let config = ClipmapConfig {
-            window_texels: base.window_for(
+        let mut config = ClipmapConfig {
+            pixel_angle: crate::terrain::clipmap::pixel_angle(
                 viewport.y,
                 f64::from(crate::camera::FOV_Y_DEGREES).to_radians(),
             ),
-            ..base
+            ..ClipmapConfig::default()
         };
+        config.window_texels = config.window_for();
         Self::with_config(device, format, viewport, terrain_root, config)
     }
 
@@ -351,6 +351,15 @@ mod tests {
         ClipmapConfig {
             block_verts: 16,
             window_texels: 64,
+            // A far coarser pixel than any real viewport, because the rule for
+            // giving up a level compares its texels to one. This raster's are
+            // thirty metres, which a 256-pixel frame still resolves from
+            // thirteen kilometres up -- four times further than the raster is
+            // wide, so no camera that can see it would ever drop a level and
+            // the tests for dropping one would have nothing to say. Three and a
+            // half degrees a pixel puts the handover at a kilometre instead,
+            // which the altitudes below fly through.
+            pixel_angle: 0.06,
             ..Default::default()
         }
     }
@@ -565,11 +574,12 @@ mod tests {
     /// An oblique view from low enough that the mesh is not blending vertically.
     ///
     /// `detail_base` starts blending the finest level into the one outside it as
-    /// soon as the camera is more than a ring reach -- 480 m for this raster --
-    /// above the ground beneath it, and the march does not reproduce that blend.
-    /// Six hundred metres over ground standing at about 180 leaves it at zero, so
-    /// a comparison from here is measuring the traversal rather than measuring a
-    /// mismatch that is already known and accepted.
+    /// soon as a pixel covers more than one of its texels -- 500 m above the
+    /// ground for this raster and this test's deliberately coarse pixel -- and
+    /// the march does not reproduce that blend. Six hundred metres over ground
+    /// standing at about 180 leaves it at zero, so a comparison from here is
+    /// measuring the traversal rather than measuring a mismatch that is already
+    /// known and accepted.
     fn low_and_looking_out(camera: &mut Camera) {
         camera.position = Vec3::new(70.0, 600.0, -110.0);
         camera.orientation = Camera::from_yaw_pitch_roll(0.0, -20f32.to_radians(), 0.0);
@@ -1159,9 +1169,14 @@ mod tests {
             std::env::var("FLIGHT_SIM_TERRAIN")
                 .expect("set FLIGHT_SIM_TERRAIN to a directory terrain-download wrote"),
         );
-        let mut config = ClipmapConfig::default();
-        config.window_texels =
-            config.window_for(TALL, f64::from(crate::camera::FOV_Y_DEGREES).to_radians());
+        let mut config = ClipmapConfig {
+            pixel_angle: crate::terrain::clipmap::pixel_angle(
+                TALL,
+                f64::from(crate::camera::FOV_Y_DEGREES).to_radians(),
+            ),
+            ..ClipmapConfig::default()
+        };
+        config.window_texels = config.window_for();
         if let Ok(rings) = std::env::var("FLIGHT_SIM_NEAR_RINGS") {
             config.near_rings = rings
                 .parse()
@@ -1203,7 +1218,11 @@ mod tests {
         // quickly can still stall here, and the two want telling apart.
         let started = std::time::Instant::now();
         scene.update(&queue);
-        eprintln!("filled the windows in {:.2?}", started.elapsed());
+        eprintln!(
+            "filled the windows in {:.2?}, finest level {}",
+            started.elapsed(),
+            scene.terrain.base_level()
+        );
 
         let bytes_per_row = WIDE * 4;
         assert_eq!(bytes_per_row % 256, 0, "readback rows must stay aligned");

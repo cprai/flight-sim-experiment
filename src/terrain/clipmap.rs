@@ -63,6 +63,22 @@ pub struct ClipmapConfig {
     /// window the screen asks for is halved until the textures fit. Memory is
     /// quadratic in the window, so one halving is four times less.
     pub memory_budget: usize,
+    /// The angle one pixel of the target subtends, in radians.
+    ///
+    /// The one number both detail rules are written in. How much ground stays
+    /// resident at each level -- [`ClipmapConfig::window_for`] -- and how many
+    /// of the fine levels are worth keeping at all -- [`detail_base`] -- are
+    /// the same question asked at two distances, and neither can be answered
+    /// without knowing how large a pixel is. See [`pixel_angle`].
+    pub pixel_angle: f64,
+}
+
+/// The angle one pixel subtends, for a viewport of this height.
+///
+/// The horizontal angle is the same: widening the viewport widens the field of
+/// view with it rather than stretching the picture, so pixels stay square.
+pub fn pixel_angle(viewport_height: u32, fov_y: f64) -> f64 {
+    2.0 * (fov_y * 0.5).tan() / f64::from(viewport_height.max(1))
 }
 
 /// Widest window ever asked for, whatever the screen would like.
@@ -104,6 +120,9 @@ impl Default for ClipmapConfig {
             // spending memory on and the sizes it can take are powers of two --
             // a budget between two of them buys nothing.
             memory_budget: 1600 << 20,
+            // 1080p at sixty degrees, replaced wherever a real viewport is
+            // known.
+            pixel_angle: 2.0 * (30f64.to_radians()).tan() / 1080.0,
         }
     }
 }
@@ -168,9 +187,8 @@ impl ClipmapConfig {
     /// but of how much ground is resident at each level, and that is the
     /// window. Anything finer than this is detail the screen cannot show;
     /// anything coarser is texels visibly larger than pixels in the distance.
-    pub fn window_for(&self, viewport_height: u32, fov_y: f64) -> u32 {
-        let pixel = 2.0 * (fov_y * 0.5).tan() / f64::from(viewport_height.max(1));
-        let wanted = 4.0 / (TEXELS_PER_PIXEL * pixel);
+    pub fn window_for(&self) -> u32 {
+        let wanted = 4.0 / (TEXELS_PER_PIXEL * self.pixel_angle);
         (wanted.ceil() as u32)
             .next_power_of_two()
             .clamp(self.grid_verts() + 1, MAX_WINDOW)
@@ -253,26 +271,29 @@ impl ClipmapConfig {
     }
 }
 
-/// The finest level worth drawing when the camera is `distance` metres from the
+/// The finest level worth keeping when the camera is `distance` metres from the
 /// ground beneath it, and how far it has already blended into the level outside
 /// it.
 ///
-/// Levels are nested rings centred on the camera, so a level's detail is chosen
-/// by how far away the ground it covers is: level `l`'s ring starts at
-/// `hole_quads / 2 * 2^l` texels out. Horizontally that falls out of the
-/// geometry for free, but a camera in the air is that far from the ground
-/// directly below it as well, and nothing in the ring layout knows it. Drawing
-/// the finest level from ten kilometres up spends full-resolution triangles --
-/// and a fine window's worth of tile reads -- on ground that covers a fraction
-/// of a pixel.
+/// A level earns its residency while its texels are still smaller than the
+/// pixels they land in. The nearest ground on screen is the ground directly
+/// below, at `distance`, and that is where the demand is highest: a pixel there
+/// covers `distance * pixel_angle` metres, and any level finer than that is
+/// detail nothing can show. Everything below it is dropped, which saves both
+/// the triangles the mesh would spend on it and -- much more valuable -- the
+/// tiles that would have to be read to fill its window.
 ///
-/// So the same rule is applied to the vertical: the level that would serve
-/// horizontal distance `distance` is the finest level worth drawing at altitude
-/// `distance`, and everything below it is dropped. Combined with the rings, a
-/// point at horizontal distance `r` ends up at `max(level_of(r),
-/// level_of(distance))`, which is within half a level of the `sqrt(r^2 + d^2)`
-/// an exact radial measure would give -- the same square-for-round
-/// approximation the rings themselves already make.
+/// The rule this replaced measured altitude in ring reaches: level `l` went
+/// once the camera was `hole_quads / 2 * 2^l` texels up, which is where the
+/// *rings* hand `l` over to `l + 1` horizontally. That was self-consistent but
+/// had nothing to do with what could be seen. On a one-metre raster it gave up
+/// level 0 at sixty-four metres of altitude, where a 1080p screen can still
+/// resolve a one-metre texel from six hundred; at ten kilometres up it was
+/// asking for a hundred-and-twenty-eight-metre texel where sixteen would do.
+/// Both errors were invisible while the mesh drew everything, because a level
+/// dropped for altitude is one the rings were about to hand over anyway. They
+/// stopped being invisible when the far field started reading the same levels
+/// out to the edge of the window.
 ///
 /// The fractional part is returned rather than rounded away: the caller blends
 /// the base level uniformly into the level outside it by that much, so by the
@@ -285,15 +306,14 @@ pub fn detail_base(
     distance: f64,
     levels: u32,
 ) -> (u32, f32) {
-    // Where level 0 hands over to level 1: the radius of the hole its ring
-    // leaves. Half a grid out, the next level has taken over regardless.
-    let handover = f64::from(config.hole_quads()) * 0.5 * metres_per_texel;
     let coarsest = levels.saturating_sub(1);
+    // How many base texels a pixel covers at the nearest ground on screen.
+    let resolvable = distance * config.pixel_angle / metres_per_texel;
 
-    let t = (distance / handover)
-        .max(1.0)
-        .log2()
-        .clamp(0.0, f64::from(coarsest));
+    // Level `l`'s texels are `2^l` base texels across, so this is the level
+    // whose texels are about a pixel. Below one the finest level is still not
+    // enough, which is the ordinary case near the ground.
+    let t = resolvable.max(1.0).log2().clamp(0.0, f64::from(coarsest));
     let base = t.floor();
     if base as u32 >= coarsest {
         (coarsest, 0.0)
@@ -651,16 +671,19 @@ mod tests {
     /// on ground the screen cannot resolve.
     #[test]
     fn a_texel_never_covers_more_than_a_pixel() {
-        let config = ClipmapConfig::default();
         let fov = 60f64.to_radians();
         let ratio = |window: u32, height: u32| {
-            let pixel = 2.0 * (fov * 0.5).tan() / f64::from(height);
             // The coarse end of a level's range, where a texel is largest.
-            4.0 / (f64::from(window) * pixel)
+            4.0 / (f64::from(window) * pixel_angle(height, fov))
+        };
+        let sized = |height: u32| ClipmapConfig {
+            pixel_angle: pixel_angle(height, fov),
+            ..ClipmapConfig::default()
         };
 
         for height in [360u32, 480, 720, 1080, 1440, 2160] {
-            let window = config.window_for(height, fov);
+            let config = sized(height);
+            let window = config.window_for();
             assert!(window.is_power_of_two(), "{height}p asked for {window}");
             // Past the cap the screen is asking for more than the update path
             // is willing to move, and distant texels start to show.
@@ -680,10 +703,7 @@ mod tests {
         }
 
         // Twice the pixels wants twice the window, until the cap.
-        assert_eq!(
-            config.window_for(1080, fov),
-            config.window_for(540, fov) * 2
-        );
+        assert_eq!(sized(1080).window_for(), sized(540).window_for() * 2);
     }
 
     #[test]
@@ -1032,24 +1052,36 @@ mod tests {
         assert_eq!(config.level_count(UVec2::splat(1), 8), 1);
     }
 
-    /// The distance at which level 0 hands over to level 1.
+    /// How far up a level's texels stop being smaller than a pixel.
+    ///
+    /// Level 0 goes at `handover`, level 1 at twice that, and so on.
     fn handover(config: &ClipmapConfig, metres_per_texel: f64) -> f64 {
-        f64::from(config.hole_quads()) * 0.5 * metres_per_texel
+        metres_per_texel / config.pixel_angle
+    }
+
+    /// A clipmap whose pixels are a fixed, easily-reckoned angle.
+    fn seen_at(pixel: f64) -> ClipmapConfig {
+        ClipmapConfig {
+            pixel_angle: pixel,
+            ..config()
+        }
     }
 
     #[test]
-    fn every_level_survives_until_the_camera_is_its_own_radius_away() {
-        let config = config();
+    fn every_level_survives_until_its_texels_are_smaller_than_a_pixel() {
+        let config = seen_at(0.001);
         let reach = handover(&config, 10.0);
+        assert_eq!(reach, 10_000.0, "ten metres at a milliradian");
 
-        // On the ground and just below the handover, nothing is given up.
+        // Below the handover the finest level is still not fine enough, so
+        // nothing is given up however close to the ground the camera is.
         for distance in [0.0, 1.0, reach * 0.5, reach * 0.99] {
             let (base, _) = detail_base(&config, 10.0, distance, 8);
             assert_eq!(base, 0, "level 0 was dropped only {distance} m up");
         }
 
-        // ... and past it, one level goes per doubling, the same schedule the
-        // rings follow outwards.
+        // ... and past it, one level goes per doubling, because each level's
+        // texels are twice the last one's.
         for level in 0..6u32 {
             let distance = reach * f64::from(1u32 << level);
             let (base, _) = detail_base(&config, 10.0, distance * 1.01, 8);
@@ -1057,9 +1089,39 @@ mod tests {
         }
     }
 
+    /// The rule this replaced answered a different question, and got this one
+    /// wrong in both directions.
+    ///
+    /// It measured altitude in ring reaches, so on a fine raster it gave up
+    /// detail the screen could still resolve, and on a coarse one it kept
+    /// detail nothing could see. The far field reads whatever `detail_base`
+    /// leaves resident, out to the edge of the window, so both now show.
+    #[test]
+    fn levels_are_kept_by_what_the_screen_can_show_not_by_ring_geometry() {
+        // 1080p at sixty degrees over a one-metre raster.
+        let config = ClipmapConfig {
+            pixel_angle: pixel_angle(1080, 60f64.to_radians()),
+            ..ClipmapConfig::default()
+        };
+        // The old rule's handover, quoted so the comparison below is concrete.
+        assert_eq!(f64::from(config.hole_quads()) * 0.5, 64.0);
+
+        // Sixty-four metres up, the old rule gave up level 0. A pixel there
+        // covers a tenth of a metre, so it is nowhere near time: a one-metre
+        // texel is still the right size until a pixel covers two of them,
+        // which is at 1870 m.
+        assert_eq!(detail_base(&config, 1.0, 64.0, 12).0, 0);
+        assert_eq!(detail_base(&config, 1.0, 1_800.0, 12).0, 0);
+        assert_eq!(detail_base(&config, 1.0, 1_900.0, 12).0, 1);
+
+        // Ten kilometres up the old rule asked for level 7, a hundred and
+        // twenty-eight metre texels, where a pixel covers about eleven.
+        assert_eq!(detail_base(&config, 1.0, 10_000.0, 12).0, 3);
+    }
+
     #[test]
     fn a_level_is_fully_blended_away_before_it_is_dropped() {
-        let config = config();
+        let config = seen_at(0.001);
         let reach = handover(&config, 10.0);
 
         // Approaching a boundary from below, the level being retired is all but
@@ -1075,7 +1137,7 @@ mod tests {
 
     #[test]
     fn the_coarsest_level_is_never_dropped_and_never_blends_outwards() {
-        let config = config();
+        let config = seen_at(0.001);
         let reach = handover(&config, 10.0);
 
         // There is nothing outside the coarsest level to blend towards, so the
@@ -1091,12 +1153,44 @@ mod tests {
 
     #[test]
     fn a_finer_raster_gives_up_its_finest_level_sooner() {
-        let config = config();
-        // The same altitude is more levels' worth of distance over a raster
-        // whose texels are smaller, because the level it should be drawn at is
-        // measured in texels rather than metres.
-        let (coarse, _) = detail_base(&config, 40.0, 5_000.0, 12);
-        let (fine, _) = detail_base(&config, 5.0, 5_000.0, 12);
+        let config = seen_at(0.001);
+        // The same altitude is more levels' worth of detail over a raster whose
+        // texels are smaller, because what is being compared to a pixel is a
+        // texel and not a distance.
+        let (coarse, _) = detail_base(&config, 40.0, 500_000.0, 12);
+        let (fine, _) = detail_base(&config, 5.0, 500_000.0, 12);
         assert_eq!(fine, coarse + 3, "eight times finer is three levels sooner");
+    }
+
+    /// A window the budget cut short cannot deliver what the screen asked for,
+    /// and nothing downstream should pretend otherwise.
+    ///
+    /// The two rules are written in the same number, so they cannot disagree:
+    /// the finest level kept is always one the window still has room to serve
+    /// at the distance it is wanted.
+    #[test]
+    fn the_finest_level_kept_is_one_the_window_can_still_serve() {
+        let raster = UVec2::splat(114_688);
+        for height in [360u32, 720, 1080] {
+            let mut config = ClipmapConfig {
+                pixel_angle: pixel_angle(height, 60f64.to_radians()),
+                ..ClipmapConfig::default()
+            };
+            config.window_texels = config.window_for();
+            config.window_texels = config.fit_window(raster, 32);
+            let levels = config.level_count(raster, 32);
+
+            // At any altitude, the base level's own window has to reach at
+            // least as far as the ground the camera is looking at from it.
+            for altitude in [10.0f64, 300.0, 3_000.0, 30_000.0] {
+                let (base, _) = detail_base(&config, 1.0, altitude, levels);
+                let reach = f64::from(config.window_quads() / 2) * f64::from(1u32 << base);
+                assert!(
+                    reach >= altitude || base + 1 == levels,
+                    "{height}p at {altitude} m keeps level {base}, whose window \
+                     reaches only {reach} m"
+                );
+            }
+        }
     }
 }
