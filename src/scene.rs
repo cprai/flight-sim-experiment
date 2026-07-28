@@ -177,10 +177,6 @@ impl Scene {
         view: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) {
-        // Before the render pass, because a compute pass cannot be nested in one
-        // and what it builds is read while drawing.
-        self.terrain.build_pyramid(encoder);
-
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("scene pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1113,7 +1109,12 @@ mod tests {
             "camera at {} facing {:?}",
             scene.camera.position, scene.camera.orientation
         );
+        // Timed separately from the frame below it, because this is where the
+        // tile reads and the pyramid reductions happen: a frame that draws
+        // quickly can still stall here, and the two want telling apart.
+        let started = std::time::Instant::now();
         scene.update(&queue);
+        eprintln!("filled the windows in {:.2?}", started.elapsed());
 
         let bytes_per_row = WIDE * 4;
         assert_eq!(bytes_per_row % 256, 0, "readback rows must stay aligned");

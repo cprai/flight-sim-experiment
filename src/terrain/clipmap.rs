@@ -105,13 +105,28 @@ impl ClipmapConfig {
         (self.window_texels - self.grid_verts() - 1) / 2
     }
 
+    /// Coarsest depth of the max pyramid, where one texel covers `2^max_mip`
+    /// samples on a side.
+    ///
+    /// Three short of the whole window rather than the window itself, and that
+    /// costs the reach below. The pyramid is anchored to the raster, so a cell
+    /// at depth `m` starts at a multiple of `2^m` samples and a window whose
+    /// origin is not such a multiple straddles one cell more than it has room
+    /// for. Stopping three depths short leaves the coarsest cell an eighth of a
+    /// window, so an empty annulus still crosses in a handful of steps.
+    pub const fn max_mip(&self) -> u32 {
+        self.window_texels.trailing_zeros().saturating_sub(3)
+    }
+
     /// Side length of a level's window, in quads.
     ///
-    /// One less than a naive count: the last texel has nothing beyond it to
-    /// make a quad with. This is how far a ray may travel across a level before
-    /// it has to be handed over to the level outside.
+    /// How far a ray may travel across a level before it has to be handed over
+    /// to the level outside. Short of the window by one coarsest cell, which is
+    /// exactly the overhang [`ClipmapConfig::max_mip`] describes: a ray past
+    /// this point would want a ceiling the texture has no room for and would
+    /// read a wrapped one instead, which is ground somewhere else entirely.
     pub const fn window_quads(&self) -> u32 {
-        self.window_texels - 2
+        self.window_texels - (1 << self.max_mip())
     }
 
     /// Side length of the hole a ring leaves for the next finer level, in quads.
@@ -458,7 +473,7 @@ mod tests {
 
                     // Every vertex of the finer window, and the half-texel
                     // positions between them that a ray also lands on.
-                    for step in 0..=2 * config.window_quads() {
+                    for step in 0..=2 * (config.window_texels - 1) {
                         let w = f64::from(step) * 0.5;
                         // Where this window position sits in the raster, at
                         // each level's own resolution.
@@ -624,7 +639,7 @@ mod tests {
     #[test]
     fn the_camera_stays_near_the_middle_of_every_window() {
         for config in [config(), wide()] {
-            let half = f64::from(config.window_quads()) * 0.5;
+            let half = f64::from(config.window_texels - 1) * 0.5;
 
             for camera in camera_positions(200) {
                 for level in 0..6 {

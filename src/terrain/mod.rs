@@ -3,6 +3,7 @@
 pub mod clipmap;
 pub mod geotiff;
 pub mod gpu;
+pub mod maxima;
 pub mod mesh;
 pub mod pyramid;
 pub mod tiles;

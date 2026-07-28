@@ -12,6 +12,7 @@ use crate::terrain::clipmap::{
     ClipmapConfig, detail_base, exposed_regions, grid_origin, split_across_seam, window_origin,
 };
 use crate::terrain::geotiff::Georeferencing;
+use crate::terrain::maxima::Maxima;
 use crate::terrain::mesh::{self, PatchKind};
 use crate::terrain::pyramid::{RasterSource, Resident, Srgb8};
 use crate::terrain::tiles::TileStore;
@@ -23,14 +24,39 @@ const MAX_LEVELS: usize = 16;
 /// exaggerating to read clearly. One means true to the data.
 const VERTICAL_EXAGGERATION: f32 = 1.0;
 
-/// Side length of a compute workgroup, in texels of the mip it writes.
-const WORKGROUP: u32 = 8;
-
-/// The coarsest mip of the max pyramid: one texel covering the whole window.
+/// Side length of the squares the max pyramid is reduced in, in texels.
 ///
-/// A window is a power of two texels across, so this is just its exponent.
-const fn max_mip(config: &ClipmapConfig) -> u32 {
-    config.window_texels.trailing_zeros()
+/// Half a tile, by measurement. A window overlaps the same small number of
+/// blocks whatever their size -- two per axis plus one for misalignment -- so a
+/// larger block reads proportionally more ground per build for no fewer builds.
+/// Against `assets/terrain` at a low camera, filling every window from cold took
+/// 45.8 ms at 256 against 61.7 ms at 512; 128 read less again but paid it back
+/// in per-block overhead, at 42.2 ms and a worse worst frame.
+const MAXIMA_BLOCK: u32 = 256;
+
+/// Slack over the blocks a frame actually touches, before the cache starts
+/// dropping them.
+///
+/// The working set is every block a window overlaps, at every level, and all of
+/// it is read every frame; a budget below that would evict blocks the same frame
+/// rebuilds. A quarter over is room for the window to drift onto new blocks
+/// without immediately throwing away the ones it is still standing on.
+const MAXIMA_SLACK: usize = 5;
+
+/// How many bytes of reduced blocks to keep, for a clipmap of this shape.
+///
+/// Every level's window is read every frame, so the whole working set has to fit
+/// or the cache thrashes. A window of `w` texels overlaps `w / block + 1` blocks
+/// on each axis, and a block's chain is a third of its own area.
+fn maxima_budget(config: &ClipmapConfig, levels: u32, block: u32) -> usize {
+    let across = (config.window_texels.div_ceil(block) + 1) as usize;
+    let chain = (block as usize).pow(2) / 3 * size_of::<f32>();
+    across.pow(2) * chain * levels as usize * MAXIMA_SLACK / 4
+}
+
+/// The largest of a run of ceilings, which is never empty.
+fn highest(cells: &[f32]) -> f32 {
+    cells.iter().copied().fold(f32::NEG_INFINITY, f32::max)
 }
 
 /// A grid vertex: nothing but its integer position within the shared grid.
@@ -57,6 +83,8 @@ struct LevelUniform {
     spacing: [f32; 2],
     torus: [u32; 2],
     coarse_offset: [f32; 2],
+    ceiling: f32,
+    padding: [f32; 3],
 }
 
 /// Mirrors `Terrain` in the shader.
@@ -76,9 +104,10 @@ struct TerrainUniform {
     max_mip: u32,
     window_quads: f32,
     grid_offset: f32,
+    ceiling: f32,
     // The struct's alignment is that of its widest member, so its size has to
     // stay a multiple of sixteen to match the shader's layout.
-    padding: [u32; 2],
+    padding: u32,
 }
 
 /// A height raster and a matching colour raster, drawn as a geometry clipmap.
@@ -114,37 +143,29 @@ pub struct Terrain {
     /// Reused between uploads so a moving camera allocates nothing.
     staging: Vec<u8>,
 
+    /// The quadtree the far field is raymarched through, reduced on the CPU.
+    ///
+    /// Anchored to the raster rather than to any window, which is what lets it
+    /// travel through the same incremental upload path as the heights; see
+    /// [`crate::terrain::maxima`].
+    maxima: Maxima,
+    /// A mirror of the coarsest cells of each level, in window order.
+    ///
+    /// The far field's cheapest early out is "above everything and climbing",
+    /// and answering it needs the highest ground anywhere resident. Kept on the
+    /// CPU because there is no single texel to read it from: the pyramid stops
+    /// three depths short of covering a whole window in one cell.
+    ceilings: Vec<Vec<f32>>,
+
     height_texture: wgpu::Texture,
     colour_texture: wgpu::Texture,
-    /// The max pyramid itself, kept only so a test can copy it back.
-    ///
-    /// Drawing does not need the handle: the bind groups below hold views of it,
-    /// and wgpu resources are reference counted, so the texture outlives this
-    /// struct field whether or not it exists.
-    #[cfg(test)]
-    maxima: wgpu::Texture,
+    maxima_texture: wgpu::Texture,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
     /// Draws everything past the near radius by raymarching the max pyramid.
     far_pipeline: wgpu::RenderPipeline,
     far_group: wgpu::BindGroup,
-
-    /// Builds the quadtree the far field is raymarched through.
-    ///
-    /// Layer `l` mip `m` texel `(i, j)` ends up an upper bound on level `l`'s
-    /// surface across the closed square `[i*2^m, (i+1)*2^m]` on each axis of its
-    /// window, so a ray staying above that value skips the whole square in one
-    /// step. `cell_max` writes the finest mip from the height windows and
-    /// `reduce` folds each mip into the next.
-    cell_max_pipeline: wgpu::ComputePipeline,
-    reduce_pipeline: wgpu::ComputePipeline,
-    cell_max_group: wgpu::BindGroup,
-    /// One per mip above the finest: the mip below it read, this one written.
-    ///
-    /// Built once, because the views never change; only how many layers are
-    /// dispatched varies, with the base level.
-    reduce_groups: Vec<wgpu::BindGroup>,
 
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
@@ -262,20 +283,21 @@ impl Terrain {
         );
 
         // Unlike the clipmap's own textures, this one is a real mip chain: the
-        // array indexes clipmap level, the mips index quadtree depth within a
-        // level's window. `COPY_SRC` is not needed to draw, only so a test can
-        // read the pyramid back and check it against a reference built on the
-        // CPU -- which is cheap enough to be worth paying for always rather than
-        // building a differently-shaped texture under `cfg(test)`.
-        let maxima = device.create_texture(&wgpu::TextureDescriptor {
+        // array indexes clipmap level, the mips index quadtree depth. It stops
+        // three short of a single texel per layer; see `ClipmapConfig::max_mip`.
+        // `COPY_SRC` is not needed to draw, only so a test can read the pyramid
+        // back and check it against a reference built on the CPU -- which is
+        // cheap enough to be worth paying for always rather than building a
+        // differently-shaped texture under `cfg(test)`.
+        let maxima_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("terrain maxima"),
             size: layers,
-            mip_level_count: max_mip(&config) + 1,
+            mip_level_count: config.max_mip() + 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::R32Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -315,8 +337,7 @@ impl Terrain {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT
-                        .union(wgpu::ShaderStages::COMPUTE),
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -326,11 +347,9 @@ impl Terrain {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    // Every stage: the vertex stage places the mesh on it,
-                    // compute builds the max pyramid over it, and the fragment
-                    // stage reads it at the leaf of a raymarch.
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT
-                        .union(wgpu::ShaderStages::COMPUTE),
+                    // Both stages: the vertex stage places the mesh on it, and
+                    // the fragment stage reads it at the leaf of a raymarch.
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         // Only ever `textureLoad`ed, so filtering support for
                         // 32-bit floats is not needed on the device.
@@ -384,111 +403,6 @@ impl Terrain {
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("../terrain.wgsl"));
 
-        // Two layouts rather than one with an unused entry, because a bind group
-        // has to supply everything its layout declares: a shared layout would
-        // force the first pass to name some view as its source, and the only
-        // view it could name is the mip it is about to write. Sampling and
-        // storing the same subresource in one dispatch is a validation error.
-        let storage_target = wgpu::BindGroupLayoutEntry {
-            binding: 1,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::StorageTexture {
-                access: wgpu::StorageTextureAccess::WriteOnly,
-                format: wgpu::TextureFormat::R32Float,
-                view_dimension: wgpu::TextureViewDimension::D2Array,
-            },
-            count: None,
-        };
-        let cell_max_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("terrain cell max layout"),
-            entries: &[storage_target],
-        });
-        let reduce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("terrain pyramid reduce layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                storage_target,
-            ],
-        });
-
-        // A view of one mip, across every layer. Single-mip on both sides of a
-        // reduction: a storage view is required to be one mip, and an all-mip
-        // view bound beside a storage view of a mip it contains would overlap.
-        let mip_view = |mip: u32, label: &str| {
-            maxima.create_view(&wgpu::TextureViewDescriptor {
-                label: Some(label),
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                base_mip_level: mip,
-                mip_level_count: Some(1),
-                ..Default::default()
-            })
-        };
-
-        let cell_max_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("terrain cell max"),
-            layout: &cell_max_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&mip_view(0, "terrain maxima mip 0")),
-            }],
-        });
-        let reduce_groups = (1..=max_mip(&config))
-            .map(|mip| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("terrain pyramid reduce"),
-                    layout: &reduce_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&mip_view(
-                                mip - 1,
-                                "terrain maxima source",
-                            )),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&mip_view(
-                                mip,
-                                "terrain maxima target",
-                            )),
-                        },
-                    ],
-                })
-            })
-            .collect();
-
-        // Group 3 rather than 0, so that the groups the render pipelines share
-        // -- the camera at 0 and the terrain at 1 -- keep their numbering in a
-        // shader module every pipeline is compiled from.
-        let compute_pipeline = |entry: &str, group: &wgpu::BindGroupLayout| {
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("terrain pyramid pipeline layout"),
-                bind_group_layouts: &[None, Some(&terrain_layout), None, Some(group)],
-                immediate_size: 0,
-            });
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(&layout),
-                module: &shader,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        };
-        let cell_max_pipeline = compute_pipeline("cs_cell_max", &cell_max_layout);
-        let reduce_pipeline = compute_pipeline("cs_reduce", &reduce_layout);
-
-        // The far pass reads every mip at once, which is why this view is
-        // separate from the single-mip pair the reductions run between.
         let far_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain far bind group layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -507,7 +421,7 @@ impl Terrain {
             layout: &far_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&array_view(&maxima)),
+                resource: wgpu::BindingResource::TextureView(&array_view(&maxima_texture)),
             }],
         });
 
@@ -635,6 +549,7 @@ impl Terrain {
 
         let height_range = Self::coarsest_height_range(heights.as_ref(), &placement);
         let window_bytes = (window * window) as usize;
+        let ceiling_texels = ((window >> config.max_mip()) as usize).pow(2);
         Self {
             config,
             placement,
@@ -646,19 +561,19 @@ impl Terrain {
             detail: (0, 0.0),
             ground: vec![0.0; window_bytes],
             staging: vec![0; window_bytes * size_of::<Srgb8>().max(size_of::<f32>())],
+            maxima: Maxima::new(
+                MAXIMA_BLOCK,
+                maxima_budget(&config, level_count, MAXIMA_BLOCK),
+            ),
+            ceilings: vec![vec![f32::NEG_INFINITY; ceiling_texels]; level_count as usize],
             height_texture,
             colour_texture,
-            #[cfg(test)]
-            maxima,
+            maxima_texture,
             uniform,
             bind_group,
             pipeline,
             far_pipeline,
             far_group,
-            cell_max_pipeline,
-            reduce_pipeline,
-            cell_max_group,
-            reduce_groups,
             vertices,
             indices,
             index_ranges,
@@ -688,27 +603,6 @@ impl Terrain {
     #[cfg(test)]
     pub fn base_level(&self) -> u32 {
         self.detail.0
-    }
-
-    /// One level's resident window, in window order and after exaggeration.
-    ///
-    /// Read back from the raster source rather than from the texture, so a test
-    /// comparing the max pyramid against it is comparing against the ground the
-    /// upload was asked for and not against the same GPU state twice.
-    #[cfg(test)]
-    pub fn window_heights(&self, level: u32) -> Vec<f32> {
-        let window = self.config.window_texels;
-        let mut heights = vec![0f32; (window * window) as usize];
-        self.heights.read_rect(
-            level,
-            self.origins[level as usize],
-            UVec2::splat(window),
-            bytemuck::cast_slice_mut(&mut heights),
-        );
-        for height in &mut heights {
-            *height *= VERTICAL_EXAGGERATION;
-        }
-        heights
     }
 
     /// Moves every level's window to follow the camera, uploading only the
@@ -775,10 +669,16 @@ impl Terrain {
             base_level: base,
             base_morph,
             near_radius: near_radius as f32,
-            max_mip: max_mip(&self.config),
+            max_mip: self.config.max_mip(),
             window_quads: self.config.window_quads() as f32,
             grid_offset: self.config.margin() as f32,
-            padding: [0; 2],
+            // Across every level being marched, because a ray leaving a fine
+            // window carries on into a coarse one and could meet either.
+            ceiling: self.ceilings[base as usize..]
+                .iter()
+                .map(|level| highest(level))
+                .fold(f32::NEG_INFINITY, f32::max),
+            padding: 0,
         };
 
         for (level, &new) in placed.iter().enumerate() {
@@ -802,6 +702,8 @@ impl Terrain {
                     new.y.rem_euclid(window as i32) as u32,
                 ],
                 coarse_offset: [coarse_offset.x as f32, coarse_offset.y as f32],
+                ceiling: highest(&self.ceilings[level]),
+                padding: [0.0; 3],
             };
         }
 
@@ -817,15 +719,17 @@ impl Terrain {
     /// nothing for an incremental update to keep in that case.
     fn refresh(&mut self, queue: &wgpu::Queue, level: usize, new: IVec2) {
         let window = self.config.window_texels;
-        let regions = if self.filled[level] {
+        let filled = self.filled[level];
+        let whole = |origin: IVec2, span: u32| crate::terrain::clipmap::Rect {
+            x: origin.x,
+            y: origin.y,
+            width: span,
+            height: span,
+        };
+        let regions = if filled {
             exposed_regions(self.origins[level], new, window)
         } else {
-            vec![crate::terrain::clipmap::Rect {
-                x: new.x,
-                y: new.y,
-                width: window,
-                height: window,
-            }]
+            vec![whole(new, window)]
         };
 
         for region in regions {
@@ -833,6 +737,31 @@ impl Terrain {
                 self.upload(queue, level as u32, piece, destination);
             }
         }
+
+        // The pyramid's cells are anchored to the raster, so depth `m`'s window
+        // is the level's own origin divided down -- an arithmetic shift, which
+        // floors for negative origins exactly as the cells do. That is what
+        // makes the same incremental machinery work for every depth: each has
+        // its own origin, its own span, and its own seam, and nothing about it
+        // depends on where the window happens to have stopped.
+        //
+        // A depth only moves once the origin crosses a multiple of `2^m`, so
+        // most frames touch only the finest one or two.
+        for mip in 0..=self.config.max_mip() {
+            let (was, now) = (self.origins[level] >> mip, new >> mip);
+            let span = window >> mip;
+            let regions = if filled {
+                exposed_regions(was, now, span)
+            } else {
+                vec![whole(now, span)]
+            };
+            for region in regions {
+                for (piece, destination) in split_across_seam(region, span) {
+                    self.upload_maxima(queue, level as u32, mip, piece, destination);
+                }
+            }
+        }
+
         self.origins[level] = new;
         self.filled[level] = true;
     }
@@ -924,6 +853,72 @@ impl Terrain {
         self.colours
             .read_rect(level, piece.origin(), size, &mut self.staging[..bytes]);
         copy(&self.colour_texture, 4, &self.staging[..bytes]);
+    }
+
+    /// Copies one seam-free piece of one depth of the max pyramid.
+    fn upload_maxima(
+        &mut self,
+        queue: &wgpu::Queue,
+        level: u32,
+        mip: u32,
+        piece: crate::terrain::clipmap::Rect,
+        destination: UVec2,
+    ) {
+        let size = piece.size();
+        let texels = (size.x * size.y) as usize;
+        let bytes = texels * size_of::<f32>();
+        let cells: &mut [f32] = bytemuck::cast_slice_mut(&mut self.staging[..bytes]);
+        self.maxima.read_rect(
+            self.heights.as_ref(),
+            level,
+            mip,
+            piece.origin(),
+            size,
+            cells,
+        );
+        if VERTICAL_EXAGGERATION != 1.0 {
+            for cell in cells.iter_mut() {
+                *cell *= VERTICAL_EXAGGERATION;
+            }
+        }
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.maxima_texture,
+                mip_level: mip,
+                origin: wgpu::Origin3d {
+                    x: destination.x,
+                    y: destination.y,
+                    z: level,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.staging[..bytes],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size.x * size_of::<f32>() as u32),
+                rows_per_image: Some(size.y),
+            },
+            wgpu::Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // The coarsest depth is small enough to mirror whole, and mirroring it
+        // from the same staging buffer at the same destination keeps it wrapped
+        // around the torus exactly as the texture is.
+        if mip == self.config.max_mip() {
+            let cells: &[f32] = bytemuck::cast_slice(&self.staging[..bytes]);
+            let span = (self.config.window_texels >> mip) as usize;
+            for row in 0..size.y as usize {
+                let from = row * size.x as usize;
+                let to = (destination.y as usize + row) * span + destination.x as usize;
+                self.ceilings[level as usize][to..to + size.x as usize]
+                    .copy_from_slice(&cells[from..from + size.x as usize]);
+            }
+        }
     }
 
     /// Copies a just-uploaded piece of the coarsest window into the CPU mirror.
@@ -1077,48 +1072,6 @@ impl Terrain {
         }
     }
 
-    /// Rebuilds the max pyramid over the windows [`Terrain::update`] left.
-    ///
-    /// Records its own compute pass, so it has to be called on the frame's
-    /// encoder between `update` and [`Terrain::draw`]. `update` has only a
-    /// queue, and that is fine: wgpu runs a submission's queued writes before
-    /// its encoder's commands, so the uploads are in place by the first
-    /// dispatch.
-    ///
-    /// The whole chain is rebuilt every frame rather than patched where the
-    /// windows moved. Almost every frame moves almost every window, and at a
-    /// third of a million texels a level this is a fraction of a millisecond --
-    /// far less than working out which cells an incremental update would have to
-    /// touch.
-    pub fn build_pyramid(&self, encoder: &mut wgpu::CommandEncoder) {
-        // Levels below the base are neither uploaded nor drawn nor marched, so
-        // there is nothing to bound. At altitude that is most of them.
-        let layers = self.origins.len() as u32 - self.detail.0;
-        let window = self.config.window_texels;
-
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("terrain pyramid pass"),
-            timestamp_writes: None,
-        });
-
-        pass.set_pipeline(&self.cell_max_pipeline);
-        pass.set_bind_group(1, &self.bind_group, &[]);
-        pass.set_bind_group(3, &self.cell_max_group, &[]);
-        let groups = window.div_ceil(WORKGROUP);
-        pass.dispatch_workgroups(groups, groups, layers);
-
-        // Consecutive dispatches in one pass are ordered against each other, so
-        // each mip sees the one below it finished without a pass boundary.
-        pass.set_pipeline(&self.reduce_pipeline);
-        pass.set_bind_group(1, &self.bind_group, &[]);
-        for (mip, group) in self.reduce_groups.iter().enumerate() {
-            let size = (window >> (mip + 1)).max(1);
-            pass.set_bind_group(3, group, &[]);
-            let groups = size.div_ceil(WORKGROUP);
-            pass.dispatch_workgroups(groups, groups, layers);
-        }
-    }
-
     /// Records the terrain into an already-started render pass.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_pipeline(&self.pipeline);
@@ -1153,7 +1106,7 @@ mod tests {
     use crate::terrain::pyramid::{Level, Pyramid};
 
     /// Small enough to keep the readback cheap, large enough that the pyramid
-    /// has six mips to disagree over.
+    /// has three depths to disagree over.
     fn test_config() -> ClipmapConfig {
         ClipmapConfig {
             block_verts: 8,
@@ -1175,83 +1128,36 @@ mod tests {
             .collect()
     }
 
-    /// What the compute passes are supposed to produce, in plain Rust.
+    /// The highest sample in the closed square a cell covers, read straight
+    /// from the raster.
     ///
-    /// Mip 0 takes the four corners of each quad rather than the one sample the
-    /// cell is named after, which is what makes a cell an upper bound over the
-    /// ground *between* samples and not just at them.
-    fn reference_pyramid(window: &[f32], side: u32) -> Vec<Vec<f32>> {
-        let last = side - 1;
-        let at = |x: u32, y: u32| window[(y * side + x) as usize];
-
-        let mut base = vec![0f32; (side * side) as usize];
-        for y in 0..side {
-            for x in 0..side {
-                let (fx, fy) = ((x + 1).min(last), (y + 1).min(last));
-                base[(y * side + x) as usize] =
-                    at(x, y).max(at(fx, y)).max(at(x, fy)).max(at(fx, fy));
-            }
-        }
-
-        let mut mips = vec![base];
-        let mut size = side;
-        while size > 1 {
-            let finer = mips.last().expect("the base is always there");
-            let half = size / 2;
-            let mut coarse = vec![0f32; (half * half) as usize];
-            for y in 0..half {
-                for x in 0..half {
-                    let cell =
-                        |dx: u32, dy: u32| finer[((2 * y + dy) * size + 2 * x + dx) as usize];
-                    coarse[(y * half + x) as usize] =
-                        cell(0, 0).max(cell(1, 0)).max(cell(0, 1)).max(cell(1, 1));
-                }
-            }
-            mips.push(coarse);
-            size = half;
-        }
-        mips
+    /// An oracle deliberately independent of everything the upload path does:
+    /// it knows only which ground a cell is named after, and asks the source
+    /// what stands on it.
+    fn cell_ceiling(source: &dyn RasterSource, level: u32, mip: u32, cell: IVec2) -> f32 {
+        let span = 1i32 << mip;
+        let side = span as u32 + 1;
+        let mut samples = vec![0f32; (side * side) as usize];
+        source.read_rect(
+            level,
+            cell * span,
+            UVec2::splat(side),
+            bytemuck::cast_slice_mut(&mut samples),
+        );
+        samples.iter().copied().fold(f32::NEG_INFINITY, f32::max)
     }
 
+    /// Every texel of the pyramid bounds the ground it claims, and sits where
+    /// the raymarcher will go looking for it.
+    ///
+    /// Both halves matter and they fail differently. A wrong *value* lets rays
+    /// through ridges; a wrong *position* is worse, because the cells are
+    /// anchored to the raster while the window is not, so a version that walked
+    /// the cells in window coordinates would read the ceiling of a neighbouring
+    /// cell and be wrong by one cell everywhere except when the origin happened
+    /// to land on a multiple of the cell size.
     #[test]
-    fn a_cell_bounds_every_sample_it_covers() {
-        let side = 32;
-        let window: Vec<f32> = (0..side * side)
-            .map(|i| {
-                let (x, y) = ((i % side) as f32, (i / side) as f32);
-                (x * 1.1).sin() * 70.0 + (y * 0.7).cos() * 45.0
-            })
-            .collect();
-        let mips = reference_pyramid(&window, side);
-        assert_eq!(mips.len(), 6, "32 texels should reduce to one in six mips");
-
-        // The property the whole traversal rests on, stated over the *closed*
-        // square. Bounding only the half-open one -- the samples strictly inside
-        // -- would leave a ray free to pass between the last sample of one cell
-        // and the first of the next, straight through any ridge standing there.
-        for (mip, cells) in mips.iter().enumerate() {
-            let span = 1u32 << mip;
-            let across = side >> mip;
-            for j in 0..across {
-                for i in 0..across {
-                    let bound = cells[(j * across + i) as usize];
-                    for y in (j * span)..=((j + 1) * span).min(side - 1) {
-                        for x in (i * span)..=((i + 1) * span).min(side - 1) {
-                            let sample = window[(y * side + x) as usize];
-                            assert!(
-                                bound >= sample,
-                                "mip {mip} cell ({i}, {j}) bounds {bound} \
-                                 but ({x}, {y}) stands at {sample}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_max_pyramid_on_the_gpu_matches_the_one_on_the_cpu() {
+    fn every_cell_of_the_pyramid_bounds_the_ground_it_covers() {
         let (device, queue) = crate::scene::test_device();
         let camera_layout = crate::scene::test_camera_layout(&device);
         let config = test_config();
@@ -1271,16 +1177,18 @@ mod tests {
             ))),
         );
 
-        // Low enough that no level is dropped for altitude, so every layer of
-        // the pyramid is dispatched and every one of them is checked.
-        terrain.update(&queue, Vec3::new(0.0, 100.0, 0.0));
+        // Off any round number, so that a window origin is not a multiple of a
+        // coarse cell and reading the cells in window order would be visibly
+        // wrong. Low enough that no level is dropped for altitude, so every
+        // layer is uploaded and every one of them is checked.
+        terrain.update(&queue, Vec3::new(137.0, 100.0, -71.0));
         assert_eq!(terrain.base_level(), 0, "the test wants every level built");
         let levels = terrain.origins.len() as u32;
 
         // Rows in a texture-to-buffer copy are padded to 256 bytes, which the
-        // finer mips of a 32-texel window are well short of.
+        // coarser mips of a 32-texel window are well short of.
         let stride = |size: u32| (size * 4).div_ceil(256) * 256;
-        let readbacks: Vec<wgpu::Buffer> = (0..=max_mip(&config))
+        let readbacks: Vec<wgpu::Buffer> = (0..=config.max_mip())
             .map(|mip| {
                 let size = (window >> mip).max(1);
                 device.create_buffer(&wgpu::BufferDescriptor {
@@ -1293,12 +1201,11 @@ mod tests {
             .collect();
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        terrain.build_pyramid(&mut encoder);
         for (mip, readback) in readbacks.iter().enumerate() {
             let size = (window >> mip).max(1);
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
-                    texture: &terrain.maxima,
+                    texture: &terrain.maxima_texture,
                     mip_level: mip as u32,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -1327,25 +1234,36 @@ mod tests {
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll failed");
 
+        let mut checked = 0;
         for level in 0..levels {
-            let expected = reference_pyramid(&terrain.window_heights(level), window);
             for (mip, readback) in readbacks.iter().enumerate() {
-                let size = (window >> mip).max(1);
-                let stride = stride(size) as usize;
+                let mip = mip as u32;
+                let span = (window >> mip).max(1) as i32;
+                let stride = stride(span as u32) as usize;
                 let bytes = readback.get_mapped_range(..).expect("buffer not mapped");
-                let layer = &bytes[level as usize * stride * size as usize..];
-                for y in 0..size as usize {
-                    let row: &[f32] =
-                        bytemuck::cast_slice(&layer[y * stride..y * stride + size as usize * 4]);
-                    for (x, &got) in row.iter().enumerate() {
-                        let want = expected[mip][y * size as usize + x];
-                        assert_eq!(
-                            got, want,
-                            "level {level} mip {mip} texel ({x}, {y}): {got} not {want}"
+                let layer = &bytes[level as usize * stride * span as usize..];
+
+                // Where the window's first cell falls on the raster. An
+                // arithmetic shift, which floors for the negative origins a
+                // window near the raster's edge legally has.
+                let base = terrain.origins[level as usize] >> mip;
+                for j in 0..span {
+                    for i in 0..span {
+                        let cell = base + IVec2::new(i, j);
+                        let (x, y) = (cell.x.rem_euclid(span), cell.y.rem_euclid(span));
+                        let row: &[f32] = bytemuck::cast_slice(
+                            &layer[y as usize * stride..y as usize * stride + span as usize * 4],
                         );
+                        let want = cell_ceiling(terrain.heights.as_ref(), level, mip, cell);
+                        assert_eq!(
+                            row[x as usize], want,
+                            "level {level} mip {mip} cell {cell} landed at ({x}, {y})"
+                        );
+                        checked += 1;
                     }
                 }
             }
         }
+        assert!(checked > 1000, "only {checked} cells were checked");
     }
 }

@@ -35,6 +35,15 @@ struct Level {
     // Where this window's origin lands in the next coarser window, so a vertex
     // can find its own position on the level it blends towards.
     coarse_offset: vec2<f32>,
+    // The highest ground anywhere in this window. The pyramid's coarsest cell
+    // covers only an eighth of a window, so this is the one bound a ray can
+    // clear a whole level with in a single test -- which is most of what a ray
+    // heading for the horizon does, level after level.
+    ceiling: f32,
+    // Uniform arrays need a stride that is a multiple of sixteen, so a level is
+    // forty-eight bytes whether or not it has anything to say in the last few.
+    padding: f32,
+    more_padding: vec2<f32>,
 };
 
 struct Terrain {
@@ -77,7 +86,10 @@ struct Terrain {
     // centred in the window, so this is what turns a grid coordinate -- which is
     // what the mesh's vertices carry -- into a window one.
     grid_offset: f32,
-    padding: vec2<u32>,
+    // The highest ground anywhere currently resident, taken across the coarsest
+    // cell of every level being marched. A ray above it and climbing is sky.
+    ceiling: f32,
+    padding: u32,
 };
 
 @group(1) @binding(0) var<uniform> terrain: Terrain;
@@ -302,90 +314,22 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 // ---------------------------------------------------------------------------
 // The max pyramid
 //
-// A quadtree over each level's height window, built fresh every frame, that the
-// far field is raymarched through. Layer `l` mip `m` texel (i, j) is an upper
-// bound on level `l`'s surface across the closed square
-// `[i*2^m, (i+1)*2^m] x [j*2^m, (j+1)*2^m]` of its window, so a ray that stays
-// above that value cannot hit anything inside the square and skips the lot in
-// one step.
+// A quadtree over each level's heights, that the far field is raymarched
+// through. Layer `l` mip `m` bounds level `l`'s surface across a closed square
+// of `2^m` samples on a side, so a ray that stays above a cell's value cannot
+// hit anything inside it and skips the lot in one step.
 //
-// Held in window space rather than the toroidal layout the height texture uses.
-// Window origins are only ever snapped to *even* texels, so a 2x2 reduction of
-// the torus lines up at the first mip and at no mip above it -- from the second
-// up it would be taking the maximum of texels either side of the seam, which are
-// kilometres apart on the ground. Copying into window space costs one pass and
-// keeps the torus out of the raymarching path entirely.
+// Built on the CPU and uploaded as strips beside the heights themselves, in
+// `terrain::maxima`, which is where the reasoning about how it is anchored
+// lives. What matters here is the consequence: its cells are anchored to the
+// raster rather than to the window, so a cell's boundaries fall wherever the
+// raster's own multiples of `2^m` fall and not where the window happens to
+// start. Adding the window's torus offset before dividing is what lines the two
+// up -- and it is also what makes the lookup toroidal, exactly as the height
+// texture's is.
 // ---------------------------------------------------------------------------
 
 @group(2) @binding(0) var maxima: texture_2d_array<f32>;
-
-// Only read by `cs_reduce`; `cs_cell_max` sources the height texture instead, so
-// its layout does not carry this binding.
-@group(3) @binding(0) var pyramid_source: texture_2d_array<f32>;
-@group(3) @binding(1) var pyramid_target: texture_storage_2d_array<r32float, write>;
-
-// The finest mip: for each quad of the window, the highest of its four corners.
-//
-// Bounding the *quad* rather than the sample is the whole point. A cell holding
-// only the height at its own corner would say nothing about the surface between
-// that corner and the next, and a ray skipping such a cell can pass clean
-// through a ridge rising between two samples. That failure shows up as pinholes
-// of sky scattered across the far field, which is the worst way this can go
-// wrong -- so the base of the reduction is per-quad, and every mip above it
-// inherits the property by induction.
-@compute @workgroup_size(8, 8, 1)
-fn cs_cell_max(@builtin(global_invocation_id) id: vec3<u32>) {
-    // Levels below the base are not being uploaded, so their windows hold
-    // whatever ground they were abandoned over. The dispatch starts at the base
-    // and the raymarcher never descends below it.
-    let layer = id.z + terrain.base_level;
-    if (layer >= terrain.level_count || any(id.xy > vec2<u32>(terrain.window_mask))) {
-        return;
-    }
-
-    // The window's last row and column have no quad beyond them. Clamping keeps
-    // those cells bounding a degenerate square of their own rather than wrapping
-    // round the torus to unrelated ground.
-    let near = vec2<i32>(id.xy);
-    let far = vec2<i32>(min(id.xy + vec2<u32>(1u), vec2<u32>(terrain.window_mask)));
-    let a = height_at(layer, near);
-    let b = height_at(layer, vec2<i32>(far.x, near.y));
-    let c = height_at(layer, vec2<i32>(near.x, far.y));
-    let d = height_at(layer, far);
-
-    textureStore(
-        pyramid_target,
-        id.xy,
-        layer,
-        vec4<f32>(max(max(a, b), max(c, d)), 0.0, 0.0, 0.0),
-    );
-}
-
-// Every mip above the first: the maximum of the four cells beneath it.
-//
-// Self-describing from the target's own size, so the mip being written never has
-// to be passed in and the pipeline needs no immediates.
-@compute @workgroup_size(8, 8, 1)
-fn cs_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
-    let layer = id.z + terrain.base_level;
-    let size = textureDimensions(pyramid_target);
-    if (layer >= terrain.level_count || any(id.xy >= size)) {
-        return;
-    }
-
-    let s = vec2<i32>(id.xy * 2u);
-    let a = textureLoad(pyramid_source, s, layer, 0).r;
-    let b = textureLoad(pyramid_source, s + vec2<i32>(1, 0), layer, 0).r;
-    let c = textureLoad(pyramid_source, s + vec2<i32>(0, 1), layer, 0).r;
-    let d = textureLoad(pyramid_source, s + vec2<i32>(1, 1), layer, 0).r;
-
-    textureStore(
-        pyramid_target,
-        id.xy,
-        layer,
-        vec4<f32>(max(max(a, b), max(c, d)), 0.0, 0.0, 0.0),
-    );
-}
 
 // ---------------------------------------------------------------------------
 // The raymarched far field
@@ -505,11 +449,46 @@ fn march(eye: vec3<f32>, dir: vec3<f32>, start: f32) -> Hit {
             continue;
         }
 
+        // A whole level cleared in one test, before any cell of it is looked at.
+        //
+        // The pyramid's coarsest cell covers an eighth of a window, so without
+        // this a ray heading for the horizon would step across every level it
+        // passes through eight cells at a time -- and most of those levels have
+        // nothing in them it could possibly hit. Only worth asking at the
+        // coarsest depth: below that the ray has already found something.
+        if (mip == terrain.max_mip) {
+            let edge = select(
+                vec2<f32>(0.0),
+                vec2<f32>(terrain.window_quads),
+                wd > vec2<f32>(0.0),
+            );
+            let reach = (edge - w) / wd;
+            let leaves = t + max(min(
+                select(NEVER, reach.x, abs(wd.x) > 0.0),
+                select(NEVER, reach.y, abs(wd.y) > 0.0),
+            ), 0.0);
+            let out_t = min(leaves, limit);
+            if (min(eye.y + dir.y * t, eye.y + dir.y * out_t) > terrain.levels[level].ceiling) {
+                // Past the edge, so the next step hands the ray over.
+                t = out_t + 0.001 / max(max(abs(wd.x), abs(wd.y)), 1.0 / NEVER);
+                moved = true;
+                continue;
+            }
+        }
+
         // Where the ray leaves the cell it is standing in, at this mip.
+        //
+        // Measured from the window's torus offset rather than from its origin,
+        // because the pyramid's cells are anchored to the raster: a cell of
+        // `2^mip` samples starts wherever the raster's own multiples of `2^mip`
+        // fall, which is `torus mod 2^mip` texels into the window. Walking the
+        // cells in window coordinates instead would take the ceiling of one cell
+        // for the ground of its neighbour.
         let size = f32(1u << mip);
-        let cell = floor(w / size);
+        let u = w + vec2<f32>(terrain.levels[level].torus);
+        let cell = floor(u / size);
         let wall = (cell + select(vec2<f32>(0.0), vec2<f32>(1.0), wd > vec2<f32>(0.0))) * size;
-        let cross = (wall - w) / wd;
+        let cross = (wall - u) / wd;
         let span = min(
             select(NEVER, cross.x, abs(wd.x) > 0.0),
             select(NEVER, cross.y, abs(wd.y) > 0.0),
@@ -520,7 +499,15 @@ fn march(eye: vec3<f32>, dir: vec3<f32>, start: f32) -> Hit {
         // the metres they are worth vary by a factor of two per level.
         let nudge = 0.001 / max(max(abs(wd.x), abs(wd.y)), 1.0 / NEVER);
 
-        let ceiling = textureLoad(maxima, vec2<i32>(cell), i32(level), i32(mip)).r;
+        // The cell index wraps the same way the window does, one mip coarser per
+        // halving of the texture.
+        let wrap = i32(terrain.window_mask >> mip);
+        let ceiling = textureLoad(
+            maxima,
+            vec2<i32>(cell) & vec2<i32>(wrap),
+            i32(level),
+            i32(mip),
+        ).r;
         // The cell bounds its whole closed square, so a ray above that ceiling
         // at both ends of the segment is above it throughout.
         if (min(eye.y + dir.y * t, eye.y + dir.y * exit) > ceiling) {
@@ -633,16 +620,11 @@ fn fs_far(in: FarOut) -> FarHit {
     );
     let start = max(terrain.near_radius, 0.0);
 
-    // The coarsest level's top mip is one texel covering every window, so it is
-    // the highest ground anywhere the clipmap can currently see. A ray already
-    // above it and still climbing is never coming back down.
-    let everything = textureLoad(
-        maxima,
-        vec2<i32>(0),
-        i32(terrain.level_count - 1u),
-        i32(terrain.max_mip),
-    ).r;
-    if (dir.y >= 0.0 && eye.y + dir.y * start >= everything) {
+    // A ray already above the highest ground anywhere resident, and still
+    // climbing, is never coming back down. Worth one comparison: at any horizon
+    // view most of the frame is sky, and every one of those pixels would
+    // otherwise walk its ray to the end of the coarsest window before giving up.
+    if (dir.y >= 0.0 && eye.y + dir.y * start >= terrain.ceiling) {
         discard;
         return out;
     }
