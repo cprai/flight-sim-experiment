@@ -95,14 +95,28 @@ impl Scene {
         aspect: f32,
         terrain_root: &std::path::Path,
     ) -> Result<Self> {
-        let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
-        let terrain = Terrain::from_tiles(
+        Self::with_config(
             device,
             format,
-            &camera_layout,
-            ClipmapConfig::default(),
+            aspect,
             terrain_root,
-        )?;
+            ClipmapConfig::default(),
+        )
+    }
+
+    /// As [`Scene::new`], but over a clipmap configured by the caller.
+    ///
+    /// Only [`dump_installed_terrain`] uses this, to time one view with the near
+    /// field cut at several radii; the application takes the default.
+    pub fn with_config(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        aspect: f32,
+        terrain_root: &std::path::Path,
+        config: ClipmapConfig,
+    ) -> Result<Self> {
+        let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
+        let terrain = Terrain::from_tiles(device, format, &camera_layout, config, terrain_root)?;
         Ok(Self::assemble(
             camera_buffer,
             camera_bind_group,
@@ -964,6 +978,11 @@ mod tests {
     /// most of the box. That is the wrong tool for checking one corner of it:
     /// a change confined to ground the default view does not reach renders
     /// byte-identical frames and looks like it did nothing.
+    ///
+    /// `FLIGHT_SIM_NEAR_RINGS` overrides [`ClipmapConfig::near_rings`], so the
+    /// same view can be timed and dumped with the near field cut at different
+    /// radii -- including infinity, which rasterizes the lot, and zero, which
+    /// raymarches it. That comparison is the only way to choose the default.
     #[test]
     #[ignore = "requires a tile pyramid, which is not in version control"]
     fn dump_installed_terrain() {
@@ -994,8 +1013,16 @@ mod tests {
             std::env::var("FLIGHT_SIM_TERRAIN")
                 .expect("set FLIGHT_SIM_TERRAIN to a directory terrain-download wrote"),
         );
-        let mut scene = Scene::new(&device, format, WIDE as f32 / TALL as f32, &root)
-            .expect("failed to open the terrain pyramid");
+        let mut config = ClipmapConfig::default();
+        if let Ok(rings) = std::env::var("FLIGHT_SIM_NEAR_RINGS") {
+            config.near_rings = rings
+                .parse()
+                .expect("FLIGHT_SIM_NEAR_RINGS must be a number");
+        }
+        eprintln!("rasterizing out to {} ring reaches", config.near_rings);
+        let mut scene =
+            Scene::with_config(&device, format, WIDE as f32 / TALL as f32, &root, config)
+                .expect("failed to open the terrain pyramid");
         eprintln!("built the scene in {:.2?}", started.elapsed());
 
         if let Ok(aim) = std::env::var("FLIGHT_SIM_CAMERA") {

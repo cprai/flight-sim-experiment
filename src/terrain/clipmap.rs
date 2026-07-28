@@ -50,7 +50,11 @@ impl Default for ClipmapConfig {
         Self {
             block_verts: 64,
             morph_band: 0.25,
-            near_rings: f32::INFINITY,
+            // Chosen by measurement, not by feel: see the commit that set it.
+            // Four reaches sheds a third of the geometry at low altitude while
+            // moving the frame by 0.11 of 255; eight sheds only a twelfth, and
+            // two starts to show where the ring blend and the march disagree.
+            near_rings: 4.0,
         }
     }
 }
@@ -425,13 +429,18 @@ mod tests {
         // level covers as the camera climbs and the base level rises.
         assert_eq!(config.near_radius(30.0, 3), handover * 8.0);
 
-        // The two ends the far field is tested between.
+        // The two ends the far field is tested between: nothing rasterized, and
+        // nothing raymarched.
         let none = ClipmapConfig {
             near_rings: 0.0,
             ..config
         };
         assert_eq!(none.near_radius(30.0, 4), 0.0);
-        assert!(ClipmapConfig::default().near_radius(1.0, 0).is_infinite());
+        let all = ClipmapConfig {
+            near_rings: f32::INFINITY,
+            ..config
+        };
+        assert!(all.near_radius(30.0, 0).is_infinite());
     }
 
     #[test]
