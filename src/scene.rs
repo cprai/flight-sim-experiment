@@ -606,6 +606,14 @@ mod tests {
     /// check rather than an assertion. Run it with
     /// `FLIGHT_SIM_TERRAIN=/tmp/terrain cargo test --release -- --ignored dump_installed`
     /// and open the file.
+    ///
+    /// `FLIGHT_SIM_CAMERA` overrides the opening view, as
+    /// `x,y,z,yaw,pitch` -- position in metres from the pyramid's centre, then
+    /// two angles in degrees. Without it the scene's own opening camera is
+    /// used, which frames the whole extent and therefore looks at whatever is
+    /// most of the box. That is the wrong tool for checking one corner of it:
+    /// a change confined to ground the default view does not reach renders
+    /// byte-identical frames and looks like it did nothing.
     #[test]
     #[ignore = "requires a tile pyramid, which is not in version control"]
     fn dump_installed_terrain() {
@@ -639,7 +647,22 @@ mod tests {
         let mut scene = Scene::new(&device, format, WIDE as f32 / TALL as f32, &root)
             .expect("failed to open the terrain pyramid");
         eprintln!("built the scene in {:.2?}", started.elapsed());
-        eprintln!("camera opens at {}", scene.camera.position);
+
+        if let Ok(aim) = std::env::var("FLIGHT_SIM_CAMERA") {
+            let n: Vec<f32> = aim
+                .split(',')
+                .map(|p| p.trim().parse().expect("FLIGHT_SIM_CAMERA wants numbers"))
+                .collect();
+            assert_eq!(n.len(), 5, "FLIGHT_SIM_CAMERA wants x,y,z,yaw,pitch");
+            scene.camera.position = Vec3::new(n[0], n[1], n[2]);
+            scene.camera.orientation =
+                Camera::from_yaw_pitch_roll(n[3].to_radians(), n[4].to_radians(), 0.0);
+        }
+
+        eprintln!(
+            "camera at {} facing {:?}",
+            scene.camera.position, scene.camera.orientation
+        );
         scene.update(&queue);
 
         let bytes_per_row = WIDE * 4;
