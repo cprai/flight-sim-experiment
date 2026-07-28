@@ -74,7 +74,15 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let depth = create_depth_view(&device, config.width, config.height);
-        let scene = Scene::new(&device, format, aspect_ratio(&config), terrain_root)?;
+        // Sized for the surface as it is now. A later resize only changes the
+        // aspect: the clipmap's textures are allocated once, and rebuilding
+        // them mid-flight would mean refilling every window from disk.
+        let scene = Scene::new(
+            &device,
+            format,
+            glam::UVec2::new(config.width, config.height),
+            terrain_root,
+        )?;
 
         Ok(Self {
             window,

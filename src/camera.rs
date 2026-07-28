@@ -22,12 +22,19 @@ pub struct Camera {
     pub z_near: f32,
 }
 
+/// Vertical field of view, in degrees.
+///
+/// Fixed rather than configurable, and named here rather than buried in
+/// [`Camera::new`], because the clipmap sizes its windows from the angle one
+/// pixel subtends -- which is this over the viewport's height.
+pub const FOV_Y_DEGREES: f32 = 60.0;
+
 impl Camera {
     pub fn new(position: Vec3, orientation: Quat, aspect: f32) -> Self {
         Self {
             position,
             orientation,
-            fov_y: 60f32.to_radians(),
+            fov_y: FOV_Y_DEGREES.to_radians(),
             aspect,
             z_near: 1.0,
         }

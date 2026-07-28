@@ -252,8 +252,20 @@ impl Terrain {
     ) -> Self {
         let raster = UVec2::new(placement.width, placement.height);
         let available = heights.level_count().min(colours.level_count());
+        // The caller asks for the window the screen would like; how much of it
+        // is affordable depends on the raster, which only becomes known here.
+        let config = ClipmapConfig {
+            window_texels: config.fit_window(raster, available),
+            ..config
+        };
         let level_count = config.level_count(raster, available).min(MAX_LEVELS as u32);
         let window = config.window_texels;
+        log::info!(
+            "clipmap: {level_count} levels of {window} texels, \
+             {:.0} MiB of texture, reaching {} texels from the camera",
+            config.texture_bytes(level_count) as f64 / (1 << 20) as f64,
+            (config.window_quads() / 2) << (level_count - 1),
+        );
 
         let layers = wgpu::Extent3d {
             width: window,

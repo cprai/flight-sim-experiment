@@ -56,21 +56,54 @@ pub struct ClipmapConfig {
     /// [`f32::INFINITY`] rasterizes everything and zero raymarches everything,
     /// which is how the two halves are tested against each other.
     pub near_rings: f32,
+    /// How many bytes of texture the clipmap may occupy.
+    ///
+    /// A ceiling on [`ClipmapConfig::window_texels`], applied by
+    /// [`ClipmapConfig::fit_window`] once the raster's size is known: the
+    /// window the screen asks for is halved until the textures fit. Memory is
+    /// quadratic in the window, so one halving is four times less.
+    pub memory_budget: usize,
 }
+
+/// Widest window ever asked for, whatever the screen would like.
+///
+/// Not a memory limit -- [`ClipmapConfig::memory_budget`] is that -- but a
+/// limit on how much ground the update path is asked to move in one go. A
+/// window this wide already holds sixteen million texels a level.
+pub const MAX_WINDOW: u32 = 4096;
+
+/// How many texels of a level may cover one pixel, at the worst point of that
+/// level's range.
+///
+/// Level `l` serves from `(window_quads / 2) * 2^(l-1)` texels out to
+/// `(window_quads / 2) * 2^l`, and its texel is `2^l` of the base raster's, so
+/// across a level a texel covers between `2 / (window * pixel)` and
+/// `4 / (window * pixel)` pixels, where `pixel` is the angle one pixel
+/// subtends. The ratio swings by exactly two whatever the window is -- that is
+/// what a power-of-two level chain costs -- so this names the worse end. One
+/// means no texel is ever larger than a pixel; two would allow one to two and
+/// costs a quarter of the memory.
+const TEXELS_PER_PIXEL: f64 = 1.0;
 
 impl Default for ClipmapConfig {
     fn default() -> Self {
         Self {
             block_verts: 64,
-            // Exactly one texel wider than the grid, so the mesh fills the
-            // window and the margin around it is zero.
-            window_texels: 256,
+            // Replaced by `window_for` wherever a viewport height is known, and
+            // capped by `fit_window` once the raster's size is.
+            window_texels: MAX_WINDOW,
             morph_band: 0.25,
             // Chosen by measurement, not by feel: see the commit that set it.
             // Four reaches sheds a third of the geometry at low altitude while
             // moving the frame by 0.11 of 255; eight sheds only a twelfth, and
             // two starts to show where the ring blend and the march disagree.
             near_rings: 4.0,
+            // What a 4096 window costs on the raster this flies: seven levels
+            // of heights, colours and maxima. Sized to admit that rather than
+            // to any round number, because the window is the one knob worth
+            // spending memory on and the sizes it can take are powers of two --
+            // a budget between two of them buys nothing.
+            memory_budget: 1600 << 20,
         }
     }
 }
@@ -127,6 +160,56 @@ impl ClipmapConfig {
     /// read a wrapped one instead, which is ground somewhere else entirely.
     pub const fn window_quads(&self) -> u32 {
         self.window_texels - (1 << self.max_mip())
+    }
+
+    /// The window width that resolves a level's texel to a pixel.
+    ///
+    /// The far field's sharpness is not a property of how hard it is marched
+    /// but of how much ground is resident at each level, and that is the
+    /// window. Anything finer than this is detail the screen cannot show;
+    /// anything coarser is texels visibly larger than pixels in the distance.
+    pub fn window_for(&self, viewport_height: u32, fov_y: f64) -> u32 {
+        let pixel = 2.0 * (fov_y * 0.5).tan() / f64::from(viewport_height.max(1));
+        let wanted = 4.0 / (TEXELS_PER_PIXEL * pixel);
+        (wanted.ceil() as u32)
+            .next_power_of_two()
+            .clamp(self.grid_verts() + 1, MAX_WINDOW)
+    }
+
+    /// Bytes of texture a clipmap of this shape occupies.
+    ///
+    /// Heights and colours are four bytes a texel at full window size; the max
+    /// pyramid is a real mip chain, so it costs about a third again over its
+    /// own base.
+    pub fn texture_bytes(&self, levels: u32) -> usize {
+        let window = self.window_texels as usize;
+        let mut per_level = window * window * (size_of::<f32>() + 4);
+        for mip in 0..=self.max_mip() {
+            let side = (window >> mip).max(1);
+            per_level += side * side * size_of::<f32>();
+        }
+        per_level * levels as usize
+    }
+
+    /// The widest window no wider than this one whose textures fit the budget.
+    ///
+    /// Halving the window quarters the memory and also, usually, drops a level
+    /// -- a narrower window reaches less far, so more of them are needed to
+    /// cross the raster -- so the saving is a little under four each time.
+    pub fn fit_window(&self, raster: UVec2, available: u32) -> u32 {
+        let smallest = self.grid_verts() + 1;
+        let mut window = self.window_texels.max(smallest);
+        while window > smallest {
+            let trial = Self {
+                window_texels: window,
+                ..*self
+            };
+            if trial.texture_bytes(trial.level_count(raster, available)) <= self.memory_budget {
+                break;
+            }
+            window /= 2;
+        }
+        window
     }
 
     /// Side length of the hole a ring leaves for the next finer level, in quads.
@@ -556,6 +639,118 @@ mod tests {
                     "level {level} at {camera}: the grid moved with the window"
                 );
             }
+        }
+    }
+
+    /// The window is sized so that no texel of any level is larger than the
+    /// pixel it lands in -- and no larger than it has to be.
+    ///
+    /// Both halves are the point. Too narrow and the far field is visibly
+    /// blocky however hard it is marched, because the detail is simply not
+    /// resident; too wide and the memory, which is quadratic in this, is spent
+    /// on ground the screen cannot resolve.
+    #[test]
+    fn a_texel_never_covers_more_than_a_pixel() {
+        let config = ClipmapConfig::default();
+        let fov = 60f64.to_radians();
+        let ratio = |window: u32, height: u32| {
+            let pixel = 2.0 * (fov * 0.5).tan() / f64::from(height);
+            // The coarse end of a level's range, where a texel is largest.
+            4.0 / (f64::from(window) * pixel)
+        };
+
+        for height in [360u32, 480, 720, 1080, 1440, 2160] {
+            let window = config.window_for(height, fov);
+            assert!(window.is_power_of_two(), "{height}p asked for {window}");
+            // Past the cap the screen is asking for more than the update path
+            // is willing to move, and distant texels start to show.
+            assert!(
+                ratio(window, height) <= TEXELS_PER_PIXEL || window == MAX_WINDOW,
+                "{height}p at {window} texels leaves {:.2} texels a pixel",
+                ratio(window, height)
+            );
+            // Halving it would not do, or the window is wider than it need be.
+            assert!(
+                window == MAX_WINDOW
+                    || window == config.grid_verts() + 1
+                    || ratio(window / 2, height) > TEXELS_PER_PIXEL,
+                "{height}p could have made do with {}",
+                window / 2
+            );
+        }
+
+        // Twice the pixels wants twice the window, until the cap.
+        assert_eq!(
+            config.window_for(1080, fov),
+            config.window_for(540, fov) * 2
+        );
+    }
+
+    #[test]
+    fn the_window_shrinks_until_its_textures_fit() {
+        let raster = UVec2::splat(100_000);
+        let wanted = ClipmapConfig {
+            window_texels: 4096,
+            ..ClipmapConfig::default()
+        };
+        let cost = |window: u32| {
+            let trial = ClipmapConfig {
+                window_texels: window,
+                ..wanted
+            };
+            trial.texture_bytes(trial.level_count(raster, 32))
+        };
+
+        // A budget that fits what was asked for leaves it alone.
+        let roomy = ClipmapConfig {
+            memory_budget: cost(4096),
+            ..wanted
+        };
+        assert_eq!(roomy.fit_window(raster, 32), 4096);
+
+        // One byte short of it drops a halving, and no more than one.
+        let tight = ClipmapConfig {
+            memory_budget: cost(4096) - 1,
+            ..wanted
+        };
+        assert_eq!(tight.fit_window(raster, 32), 2048);
+
+        // Nothing shrinks below the grid the mesh has to draw, however small
+        // the budget: a window narrower than that has no clipmap in it.
+        let starved = ClipmapConfig {
+            memory_budget: 0,
+            ..wanted
+        };
+        assert_eq!(
+            starved.fit_window(raster, 32),
+            starved.grid_verts() + 1,
+            "the mesh still needs its grid"
+        );
+    }
+
+    /// Widening the window is what buys far-field detail, and it pays for
+    /// itself twice: the same ground is covered by fewer, finer levels.
+    #[test]
+    fn a_wider_window_reaches_further_with_fewer_levels() {
+        let raster = UVec2::splat(114_688);
+        let mut previous = u32::MAX;
+        for window in [256u32, 512, 1024, 2048, 4096] {
+            let config = ClipmapConfig {
+                window_texels: window,
+                ..ClipmapConfig::default()
+            };
+            let levels = config.level_count(raster, 32);
+            assert!(
+                levels <= previous,
+                "{window} texels wanted {levels} levels, more than {previous}"
+            );
+            previous = levels;
+            // ... and however few, they still have to reach the far edge.
+            let reach = u64::from(config.window_quads() / 2) << (levels - 1);
+            assert!(
+                reach >= u64::from(raster.x),
+                "{levels} levels of {window} reach only {reach}"
+            );
         }
     }
 

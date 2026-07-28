@@ -1,4 +1,5 @@
 use anyhow::Result;
+use glam::UVec2;
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
@@ -89,29 +90,35 @@ pub struct Scene {
 
 impl Scene {
     /// Opens the terrain tile pyramid and frames the camera on it.
+    ///
+    /// `viewport` is the target's size in pixels, not merely its aspect: how
+    /// much ground the clipmap keeps resident at each level is chosen so that
+    /// a texel of it lands on about a pixel, and that needs the pixel count.
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        aspect: f32,
+        viewport: UVec2,
         terrain_root: &std::path::Path,
     ) -> Result<Self> {
-        Self::with_config(
-            device,
-            format,
-            aspect,
-            terrain_root,
-            ClipmapConfig::default(),
-        )
+        let base = ClipmapConfig::default();
+        let config = ClipmapConfig {
+            window_texels: base.window_for(
+                viewport.y,
+                f64::from(crate::camera::FOV_Y_DEGREES).to_radians(),
+            ),
+            ..base
+        };
+        Self::with_config(device, format, viewport, terrain_root, config)
     }
 
     /// As [`Scene::new`], but over a clipmap configured by the caller.
     ///
-    /// Only [`dump_installed_terrain`] uses this, to time one view with the near
-    /// field cut at several radii; the application takes the default.
+    /// Only [`dump_installed_terrain`] uses this, to time one view against
+    /// several shapes of clipmap; the application takes the default.
     pub fn with_config(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        aspect: f32,
+        viewport: UVec2,
         terrain_root: &std::path::Path,
         config: ClipmapConfig,
     ) -> Result<Self> {
@@ -121,7 +128,7 @@ impl Scene {
             camera_buffer,
             camera_bind_group,
             terrain,
-            aspect,
+            viewport.x as f32 / viewport.y.max(1) as f32,
         ))
     }
 
@@ -566,6 +573,69 @@ mod tests {
     fn low_and_looking_out(camera: &mut Camera) {
         camera.position = Vec3::new(70.0, 600.0, -110.0);
         camera.orientation = Camera::from_yaw_pitch_roll(0.0, -20f32.to_radians(), 0.0);
+    }
+
+    /// A wider window is the only thing that buys the far field more detail.
+    ///
+    /// The whole arrangement rests on this and nothing else measures it. The
+    /// ground is flat and painted in a one-texel check, so a ray's hit position
+    /// is identical either way and the only thing that can differ is which
+    /// level's colours it reads there. Coarse levels are box filters, so the
+    /// check averages towards a flat wash; a window that keeps finer levels
+    /// resident further out reads it before it has been averaged away.
+    ///
+    /// Measured as the contrast between horizontally adjacent pixels, which is
+    /// what a check surviving looks like and what a wash does not.
+    #[test]
+    fn a_wider_window_reads_finer_ground_at_the_same_distance() {
+        let check: Vec<Srgb8> = (0..RASTER * RASTER)
+            .map(|index| {
+                let (x, y) = (index % RASTER, index / RASTER);
+                if (x + y) % 2 == 0 { RED } else { GREEN }
+            })
+            .collect();
+
+        let contrast = |config: ClipmapConfig| {
+            let (pixels, _) = render_config(
+                ClipmapConfig {
+                    // Nothing rasterized, so every pixel of ground was found by
+                    // a ray and the comparison is of the march alone.
+                    near_rings: 0.0,
+                    ..config
+                },
+                vec![0.0; (RASTER * RASTER) as usize],
+                check.clone(),
+                low_and_looking_out,
+                &[],
+            );
+            let mut total = 0u64;
+            let mut ground = 0u64;
+            for y in 0..SIZE {
+                for x in 0..SIZE - 1 {
+                    let (here, next) = (pixel(&pixels, x, y), pixel(&pixels, x + 1, y));
+                    if is_sky(here) || is_sky(next) {
+                        continue;
+                    }
+                    total += u64::from(here[0].abs_diff(next[0]));
+                    ground += 1;
+                }
+            }
+            assert!(ground > 10_000, "only {ground} pixels of ground to measure");
+            total as f64 / ground as f64
+        };
+
+        let narrow = contrast(test_config());
+        // Four times the width, so that level zero's reach covers the whole of
+        // the raster this camera can see rather than only the near half of it.
+        let wide = contrast(ClipmapConfig {
+            window_texels: 256,
+            ..test_config()
+        });
+        assert!(
+            wide > narrow * 1.8,
+            "widening the window resolved {wide:.2} of contrast against {narrow:.2}, \
+             which is not the detail it was supposed to buy"
+        );
     }
 
     /// The far field on its own draws the ground the mesh would have drawn.
@@ -1077,21 +1147,40 @@ mod tests {
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let depth = create_depth_view(&device, WIDE, TALL);
 
+        // The clipmap reports what it chose and what that costs through `log`,
+        // which is most of what this test exists to read.
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("warn,flight_sim=info"),
+        )
+        .try_init();
+
         let started = std::time::Instant::now();
         let root = std::path::PathBuf::from(
             std::env::var("FLIGHT_SIM_TERRAIN")
                 .expect("set FLIGHT_SIM_TERRAIN to a directory terrain-download wrote"),
         );
         let mut config = ClipmapConfig::default();
+        config.window_texels =
+            config.window_for(TALL, f64::from(crate::camera::FOV_Y_DEGREES).to_radians());
         if let Ok(rings) = std::env::var("FLIGHT_SIM_NEAR_RINGS") {
             config.near_rings = rings
                 .parse()
                 .expect("FLIGHT_SIM_NEAR_RINGS must be a number");
         }
-        eprintln!("rasterizing out to {} ring reaches", config.near_rings);
-        let mut scene =
-            Scene::with_config(&device, format, WIDE as f32 / TALL as f32, &root, config)
-                .expect("failed to open the terrain pyramid");
+        // Overriding the window is how the detail this whole arrangement buys
+        // is measured against what it costs, which is why it is a knob here and
+        // nowhere else.
+        if let Ok(window) = std::env::var("FLIGHT_SIM_WINDOW") {
+            config.window_texels = window
+                .parse()
+                .expect("FLIGHT_SIM_WINDOW must be a power of two");
+        }
+        eprintln!(
+            "rasterizing out to {} ring reaches, windows of {} texels",
+            config.near_rings, config.window_texels
+        );
+        let mut scene = Scene::with_config(&device, format, UVec2::new(WIDE, TALL), &root, config)
+            .expect("failed to open the terrain pyramid");
         eprintln!("built the scene in {:.2?}", started.elapsed());
 
         if let Ok(aim) = std::env::var("FLIGHT_SIM_CAMERA") {
