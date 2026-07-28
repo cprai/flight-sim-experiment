@@ -29,6 +29,20 @@ pub struct ClipmapConfig {
     pub block_verts: u32,
     /// Fraction of a ring's outer edge over which it blends into the next level.
     pub morph_band: f32,
+    /// How far out geometry is rasterized, in ring reaches of the base level.
+    ///
+    /// Ground beyond it is raymarched instead of drawn as triangles, so this is
+    /// where the two halves of the renderer meet. One unit is the distance at
+    /// which the finest level being drawn would normally hand over to the next
+    /// -- the radius of the hole its ring leaves.
+    ///
+    /// Measured in ring reaches rather than metres so that a single figure
+    /// suits a raster of any resolution, and so that the disc widens with
+    /// altitude at exactly the rate the levels inside it coarsen: the triangle
+    /// count it costs then stays roughly flat whatever the camera is doing.
+    /// [`f32::INFINITY`] rasterizes everything and zero raymarches everything,
+    /// which is how the two halves are tested against each other.
+    pub near_rings: f32,
 }
 
 impl Default for ClipmapConfig {
@@ -36,6 +50,7 @@ impl Default for ClipmapConfig {
         Self {
             block_verts: 64,
             morph_band: 0.25,
+            near_rings: f32::INFINITY,
         }
     }
 }
@@ -71,6 +86,18 @@ impl ClipmapConfig {
     /// Side length of the hole a ring leaves for the next finer level, in quads.
     pub const fn hole_quads(&self) -> u32 {
         self.grid_quads() - 2 * self.ring_quads()
+    }
+
+    /// How far out geometry is rasterized, in metres.
+    ///
+    /// `base` is the finest level being drawn, from [`detail_base`]; its ring
+    /// reach is the unit [`ClipmapConfig::near_rings`] counts.
+    pub fn near_radius(&self, metres_per_texel: f64, base: u32) -> f64 {
+        f64::from(self.near_rings)
+            * f64::from(self.hole_quads())
+            * 0.5
+            * f64::from(1u32 << base)
+            * metres_per_texel
     }
 
     /// How many levels are needed to cover a raster of this size.
@@ -346,6 +373,65 @@ mod tests {
         // width whatever the block size, and is what the L-shaped trim fills.
         let footprint = config.grid_quads() / 2;
         assert_eq!(footprint, config.hole_quads() - 1);
+    }
+
+    /// The transform the raymarched far field hands a ray over levels with.
+    ///
+    /// A point's window position on the level outside is
+    /// `w * 0.5 + coarse_offset`, and it has to be *exact*: the march applies it
+    /// to both a position and a direction, so any drift would accumulate over
+    /// every handoff and pull the ray off the line it started on. It is exact
+    /// because window origins are always even, which is what `snap_axis` snaps
+    /// to two for, so equality here is the right assertion rather than a
+    /// tolerance.
+    #[test]
+    fn the_coarse_offset_moves_a_point_between_levels_exactly() {
+        let config = config();
+        for camera in camera_positions(200) {
+            for level in 0..6 {
+                let fine = window_origin(&config, level, camera);
+                let coarse = window_origin(&config, level + 1, camera);
+                let offset = (fine / 2 - coarse).as_dvec2();
+
+                // Every vertex of the finer grid, and the half-texel positions
+                // between them that a ray also lands on.
+                for step in 0..=2 * config.grid_quads() {
+                    let w = f64::from(step) * 0.5;
+                    // Where this window position sits in the raster, at each
+                    // level's own resolution.
+                    let texel = f64::from(fine.x) + w;
+                    assert_eq!(
+                        w * 0.5 + offset.x,
+                        texel / 2.0 - f64::from(coarse.x),
+                        "level {level} at w {w} from camera {camera}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_near_radius_is_a_ring_reach_of_the_level_it_is_measured_from() {
+        let config = ClipmapConfig {
+            near_rings: 1.0,
+            ..config()
+        };
+        // One ring reach is where a level's own ring starts, which is exactly
+        // the distance `detail_base` hands that level over to the next at.
+        let handover = f64::from(config.hole_quads()) * 0.5 * 30.0;
+        assert_eq!(config.near_radius(30.0, 0), handover);
+
+        // And it doubles per level, so the disc keeps pace with the ground each
+        // level covers as the camera climbs and the base level rises.
+        assert_eq!(config.near_radius(30.0, 3), handover * 8.0);
+
+        // The two ends the far field is tested between.
+        let none = ClipmapConfig {
+            near_rings: 0.0,
+            ..config
+        };
+        assert_eq!(none.near_radius(30.0, 4), 0.0);
+        assert!(ClipmapConfig::default().near_radius(1.0, 0).is_infinite());
     }
 
     #[test]

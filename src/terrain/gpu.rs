@@ -72,9 +72,11 @@ struct TerrainUniform {
     data_max: [f32; 2],
     base_level: u32,
     base_morph: f32,
-    // The struct's alignment is that of its widest member, so its size has to be
-    // a multiple of sixteen for the uniform layout to match the shader's.
-    padding: [u32; 2],
+    // These two land exactly in the padding the struct already carried, so its
+    // size is unchanged. Its alignment is that of its widest member, so that
+    // size has to stay a multiple of sixteen to match the shader's layout.
+    near_radius: f32,
+    max_mip: u32,
 }
 
 /// A height raster and a matching colour raster, drawn as a geometry clipmap.
@@ -122,6 +124,9 @@ pub struct Terrain {
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
+    /// Draws everything past the near radius by raymarching the max pyramid.
+    far_pipeline: wgpu::RenderPipeline,
+    far_group: wgpu::BindGroup,
 
     /// Builds the quadtree the far field is raymarched through.
     ///
@@ -313,9 +318,11 @@ impl Terrain {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    // Also compute, which reads the windows to build the max
-                    // pyramid over them.
-                    visibility: wgpu::ShaderStages::VERTEX.union(wgpu::ShaderStages::COMPUTE),
+                    // Every stage: the vertex stage places the mesh on it,
+                    // compute builds the max pyramid over it, and the fragment
+                    // stage reads it at the leaf of a raymarch.
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT
+                        .union(wgpu::ShaderStages::COMPUTE),
                     ty: wgpu::BindingType::Texture {
                         // Only ever `textureLoad`ed, so filtering support for
                         // 32-bit floats is not needed on the device.
@@ -472,6 +479,30 @@ impl Terrain {
         let cell_max_pipeline = compute_pipeline("cs_cell_max", &cell_max_layout);
         let reduce_pipeline = compute_pipeline("cs_reduce", &reduce_layout);
 
+        // The far pass reads every mip at once, which is why this view is
+        // separate from the single-mip pair the reductions run between.
+        let far_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("terrain far bind group layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let far_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terrain far"),
+            layout: &far_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&array_view(&maxima)),
+            }],
+        });
+
         let grid: Vec<GridVertex> = mesh::grid_vertices(&config)
             .into_iter()
             .map(|position| GridVertex { position })
@@ -548,6 +579,52 @@ impl Terrain {
             cache: None,
         });
 
+        let far_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("terrain far pipeline layout"),
+            bind_group_layouts: &[
+                Some(camera_layout),
+                Some(&terrain_layout),
+                Some(&far_layout),
+            ],
+            immediate_size: 0,
+        });
+        let far_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("terrain far pipeline"),
+            layout: Some(&far_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_far"),
+                compilation_options: Default::default(),
+                // One triangle covering the viewport, generated from the vertex
+                // index alone.
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_far"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::scene::DEPTH_FORMAT,
+                // The fragment stage writes its own depth, from the distance the
+                // ray actually met the ground, so the far field sorts against
+                // the near field rather than simply losing to it.
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let height_range = Self::coarsest_height_range(heights.as_ref(), &placement);
         let window_bytes = (window * window) as usize;
         Self {
@@ -568,6 +645,8 @@ impl Terrain {
             uniform,
             bind_group,
             pipeline,
+            far_pipeline,
+            far_group,
             cell_max_pipeline,
             reduce_pipeline,
             cell_max_group,
@@ -661,6 +740,7 @@ impl Terrain {
             levels as u32,
         );
         let (base, base_morph) = self.detail;
+        let near_radius = self.config.near_radius(metres_per_texel, base);
 
         for (level, &new) in placed.iter().enumerate().take(coarsest) {
             if level as u32 >= base {
@@ -686,7 +766,8 @@ impl Terrain {
             data_max: [data_max.0 as f32, data_max.1 as f32],
             base_level: base,
             base_morph,
-            padding: [0; 2],
+            near_radius: near_radius as f32,
+            max_mip: max_mip(&self.config),
         };
 
         for (level, &new) in placed.iter().enumerate() {
@@ -714,7 +795,7 @@ impl Terrain {
         }
 
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
-        self.rebuild_patches(queue);
+        self.rebuild_patches(queue, camera, near_radius);
     }
 
     /// Moves one level's window to `new`, uploading the ground that exposes.
@@ -889,12 +970,7 @@ impl Terrain {
     }
 
     /// Rebuilds the instance buffer and the draw ranges that index it.
-    fn rebuild_patches(&mut self, queue: &wgpu::Queue) {
-        // Rings reach beyond the raster, and the fragment stage cuts away
-        // whatever falls outside it. A patch lying wholly out there would have
-        // every one of its fragments thrown away, so drop it here instead and
-        // never rasterize it at all. The saving is largest exactly where it
-        // matters: a coarse ring viewed from over a corner of the data.
+    fn rebuild_patches(&mut self, queue: &wgpu::Queue, camera: Vec3, near_radius: f64) {
         let (data_min, data_max) = self.placement.data_bounds();
         let patches: Vec<mesh::Patch> = mesh::patches(&self.config, &self.origins, self.detail.0)
             .into_iter()
@@ -910,10 +986,35 @@ impl Terrain {
                 let far_x = near_x + f64::from(size.x) * scale * self.placement.metres_per_texel_x;
                 let far_z = near_z + f64::from(size.y) * scale * self.placement.metres_per_texel_z;
 
-                far_x >= data_min.0
+                // Rings reach beyond the raster, and the fragment stage cuts
+                // away whatever falls outside it. A patch lying wholly out there
+                // would have every one of its fragments thrown away, so drop it
+                // here instead and never rasterize it at all. The saving is
+                // largest exactly where it matters: a coarse ring viewed from
+                // over a corner of the data.
+                let inside_data = far_x >= data_min.0
                     && near_x <= data_max.0
                     && far_z >= data_min.1
-                    && near_z <= data_max.1
+                    && near_z <= data_max.1;
+
+                // Likewise for the patches the raymarched pass has taken over.
+                // The fragment stage cuts at the exact radius in three
+                // dimensions; this only has to save the vertex work without ever
+                // dropping a patch that stage would have kept, so it measures
+                // horizontally to the nearest point of the patch's box. Three
+                // dimensional distance is never less than horizontal distance,
+                // which makes that exactly conservative and needs no bound on
+                // how high the ground inside the box reaches. No such bound is
+                // available anyway: `height_range` comes from the coarsest level
+                // of the pyramid, which has already averaged the peaks down, so
+                // using it here would drop patches whose fragments were well
+                // inside the radius and leave the far field to fill a hole it
+                // starts too far out to see.
+                let x = (near_x - f64::from(camera.x)).max(f64::from(camera.x) - far_x);
+                let z = (near_z - f64::from(camera.z)).max(f64::from(camera.z) - far_z);
+                let nearest = x.max(0.0).powi(2) + z.max(0.0).powi(2);
+
+                inside_data && nearest <= near_radius * near_radius
             })
             .collect();
 
@@ -998,6 +1099,19 @@ impl Terrain {
         for (kind, instances) in &self.draws {
             pass.draw_indexed(self.index_ranges[*kind].clone(), 0, instances.clone());
         }
+    }
+
+    /// Records the raymarched far field into an already-started render pass.
+    ///
+    /// Wants its own pass, after [`Terrain::draw`]'s and loading rather than
+    /// clearing both attachments: it writes its own depth, so the near field
+    /// already being in the buffer is what keeps the two from drawing over each
+    /// other where they meet.
+    pub fn draw_far(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_pipeline(&self.far_pipeline);
+        pass.set_bind_group(1, &self.bind_group, &[]);
+        pass.set_bind_group(2, &self.far_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 

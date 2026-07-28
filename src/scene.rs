@@ -195,6 +195,39 @@ impl Scene {
 
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         self.terrain.draw(&mut pass);
+        drop(pass);
+
+        // The far field goes in a second pass loading what the first left, not
+        // in more draws at the end of it, because a pipeline's depth state is
+        // fixed and this one writes its depth from the fragment stage. Loading
+        // the depth buffer is the whole mechanism: the near field is already in
+        // it, so the two sort against each other with nothing else to arrange.
+        let mut far = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("far terrain pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        far.set_bind_group(0, &self.camera_bind_group, &[]);
+        self.terrain.draw_far(&mut far);
     }
 }
 
@@ -350,6 +383,28 @@ mod tests {
         aim: impl FnOnce(&mut Camera),
         path: &[Vec3],
     ) -> (Vec<u8>, u32) {
+        render_config(test_config(), heights, colours, aim, path)
+    }
+
+    /// The clipmap of [`test_config`] cut at a given radius.
+    ///
+    /// Infinity rasterizes the whole frame and zero raymarches it, which is how
+    /// the two halves of the renderer are held against each other.
+    fn cut_at(near_rings: f32) -> ClipmapConfig {
+        ClipmapConfig {
+            near_rings,
+            ..test_config()
+        }
+    }
+
+    /// As [`render_probed`], but over a clipmap configured by the caller.
+    fn render_config(
+        config: ClipmapConfig,
+        heights: Vec<f32>,
+        colours: Vec<Srgb8>,
+        aim: impl FnOnce(&mut Camera),
+        path: &[Vec3],
+    ) -> (Vec<u8>, u32) {
         let (device, queue) = test_device();
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -377,7 +432,7 @@ mod tests {
                     &device,
                     format,
                     camera_layout,
-                    test_config(),
+                    config,
                     placement(),
                     Box::new(Pyramid::build(Level::new(RASTER, RASTER, heights))),
                     Box::new(Pyramid::build(Level::new(RASTER, RASTER, colours))),
@@ -458,6 +513,134 @@ mod tests {
     fn world_of(col: f64, row: f64) -> Vec3 {
         let (x, z) = placement().world_of_texel(0, col, row);
         Vec3::new(x as f32, 0.0, z as f32)
+    }
+
+    /// How many pixels of a frame are sky.
+    fn count_sky(pixels: &[u8]) -> usize {
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| is_sky(pixel(pixels, x, y)))
+            .count()
+    }
+
+    /// Mean absolute difference between two frames, per colour byte.
+    fn mean_difference(a: &[u8], b: &[u8]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| f64::from(a.abs_diff(*b)))
+            .sum::<f64>()
+            / a.len() as f64
+    }
+
+    /// The far field on its own draws the ground the mesh would have drawn.
+    ///
+    /// The strongest statement available about the traversal: with the radius at
+    /// zero the mesh draws nothing at all and every lit pixel in the frame was
+    /// found by a ray, so holding it against the fully rasterized frame compares
+    /// the two halves of the renderer directly. They agree because they read the
+    /// same data at the same level -- a point belongs to the finest level whose
+    /// grid contains it, which is exactly the level whose ring the mesh would
+    /// have used -- and differ only where a silhouette falls between the
+    /// bilinear surface a ray meets and the two triangles a quad is drawn as.
+    #[test]
+    fn raymarching_the_whole_frame_matches_rasterizing_it() {
+        let (heights, colours) = rugged_painted();
+        let rastered = render_config(
+            cut_at(f32::INFINITY),
+            heights.clone(),
+            colours.clone(),
+            |_| {},
+            &[],
+        )
+        .0;
+        let marched = render_config(cut_at(0.0), heights, colours, |_| {}, &[]).0;
+
+        // Guard against the happy case where both frames are empty sky and any
+        // comparison between them passes.
+        let (sky, marched_sky) = (count_sky(&rastered), count_sky(&marched));
+        let pixels = (SIZE * SIZE) as usize;
+        assert!(
+            marched_sky < pixels / 2,
+            "the marched frame should be mostly ground, got {marched_sky} sky pixels"
+        );
+
+        // The horizon has to land in the same place, which a mean cannot say:
+        // a few hundred pixels of sky where there should be terrain barely move
+        // one, and that is what a hole in the acceleration structure looks like.
+        assert!(
+            marched_sky.abs_diff(sky) < pixels / 100,
+            "sky covers {marched_sky} pixels marched against {sky} rasterized"
+        );
+
+        let difference = mean_difference(&marched, &rastered);
+        assert!(
+            difference < 3.0,
+            "the two halves should draw the same ground, mean |difference| {difference:.3}"
+        );
+    }
+
+    /// The radius is a performance knob, not a quality one.
+    ///
+    /// Nothing about which level covers a point depends on where the cut falls,
+    /// so moving it should change how the frame was computed and not what it
+    /// shows. This is what makes the radius safe to tune by frame time alone.
+    #[test]
+    fn no_choice_of_near_radius_changes_what_the_frame_shows() {
+        let (heights, colours) = rugged_painted();
+        let rastered = render_config(
+            cut_at(f32::INFINITY),
+            heights.clone(),
+            colours.clone(),
+            |_| {},
+            &[],
+        )
+        .0;
+        let sky = count_sky(&rastered);
+
+        for rings in [8.0, 4.0, 2.0, 1.0, 0.5, 0.0] {
+            let frame =
+                render_config(cut_at(rings), heights.clone(), colours.clone(), |_| {}, &[]).0;
+            let difference = mean_difference(&frame, &rastered);
+            assert!(
+                difference < 3.0,
+                "cutting at {rings} rings moved the frame by {difference:.3}"
+            );
+            // A gap at the join, or a ray slipping between two cells, both show
+            // up here as sky that the mesh did not put there.
+            assert!(
+                count_sky(&frame).abs_diff(sky) < (SIZE * SIZE) as usize / 100,
+                "cutting at {rings} rings left {} sky pixels against {sky}",
+                count_sky(&frame)
+            );
+        }
+    }
+
+    /// Looking straight down at rough ground, a ray must find it.
+    ///
+    /// The failure this is here for is a max pyramid whose cells bound only the
+    /// samples at their corners rather than the ground between them: rays then
+    /// slip through ridges and the frame fills with pinholes of sky.
+    #[test]
+    fn the_far_field_does_not_let_pinholes_of_sky_through() {
+        let (heights, _) = rugged();
+        let rastered = render_config(
+            cut_at(f32::INFINITY),
+            heights.clone(),
+            flat_ground(),
+            straight_down,
+            &[],
+        )
+        .0;
+        let marched = render_config(cut_at(0.0), heights, flat_ground(), straight_down, &[]).0;
+
+        // Not zero either way: the frame's corners reach past the raster, and
+        // that ground is cut by both halves alike. What matters is that marching
+        // does not add to it.
+        let (sky, marched_sky) = (count_sky(&rastered), count_sky(&marched));
+        assert!(
+            marched_sky < sky + 200,
+            "marching showed {marched_sky} sky pixels where the mesh showed {sky}"
+        );
     }
 
     #[test]
@@ -603,6 +786,127 @@ mod tests {
         assert_eq!(
             occluded, 0,
             "the near ridge should have depth-rejected every fragment behind it"
+        );
+    }
+
+    /// The same two plateaus, found by rays rather than drawn as triangles.
+    ///
+    /// Exercises occlusion inside the traversal: with the radius at zero the
+    /// depth buffer has nothing in it to reject the far plateau, so the only
+    /// thing that can hide it is the march stopping at the near ridge first.
+    #[test]
+    fn a_near_ridge_hides_what_is_behind_it_in_the_far_field() {
+        let ridges = |near: bool| {
+            let mut heights = vec![0.0f32; (RASTER * RASTER) as usize];
+            let mut colours = flat_ground();
+            for row in 0..RASTER {
+                let (height, colour) = match row {
+                    66..=73 if near => (900.0, RED),
+                    46..=53 => (250.0, MAGENTA),
+                    _ => continue,
+                };
+                for col in 0..RASTER {
+                    heights[(row * RASTER + col) as usize] = height;
+                    colours[(row * RASTER + col) as usize] = colour;
+                }
+            }
+            (heights, colours)
+        };
+        let aim = |camera: &mut Camera| {
+            camera.position = Vec3::new(0.0, 400.0, world_of(64.0, 76.0).z + 400.0);
+            camera.orientation = Camera::from_yaw_pitch_roll(0.0, -10f32.to_radians(), 0.0);
+        };
+        let count_far = |pixels: &[u8]| {
+            (0..SIZE)
+                .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+                .filter(|&(x, y)| is_magenta(pixel(pixels, x, y)))
+                .count()
+        };
+
+        let (heights, colours) = ridges(false);
+        let alone = count_far(&render_config(cut_at(0.0), heights, colours, aim, &[]).0);
+        assert!(
+            alone > 500,
+            "the far plateau should be plainly in shot on its own, got {alone} pixels"
+        );
+
+        let (heights, colours) = ridges(true);
+        let occluded = count_far(&render_config(cut_at(0.0), heights, colours, aim, &[]).0);
+        assert_eq!(
+            occluded, 0,
+            "every ray should have stopped at the near ridge"
+        );
+    }
+
+    /// Nodata and the edge of the raster are holes to a ray as much as to a
+    /// triangle, and for the same reason: there is no ground there to draw.
+    #[test]
+    fn the_far_field_cuts_holes_and_the_data_edge_out_too() {
+        const NODATA: f32 = -32767.0;
+
+        let with_hole = |hole: bool| {
+            let mut heights = vec![0.0f32; (RASTER * RASTER) as usize];
+            if hole {
+                for row in 56..72 {
+                    for col in 56..72 {
+                        heights[(row * RASTER + col) as usize] = NODATA;
+                    }
+                }
+            }
+            heights
+        };
+
+        let solid = count_sky(
+            &render_config(
+                cut_at(0.0),
+                with_hole(false),
+                flat_ground(),
+                straight_down,
+                &[],
+            )
+            .0,
+        );
+        assert_eq!(solid, 0, "unbroken ground should show no sky");
+
+        let punched = count_sky(
+            &render_config(
+                cut_at(0.0),
+                with_hole(true),
+                flat_ground(),
+                straight_down,
+                &[],
+            )
+            .0,
+        );
+        // Fewer pixels than the mesh cuts for the same hole, and that is
+        // expected: the raster stage throws away every triangle that touches
+        // nodata, while a ray only refuses the one quad it is standing in. Both
+        // are conservative, the march just less coarsely so.
+        assert!(
+            punched > 100,
+            "the hole should show sky through it, got {punched} pixels"
+        );
+
+        // Climbing until the raster no longer fills the frame puts its edge in
+        // shot. Rings reach past it and reads out there repeat the border texel,
+        // so a march that did not cut at the data bounds would draw a plateau of
+        // invented ground rather than sky.
+        let beyond = count_sky(
+            &render_config(
+                cut_at(0.0),
+                with_hole(false),
+                flat_ground(),
+                |camera| {
+                    camera.position = Vec3::new(0.0, 6000.0, 0.0);
+                    camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+                },
+                &[],
+            )
+            .0,
+        );
+        assert!(
+            beyond > 2000,
+            "the ground should stop at the raster's edge, got {beyond} sky pixels"
         );
     }
 
