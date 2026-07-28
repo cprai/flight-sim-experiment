@@ -1,10 +1,11 @@
 //! Finding which published rasters cover the requested box.
 //!
-//! Natural Resources Canada exposes HRDEM through a STAC API. Each collection
-//! is split into items that are 500 km squares of the EPSG:3979 grid, and each
-//! item carries its rasters as assets. Asking the service which items intersect
-//! a longitude/latitude box is a single request, so nothing here has to
-//! understand the block naming scheme.
+//! Natural Resources Canada exposes its elevation products through one STAC
+//! API. The HRDEM collections are split into items that are 500 km squares of
+//! the EPSG:3979 grid; MRDEM is a single national item. Either way each item
+//! carries its rasters as assets, and asking the service which items intersect
+//! a longitude/latitude box is a single request -- so nothing here has to
+//! understand the block naming scheme, or care how many items a collection has.
 //!
 //! Two shapes of the data drive the code below. Items are *not* guaranteed to
 //! carry the product being asked for -- the northern blocks of the two-metre
@@ -60,20 +61,37 @@ impl Product {
     }
 }
 
-/// Which mosaic to draw from. One metre is preferred; two metre is the fallback.
+/// Which published raster to draw from, finest first. Each tier is tried only
+/// for ground the tiers above it left empty.
+///
+/// The first two are HRDEM, which exists only where a LiDAR survey flew. The
+/// third is a different product entirely: MRDEM, a 30 m model that covers
+/// Canada without gaps. It is thirty times coarser than the mosaics and is
+/// there to put ground under the holes rather than to compete with them --
+/// over the Squamish box the first two tiers leave 11% of the ground with no
+/// elevation at all, and the renderer draws that as sky you can fly through.
+///
+/// MRDEM is still bare earth, not a surface model standing in for one: where
+/// LiDAR exists it *is* HRDEM resampled to 30 m, and elsewhere it is Copernicus
+/// GLO-30 with forest-removal and settlement-removal models applied.
+// The shared `Metre` suffix is the unit, not noise: these name ground sample
+// distances, and `One`/`Two`/`Thirty` alone would read as ordinals.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Resolution {
     OneMetre,
     TwoMetre,
+    ThirtyMetre,
 }
 
 impl Resolution {
-    pub const ALL: [Self; 2] = [Self::OneMetre, Self::TwoMetre];
+    pub const ALL: [Self; 3] = [Self::OneMetre, Self::TwoMetre, Self::ThirtyMetre];
 
     pub fn collection(self) -> &'static str {
         match self {
             Self::OneMetre => "hrdem-mosaic-1m",
             Self::TwoMetre => "hrdem-mosaic-2m",
+            Self::ThirtyMetre => "mrdem-30",
         }
     }
 
@@ -83,6 +101,7 @@ impl Resolution {
         match self {
             Self::OneMetre => 1.0,
             Self::TwoMetre => 2.0,
+            Self::ThirtyMetre => 30.0,
         }
     }
 
@@ -91,6 +110,7 @@ impl Resolution {
         match self {
             Self::OneMetre => "1 m",
             Self::TwoMetre => "2 m",
+            Self::ThirtyMetre => "30 m",
         }
     }
 }

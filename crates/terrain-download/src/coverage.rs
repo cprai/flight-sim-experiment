@@ -16,6 +16,12 @@
 //! requested ground. Callers should present the numbers as "at most this much
 //! data, at least this much missing", which is what makes them safe to act on.
 //!
+//! Since MRDEM became the last tier, almost no box over Canada comes out
+//! missing anything: what used to be a hole is now 30 m ground. The question
+//! worth asking before a download is therefore no longer "will this be empty"
+//! but "how much of this will be coarse", which is what
+//! [`Estimate::unsurveyed_fraction`] answers and what the prompt is keyed to.
+//!
 //! The percentages printed at the end of a run are counted from the resampled
 //! pixels themselves and are exact.
 
@@ -24,6 +30,7 @@ use std::io::{IsTerminal, Write};
 use anyhow::{Context, Result};
 
 use crate::extent::TileExtent;
+use crate::resample::Shares;
 use crate::source::SourceRaster;
 
 /// Roughly how many points to test. Sampling rather than projecting every pixel
@@ -37,50 +44,62 @@ pub struct Estimate {
     pub sampled: u64,
     pub one_metre: u64,
     pub two_metre: u64,
+    pub thirty_metre: u64,
     pub missing: u64,
     pub bytes: u64,
 }
 
 impl Estimate {
-    /// The shares of one-metre, two-metre and absent data, as percentages.
+    /// The shares of each tier and of absent data, as percentages.
     ///
-    /// The first two are upper bounds and the third a lower bound, for the
-    /// reason given at the top of this module.
-    pub fn percentages(&self) -> (f64, f64, f64) {
+    /// The tiers are upper bounds and `missing` a lower bound, for the reason
+    /// given at the top of this module.
+    pub fn percentages(&self) -> Shares {
         if self.sampled == 0 {
-            return (0.0, 0.0, 0.0);
+            return Shares::default();
         }
         let share = |n: u64| 100.0 * n as f64 / self.sampled as f64;
-        (
-            share(self.one_metre),
-            share(self.two_metre),
-            share(self.missing),
-        )
+        Shares {
+            one_metre: share(self.one_metre),
+            two_metre: share(self.two_metre),
+            thirty_metre: share(self.thirty_metre),
+            missing: share(self.missing),
+        }
     }
 
-    /// A *lower* bound on how much of the box has no data. The prompt therefore
-    /// errs towards letting a download through, never towards blocking one that
-    /// would have been fine.
-    pub fn missing_fraction(&self) -> f64 {
+    /// A *lower* bound on how much of the box no LiDAR survey covers. The
+    /// prompt therefore errs towards letting a download through, never towards
+    /// blocking one that would have been fine.
+    ///
+    /// Counts the 30 m tier as unsurveyed even though it will produce ground.
+    /// This is the quantity the threshold has always meant -- before MRDEM was
+    /// a tier, ground HRDEM missed simply stayed a hole, so "missing" and
+    /// "unsurveyed" were the same number. Keeping the threshold on *this* side
+    /// of the line is what stops the fill from quietly switching the warning
+    /// off: MRDEM covers Canada, so a box judged on holes alone would now
+    /// always pass, and nobody would be told their box is about to come out
+    /// thirty times coarser than they asked for.
+    pub fn unsurveyed_fraction(&self) -> f64 {
         if self.sampled == 0 {
             return 1.0;
         }
-        self.missing as f64 / self.sampled as f64
+        (self.thirty_metre + self.missing) as f64 / self.sampled as f64
     }
 }
 
 /// Estimates coverage by testing a regular sample of the output extent.
 ///
 /// A point counts as one-metre if any one-metre raster holds data there, then
-/// as two-metre on the same test, and otherwise as missing -- the same
-/// preference order the fill itself applies.
+/// as two-metre on the same test, then as thirty-metre, and otherwise as
+/// missing -- the same preference order the fill itself applies.
 ///
-/// No projection is involved: the output is drawn on the mosaics' own grid, so
-/// a sample point's metres are already the metres the rasters are indexed by.
+/// No projection is involved: the output is drawn on the rasters' own grid, so
+/// a sample point's metres are already the metres they are indexed by.
 pub fn estimate(
     extent: &TileExtent,
     fine: &[SourceRaster],
     coarse: &[SourceRaster],
+    medium: &[SourceRaster],
 ) -> Result<Estimate> {
     let grid = extent.grid(0);
 
@@ -94,6 +113,7 @@ pub fn estimate(
         sampled: 0,
         one_metre: 0,
         two_metre: 0,
+        thirty_metre: 0,
         missing: 0,
         bytes: 0,
     };
@@ -108,6 +128,8 @@ pub fn estimate(
                 estimate.one_metre += 1;
             } else if coarse.iter().any(|r| r.has_data_at(metres_x, metres_y)) {
                 estimate.two_metre += 1;
+            } else if medium.iter().any(|r| r.has_data_at(metres_x, metres_y)) {
+                estimate.thirty_metre += 1;
             } else {
                 estimate.missing += 1;
             }
@@ -141,21 +163,25 @@ pub fn describe_bytes(bytes: u64) -> String {
 /// a CI job -- this fails rather than blocking on a prompt nobody will answer,
 /// and says which flag would have let it through.
 pub fn confirm(estimate: &Estimate, threshold: f64, assume_yes: bool) -> Result<bool> {
-    if assume_yes || estimate.missing_fraction() <= threshold {
+    if assume_yes || estimate.unsurveyed_fraction() <= threshold {
         return Ok(true);
     }
 
-    let (_, _, missing) = estimate.percentages();
+    let coarse = estimate.unsurveyed_fraction() * 100.0;
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(
-            "at least {missing:.1}% of the requested box has no elevation data, above \
-             the {:.0}% threshold, and there is no terminal to confirm at; pass --yes \
-             to download it anyway or --prompt-threshold to change the limit",
+            "at least {coarse:.1}% of the requested box has no LiDAR survey and would \
+             be filled from 30 m data, above the {:.0}% threshold, and there is no \
+             terminal to confirm at; pass --yes to download it anyway or \
+             --prompt-threshold to change the limit",
             threshold * 100.0
         );
     }
 
-    print!("At least {missing:.1}% of this box has no data, likely more. Download anyway? [y/N] ");
+    print!(
+        "At least {coarse:.1}% of this box has no LiDAR survey, likely more, and \
+         would come from 30 m data. Download anyway? [y/N] "
+    );
     std::io::stdout().flush().context("prompting")?;
 
     let mut answer = String::new();
@@ -169,42 +195,59 @@ pub fn confirm(estimate: &Estimate, threshold: f64, assume_yes: bool) -> Result<
 mod tests {
     use super::*;
 
-    fn estimate_of(one_metre: u64, two_metre: u64, missing: u64) -> Estimate {
+    fn estimate_of(one_metre: u64, two_metre: u64, thirty_metre: u64, missing: u64) -> Estimate {
         Estimate {
-            sampled: one_metre + two_metre + missing,
+            sampled: one_metre + two_metre + thirty_metre + missing,
             one_metre,
             two_metre,
+            thirty_metre,
             missing,
             bytes: 0,
         }
     }
 
     #[test]
-    fn the_three_shares_add_up() {
-        let (one, two, none) = estimate_of(70, 20, 10).percentages();
-        assert!((one - 70.0).abs() < 1e-9);
-        assert!((two - 20.0).abs() < 1e-9);
-        assert!((none - 10.0).abs() < 1e-9);
+    fn the_four_shares_add_up() {
+        let shares = estimate_of(70, 20, 5, 5).percentages();
+        assert!((shares.one_metre - 70.0).abs() < 1e-9);
+        assert!((shares.two_metre - 20.0).abs() < 1e-9);
+        assert!((shares.thirty_metre - 5.0).abs() < 1e-9);
+        assert!((shares.missing - 5.0).abs() < 1e-9);
     }
 
     #[test]
-    fn a_box_with_nothing_sampled_counts_as_entirely_missing() {
-        let nothing = estimate_of(0, 0, 0);
-        assert_eq!(nothing.missing_fraction(), 1.0);
-        assert_eq!(nothing.percentages(), (0.0, 0.0, 0.0));
+    fn a_box_with_nothing_sampled_counts_as_entirely_unsurveyed() {
+        let nothing = estimate_of(0, 0, 0, 0);
+        assert_eq!(nothing.unsurveyed_fraction(), 1.0);
+        assert_eq!(nothing.percentages(), Shares::default());
     }
 
     #[test]
     fn a_well_covered_box_is_not_queried() {
-        let good = estimate_of(95, 0, 5);
+        let good = estimate_of(95, 0, 0, 5);
         assert!(confirm(&good, 0.2, false).expect("should not prompt"));
+    }
+
+    /// The whole point of keying the threshold to survey coverage rather than
+    /// to holes. MRDEM would fill every one of these texels, so judged on
+    /// missing data alone this box looks perfect -- but it is 90% coarse, which
+    /// is exactly what the person running the tool needs to be told.
+    #[test]
+    fn a_box_mrdem_would_fill_entirely_still_prompts_when_mostly_coarse() {
+        let coarse = estimate_of(10, 0, 90, 0);
+        assert_eq!(coarse.missing, 0);
+        let error = confirm(&coarse, 0.2, false)
+            .expect_err("should refuse without a terminal")
+            .to_string();
+        assert!(error.contains("90.0%"), "{error}");
+        assert!(error.contains("30 m"), "{error}");
     }
 
     /// The test process has no terminal, so this exercises the non-interactive
     /// path: refuse rather than block, and name the flag that would proceed.
     #[test]
     fn a_poorly_covered_box_refuses_when_there_is_nobody_to_ask() {
-        let bad = estimate_of(10, 0, 90);
+        let bad = estimate_of(10, 0, 0, 90);
         let error = confirm(&bad, 0.2, false)
             .expect_err("should refuse without a terminal")
             .to_string();
@@ -214,13 +257,13 @@ mod tests {
 
     #[test]
     fn assuming_yes_skips_the_question_entirely() {
-        let bad = estimate_of(0, 0, 100);
+        let bad = estimate_of(0, 0, 0, 100);
         assert!(confirm(&bad, 0.2, true).expect("--yes should proceed"));
     }
 
     #[test]
     fn a_threshold_of_one_accepts_a_box_with_no_data_at_all() {
-        let empty = estimate_of(0, 0, 100);
+        let empty = estimate_of(0, 0, 0, 100);
         assert!(confirm(&empty, 1.0, false).expect("should not prompt"));
     }
 

@@ -16,8 +16,16 @@
 //! one-metre mosaic only covers ground a LiDAR survey delivered at that
 //! resolution. In practice the two-metre fill is small -- across two whole
 //! 500 km blocks it added 9 km2 and 1 km2 -- because both products derive from
-//! the same surveys. The percentages printed at the end say exactly how much
-//! each contributed.
+//! the same surveys.
+//!
+//! What is not small is what neither of them covers. HRDEM exists only where
+//! someone flew a survey, and over the Squamish box that left 11.15% of the
+//! ground with no elevation at all -- which the renderer draws as sky, so the
+//! terrain has holes you can fly through. MRDEM, a 30 m model covering Canada
+//! without gaps, is the last tier and fills whatever the mosaics did not. It is
+//! thirty times coarser than the output's finest level and is meant to be: the
+//! choice is between coarse ground and no ground. The percentages printed at
+//! the end say exactly how much each tier contributed.
 //!
 //! Colour comes from somewhere else entirely: annual cloud-free Sentinel-2
 //! composites, which are already mosaicked and need no scene picking or cloud
@@ -209,8 +217,8 @@ async fn fetch_elevation(
     extent: &TileExtent,
     root: &Path,
 ) -> Result<()> {
-    // Both mosaics are opened up front: the coverage estimate has to know what
-    // the fallback could contribute before anything is downloaded.
+    // Every tier is opened up front: the coverage estimate has to know what the
+    // fallbacks could contribute before anything is downloaded.
     let mut rasters: Vec<Vec<SourceRaster>> = Vec::new();
     for resolution in Resolution::ALL {
         let items = stac::find_items(
@@ -234,19 +242,28 @@ async fn fetch_elevation(
                 metres_per_pixel: resolution.metres(),
                 bands: 1,
                 fallback_nodata: ELEVATION_NODATA,
-                empty_tile_limit: source::ELEVATION_EMPTY_TILE_LIMIT,
+                // Matched exhaustively rather than defaulted: the threshold is
+                // a property of how a particular product compresses, and a new
+                // tier silently inheriting HRDEM's would throw away its data.
+                empty_tile_limit: match resolution {
+                    Resolution::OneMetre | Resolution::TwoMetre => {
+                        source::ELEVATION_EMPTY_TILE_LIMIT
+                    }
+                    Resolution::ThirtyMetre => source::MRDEM_EMPTY_TILE_LIMIT,
+                },
             };
             opened.push(SourceRaster::open(client, item, spec).await?);
         }
         rasters.push(opened);
     }
-    let coarse = rasters.pop().expect("both resolutions were searched");
-    let fine = rasters.pop().expect("both resolutions were searched");
+    let medium = rasters.pop().expect("every resolution was searched");
+    let coarse = rasters.pop().expect("every resolution was searched");
+    let fine = rasters.pop().expect("every resolution was searched");
 
     anyhow::ensure!(
-        !fine.is_empty() || !coarse.is_empty(),
-        "no published {} raster covers that box; HRDEM only exists over surveyed \
-         areas of Canada",
+        !fine.is_empty() || !coarse.is_empty() || !medium.is_empty(),
+        "no published {} raster covers that box; even MRDEM stops at Canada's \
+         borders",
         arguments.product.label()
     );
 
@@ -255,20 +272,22 @@ async fn fetch_elevation(
     let nodata = fine
         .first()
         .or_else(|| coarse.first())
+        .or_else(|| medium.first())
         .map(SourceRaster::nodata)
         .expect("at least one raster was just checked for");
 
-    let mut estimate = coverage::estimate(extent, &fine, &coarse)?;
+    let mut estimate = coverage::estimate(extent, &fine, &coarse, &medium)?;
     let whole = extent.grid(0).extent();
     estimate.bytes = fine.iter().map(|r| r.bytes_for(whole)).sum();
 
     // Deliberately phrased as bounds. The estimate judges whole 512 m tiles, so
     // a tile with one valid pixel counts the same as a full one; over ground at
     // the edge of a survey it can read 16% where the truth is 0.6%.
-    let (one, two, none) = estimate.percentages();
+    let shares = estimate.percentages();
     println!(
-        "Estimated coverage, judged per 512 m tile: at most {one:.1}% at 1 m and \
-         {two:.1}% at 2 m, at least {none:.1}% missing"
+        "Estimated coverage, judged per 512 m tile: at most {:.1}% at 1 m and \
+         {:.1}% at 2 m, at least {:.1}% from 30 m data and {:.1}% missing",
+        shares.one_metre, shares.two_metre, shares.thirty_metre, shares.missing
     );
     println!(
         "Estimated download: {} of 1 m tiles",
@@ -284,6 +303,13 @@ async fn fetch_elevation(
     // interpolated, which is only sound if its pixels land on the output's own
     // texels. Checked once, against the whole extent: every block's origin is a
     // tile origin, so they all share this lattice.
+    //
+    // Only this tier is checked, because only this tier is copied. Two metres
+    // halves the output's lattice and thirty neither divides it nor lands on
+    // it -- MRDEM's own origin sits 20 m off a round number -- so both go
+    // through `fill_from` and interpolate, which is what the bilinear margin on
+    // their windows is for. Asserting alignment for them would fail on correct
+    // data.
     let base = extent.grid(0);
     for raster in &fine {
         let (west, north) = raster.origin();
@@ -329,28 +355,30 @@ async fn fetch_elevation(
         }
 
         // Two-metre tiles are fetched only for ground the one-metre pass could
-        // not fill, which is usually none of it. They are half the output's
-        // resolution, so they do have to be interpolated, and interpolation
-        // needs the pixels either side of each sample point -- more than one
-        // tile carries. That pass keeps its window.
-        if canvas.has_holes() && !coarse.is_empty() {
-            let coarse_metres = Resolution::TwoMetre.metres();
-            if let Some(holes) = canvas.hole_extent(None, coarse_metres)? {
-                let mut window = Window::covering(
-                    holes.min_x,
-                    holes.min_y,
-                    holes.max_x,
-                    holes.max_y,
-                    coarse_metres,
-                    1,
-                    nodata,
-                )?;
-                for raster in &coarse {
-                    downloaded += raster.fill(&mut window, arguments.concurrency).await?;
-                }
-                canvas.fill_from(&window, None, Provenance::TwoMetre)?;
-            }
-        }
+        // not fill, which is usually none of it. Then MRDEM for whatever is
+        // still empty after that, which over an unsurveyed box is most of it.
+        //
+        // Both are coarser than the output, so both interpolate rather than
+        // copy, and interpolation needs the pixels either side of each sample
+        // point -- more than one tile carries. Those passes keep their windows.
+        downloaded += fill_holes_from(
+            &mut canvas,
+            &coarse,
+            Resolution::TwoMetre,
+            Provenance::TwoMetre,
+            arguments.concurrency,
+            nodata,
+        )
+        .await?;
+        downloaded += fill_holes_from(
+            &mut canvas,
+            &medium,
+            Resolution::ThirtyMetre,
+            Provenance::ThirtyMetre,
+            arguments.concurrency,
+            nodata,
+        )
+        .await?;
 
         tally.add(canvas.tally());
         written += write_block(root, &grid, block, &canvas, 0, nodata, &mut samples)?;
@@ -362,7 +390,7 @@ async fn fetch_elevation(
         .manifest(arguments.product.label(), 0, 1, nodata)
         .write(root)?;
 
-    let (one, two, none) = tally.percentages();
+    let shares = tally.percentages();
     println!("Wrote {}", root.display());
     println!(
         "  {} x {} texels, {written} tiles, {} downloaded",
@@ -370,8 +398,56 @@ async fn fetch_elevation(
         extent.height,
         coverage::describe_bytes(downloaded)
     );
-    println!("  {one:.2}% from 1 m data, {two:.2}% from 2 m data, {none:.2}% no data");
+    println!(
+        "  {:.2}% from 1 m data, {:.2}% from 2 m data, {:.2}% from 30 m data, \
+         {:.2}% no data",
+        shares.one_metre, shares.two_metre, shares.thirty_metre, shares.missing
+    );
     Ok(())
+}
+
+/// Fills whatever the passes before it left empty, from one coarser tier.
+///
+/// Returns the bytes downloaded, which is zero when there was nothing left to
+/// fill or no raster to fill it from -- both ordinary. The window is sized to
+/// the holes rather than to the block, so a block the finer tiers already
+/// covered costs one scan of the provenance and no request at all.
+///
+/// Texels that already have a value are left alone by `fill_from`, and that is
+/// the whole of what makes this a fallback rather than an overwrite: the order
+/// these are called in *is* the preference between the tiers.
+async fn fill_holes_from(
+    canvas: &mut Canvas,
+    rasters: &[SourceRaster],
+    resolution: Resolution,
+    provenance: Provenance,
+    concurrency: usize,
+    nodata: f32,
+) -> Result<u64> {
+    if rasters.is_empty() || !canvas.has_holes() {
+        return Ok(0);
+    }
+
+    let metres = resolution.metres();
+    let Some(holes) = canvas.hole_extent(None, metres)? else {
+        return Ok(0);
+    };
+    let mut window = Window::covering(
+        holes.min_x,
+        holes.min_y,
+        holes.max_x,
+        holes.max_y,
+        metres,
+        1,
+        nodata,
+    )?;
+
+    let mut downloaded = 0;
+    for raster in rasters {
+        downloaded += raster.fill(&mut window, concurrency).await?;
+    }
+    canvas.fill_from(&window, None, provenance)?;
+    Ok(downloaded)
 }
 
 /// Fetches cloud-free Sentinel-2 colour for the box.
@@ -481,7 +557,7 @@ async fn fetch_albedo(
         .manifest(arguments.product.label(), COLOUR_BASE_LEVEL, 3, 0.0)
         .write(root)?;
 
-    let (covered, _, none) = tally.percentages();
+    let shares = tally.percentages();
     println!("Wrote {}", root.display());
     println!(
         "  {} x {} texels at level {COLOUR_BASE_LEVEL}, {written} tiles, {} downloaded",
@@ -489,7 +565,12 @@ async fn fetch_albedo(
         extent.size_texels(COLOUR_BASE_LEVEL).1,
         coverage::describe_bytes(downloaded)
     );
-    println!("  {covered:.2}% imagery, {none:.2}% no data");
+    // Colour has one source, so it lands wholly in the first tier -- see
+    // `Provenance::FILLED` -- and the tiers below it are always zero here.
+    println!(
+        "  {:.2}% imagery, {:.2}% no data",
+        shares.one_metre, shares.missing
+    );
     Ok(())
 }
 

@@ -36,6 +36,22 @@ const EMPTY_TILE_BYTES: u64 = 3994;
 /// seen in the mosaic is 118 139 bytes, fifteen times this limit.
 pub const ELEVATION_EMPTY_TILE_LIMIT: u64 = EMPTY_TILE_BYTES * 2;
 
+/// The same test for MRDEM, which cannot afford HRDEM's tolerance.
+///
+/// MRDEM is written with the same LZW-and-no-predictor settings, so its empty
+/// tiles are the same 3994 bytes -- but the gap above them is gone. Across the
+/// whole national raster 58 206 of its 118 012 tiles are exactly 3994 bytes and
+/// the next size up is 4014, twenty bytes away, where HRDEM's next size up is a
+/// hundred thousand bytes away.
+///
+/// Resolution is why. An MRDEM tile is 512 pixels of 30 m, so it covers 15 km
+/// square; a tile holding one sliver of coastline and 99% ocean compresses
+/// almost as small as an empty one. Doubling this limit the way HRDEM's does
+/// would discard 732 tiles that hold real coast. So the test is exact equality
+/// with the empty size in all but name, and the margin is measurement rather
+/// than allowance.
+pub const MRDEM_EMPTY_TILE_LIMIT: u64 = EMPTY_TILE_BYTES;
+
 /// Whether a tile's compressed size says it holds nothing but nodata.
 ///
 /// Zero always counts: that is how a sparse block is recorded, and there are no

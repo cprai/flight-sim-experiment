@@ -10,11 +10,13 @@
 //! the whole download no longer fits anywhere. A block is a few tiles square; it
 //! is filled, cut into tiles, written, and dropped before the next one starts.
 //!
-//! One metre is preferred and two metre fills what is left. The switch is
-//! abrupt by design: a texel comes from one mosaic or the other, never a blend
-//! of both. Where the two disagree in height -- different survey years, both on
-//! CGVD2013 -- that shows up as a step at the boundary rather than being
-//! smoothed into something untraceable.
+//! One metre is preferred, two metre fills what is left, and MRDEM at 30 m
+//! fills whatever neither survey reached. The switch is abrupt by design: a
+//! texel comes from one source or another, never a blend of them. Where two
+//! disagree in height -- different survey years, all on CGVD2013 -- that shows
+//! up as a step at the boundary rather than being smoothed into something
+//! untraceable. The step against MRDEM is the largest of the three, and it is
+//! still preferable to inventing a ramp between a measurement and a model.
 
 use anyhow::{Context, Result};
 use terrain_tiles::TILE_SIZE;
@@ -184,16 +186,24 @@ pub fn source_extent(
 /// Where a texel's value came from.
 ///
 /// No longer written to disk -- the tiles carry elevation alone -- but still
-/// tracked, because it is what implements the preference between the two
-/// mosaics and what the percentages printed at the end are counted from.
+/// tracked, because it is what implements the preference between the sources
+/// and what the percentages printed at the end are counted from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Provenance {
-    /// Neither mosaic had data here; the elevation is the nodata value.
+    /// No source had data here; the elevation is the nodata value.
     Missing = 0,
     /// From the one-metre mosaic.
     OneMetre = 1,
     /// From the two-metre mosaic, interpolated onto the output grid.
     TwoMetre = 2,
+    /// From MRDEM at 30 m, interpolated onto the output grid.
+    ///
+    /// Worth telling apart from the two above rather than lumping in as
+    /// "filled": it is thirty times coarser than the ground around it, so the
+    /// share of a download that comes from here is the one number that says how
+    /// much of the box is coarse. A run reporting most of its texels from this
+    /// tier has been pointed at ground HRDEM never surveyed.
+    ThirtyMetre = 3,
 }
 
 impl Provenance {
@@ -210,34 +220,50 @@ impl Provenance {
 pub struct Tally {
     pub one_metre: u64,
     pub two_metre: u64,
+    pub thirty_metre: u64,
     pub missing: u64,
 }
 
 impl Tally {
     pub fn total(&self) -> u64 {
-        self.one_metre + self.two_metre + self.missing
+        self.one_metre + self.two_metre + self.thirty_metre + self.missing
     }
 
     /// Accumulates another block's counts into this one.
     pub fn add(&mut self, other: Tally) {
         self.one_metre += other.one_metre;
         self.two_metre += other.two_metre;
+        self.thirty_metre += other.thirty_metre;
         self.missing += other.missing;
     }
 
-    /// The three shares as percentages, which is what gets printed.
-    pub fn percentages(&self) -> (f64, f64, f64) {
+    /// The four shares as percentages, which is what gets printed.
+    pub fn percentages(&self) -> Shares {
         let total = self.total();
         if total == 0 {
-            return (0.0, 0.0, 0.0);
+            return Shares::default();
         }
         let share = |n: u64| 100.0 * n as f64 / total as f64;
-        (
-            share(self.one_metre),
-            share(self.two_metre),
-            share(self.missing),
-        )
+        Shares {
+            one_metre: share(self.one_metre),
+            two_metre: share(self.two_metre),
+            thirty_metre: share(self.thirty_metre),
+            missing: share(self.missing),
+        }
     }
+}
+
+/// The tiers' shares of a download, as percentages.
+///
+/// A named struct rather than a tuple because there are now four of them and
+/// three are easy to transpose. `let (one, two, none) = ...` silently became
+/// wrong when the third tier was added; `shares.missing` cannot.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct Shares {
+    pub one_metre: f64,
+    pub two_metre: f64,
+    pub thirty_metre: f64,
+    pub missing: f64,
 }
 
 /// One block of the output being filled in.
@@ -318,6 +344,8 @@ impl Canvas {
                 tally.one_metre += 1;
             } else if source == Provenance::TwoMetre as u8 {
                 tally.two_metre += 1;
+            } else if source == Provenance::ThirtyMetre as u8 {
+                tally.thirty_metre += 1;
             } else {
                 tally.missing += 1;
             }
@@ -902,21 +930,77 @@ mod tests {
 
     #[test]
     fn percentages_add_up() {
-        let mut tally = Tally {
-            one_metre: 35,
+        let half = Tally {
+            one_metre: 30,
             two_metre: 10,
+            thirty_metre: 5,
             missing: 5,
         };
-        tally.add(Tally {
-            one_metre: 35,
-            two_metre: 10,
-            missing: 5,
-        });
-        let (one, two, none) = tally.percentages();
-        assert!((one - 70.0).abs() < 1e-9);
-        assert!((two - 20.0).abs() < 1e-9);
-        assert!((none - 10.0).abs() < 1e-9);
-        assert!((one + two + none - 100.0).abs() < 1e-9);
+        let mut tally = half;
+        tally.add(half);
+        let shares = tally.percentages();
+        assert!((shares.one_metre - 60.0).abs() < 1e-9);
+        assert!((shares.two_metre - 20.0).abs() < 1e-9);
+        assert!((shares.thirty_metre - 10.0).abs() < 1e-9);
+        assert!((shares.missing - 10.0).abs() < 1e-9);
+        let total = shares.one_metre + shares.two_metre + shares.thirty_metre + shares.missing;
+        assert!((total - 100.0).abs() < 1e-9);
+    }
+
+    /// The thirty-metre tier is a fallback below the other two, not a peer: it
+    /// may only fill what they left, exactly as two metres may only fill what
+    /// one metre left. This is what stops MRDEM's 30 m ground from landing on
+    /// top of surveyed LiDAR.
+    #[test]
+    fn thirty_metre_data_fills_only_the_holes_left_by_the_mosaics() {
+        let grid = grid(1.0, 64, 64);
+        let half = grid.west + f64::from(grid.width) * 0.5;
+        let three_quarters = grid.west + f64::from(grid.width) * 0.75;
+
+        // One metre covers the west half, two metres a quarter more, and the
+        // last quarter has nothing under it until MRDEM reaches it.
+        let fine = window_over(&grid, 1.0, |x, _| if x < half { 100.0 } else { NODATA });
+        let coarse = window_over(
+            &grid,
+            2.0,
+            |x, _| {
+                if x < three_quarters { 200.0 } else { NODATA }
+            },
+        );
+        let medium = window_over(&grid, 30.0, |_, _| 300.0);
+
+        let mut canvas = Canvas::new(grid, 1, NODATA).expect("failed to allocate");
+        canvas
+            .fill_from(&fine, None, Provenance::OneMetre)
+            .expect("failed to fill");
+        canvas
+            .fill_from(&coarse, None, Provenance::TwoMetre)
+            .expect("failed to fill");
+
+        let after_mosaics = canvas.tally();
+        assert!(after_mosaics.one_metre > 0, "one metre filled nothing");
+        assert!(after_mosaics.two_metre > 0, "two metre filled nothing");
+        assert!(after_mosaics.missing > 0, "nothing left for thirty metre");
+
+        canvas
+            .fill_from(&medium, None, Provenance::ThirtyMetre)
+            .expect("failed to fill");
+        let tally = canvas.tally();
+
+        assert_eq!(
+            tally.one_metre, after_mosaics.one_metre,
+            "one metre was overwritten"
+        );
+        assert_eq!(
+            tally.two_metre, after_mosaics.two_metre,
+            "two metre was overwritten"
+        );
+        assert_eq!(tally.thirty_metre, after_mosaics.missing);
+        assert_eq!(
+            tally.missing, 0,
+            "thirty metre should have covered the rest"
+        );
+        assert_eq!(tally.total(), grid.texel_count());
     }
 
     #[test]
