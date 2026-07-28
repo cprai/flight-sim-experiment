@@ -123,6 +123,18 @@ struct Arguments {
     #[arg(short = 'y', long)]
     yes: bool,
 
+    /// Skip blocks whose tiles are all already written, to continue a run that
+    /// died part way through.
+    ///
+    /// Off by default, because "already on disk" and "already correct" are not
+    /// the same claim. Tiles are named by their place on a global lattice, so a
+    /// file at a given path always covers the same ground -- but it may have
+    /// been written by an older version of this tool, from fewer sources, or
+    /// before a bug was fixed. Resuming into such a directory would silently
+    /// keep the stale tiles and hide the very difference the run was for.
+    #[arg(long)]
+    resume: bool,
+
     /// Fraction of the box that may be missing before confirmation is required.
     #[arg(long, default_value_t = 0.2, value_name = "FRACTION")]
     prompt_threshold: f64,
@@ -329,6 +341,7 @@ async fn fetch_elevation(
     let mut tally = Tally::default();
     let mut downloaded = 0;
     let mut written = 0;
+    let mut skipped = 0;
     let mut samples = Vec::new();
 
     // One canvas for the whole run: the first block is the largest, so its
@@ -338,6 +351,10 @@ async fn fetch_elevation(
     let mut canvas = Canvas::new(first.grid, 1, nodata)?;
 
     for (index, block) in blocks.iter().enumerate() {
+        if arguments.resume && block_is_written(root, &grid, block, 0) {
+            skipped += 1;
+            continue;
+        }
         log::info!("block {}/{}", index + 1, blocks.len());
         canvas.reset(block.grid)?;
 
@@ -404,7 +421,36 @@ async fn fetch_elevation(
          {:.2}% no data",
         shares.one_metre, shares.two_metre, shares.thirty_metre, shares.missing
     );
+    // Provenance is not stored on disk, so a resumed run cannot say where the
+    // tiles it skipped came from. Saying which blocks the percentages cover is
+    // the only honest option -- quietly reporting a fraction of the pyramid as
+    // though it were all of it would be worse than not reporting at all.
+    if skipped > 0 {
+        println!(
+            "  {skipped} of {} blocks were already written and were skipped; the \
+             percentages above cover the {} this run filled",
+            blocks.len(),
+            blocks.len() - skipped
+        );
+    }
     Ok(())
+}
+
+/// Whether every tile this block covers is already written.
+///
+/// Deliberately conservative in one direction. A block does not write tiles it
+/// has no data for, so one that legitimately covers some empty ground can never
+/// satisfy this and is filled again on every resumed run. That wastes work on a
+/// handful of blocks at the edge of the data; the alternative -- treating "some
+/// tiles present" as done -- would skip a block that died half way through
+/// writing and leave a hole nothing would ever fill.
+fn block_is_written(root: &Path, grid: &TileGrid, block: &Block, level: u32) -> bool {
+    (0..block.tiles_down).all(|row| {
+        (0..block.tiles_across).all(|column| {
+            let tile = Tile::new(block.tile.x + column as i32, block.tile.y + row as i32);
+            grid.tile_path(root, level, tile).is_file()
+        })
+    })
 }
 
 /// Fills whatever the passes before it left empty, from one coarser tier.
@@ -666,6 +712,71 @@ mod tests {
                 assert_eq!(block.grid.height / TILE_SIZE, block.tiles_down);
             }
         }
+    }
+
+    /// `--resume` must never skip a block that is only partly written, and the
+    /// price of that guarantee is that a block missing a tile it would never
+    /// have written is filled again. Both directions are checked here, because
+    /// only the first is a correctness claim and it is the one worth keeping.
+    #[test]
+    fn a_block_counts_as_written_only_when_every_tile_is_there() {
+        let root = std::env::temp_dir().join(format!(
+            "terrain-download-resume-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let box_ = LatLonBox::from_corners(
+            LatLon {
+                latitude: 49.633,
+                longitude: -123.307,
+            },
+            LatLon {
+                latitude: 49.637,
+                longitude: -123.303,
+            },
+        )
+        .expect("failed to build a box");
+        let extent = TileExtent::cover(box_).expect("failed to cover");
+        let grid = extent.tile_grid();
+        let blocks = extent.blocks(0, ELEVATION_BLOCK_TILES);
+        let block = blocks.first().expect("the extent covers no tiles");
+
+        assert!(
+            !block_is_written(&root, &grid, block, 0),
+            "nothing is written yet"
+        );
+
+        // Write every tile but the last, which is the state a run killed
+        // part way through a block would leave behind.
+        let tiles: Vec<Tile> = (0..block.tiles_down)
+            .flat_map(|row| {
+                (0..block.tiles_across).map(move |column| {
+                    Tile::new(block.tile.x + column as i32, block.tile.y + row as i32)
+                })
+            })
+            .collect();
+        for tile in &tiles[..tiles.len() - 1] {
+            let path = grid.tile_path(&root, 0, *tile);
+            std::fs::create_dir_all(path.parent().expect("a tile path has a parent"))
+                .expect("failed to make the level directory");
+            std::fs::write(&path, b"not a real tile").expect("failed to write");
+        }
+        assert!(
+            !block_is_written(&root, &grid, block, 0),
+            "one missing tile must not count as written, or the gap it leaves \
+             would never be filled"
+        );
+
+        let last = grid.tile_path(&root, 0, *tiles.last().expect("blocks have tiles"));
+        std::fs::write(&last, b"not a real tile").expect("failed to write");
+        assert!(
+            block_is_written(&root, &grid, block, 0),
+            "a complete block should be skipped"
+        );
+
+        std::fs::remove_dir_all(&root).expect("failed to clean up");
     }
 
     #[test]
