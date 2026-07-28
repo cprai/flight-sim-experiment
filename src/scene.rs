@@ -56,13 +56,25 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     /// `w` is unused padding; uniform members are aligned to 16 bytes anyway.
     position: [f32; 4],
+    /// [`Camera::ray_basis`], one vector per row, `w` unused on each.
+    ///
+    /// Carried alongside the matrix rather than derived from it because the
+    /// raymarched far field needs a ray per pixel and inverting `view_proj` on
+    /// the GPU to get one would cost far more than three vectors of uniform.
+    ray_right: [f32; 4],
+    ray_up: [f32; 4],
+    ray_forward: [f32; 4],
 }
 
 impl CameraUniform {
     fn new(camera: &Camera) -> Self {
+        let [right, up, forward] = camera.ray_basis();
         Self {
             view_proj: camera.view_projection().to_cols_array_2d(),
             position: camera.position.extend(1.0).to_array(),
+            ray_right: right.extend(0.0).to_array(),
+            ray_up: up.extend(0.0).to_array(),
+            ray_forward: forward.extend(0.0).to_array(),
         }
     }
 }
@@ -192,6 +204,9 @@ fn camera_binding(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::BindGroupLayout
         contents: bytemuck::bytes_of(&CameraUniform {
             view_proj: [[0.0; 4]; 4],
             position: [0.0; 4],
+            ray_right: [0.0; 4],
+            ray_up: [0.0; 4],
+            ray_forward: [0.0; 4],
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });

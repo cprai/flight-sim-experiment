@@ -102,6 +102,28 @@ impl Camera {
     pub fn view_projection(&self) -> Mat4 {
         self.projection() * self.view()
     }
+
+    /// Right, up, and forward vectors that turn a screen position into a ray.
+    ///
+    /// A pixel at normalized device coordinates `(x, y)` looks along
+    /// `x * right + y * up + forward`, before normalizing. The two lateral
+    /// vectors carry the field of view and the aspect ratio, so a shader that
+    /// needs a world-space ray per pixel -- the raymarched far field -- needs
+    /// neither the projection matrix nor its inverse, and pays a couple of
+    /// multiply-adds instead of a matrix product and a perspective divide.
+    ///
+    /// Lengths are those of the near plane at unit distance, so the returned
+    /// forward vector is a unit vector and the others are scaled relative to it.
+    /// Nothing here depends on the depth range, so the reversed, infinite
+    /// projection needs no special handling.
+    pub fn ray_basis(&self) -> [Vec3; 3] {
+        let half_height = (self.fov_y * 0.5).tan();
+        [
+            self.orientation * Vec3::X * half_height * self.aspect,
+            self.orientation * Vec3::Y * half_height,
+            self.orientation * Vec3::NEG_Z,
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +227,50 @@ mod tests {
             tilted > level,
             "looking down should raise distant geometry: {level} -> {tilted}"
         );
+    }
+
+    #[test]
+    fn the_ray_through_the_centre_of_the_screen_is_the_forward_axis() {
+        let camera = Camera::new(
+            Vec3::new(10.0, 20.0, 30.0),
+            Camera::from_yaw_pitch_roll(0.7, -0.3, 0.2),
+            16.0 / 9.0,
+        );
+        let [.., forward] = camera.ray_basis();
+        // Normalized device coordinates (0, 0) contribute neither lateral
+        // vector, so the middle of the screen looks straight down the barrel.
+        assert!(forward.abs_diff_eq(camera.orientation * Vec3::NEG_Z, 1e-6));
+        assert!((forward.length() - 1.0).abs() < 1e-6, "{forward}");
+    }
+
+    #[test]
+    fn rays_agree_with_the_projection_they_have_to_invert() {
+        let camera = Camera::new(
+            Vec3::new(-40.0, 120.0, 55.0),
+            Camera::from_yaw_pitch_roll(-1.1, 0.4, -0.25),
+            16.0 / 9.0,
+        );
+        let [right, up, forward] = camera.ray_basis();
+
+        // The corners are where an error in the field of view or the aspect
+        // shows up; the centre would pass with both wrong.
+        for (x, y) in [
+            (0.0, 0.0),
+            (1.0, 1.0),
+            (-1.0, 1.0),
+            (1.0, -1.0),
+            (-1.0, -1.0),
+            (0.35, -0.8),
+        ] {
+            let ray = (right * x + up * y + forward).normalize();
+            // Any distance along the ray lands on the same pixel, so projecting
+            // one point back is a complete check of the direction.
+            let ndc = project(&camera, camera.position + ray * 5_000.0);
+            assert!(
+                (ndc.x - x).abs() < 1e-4 && (ndc.y - y).abs() < 1e-4,
+                "ray through ({x}, {y}) projects back to {ndc}"
+            );
+        }
     }
 
     #[test]

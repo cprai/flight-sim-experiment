@@ -9,6 +9,11 @@ struct Camera {
     view_proj: mat4x4<f32>,
     // World-space eye position. `w` is padding.
     position: vec4<f32>,
+    // A pixel at normalized device coordinates (x, y) looks along
+    // `x * ray_right + y * ray_up + ray_forward`. `w` is padding on each.
+    ray_right: vec4<f32>,
+    ray_up: vec4<f32>,
+    ray_forward: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
