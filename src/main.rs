@@ -1,5 +1,6 @@
 mod camera;
 mod controls;
+mod headless;
 mod renderer;
 mod scene;
 mod terrain;
@@ -9,6 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
+use glam::UVec2;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId, KeyEvent, MouseButton, WindowEvent};
@@ -17,19 +19,64 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use crate::controls::FlyController;
+use crate::headless::Placement;
 use crate::renderer::Renderer;
 
-/// Where the terrain comes from.
+/// Size of the window, and of a screenshot that does not ask for another.
+const DEFAULT_SIZE: UVec2 = UVec2::new(1280, 720);
+
+/// Where the terrain comes from, and whether to fly over it or photograph it.
 ///
 /// The pyramid is far too large to carry in the repository -- a box a few
 /// kilometres square is hundreds of megabytes -- so there is no default path to
-/// fall back on. `terrain-download` writes one; this points at it.
+/// fall back on. `terrain-download` writes one; `--terrain` points at it.
 #[derive(Parser, Debug)]
 #[command(about = "Fly over terrain streamed from a tile pyramid", long_about = None)]
 struct Arguments {
     /// Directory holding the tile pyramid, with a subdirectory per product.
     #[arg(short, long, value_name = "DIR")]
     terrain: PathBuf,
+
+    /// Render a single frame to this PNG and exit, without opening a window.
+    ///
+    /// Presenting a swapchain needs a display server; drawing into a texture
+    /// does not. This is the way in on a machine that has the GPU but no
+    /// screen -- a container given `/dev/dri` and nothing else.
+    #[arg(short = 'o', long, value_name = "FILE")]
+    screenshot: Option<PathBuf>,
+
+    /// Where to put the camera, as `x,y,z,yaw,pitch`: metres, then degrees.
+    ///
+    /// Without it the opening view is kept, which frames the whole extent and
+    /// so looks at whatever is most of the box rather than at any part of it.
+    #[arg(long, value_name = "X,Y,Z,YAW,PITCH", requires = "screenshot")]
+    camera: Option<Placement>,
+
+    /// Size of the screenshot, as `WIDTHxHEIGHT`. Defaults to the window's.
+    ///
+    /// Not merely a crop: how much ground the clipmap keeps resident is chosen
+    /// so a texel lands on about a pixel, so this changes what is loaded.
+    #[arg(long, value_name = "WxH", requires = "screenshot", value_parser = parse_size)]
+    size: Option<UVec2>,
+}
+
+/// Reads `WIDTHxHEIGHT` for [`Arguments::size`].
+fn parse_size(text: &str) -> Result<UVec2, String> {
+    let (width, height) = text
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("expected WIDTHxHEIGHT, got {text:?}"))?;
+    let read = |side: &str, value: &str| {
+        value
+            .trim()
+            .parse::<u32>()
+            .map_err(|err| format!("{side} of {text:?}: {err}"))
+            .and_then(|n| {
+                (n > 0)
+                    .then_some(n)
+                    .ok_or_else(|| format!("{side} is zero"))
+            })
+    };
+    Ok(UVec2::new(read("width", width)?, read("height", height)?))
 }
 
 struct App {
@@ -62,7 +109,7 @@ impl ApplicationHandler for App {
 
         let attributes = Window::default_attributes()
             .with_title("flight-sim")
-            .with_inner_size(LogicalSize::new(1280, 720));
+            .with_inner_size(LogicalSize::new(DEFAULT_SIZE.x, DEFAULT_SIZE.y));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(err) => {
@@ -161,6 +208,17 @@ fn main() -> anyhow::Result<()> {
     .init();
 
     let arguments = Arguments::parse();
+
+    // Before the event loop rather than inside it: building one already fails on
+    // a machine with no display server, which is exactly where this mode is for.
+    if let Some(output) = arguments.screenshot.as_deref() {
+        return headless::run(
+            &arguments.terrain,
+            arguments.size.unwrap_or(DEFAULT_SIZE),
+            arguments.camera,
+            output,
+        );
+    }
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);

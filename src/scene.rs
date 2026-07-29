@@ -293,23 +293,13 @@ fn camera_binding(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::BindGroupLayout
 
 /// A headless device and queue for the offscreen tests.
 ///
-/// Requests exactly what [`crate::renderer::Renderer`] does, so a test passing
-/// here is evidence the application will run on the same baseline rather than on
-/// whatever the test machine happens to offer.
+/// The same one the screenshot mode runs on, so a test passing here is evidence
+/// about what the application does rather than about some other configuration.
+/// Panicking rather than returning, because a test with no GPU has nothing to
+/// say and every caller would only unwrap.
 #[cfg(test)]
 pub fn test_device() -> (wgpu::Device, wgpu::Queue) {
-    let instance =
-        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-    let adapter =
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-            .expect("no wgpu adapter available");
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("test device"),
-        required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::default(),
-        ..Default::default()
-    }))
-    .expect("failed to create device")
+    crate::headless::device().expect("no headless device")
 }
 
 /// The camera bind group layout alone, for tests that build a terrain without a
@@ -1209,7 +1199,11 @@ mod tests {
     /// kilometres is hundreds of megabytes -- and because this is a look-at-it
     /// check rather than an assertion. Run it with
     /// `FLIGHT_SIM_TERRAIN=/tmp/terrain cargo test --release -- --ignored dump_installed`
-    /// and open the file.
+    /// and open the PNG it names.
+    ///
+    /// The `--screenshot` mode renders the same way; this stays because it
+    /// reaches knobs the command line deliberately does not expose, all of them
+    /// about measuring the clipmap rather than about looking at terrain.
     ///
     /// `FLIGHT_SIM_CAMERA` overrides the opening view, as
     /// `x,y,z,yaw,pitch` -- position in metres from the pyramid's centre, then
@@ -1229,31 +1223,16 @@ mod tests {
         const WIDE: u32 = 960;
         const TALL: u32 = 540;
 
-        let (device, queue) = test_device();
-        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("preview"),
-            size: wgpu::Extent3d {
-                width: WIDE,
-                height: TALL,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        let depth = create_depth_view(&device, WIDE, TALL);
-
         // The clipmap reports what it chose and what that costs through `log`,
-        // which is most of what this test exists to read.
+        // which is most of what this test exists to read. Before the device,
+        // so that the adapter it picked is reported too.
         let _ = env_logger::Builder::from_env(
             env_logger::Env::default().default_filter_or("warn,flight_sim=info"),
         )
         .try_init();
+
+        let (device, queue) = test_device();
+        let size = UVec2::new(WIDE, TALL);
 
         let started = std::time::Instant::now();
         let root = std::path::PathBuf::from(
@@ -1285,19 +1264,20 @@ mod tests {
             "rasterizing out to {} ring reaches, windows of {} texels",
             config.near_rings, config.window_texels
         );
-        let mut scene = Scene::with_config(&device, format, UVec2::new(WIDE, TALL), &root, config)
-            .expect("failed to open the terrain pyramid");
+        let mut scene = Scene::with_config(
+            &device,
+            crate::headless::CAPTURE_FORMAT,
+            size,
+            &root,
+            config,
+        )
+        .expect("failed to open the terrain pyramid");
         eprintln!("built the scene in {:.2?}", started.elapsed());
 
         if let Ok(aim) = std::env::var("FLIGHT_SIM_CAMERA") {
-            let n: Vec<f32> = aim
-                .split(',')
-                .map(|p| p.trim().parse().expect("FLIGHT_SIM_CAMERA wants numbers"))
-                .collect();
-            assert_eq!(n.len(), 5, "FLIGHT_SIM_CAMERA wants x,y,z,yaw,pitch");
-            scene.camera.position = Vec3::new(n[0], n[1], n[2]);
-            scene.camera.orientation =
-                Camera::from_yaw_pitch_roll(n[3].to_radians(), n[4].to_radians(), 0.0);
+            aim.parse::<crate::headless::Placement>()
+                .expect("FLIGHT_SIM_CAMERA wants x,y,z,yaw,pitch")
+                .apply(&mut scene.camera);
         }
 
         eprintln!(
@@ -1325,53 +1305,13 @@ mod tests {
             scene.terrain.base_level()
         );
 
-        let bytes_per_row = WIDE * 4;
-        assert_eq!(bytes_per_row % 256, 0, "readback rows must stay aligned");
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: u64::from(bytes_per_row * TALL),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
         let started = std::time::Instant::now();
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        scene.draw(&mut encoder, &view, &depth);
-        encoder.copy_texture_to_buffer(
-            target.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(TALL),
-                },
-            },
-            wgpu::Extent3d {
-                width: WIDE,
-                height: TALL,
-                depth_or_array_layers: 1,
-            },
-        );
-        queue.submit(std::iter::once(encoder.finish()));
-        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("map failed"));
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll failed");
+        let pixels = crate::headless::capture(&device, &queue, &scene, size)
+            .expect("failed to read the frame back");
         eprintln!("rendered one frame in {:.2?}", started.elapsed());
 
-        let pixels = readback.get_mapped_range(..).expect("not mapped").to_vec();
-        let mut ppm = format!("P6\n{WIDE} {TALL}\n255\n").into_bytes();
-        for y in 0..TALL {
-            for x in 0..WIDE {
-                let i = ((y * WIDE + x) * 4) as usize;
-                ppm.extend_from_slice(&pixels[i..i + 3]);
-            }
-        }
-        readback.unmap();
-
-        let path = std::env::temp_dir().join("terrain.ppm");
-        std::fs::write(&path, ppm).expect("failed to write the preview");
+        let path = std::env::temp_dir().join("terrain.png");
+        crate::headless::write_png(&path, size, &pixels).expect("failed to write the preview");
         eprintln!("wrote {}", path.display());
     }
 

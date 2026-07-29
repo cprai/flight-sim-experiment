@@ -13,6 +13,7 @@ env_logger = "0.11.11"
 glam = "0.33.2"
 half = "2.7.1"
 log = "0.4.33"
+png = "0.18.1"
 pollster = "1.0.1"
 terrain-tiles = { path = "crates/terrain-tiles" }
 tiff = { version = "0.11", default-features = false, features = ["deflate"] }
