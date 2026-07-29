@@ -33,7 +33,12 @@ impl Renderer {
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
+                // `None`, the default, makes wgpu take whichever adapter
+                // enumerates first — it does no sorting at all for that value.
+                // Machines with a discrete GPU beside an integrated one and a
+                // software fallback need to say which they want, so honour
+                // `WGPU_POWER_PREF` and keep the old behaviour when it is unset.
+                power_preference: wgpu::PowerPreference::from_env().unwrap_or_default(),
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
                 ..Default::default()
