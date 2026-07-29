@@ -105,9 +105,7 @@ struct TerrainUniform {
     window_quads: f32,
     grid_offset: f32,
     ceiling: f32,
-    // The struct's alignment is that of its widest member, so its size has to
-    // stay a multiple of sixteen to match the shader's layout.
-    padding: u32,
+    march_steps: u32,
 }
 
 /// A height raster and a matching colour raster, drawn as a geometry clipmap.
@@ -694,7 +692,7 @@ impl Terrain {
                 .iter()
                 .map(|level| highest(level))
                 .fold(f32::NEG_INFINITY, f32::max),
-            padding: 0,
+            march_steps: self.config.march_steps(levels as u32),
         };
 
         for (level, &new) in placed.iter().enumerate() {

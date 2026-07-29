@@ -89,7 +89,9 @@ struct Terrain {
     // The highest ground anywhere currently resident, taken across the coarsest
     // cell of every level being marched. A ray above it and climbing is sky.
     ceiling: f32,
-    padding: u32,
+    // How many cells a ray may visit before the march gives up on it; see
+    // `ClipmapConfig::march_steps`.
+    march_steps: u32,
 };
 
 @group(1) @binding(0) var<uniform> terrain: Terrain;
@@ -348,11 +350,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 // the near field.
 // ---------------------------------------------------------------------------
 
-// How many cells one ray may visit before giving up and showing sky. A grazing
-// ray along a ridgeline is the case that runs long; letting it show sky is a far
-// gentler failure than letting it cost whatever it likes.
-const MAX_STEPS: u32 = 192u;
-
 // Halvings used to place the intercept once the quad holding it is known. Eight
 // takes a quad to a two-hundred-and-fiftieth of its width, which is far finer
 // than the pixel that asked.
@@ -432,7 +429,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>, start: f32) -> Hit {
     // surface it was above the whole way.
     var hole = false;
 
-    for (var step = 0u; step < MAX_STEPS; step += 1u) {
+    for (var step = 0u; step < terrain.march_steps; step += 1u) {
         if (t >= limit) {
             return out;
         }
@@ -595,6 +592,21 @@ fn march(eye: vec3<f32>, dir: vec3<f32>, start: f32) -> Hit {
         return out;
     }
 
+    // Out of steps. A ray gets here by running along a slope just above the
+    // surface -- never far enough from it to skip a cell, never near enough to
+    // meet one -- so where it had got to is close to the ground and its colour
+    // is close to the ground's. Reporting that beats reporting sky by a wide
+    // margin: the ground is genuinely there, and the alternative punches a hole
+    // through a ridge that the pixels either side of it drew perfectly well.
+    //
+    // Only for a ray that has moved and is not standing over a hole, which are
+    // the same two conditions the leaf applies for the same reasons.
+    if (moved && !hole) {
+        out.found = true;
+        out.position = eye + dir * t;
+        out.level = level;
+        out.w = w0 + wd * t;
+    }
     return out;
 }
 

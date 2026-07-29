@@ -542,6 +542,37 @@ mod tests {
         b > r && b > g
     }
 
+    /// The exact bytes a pixel nothing drew over is left holding.
+    ///
+    /// Stricter than [`is_sky`], and it has to be for counting holes: the
+    /// imagery has water in it, which is bluer than it is red or green, so a
+    /// test on the channels alone finds every lake and river as well.
+    fn untouched(pixel: [u8; 4]) -> bool {
+        let clear = [CLEAR_COLOR.r, CLEAR_COLOR.g, CLEAR_COLOR.b]
+            .map(|channel| terrain_tiles::linear_to_srgb(channel as f32));
+        pixel[..3] == clear
+    }
+
+    /// Pixels nothing drew that have ground both above and below them.
+    ///
+    /// Sky above a ridge is honest; sky enclosed by ground is a ray that should
+    /// have found something and did not.
+    fn holes(pixels: &[u8]) -> Vec<(u32, u32)> {
+        (0..SIZE)
+            .flat_map(|x| {
+                let drawn: Vec<bool> = (0..SIZE).map(|y| !untouched(pixel(pixels, x, y))).collect();
+                (0..SIZE)
+                    .filter(|&y| {
+                        !drawn[y as usize]
+                            && drawn[..y as usize].iter().any(|hit| *hit)
+                            && drawn[y as usize..].iter().any(|hit| *hit)
+                    })
+                    .map(move |y| (x, y))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Looks straight down from high enough to see most of the raster.
     fn straight_down(camera: &mut Camera) {
         camera.position = Vec3::new(0.0, 3000.0, 0.0);
@@ -583,6 +614,66 @@ mod tests {
     fn low_and_looking_out(camera: &mut Camera) {
         camera.position = Vec3::new(70.0, 600.0, -110.0);
         camera.orientation = Camera::from_yaw_pitch_roll(0.0, -20f32.to_radians(), 0.0);
+    }
+
+    /// A ray that runs out of steps must not leave a hole in a ridge.
+    ///
+    /// The expensive ray in any maximum-mipmap traversal is the one running
+    /// along a slope just above the surface: too close to skip a cell, too far
+    /// to hit one. A grazing view is made of them, and a whole column of pixels
+    /// can be doing it at once, so when the budget was too small for the window
+    /// the failure was not a scattering of pinholes but vertical bands of sky
+    /// through solid ground.
+    ///
+    /// Two things stop it and this checks the pair: a budget that scales with
+    /// the traversal it bounds, and a march that reports where it had got to
+    /// rather than reporting sky when the budget does run out.
+    #[test]
+    fn a_grazing_ray_never_leaves_a_hole_in_the_ground() {
+        let (heights, colours) = rugged();
+        let grazing = |camera: &mut Camera| {
+            camera.position = Vec3::new(-1500.0, 400.0, -1500.0);
+            camera.orientation =
+                Camera::from_yaw_pitch_roll(45f32.to_radians(), -1.5f32.to_radians(), 0.0);
+        };
+        let frame = |cells: u32| {
+            render_config(
+                ClipmapConfig {
+                    // Nothing rasterized, so every pixel of ground is a ray's.
+                    near_rings: 0.0,
+                    march_cells: cells,
+                    ..wide_config()
+                },
+                heights.clone(),
+                colours.clone(),
+                grazing,
+                &[],
+            )
+            .0
+        };
+
+        // A budget far below what the traversal needs, so that rays really do
+        // run out and what is being looked at is what happens when they do.
+        // This raster is too small to exhaust the shipped budget from any
+        // camera, which is why the starving is deliberate rather than hoped
+        // for: without it the test would pass on an empty promise.
+        let starved = frame(3);
+        let holes = holes(&starved);
+        assert!(
+            holes.is_empty(),
+            "{} pixels of ground came out as sky, first at {:?}",
+            holes.len(),
+            holes.first()
+        );
+
+        // ... and where it had got to is close enough to where it was going
+        // that the picture barely notices.
+        let whole = frame(ClipmapConfig::default().march_cells);
+        let difference = mean_difference(&starved, &whole);
+        assert!(
+            difference < 3.0,
+            "giving up early moved the frame by {difference:.2} of 255"
+        );
     }
 
     /// A wider window is the only thing that buys the far field more detail.
@@ -1217,6 +1308,16 @@ mod tests {
         // tile reads and the pyramid reductions happen: a frame that draws
         // quickly can still stall here, and the two want telling apart.
         let started = std::time::Instant::now();
+        if let Ok(walk) = std::env::var("FLIGHT_SIM_WALK") {
+            let steps: u32 = walk.parse().expect("FLIGHT_SIM_WALK wants a count");
+            let home = scene.camera.position;
+            scene.camera.position = home - Vec3::new(steps as f32, 0.0, steps as f32);
+            for _ in 0..steps {
+                scene.camera.position += Vec3::new(1.0, 0.0, 1.0);
+                scene.update(&queue);
+            }
+            scene.camera.position = home;
+        }
         scene.update(&queue);
         eprintln!(
             "filled the windows in {:.2?}, finest level {}",

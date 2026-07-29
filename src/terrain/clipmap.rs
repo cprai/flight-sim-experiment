@@ -71,6 +71,14 @@ pub struct ClipmapConfig {
     /// the same question asked at two distances, and neither can be answered
     /// without knowing how large a pixel is. See [`pixel_angle`].
     pub pixel_angle: f64,
+    /// How many cells of one level a ray may visit before the march gives up.
+    ///
+    /// Sixteen, because a window is eight of the coarsest cells across by
+    /// construction -- [`ClipmapConfig::max_mip`] stops three depths short of
+    /// covering one -- and a ray crossing on the diagonal meets at most twice
+    /// that many. A field rather than a constant so that a test can starve it
+    /// and see what the march does when it runs out.
+    pub march_cells: u32,
 }
 
 /// The angle one pixel subtends, for a viewport of this height.
@@ -124,6 +132,7 @@ impl Default for ClipmapConfig {
             // 1080p at sixty degrees, replaced wherever a real viewport is
             // known.
             pixel_angle: 2.0 * (30f64.to_radians()).tan() / 1080.0,
+            march_cells: 16,
         }
     }
 }
@@ -229,6 +238,29 @@ impl ClipmapConfig {
             window /= 2;
         }
         window
+    }
+
+    /// How many cells a ray may visit before the far field gives up on it.
+    ///
+    /// Rays that meet the ground stop when they meet it; this bounds the ones
+    /// that do not, which are the ones running along a slope just above the
+    /// surface. They are the expensive case in any maximum-mipmap traversal --
+    /// too close to skip a cell, too far to hit one -- and on a horizon view a
+    /// whole column of pixels can be doing it at once.
+    ///
+    /// Derived rather than picked, because what a ray legitimately needs scales
+    /// with the clipmap. Within one level it crosses at most
+    /// [`ClipmapConfig::march_cells`] of the coarsest cells, and each of those
+    /// may cost a descent through every depth beneath it; then it hands over to
+    /// the next level and does it again.
+    ///
+    /// That is an underestimate for a ray that hugs the surface the whole way,
+    /// which in the worst case visits a cell per texel. Bounding *that* would
+    /// mean no bound at all, so the march reports where it had got to rather
+    /// than reporting sky when it does run out -- a pixel a little too near
+    /// with roughly the right colour, instead of a hole.
+    pub const fn march_steps(&self, levels: u32) -> u32 {
+        levels * self.march_cells * (self.max_mip() + 1)
     }
 
     /// Side length of the hole a ring leaves for the next finer level, in quads.
@@ -705,6 +737,45 @@ mod tests {
 
         // Twice the pixels wants twice the window, until the cap.
         assert_eq!(sized(1080).window_for(), sized(540).window_for() * 2);
+    }
+
+    /// The step budget has to grow with the traversal it bounds, or widening
+    /// the window buys detail the march then runs out of steps before reaching.
+    #[test]
+    fn the_step_budget_grows_with_what_a_ray_has_to_cross() {
+        // A window is eight of the coarsest cells across whatever its width,
+        // because `max_mip` stops three depths short of covering one. What
+        // grows with the window is how many depths there are to descend
+        // through, and what grows with the raster is how many levels a ray
+        // hands over between.
+        for window in [256u32, 1024, 4096] {
+            let config = ClipmapConfig {
+                window_texels: window,
+                ..ClipmapConfig::default()
+            };
+            assert_eq!(window >> config.max_mip(), 8);
+            assert_eq!(
+                config.march_steps(7),
+                7 * config.march_cells * (config.max_mip() + 1)
+            );
+        }
+
+        let narrow = ClipmapConfig {
+            window_texels: 256,
+            ..ClipmapConfig::default()
+        };
+        let wide = ClipmapConfig {
+            window_texels: 4096,
+            ..ClipmapConfig::default()
+        };
+        assert!(
+            wide.march_steps(7) > narrow.march_steps(7),
+            "a wider window has more depths to descend and needs more steps"
+        );
+        assert!(
+            wide.march_steps(11) > wide.march_steps(7),
+            "more levels to hand over between needs more steps"
+        );
     }
 
     #[test]
