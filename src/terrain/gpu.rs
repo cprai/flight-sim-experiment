@@ -51,8 +51,39 @@ struct TerrainUniform {
     texel_mask: u32,
     march_steps: u32,
     ceiling: f32,
-    padding: f32,
+    wall_nudge: f32,
     more_padding: [f32; 2],
+}
+
+/// How far past a cell wall the march has to put a ray for the next step to
+/// land in the next cell, in level-0 texels.
+///
+/// A fixed fraction of a texel is not enough, and that is not obvious until the
+/// raster is large. The march works in texel indices measured from the raster's
+/// north-west corner, which on a survey a hundred kilometres across reach six
+/// figures, and consecutive `f32` values up there are 0.008 texels apart. The
+/// thousandth of a texel this used to add rounded straight back off: `t` did not
+/// change, the ray landed exactly on the wall it had just left, and whether it
+/// escaped came down to which way the multiply happened to round. It took about
+/// sixteen iterations to leave one cell, so a ray crossed 8 metres per step
+/// instead of the 128 its level was worth, ran out of budget 33 km out, and was
+/// painted as ground where it stopped -- the smeared wall across the distance.
+///
+/// So take the step from the size of the numbers. `f32::EPSILON` times the
+/// largest index in play is one to two of those gaps; eight times that is
+/// comfortably clear of them and still a tenth of a texel, far below the finest
+/// ground drawn and far below the pixel it lands in.
+///
+/// This holds while the two bounds have room between them, which on a `f32` is
+/// up to a raster of about a quarter of a million texels a side, a bit over
+/// twice the one installed. Past that the nudge a ray needs to leave a wall is a
+/// sizeable fraction of the texel it is leaving, and the traversal would have to
+/// carry the cell as an integer and step it, the way a Bresenham-style DDA does,
+/// rather than deriving it from a position each time. That is a larger change
+/// than this bug is worth on its own, and it would still want a rule for what
+/// happens when the level changes mid-cell.
+fn wall_nudge(raster: UVec2) -> f32 {
+    8.0 * raster.max_element() as f32 * f32::EPSILON
 }
 
 /// The three rasters the terrain is drawn from, all describing one piece of
@@ -579,7 +610,7 @@ impl Terrain {
             texel_mask: self.residency.texel_mask(),
             march_steps: self.residency.march_steps(levels),
             ceiling: f32::NEG_INFINITY,
-            padding: 0.0,
+            wall_nudge: wall_nudge(UVec2::new(self.placement.width, self.placement.height)),
             more_padding: [0.0; 2],
         };
 
@@ -798,6 +829,40 @@ mod tests {
     }
 
     const RASTER: u32 = 64;
+
+    /// A nudge only moves a ray off a wall if it survives being added to the
+    /// numbers the march is working in, and those numbers are texel indices
+    /// measured from the raster's corner.
+    ///
+    /// This is the property the fixed thousandth of a texel did not have. On the
+    /// installed raster an index reaches 114688, where consecutive `f32` values
+    /// are 0.0078 apart, so the nudge rounded away entirely: the ray came back
+    /// to the wall it had just left and took roughly sixteen iterations to
+    /// escape one cell. Everything visible about that -- the smeared wall across
+    /// the distance, the streaks over near ground -- followed from a step too
+    /// small to be a step.
+    #[test]
+    fn a_nudge_still_moves_a_ray_at_the_far_corner_of_the_raster() {
+        for raster in [
+            UVec2::splat(RASTER),
+            UVec2::new(98304, 114688),
+            UVec2::splat(1 << 18),
+        ] {
+            let corner = raster.max_element() as f32;
+            let spacing = f32::from_bits(corner.to_bits() + 1) - corner;
+            let nudge = wall_nudge(raster);
+            assert!(
+                nudge >= 4.0 * spacing,
+                "a {raster:?} raster nudges by {nudge} where the float step is {spacing}",
+            );
+            // And still a fraction of the finest texel, so a ray that steps into
+            // a cell has not stepped over the ground at the near edge of it.
+            assert!(
+                nudge < 0.5,
+                "a {raster:?} raster nudges by {nudge} of a level-0 texel",
+            );
+        }
+    }
 
     /// Ridged enough that neighbouring texels disagree, so a maximum is a real
     /// choice rather than whichever corner happened to be picked.

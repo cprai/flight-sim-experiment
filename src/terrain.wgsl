@@ -76,7 +76,10 @@ struct Terrain {
     // The highest ground anywhere resident, across every level being marched.
     // A ray above it and climbing is sky.
     ceiling: f32,
-    padding: f32,
+    // How far past a cell wall a ray is put so the next step lands in the next
+    // cell, in level-0 texels. Sized to the raster rather than fixed: see
+    // `wall_nudge` in `src/terrain/gpu.rs`.
+    wall_nudge: f32,
     more_padding: vec2<f32>,
 };
 
@@ -205,9 +208,10 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     let p0 = (eye.xz - terrain.origin) / terrain.metres_per_texel;
     let d0 = dir.xz / terrain.metres_per_texel;
     let speed = max(max(abs(d0.x), abs(d0.y)), 1.0 / NEVER);
-    // A thousandth of a texel past a wall, so the next step lands in the next
-    // texel rather than back in this one.
-    let nudge = 0.001 / speed;
+    // Past a wall far enough to be past it, so the next step lands in the next
+    // texel rather than back in this one. `wall_nudge` is a distance along the
+    // dominant axis; dividing by `speed` turns it into a distance along the ray.
+    let nudge = terrain.wall_nudge / speed;
     // A ray that has crossed the coarsest square twice has left it, or is going
     // straight up or down and never will.
     let limit = 2.0 * f32(terrain.texel_mask + 1u) * f32(1u << coarsest) / speed;
