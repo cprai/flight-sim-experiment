@@ -23,8 +23,12 @@ Always `--release`. Timings from a debug build mean nothing, and the tile
 decoding on the way in is unoptimised there.
 
 `assets/terrain` is the pyramid this repo has installed. It is not in version
-control; `terrain-download` writes one. Without a pyramid there is nothing to
-render and no fallback path.
+control, and it is built in two steps: `terrain-download` fetches elevation and
+colour into `assets/download`, then `terrain-process` copies those across to
+`assets/terrain` and adds the max pyramid the far field is marched through.
+`--terrain` wants the second directory. Without one there is nothing to render
+and no fallback path; a tree missing its `dtm-max` product fails at startup
+rather than drawing something wrong.
 
 ## Placing the camera
 

@@ -29,7 +29,9 @@ const DEFAULT_SIZE: UVec2 = UVec2::new(1280, 720);
 ///
 /// The pyramid is far too large to carry in the repository -- a box a few
 /// kilometres square is hundreds of megabytes -- so there is no default path to
-/// fall back on. `terrain-download` writes one; `--terrain` points at it.
+/// fall back on. `terrain-download` fetches the measurements and
+/// `terrain-process` turns them into the tree this reads; `--terrain` points at
+/// what the second of those wrote, not the first.
 #[derive(Parser, Debug)]
 #[command(about = "Fly over terrain streamed from a tile pyramid", long_about = None)]
 struct Arguments {

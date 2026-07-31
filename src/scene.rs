@@ -328,7 +328,8 @@ mod tests {
 
     use super::*;
     use crate::terrain::geotiff::Georeferencing;
-    use crate::terrain::pyramid::{Level, Pyramid, RasterSource, Srgb8};
+    use crate::terrain::gpu::Sources;
+    use crate::terrain::pyramid::{Level, Pyramid, RasterSource, Srgb8, max_pyramid};
 
     /// Side of the offscreen render target.
     const SIZE: u32 = 256;
@@ -463,8 +464,17 @@ mod tests {
                     camera_layout,
                     config,
                     placement(),
-                    Box::new(Pyramid::build(Level::new(RASTER, RASTER, heights))),
-                    Box::new(Pyramid::build(Level::new(RASTER, RASTER, colours))),
+                    Sources {
+                        heights: Box::new(Pyramid::build(Level::new(
+                            RASTER,
+                            RASTER,
+                            heights.clone(),
+                        ))),
+                        colours: Box::new(Pyramid::build(Level::new(RASTER, RASTER, colours))),
+                        maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
+                            RASTER, RASTER, heights,
+                        )))),
+                    },
                 )
             },
             1.0,
@@ -624,7 +634,7 @@ mod tests {
         let grazing = |camera: &mut Camera| {
             camera.position = Vec3::new(-1500.0, 400.0, -1500.0);
             camera.orientation =
-                Camera::from_yaw_pitch_roll(45f32.to_radians(), -1.5f32.to_radians(), 0.0);
+                Camera::from_yaw_pitch_roll(315f32.to_radians(), -1.5f32.to_radians(), 0.0);
         };
         let frame = |cells: u32| {
             render_config(
@@ -645,10 +655,12 @@ mod tests {
         // A budget far below what the traversal needs, so that rays really do
         // run out and what is being looked at is what happens when they do.
         // This raster is too small to exhaust the shipped budget from any
-        // camera, which is why the starving is deliberate rather than hoped
-        // for: without it the test would pass on an empty promise.
+        // camera -- a fifth of it already leaves this view untouched -- which is
+        // why the starving is deliberate rather than hoped for: without it the
+        // test would pass on an empty promise.
         let starved = frame(3);
         let holes = holes(&starved);
+
         assert!(
             holes.is_empty(),
             "{} pixels of ground came out as sky, first at {:?}",
@@ -1237,7 +1249,7 @@ mod tests {
         let started = std::time::Instant::now();
         let root = std::path::PathBuf::from(
             std::env::var("FLIGHT_SIM_TERRAIN")
-                .expect("set FLIGHT_SIM_TERRAIN to a directory terrain-download wrote"),
+                .expect("set FLIGHT_SIM_TERRAIN to a directory terrain-process wrote"),
         );
         let mut config = ClipmapConfig {
             pixel_angle: crate::terrain::clipmap::pixel_angle(
@@ -1621,11 +1633,20 @@ mod tests {
                     camera_layout,
                     test_config(),
                     placement(),
-                    Box::new(Counted {
-                        inner: Box::new(Pyramid::build(Level::new(RASTER, RASTER, heights))),
-                        levels: reads.clone(),
-                    }),
-                    Box::new(Pyramid::build(Level::new(RASTER, RASTER, colours))),
+                    Sources {
+                        heights: Box::new(Counted {
+                            inner: Box::new(Pyramid::build(Level::new(
+                                RASTER,
+                                RASTER,
+                                heights.clone(),
+                            ))),
+                            levels: reads.clone(),
+                        }),
+                        colours: Box::new(Pyramid::build(Level::new(RASTER, RASTER, colours))),
+                        maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
+                            RASTER, RASTER, heights,
+                        )))),
+                    },
                 )
             },
             1.0,

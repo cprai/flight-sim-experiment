@@ -354,7 +354,7 @@ mod tests {
 
     const NODATA: f32 = -32767.0;
 
-    /// Writes a tile the same way `terrain-download` does: uncompressed, one row
+    /// Writes a tile the same way the tools do: uncompressed, one row
     /// per strip, placed by its own tiepoint. Spelled out here rather than
     /// shared, so this is testing that the reader accepts the format rather than
     /// that two crates agree on one definition of it.

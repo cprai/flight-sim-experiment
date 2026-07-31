@@ -12,10 +12,11 @@ use crate::terrain::clipmap::{
     ClipmapConfig, detail_base, exposed_regions, grid_origin, split_across_seam, window_origin,
 };
 use crate::terrain::geotiff::Georeferencing;
-use crate::terrain::maxima::{Maxima, ceiling_half};
+use crate::terrain::maxima::ceiling_half;
 use crate::terrain::mesh::{self, PatchKind};
 use crate::terrain::pyramid::{RasterSource, Resident, Srgb8};
 use crate::terrain::tiles::TileStore;
+use terrain_tiles::maxima::highest;
 
 /// Must match `MAX_LEVELS` in the shader.
 const MAX_LEVELS: usize = 16;
@@ -23,41 +24,6 @@ const MAX_LEVELS: usize = 16;
 /// Vertical scale applied to the height raster, for when terrain needs
 /// exaggerating to read clearly. One means true to the data.
 const VERTICAL_EXAGGERATION: f32 = 1.0;
-
-/// Side length of the squares the max pyramid is reduced in, in texels.
-///
-/// Half a tile, by measurement. A window overlaps the same small number of
-/// blocks whatever their size -- two per axis plus one for misalignment -- so a
-/// larger block reads proportionally more ground per build for no fewer builds.
-/// Against `assets/terrain` at a low camera, filling every window from cold took
-/// 45.8 ms at 256 against 61.7 ms at 512; 128 read less again but paid it back
-/// in per-block overhead, at 42.2 ms and a worse worst frame.
-const MAXIMA_BLOCK: u32 = 256;
-
-/// Slack over the blocks a frame actually touches, before the cache starts
-/// dropping them.
-///
-/// The working set is every block a window overlaps, at every level, and all of
-/// it is read every frame; a budget below that would evict blocks the same frame
-/// rebuilds. A quarter over is room for the window to drift onto new blocks
-/// without immediately throwing away the ones it is still standing on.
-const MAXIMA_SLACK: usize = 5;
-
-/// How many bytes of reduced blocks to keep, for a clipmap of this shape.
-///
-/// Every level's window is read every frame, so the whole working set has to fit
-/// or the cache thrashes. A window of `w` texels overlaps `w / block + 1` blocks
-/// on each axis, and a block's chain is a third of its own area.
-fn maxima_budget(config: &ClipmapConfig, levels: u32, block: u32) -> usize {
-    let across = (config.window_texels.div_ceil(block) + 1) as usize;
-    let chain = (block as usize).pow(2) / 3 * size_of::<f32>();
-    across.pow(2) * chain * levels as usize * MAXIMA_SLACK / 4
-}
-
-/// The largest of a run of ceilings, which is never empty.
-fn highest(cells: &[f32]) -> f32 {
-    cells.iter().copied().fold(f32::NEG_INFINITY, f32::max)
-}
 
 /// A grid vertex: nothing but its integer position within the shared grid.
 #[repr(C)]
@@ -108,6 +74,19 @@ struct TerrainUniform {
     march_steps: u32,
 }
 
+/// The three rasters a clipmap is built over, all describing one piece of
+/// ground.
+///
+/// Grouped rather than passed alongside each other because they are only
+/// meaningful together, and because `maxima` is the one whose levels do not mean
+/// what the others' do -- naming it beside them is where that is easiest to get
+/// wrong. See [`Terrain::maxima`].
+pub struct Sources {
+    pub heights: Box<dyn RasterSource>,
+    pub colours: Box<dyn RasterSource>,
+    pub maxima: Box<dyn RasterSource>,
+}
+
 /// A height raster and a matching colour raster, drawn as a geometry clipmap.
 pub struct Terrain {
     config: ClipmapConfig,
@@ -141,12 +120,15 @@ pub struct Terrain {
     /// Reused between uploads so a moving camera allocates nothing.
     staging: Vec<u8>,
 
-    /// The quadtree the far field is raymarched through, reduced on the CPU.
+    /// The quadtree the far field is raymarched through, written by
+    /// `terrain-process` and read exactly as the heights are.
     ///
-    /// Anchored to the raster rather than to any window, which is what lets it
-    /// travel through the same incremental upload path as the heights; see
-    /// [`crate::terrain::maxima`].
-    maxima: Maxima,
+    /// **Its levels are not clipmap levels.** Level `m` of this source is the
+    /// maximum over squares of `2^m` raster samples, so clipmap level `l`'s
+    /// depth `m` is level `l + m` of it; see [`crate::terrain::maxima`]. That is
+    /// what lets one pyramid serve every level, and why this source's level
+    /// count must never be folded into the count the clipmap builds.
+    maxima: Box<dyn RasterSource>,
     /// A mirror of the coarsest cells of each level, in window order.
     ///
     /// The far field's cheapest early out is "above everything and climbing",
@@ -174,12 +156,13 @@ pub struct Terrain {
 }
 
 impl Terrain {
-    /// Opens both tile pyramids and builds the clipmap around them.
+    /// Opens the tile pyramids and builds the clipmap around them.
     ///
-    /// `root` holds one directory per product. Nothing is decoded here beyond
-    /// two manifests -- the tiles themselves are read a window at a time while
-    /// drawing, which is what keeps residency independent of how much ground the
-    /// pyramid covers.
+    /// `root` holds one directory per product: elevation, colour, and the max
+    /// pyramid `terrain-process` reduced from the elevation. Nothing is decoded
+    /// here beyond three manifests -- the tiles themselves are read a window at a
+    /// time while drawing, which is what keeps residency independent of how much
+    /// ground the pyramid covers.
     pub fn from_tiles(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
@@ -187,10 +170,9 @@ impl Terrain {
         config: ClipmapConfig,
         root: &Path,
     ) -> Result<Self> {
-        let elevation = crate::terrain::ELEVATION_PRODUCTS
+        let product = crate::terrain::ELEVATION_PRODUCTS
             .iter()
-            .map(|product| root.join(product))
-            .find(|directory| directory.is_dir())
+            .find(|product| root.join(product).is_dir())
             .with_context(|| {
                 format!(
                     "{} holds no {} directory",
@@ -198,20 +180,35 @@ impl Terrain {
                     crate::terrain::ELEVATION_PRODUCTS.join(" or ")
                 )
             })?;
+        let elevation = root.join(product);
         let colour = root.join(crate::terrain::COLOUR_PRODUCT);
+        // Named after the elevation it was reduced from, because `dtm` and `dsm`
+        // are different surfaces and a bound over one does not cover the other.
+        let ceilings = root.join(terrain_tiles::maxima_product(product));
 
         let heights = TileStore::<f32>::open(&elevation)?;
         let colours = TileStore::<Srgb8>::open(&colour)?;
+        let maxima = TileStore::<f32>::open(&ceilings).with_context(|| {
+            format!(
+                "{} holds no max pyramid for {product}; run terrain-process over the download",
+                root.display()
+            )
+        })?;
 
-        // Structural rather than approximate: both manifests come from one
-        // download over one snapped extent, so they either describe the same
+        // Structural rather than approximate: every manifest here descends from
+        // one download over one snapped extent, so they either describe the same
         // ground exactly or one of them is from a different run.
-        anyhow::ensure!(
-            heights.manifest().covers_same_ground_as(colours.manifest()),
-            "{} and {} do not cover the same ground",
-            elevation.display(),
-            colour.display()
-        );
+        for (directory, manifest) in [
+            (&colour, colours.manifest()),
+            (&ceilings, maxima.manifest()),
+        ] {
+            anyhow::ensure!(
+                heights.manifest().covers_same_ground_as(manifest),
+                "{} and {} do not cover the same ground",
+                elevation.display(),
+                directory.display()
+            );
+        }
 
         let placement = heights.placement();
         log::info!(
@@ -222,11 +219,13 @@ impl Terrain {
             heights.manifest().max_level()
         );
 
-        // The downloader writes as many levels as it was asked for, which is
-        // rarely enough to span the whole raster: five here where seven are
-        // needed. Continuing the chain in memory is what lets the outermost ring
-        // -- and so the far field marched through it -- reach the edge of the
-        // data rather than a couple of kilometres of it.
+        // The tools write as many levels as they were asked for, which is rarely
+        // enough to span the whole raster: nine here where sixteen are wanted.
+        // Continuing the chain in memory is what lets the outermost ring -- and
+        // so the far field marched through it -- reach the edge of the data
+        // rather than a couple of kilometres of it. The max chain continues with
+        // a maximum rather than a mean, or its coarsest cells would sit below
+        // the ground they are supposed to bound.
         let raster = UVec2::new(placement.width, placement.height);
         Ok(Self::new(
             device,
@@ -234,8 +233,15 @@ impl Terrain {
             camera_layout,
             config,
             placement,
-            Box::new(Resident::<f32>::over(Box::new(heights), raster)),
-            Box::new(Resident::<Srgb8>::over(Box::new(colours), raster)),
+            Sources {
+                heights: Box::new(Resident::<f32>::over(Box::new(heights), raster)),
+                colours: Box::new(Resident::<Srgb8>::over(Box::new(colours), raster)),
+                maxima: Box::new(Resident::<f32>::over_with(
+                    Box::new(maxima),
+                    raster,
+                    terrain_tiles::maxima::highest,
+                )),
+            },
         ))
     }
 
@@ -245,10 +251,17 @@ impl Terrain {
         camera_layout: &wgpu::BindGroupLayout,
         config: ClipmapConfig,
         placement: Georeferencing,
-        heights: Box<dyn RasterSource>,
-        colours: Box<dyn RasterSource>,
+        sources: Sources,
     ) -> Self {
+        let Sources {
+            heights,
+            colours,
+            maxima,
+        } = sources;
         let raster = UVec2::new(placement.width, placement.height);
+        // Only the sources whose levels *are* clipmap levels. The max pyramid's
+        // are depths of a quadtree over the same raster and run further, so
+        // folding it in here would cost real levels of terrain.
         let available = heights.level_count().min(colours.level_count());
         // The caller asks for the window the screen would like; how much of it
         // is affordable depends on the raster, which only becomes known here.
@@ -258,6 +271,19 @@ impl Terrain {
         };
         let level_count = config.level_count(raster, available).min(MAX_LEVELS as u32);
         let window = config.window_texels;
+
+        // The coarsest thing that will ever be asked for: the outermost level's
+        // coarsest depth. A source that stops short of it would answer with its
+        // own top level clamped, which bounds a smaller square than the cell
+        // covers and so is not a bound at all.
+        let deepest = level_count - 1 + config.max_mip();
+        assert!(
+            maxima.level_count() > deepest,
+            "the max pyramid reaches level {} but level {} is needed for {level_count} \
+             clipmap levels of {window} texels",
+            maxima.level_count() - 1,
+            deepest
+        );
         log::info!(
             "clipmap: {level_count} levels of {window} texels, \
              {:.0} MiB of texture, reaching {} texels from the camera",
@@ -575,10 +601,7 @@ impl Terrain {
             detail: (0, 0.0),
             ground: vec![0.0; window_bytes],
             staging: vec![0; window_bytes * size_of::<Srgb8>().max(size_of::<f32>())],
-            maxima: Maxima::new(
-                MAXIMA_BLOCK,
-                maxima_budget(&config, level_count, MAXIMA_BLOCK),
-            ),
+            maxima,
             ceilings: vec![vec![f32::NEG_INFINITY; ceiling_texels]; level_count as usize],
             height_texture,
             colour_texture,
@@ -881,13 +904,15 @@ impl Terrain {
         let size = piece.size();
         let texels = (size.x * size.y) as usize;
         let bytes = texels * size_of::<f32>();
+        // `level + mip`, not `mip`: the pyramid is one chain over the raster
+        // rather than one per clipmap level, and level `l`'s depth `m` cell is
+        // exactly the cell level `l + m` of it holds, at the same index. See
+        // [`crate::terrain::maxima`].
         self.maxima.read_rect(
-            self.heights.as_ref(),
-            level,
-            mip,
+            level + mip,
             piece.origin(),
             size,
-            bytemuck::cast_slice_mut(&mut self.staging[..bytes]),
+            &mut self.staging[..bytes],
         );
         // Narrowed in place, forwards, so that the half float for a cell is
         // written over bytes the full-precision one has already been read out
@@ -1154,12 +1179,12 @@ mod tests {
             .collect()
     }
 
-    /// The highest sample in the closed square a cell covers, read straight
-    /// from the raster.
+    /// The highest sample of one level across the closed square a cell covers.
     ///
     /// An oracle deliberately independent of everything the upload path does:
     /// it knows only which ground a cell is named after, and asks the source
-    /// what stands on it.
+    /// what stands on it. This is what the *march* needs a cell to bound when
+    /// that level is the one reading it.
     fn cell_ceiling(source: &dyn RasterSource, level: u32, mip: u32, cell: IVec2) -> f32 {
         let span = 1i32 << mip;
         let side = span as u32 + 1;
@@ -1170,7 +1195,19 @@ mod tests {
             UVec2::splat(side),
             bytemuck::cast_slice_mut(&mut samples),
         );
-        samples.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        terrain_tiles::maxima::highest(&samples)
+    }
+
+    /// What a depth is defined to hold: the greatest of [`cell_ceiling`] over
+    /// every level that could read it.
+    ///
+    /// The bound each level asks for differs, and a cell has to satisfy all of
+    /// them at once, because which level reads a given depth depends on where
+    /// the camera is rather than on anything the pyramid knows.
+    fn cell_defined(source: &dyn RasterSource, depth: u32, cell: IVec2) -> f32 {
+        (0..=depth.min(source.level_count() - 1))
+            .map(|level| cell_ceiling(source, level, depth - level, cell))
+            .fold(f32::NEG_INFINITY, f32::max)
     }
 
     /// Every texel of the pyramid bounds the ground it claims, and sits where
@@ -1189,19 +1226,27 @@ mod tests {
         let config = test_config();
         let window = config.window_texels;
 
+        // The raster the cells are defined over, kept aside so the oracle can
+        // look their squares up in it directly rather than through anything the
+        // upload path touched.
+        let raster = Pyramid::build(Level::new(RASTER, RASTER, rugged()));
         let mut terrain = Terrain::new(
             &device,
             wgpu::TextureFormat::Rgba8UnormSrgb,
             &camera_layout,
             config,
             Georeferencing::square(RASTER, RASTER, 30.0),
-            Box::new(Pyramid::build(Level::new(RASTER, RASTER, rugged()))),
-            Box::new(Pyramid::build(Level::new(
-                RASTER,
-                RASTER,
-                vec![Srgb8([0, 0, 0, 255]); (RASTER * RASTER) as usize],
-            ))),
+            Sources {
+                heights: Box::new(Pyramid::build(Level::new(RASTER, RASTER, rugged()))),
+                colours: Box::new(Pyramid::build(Level::new(
+                    RASTER,
+                    RASTER,
+                    vec![Srgb8([0, 0, 0, 255]); (RASTER * RASTER) as usize],
+                ))),
+                maxima: Box::new(crate::terrain::pyramid::max_pyramid(&raster)),
+            },
         );
+        let raster: &dyn RasterSource = &raster;
 
         // Off any round number, so that a window origin is not a multiple of a
         // coarse cell and reading the cells in window order would be visibly
@@ -1260,7 +1305,7 @@ mod tests {
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll failed");
 
-        let mut checked = 0;
+        let (mut checked, mut exact) = (0, 0);
         for level in 0..levels {
             for (mip, readback) in readbacks.iter().enumerate() {
                 let mip = mip as u32;
@@ -1281,15 +1326,40 @@ mod tests {
                             &layer[y as usize * stride..y as usize * stride + span as usize * 2],
                         );
                         let got = half::f16::from_bits(row[x as usize]).to_f32();
-                        let want = cell_ceiling(terrain.heights.as_ref(), level, mip, cell);
-                        // Half precision, rounded towards positive infinity, so
-                        // a cell is at or a little above the ground it covers
-                        // and never below it. Below would be a ridge a ray can
-                        // pass through; above only costs a descent.
+
+                        // The definition: the greatest bound any level reading
+                        // depth `level + mip` asks for. Equality pins both the
+                        // values and the `level + mip` indexing, which is the
+                        // part a version reading its own level would get right
+                        // only where the two happen to coincide.
+                        //
+                        // Asked only of cells whose square lands on real ground.
+                        // A window legitimately hangs off the raster, and out
+                        // there both the pyramid and this oracle repeat the
+                        // border -- but at their own granularities, so they
+                        // agree on the bound without agreeing on the figure.
+                        let reach = (cell + IVec2::ONE) << (level + mip);
+                        if cell.min_element() >= 0 && reach.max_element() < RASTER as i32 {
+                            let want = cell_defined(raster, level + mip, cell);
+                            assert_eq!(
+                                got,
+                                ceiling_half(want).to_f32(),
+                                "level {level} mip {mip} cell {cell} at ({x}, {y}) \
+                                 holds {got} where the levels reading it want {want}"
+                            );
+                            exact += 1;
+                        }
+
+                        // ... and the property the march actually leans on,
+                        // stated in the terms it works in: the cell is at or
+                        // above every height sample of *this* level over the
+                        // closed square it covers. Below would be a ridge a ray
+                        // can pass through; above only costs a descent.
+                        let meets = cell_ceiling(terrain.heights.as_ref(), level, mip, cell);
                         assert!(
-                            got >= want && got <= ceiling_half(want).to_f32(),
-                            "level {level} mip {mip} cell {cell} at ({x}, {y}) \
-                             holds {got} for ground at {want}"
+                            got >= meets,
+                            "level {level} mip {mip} cell {cell} holds {got} \
+                             for level-{level} ground at {meets}"
                         );
                         checked += 1;
                     }
@@ -1297,5 +1367,9 @@ mod tests {
             }
         }
         assert!(checked > 1000, "only {checked} cells were checked");
+        assert!(
+            exact > 100,
+            "only {exact} cells sat wholly on the raster, which is too few to pin the definition"
+        );
     }
 }

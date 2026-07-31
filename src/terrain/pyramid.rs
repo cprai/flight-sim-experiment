@@ -2,9 +2,10 @@
 //!
 //! The clipmap draws distant ground on a coarser grid than nearby ground, so it
 //! needs the raster pre-filtered at every power-of-two reduction. That filtering
-//! now happens in `terrain-download`, which writes the whole chain to disk as
-//! tiles; [`crate::terrain::tiles::TileStore`] is what the simulator actually
-//! reads through.
+//! happens before the simulator runs -- `terrain-download` writes the elevation
+//! and colour chains, `terrain-process` the max chain the far field is marched
+//! through -- and [`crate::terrain::tiles::TileStore`] is what the simulator
+//! actually reads them through.
 //!
 //! What remains here is the trait that hides all of it, and an in-memory
 //! implementation the tests build synthetic terrain with. Nothing is ever
@@ -77,13 +78,28 @@ pub struct Pyramid<T> {
 
 impl<T: Texel> Pyramid<T> {
     /// Builds the reduction chain from a full-resolution level, down to 1x1.
+    ///
+    /// Only tests reach for this: the application's chains are built by the
+    /// tools and continued by [`Resident`], both of which name their fold.
+    #[cfg(test)]
     pub fn build(base: Level<T>) -> Self {
+        Self::build_with(base, T::box_filter)
+    }
+
+    /// As [`Pyramid::build`], but combining four texels however `fold` says.
+    ///
+    /// A height field is averaged, because a coarse level should be a smoothed
+    /// surface rather than an aliased subsample of one. A max pyramid is not:
+    /// its texels are bounds, and the bound over four cells is their maximum.
+    /// Averaging one would produce a ceiling below the ground it is supposed to
+    /// cover, which is a ray passing through a ridge.
+    pub fn build_with(base: Level<T>, fold: fn(&[T]) -> T) -> Self {
         let mut levels = vec![base];
         while {
             let last = levels.last().expect("a pyramid always has a base level");
             last.width > 1 || last.height > 1
         } {
-            levels.push(reduce(levels.last().expect("just checked")));
+            levels.push(reduce(levels.last().expect("just checked"), fold));
         }
         Self { levels }
     }
@@ -114,8 +130,50 @@ impl Pyramid<f32> {
     }
 }
 
+/// Builds the max pyramid `terrain-process` would have written for a raster.
+///
+/// The same recurrence, applied in memory to the mip chain of `heights`, so a
+/// test can hand [`crate::terrain::gpu::Terrain`] the third source it wants
+/// without a tile tree behind it. Closing a square reaches one sample past it,
+/// and here that reach repeats the border rather than reading nodata, which is
+/// what [`RasterSource::read_rect`] does past an edge anyway.
+#[cfg(test)]
+pub fn max_pyramid(heights: &Pyramid<f32>) -> Pyramid<f32> {
+    /// One level's own samples, closed: the maximum of the four around each
+    /// cell, with the last row and column repeating the border.
+    fn close(fine: &Level<f32>) -> Level<f32> {
+        let (width, height) = (fine.width, fine.height);
+        let wide = width + 1;
+        let mut padded = vec![0f32; (wide as usize) * (height as usize + 1)];
+        for y in 0..=height {
+            for x in 0..=width {
+                padded[(y * wide + x) as usize] = fine.get(x.min(width - 1), y.min(height - 1));
+            }
+        }
+        let mut out = vec![0f32; (width as usize) * (height as usize)];
+        terrain_tiles::maxima::quad_max(&padded, width, height, &mut out);
+        Level::new(width, height, out)
+    }
+
+    let mut levels: Vec<Level<f32>> = Vec::new();
+    for depth in 0..heights.levels.len() {
+        let mut cells = close(&heights.levels[depth]);
+        if let Some(below) = levels.last() {
+            // Every bound the depth below carries, halved, against this level's
+            // own. `reduce` folds with a maximum here, and rounds the size up
+            // the same way the mip chain beside it does.
+            let carried = reduce(below, terrain_tiles::maxima::highest);
+            for (cell, from) in cells.texels.iter_mut().zip(&carried.texels) {
+                *cell = cell.max(*from);
+            }
+        }
+        levels.push(cells);
+    }
+    Pyramid { levels }
+}
+
 /// Halves a level, rounding up so a single odd texel still gets a home.
-fn reduce<T: Texel>(fine: &Level<T>) -> Level<T> {
+fn reduce<T: Texel>(fine: &Level<T>, fold: fn(&[T]) -> T) -> Level<T> {
     let width = (fine.width.div_ceil(2)).max(1);
     let height = (fine.height.div_ceil(2)).max(1);
 
@@ -143,7 +201,7 @@ fn reduce<T: Texel>(fine: &Level<T>) -> Level<T> {
             texels.push(if samples.is_empty() {
                 T::NODATA
             } else {
-                T::box_filter(&samples)
+                fold(&samples)
             });
         }
     }
@@ -208,6 +266,14 @@ impl<T: Texel> Resident<T> {
     /// `raster` is the full-resolution size, which is what says how large that
     /// level is; a source knows how many levels it has but not how wide.
     pub fn over(inner: Box<dyn RasterSource>, raster: UVec2) -> Self {
+        Self::over_with(inner, raster, T::box_filter)
+    }
+
+    /// As [`Resident::over`], but continuing the chain however `fold` says.
+    ///
+    /// The max pyramid's tail has to be folded with a maximum rather than a
+    /// mean, for the reason [`Pyramid::build_with`] gives.
+    pub fn over_with(inner: Box<dyn RasterSource>, raster: UVec2, fold: fn(&[T]) -> T) -> Self {
         let first = inner.level_count().saturating_sub(1);
         let size = UVec2::new((raster.x >> first).max(1), (raster.y >> first).max(1));
 
@@ -222,7 +288,7 @@ impl<T: Texel> Resident<T> {
         Self {
             inner,
             first,
-            coarse: Pyramid::build(Level::new(size.x, size.y, texels)),
+            coarse: Pyramid::build_with(Level::new(size.x, size.y, texels), fold),
         }
     }
 }
