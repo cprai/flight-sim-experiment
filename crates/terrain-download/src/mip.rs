@@ -16,68 +16,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
+use terrain_tiles::read::{children, read_tile};
+use terrain_tiles::write::{self, TilePlacement};
 use terrain_tiles::{Srgb8, TILE_SIZE, Texel, Tile, TileGrid};
-use tiff::decoder::{Decoder, DecodingResult, Limits};
+use tiff::decoder::DecodingResult;
 
 use crate::extent::TileExtent;
-use crate::write::{self, TilePlacement};
-
-/// The four level-`L-1` tiles a level-`L` tile is made of, in reading order.
-///
-/// A tile covers `[x * span, (x + 1) * span)`, and the finer span is half, so
-/// its children are `2x` and `2x + 1` on each axis. Both indices count away
-/// from the projection origin in the same direction, so the same doubling
-/// works for rows as for columns.
-fn children(tile: Tile) -> [Tile; 4] {
-    [
-        Tile::new(tile.x * 2, tile.y * 2),
-        Tile::new(tile.x * 2 + 1, tile.y * 2),
-        Tile::new(tile.x * 2, tile.y * 2 + 1),
-        Tile::new(tile.x * 2 + 1, tile.y * 2 + 1),
-    ]
-}
-
-/// Reads a tile back, or `None` if it was never written.
-///
-/// An absent file is the ordinary case, not an error: tiles with nothing under
-/// them are skipped, which is how a box over patchy coverage stays small.
-fn read_tile(path: &Path, bands: usize) -> Result<Option<DecodingResult>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut decoder = Decoder::new(std::io::BufReader::new(file))
-        .with_context(|| format!("reading the header of {}", path.display()))?
-        .with_limits(Limits::unlimited());
-
-    let (width, height) = decoder
-        .dimensions()
-        .with_context(|| format!("reading the size of {}", path.display()))?;
-    anyhow::ensure!(
-        width == TILE_SIZE && height == TILE_SIZE,
-        "{} is {width} x {height}, not a {TILE_SIZE} x {TILE_SIZE} tile",
-        path.display()
-    );
-
-    let image = decoder
-        .read_image()
-        .with_context(|| format!("decoding {}", path.display()))?;
-    let expected = (TILE_SIZE as usize).pow(2) * bands;
-    let got = match &image {
-        DecodingResult::F32(values) => values.len(),
-        DecodingResult::U8(values) => values.len(),
-        other => anyhow::bail!(
-            "{} holds an unexpected sample type {other:?}",
-            path.display()
-        ),
-    };
-    anyhow::ensure!(
-        got == expected,
-        "{} decoded to {got} samples, expected {expected}",
-        path.display()
-    );
-    Ok(Some(image))
-}
 
 /// Half a tile: the side of the quadrant one child fills in its parent.
 const HALF: usize = (TILE_SIZE / 2) as usize;
@@ -299,22 +243,6 @@ mod tests {
     use super::*;
 
     const NODATA: f32 = -32767.0;
-
-    #[test]
-    fn a_tiles_children_are_the_four_beneath_it() {
-        assert_eq!(
-            children(Tile::new(3, -5)),
-            [
-                Tile::new(6, -10),
-                Tile::new(7, -10),
-                Tile::new(6, -9),
-                Tile::new(7, -9),
-            ]
-        );
-        // The doubling has to keep working through zero, where a truncating
-        // divide would fold two tiles into one on the way back down.
-        assert_eq!(children(Tile::new(-1, -1))[0], Tile::new(-2, -2));
-    }
 
     /// Four known values must come out as their mean, in the right quadrant.
     #[test]

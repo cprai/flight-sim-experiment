@@ -21,10 +21,11 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use terrain_tiles::TILE_SIZE;
 use tiff::encoder::colortype::{Gray32Float, RGB8};
 use tiff::encoder::{Compression, TiffEncoder};
 use tiff::tags::Tag;
+
+use crate::TILE_SIZE;
 
 /// GeoTIFF places a raster with private tags read by number.
 const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
@@ -236,7 +237,7 @@ mod tests {
     /// sharing a path race to write and delete the same file.
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir()
-            .join(format!("terrain-download-{}-{name}", std::process::id()))
+            .join(format!("terrain-tiles-write-{}-{name}", std::process::id()))
             .join("02")
             .join("-482_-128.tif")
     }
@@ -357,7 +358,7 @@ mod tests {
     #[test]
     fn a_sample_count_that_does_not_fill_a_tile_is_refused() {
         let error = write_height_tile(
-            &std::env::temp_dir().join("terrain-download-should-not-exist.tif"),
+            &std::env::temp_dir().join("terrain-tiles-should-not-exist.tif"),
             placement(),
             &[0.0; 4],
             -32767.0,

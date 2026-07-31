@@ -43,12 +43,12 @@ mod resample;
 mod retry;
 mod source;
 mod stac;
-mod write;
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use terrain_tiles::write::{self, TilePlacement};
 use terrain_tiles::{COLOUR_BASE_LEVEL, Tile, TileGrid};
 
 use bbox::{LatLon, LatLonBox};
@@ -57,7 +57,6 @@ use project::Projector;
 use resample::{Canvas, Provenance, Tally};
 use source::{RasterSpec, SourceRaster, Window};
 use stac::{Product, Resolution};
-use write::TilePlacement;
 
 /// The value HRDEM uses for ground it has no measurement of.
 const ELEVATION_NODATA: f32 = -32767.0;

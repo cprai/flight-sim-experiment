@@ -24,7 +24,9 @@
 use std::path::{Path, PathBuf};
 
 pub mod manifest;
+pub mod read;
 pub mod texel;
+pub mod write;
 
 pub use manifest::{COLOUR_BASE_LEVEL, Manifest};
 pub use texel::{
