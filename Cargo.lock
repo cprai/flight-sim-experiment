@@ -2925,6 +2925,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "terrain-process"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "log",
+ "rayon",
+ "terrain-tiles",
+]
+
+[[package]]
 name = "terrain-tiles"
 version = "0.0.0"
 dependencies = [

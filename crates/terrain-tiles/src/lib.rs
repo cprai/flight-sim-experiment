@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 
 pub mod manifest;
+pub mod maxima;
 pub mod read;
 pub mod texel;
 pub mod write;
@@ -32,6 +33,21 @@ pub use manifest::{COLOUR_BASE_LEVEL, Manifest};
 pub use texel::{
     COLOUR_IS_SRGB_ENCODED, NODATA_BELOW, Srgb8, Texel, linear_to_srgb, srgb_to_linear,
 };
+
+/// What marks a product directory as a max pyramid rather than a measurement.
+pub const MAXIMA_SUFFIX: &str = "-max";
+
+/// What a max pyramid's product directory is called, given the elevation it was
+/// reduced from.
+///
+/// A suffix rather than one shared name because `dtm` and `dsm` are different
+/// surfaces and each needs its own bound: the renderer picks whichever elevation
+/// product is installed and must get the pyramid built from that one, not from
+/// the other. Derived here so the tool that writes it and the renderer that
+/// opens it cannot spell it differently.
+pub fn maxima_product(elevation: &str) -> String {
+    format!("{elevation}{MAXIMA_SUFFIX}")
+}
 
 /// Side length of every tile, in texels, at every level.
 ///

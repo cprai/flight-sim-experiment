@@ -99,6 +99,9 @@ struct Arguments {
     to: LatLon,
 
     /// Directory to write the tile pyramid into, under a per-product subdirectory.
+    ///
+    /// What is downloaded, not what the simulator flies over: `terrain-process`
+    /// reads this and writes the tree the renderer opens.
     #[arg(short, long, value_name = "DIR")]
     output: PathBuf,
 
