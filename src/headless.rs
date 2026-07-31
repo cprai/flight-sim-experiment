@@ -249,8 +249,8 @@ pub fn run(
     );
 
     let started = std::time::Instant::now();
-    scene.update(&queue);
-    log::info!("filled the windows in {:.2?}", started.elapsed());
+    scene.settle(&queue);
+    log::info!("filled every level in {:.2?}", started.elapsed());
 
     let started = std::time::Instant::now();
     let pixels = capture(&device, &queue, &scene, size)?;

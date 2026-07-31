@@ -3,8 +3,8 @@ use glam::UVec2;
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
-use crate::terrain::clipmap::ClipmapConfig;
 use crate::terrain::gpu::Terrain;
+use crate::terrain::residency::Residency;
 
 /// Sky the terrain is drawn against.
 pub const CLEAR_COLOR: wgpu::Color = wgpu::Color {
@@ -92,38 +92,38 @@ impl Scene {
     /// Opens the terrain tile pyramid and frames the camera on it.
     ///
     /// `viewport` is the target's size in pixels, not merely its aspect: how
-    /// much ground the clipmap keeps resident at each level is chosen so that
-    /// a texel of it lands on about a pixel, and that needs the pixel count.
+    /// many levels are worth keeping is decided by whether their texels are
+    /// still smaller than the pixels they land in, and that needs the pixel
+    /// count.
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         viewport: UVec2,
         terrain_root: &std::path::Path,
     ) -> Result<Self> {
-        let mut config = ClipmapConfig {
-            pixel_angle: crate::terrain::clipmap::pixel_angle(
+        let residency = Residency {
+            pixel_angle: crate::terrain::residency::pixel_angle(
                 viewport.y,
                 f64::from(crate::camera::FOV_Y_DEGREES).to_radians(),
             ),
-            ..ClipmapConfig::default()
+            ..Residency::default()
         };
-        config.window_texels = config.window_for();
-        Self::with_config(device, format, viewport, terrain_root, config)
+        Self::with_residency(device, format, viewport, terrain_root, residency)
     }
 
-    /// As [`Scene::new`], but over a clipmap configured by the caller.
+    /// As [`Scene::new`], but over a residency configured by the caller.
     ///
     /// Only [`dump_installed_terrain`] uses this, to time one view against
-    /// several shapes of clipmap; the application takes the default.
-    pub fn with_config(
+    /// several shapes of square; the application takes the default.
+    pub fn with_residency(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         viewport: UVec2,
         terrain_root: &std::path::Path,
-        config: ClipmapConfig,
+        residency: Residency,
     ) -> Result<Self> {
         let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
-        let terrain = Terrain::from_tiles(device, format, &camera_layout, config, terrain_root)?;
+        let terrain = Terrain::from_tiles(device, format, &camera_layout, residency, terrain_root)?;
         Ok(Self::assemble(
             camera_buffer,
             camera_bind_group,
@@ -162,9 +162,12 @@ impl Scene {
         }
     }
 
-    /// Uploads the current camera and moves the clipmap to follow it.
+    /// Uploads the current camera and brings residency up to date with it.
     ///
-    /// Call once per frame before [`Scene::draw`].
+    /// Call once per frame before [`Scene::draw`]. Bounded: a frame reads at
+    /// most a few tiles, so crossing a tile boundary costs a known amount
+    /// rather than a stall, and a level that falls behind is drawn coarser at
+    /// its outer edge rather than wrongly.
     pub fn update(&mut self, queue: &wgpu::Queue) {
         queue.write_buffer(
             &self.camera_buffer,
@@ -174,7 +177,21 @@ impl Scene {
         self.terrain.update(queue, self.camera.position);
     }
 
+    /// Updates until every level holds all the tiles it wants.
+    ///
+    /// For anything that draws one frame and stops -- a screenshot, a test --
+    /// where streaming in over the next second is no use to anybody.
+    pub fn settle(&mut self, queue: &wgpu::Queue) {
+        self.update(queue);
+        while self.terrain.pending() {
+            self.update(queue);
+        }
+    }
+
     /// Records a sky clear plus the terrain into `view`.
+    ///
+    /// One pass: every pixel of ground is raymarched, so there is no near field
+    /// to sort against and nothing to load a half-written depth buffer for.
     ///
     /// `depth` must be a [`DEPTH_FORMAT`] view matching `view`'s dimensions; see
     /// [`create_depth_view`].
@@ -212,39 +229,6 @@ impl Scene {
 
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         self.terrain.draw(&mut pass);
-        drop(pass);
-
-        // The far field goes in a second pass loading what the first left, not
-        // in more draws at the end of it, because a pipeline's depth state is
-        // fixed and this one writes its depth from the fragment stage. Loading
-        // the depth buffer is the whole mechanism: the near field is already in
-        // it, so the two sort against each other with nothing else to arrange.
-        let mut far = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("far terrain pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-
-        far.set_bind_group(0, &self.camera_bind_group, &[]);
-        self.terrain.draw_far(&mut far);
     }
 }
 
@@ -337,11 +321,18 @@ mod tests {
     const RASTER: u32 = 128;
     const METRES_PER_TEXEL: f64 = 30.0;
 
-    /// A deliberately small clipmap, so the software rasterizer stays quick.
-    fn test_config() -> ClipmapConfig {
-        ClipmapConfig {
-            block_verts: 16,
-            window_texels: 64,
+    /// A deliberately small residency, so a frame stays quick to march.
+    ///
+    /// Tiles of eight texels rather than the store's five hundred and twelve,
+    /// because a raster a test can afford to build is smaller than one real
+    /// tile and none of the squares, slots or wraps would be exercised at all.
+    fn test_residency() -> Residency {
+        Residency {
+            tiles_across: 8,
+            tile_texels: 8,
+            // Whole squares at once, so no test has to drain a queue to see a
+            // settled frame.
+            tiles_per_update: 4096,
             // A far coarser pixel than any real viewport, because the rule for
             // giving up a level compares its texels to one. This raster's are
             // thirty metres, which a 256-pixel frame still resolves from
@@ -378,8 +369,8 @@ mod tests {
         render_after(heights, colours, aim, &[])
     }
 
-    /// As [`render`], but stepping the camera through `path` first so the
-    /// clipmap has to update incrementally before the frame that is captured.
+    /// As [`render`], but stepping the camera through `path` first so residency
+    /// has to swap tiles in and out before the frame that is captured.
     fn render_after(
         heights: Vec<f32>,
         colours: Vec<Srgb8>,
@@ -401,35 +392,24 @@ mod tests {
         aim: impl FnOnce(&mut Camera),
         path: &[Vec3],
     ) -> (Vec<u8>, u32) {
-        render_config(test_config(), heights, colours, aim, path)
+        render_config(test_residency(), heights, colours, aim, path)
     }
 
-    /// The same clipmap with room around its grid.
+    /// The same shape with twice the ground resident at every level.
     ///
-    /// The mesh draws the same rings either way; the extra texels are there for
-    /// the far field, which reads whatever is resident rather than only what the
-    /// mesh covers. Anything the near field draws has to come out the same.
-    fn wide_config() -> ClipmapConfig {
-        ClipmapConfig {
-            window_texels: 128,
-            ..test_config()
+    /// The only thing that buys the march more detail at a given distance: a
+    /// point is drawn at the finest level still resident for it, and a wider
+    /// square keeps finer levels further out.
+    fn wide_residency() -> Residency {
+        Residency {
+            tiles_across: 16,
+            ..test_residency()
         }
     }
 
-    /// The clipmap of [`test_config`] cut at a given radius.
-    ///
-    /// Infinity rasterizes the whole frame and zero raymarches it, which is how
-    /// the two halves of the renderer are held against each other.
-    fn cut_at(near_rings: f32) -> ClipmapConfig {
-        ClipmapConfig {
-            near_rings,
-            ..test_config()
-        }
-    }
-
-    /// As [`render_probed`], but over a clipmap configured by the caller.
+    /// As [`render_probed`], but over a residency configured by the caller.
     fn render_config(
-        config: ClipmapConfig,
+        residency: Residency,
         heights: Vec<f32>,
         colours: Vec<Srgb8>,
         aim: impl FnOnce(&mut Camera),
@@ -462,7 +442,7 @@ mod tests {
                     &device,
                     format,
                     camera_layout,
-                    config,
+                    residency,
                     placement(),
                     Sources {
                         heights: Box::new(Pyramid::build(Level::new(
@@ -631,18 +611,22 @@ mod tests {
     #[test]
     fn a_grazing_ray_never_leaves_a_hole_in_the_ground() {
         let (heights, colours) = rugged();
+        // Aimed *into* the raster, from its north-west corner towards the far
+        // one. A grazing ray that leaves the data is cut by the bounds test
+        // however much budget it had -- ground outside the survey is invented
+        // and does not get drawn -- so a view pointed outwards measures that
+        // cut rather than what happens when a ray runs out, which is the thing
+        // here.
         let grazing = |camera: &mut Camera| {
             camera.position = Vec3::new(-1500.0, 400.0, -1500.0);
             camera.orientation =
-                Camera::from_yaw_pitch_roll(315f32.to_radians(), -1.5f32.to_radians(), 0.0);
+                Camera::from_yaw_pitch_roll(135f32.to_radians(), -1.5f32.to_radians(), 0.0);
         };
-        let frame = |cells: u32| {
+        let frame = |texels: u32| {
             render_config(
-                ClipmapConfig {
-                    // Nothing rasterized, so every pixel of ground is a ray's.
-                    near_rings: 0.0,
-                    march_cells: cells,
-                    ..wide_config()
+                Residency {
+                    march_texels: texels,
+                    ..wide_residency()
                 },
                 heights.clone(),
                 colours.clone(),
@@ -655,10 +639,11 @@ mod tests {
         // A budget far below what the traversal needs, so that rays really do
         // run out and what is being looked at is what happens when they do.
         // This raster is too small to exhaust the shipped budget from any
-        // camera -- a fifth of it already leaves this view untouched -- which is
-        // why the starving is deliberate rather than hoped for: without it the
-        // test would pass on an empty promise.
-        let starved = frame(3);
+        // camera, which is why the starving is deliberate rather than hoped
+        // for: without it the test would pass on an empty promise. A twentieth
+        // of the budget is where rays start running out and the fallback still
+        // covers every one of them.
+        let starved = frame(24);
         let holes = holes(&starved);
 
         assert!(
@@ -670,7 +655,7 @@ mod tests {
 
         // ... and where it had got to is close enough to where it was going
         // that the picture barely notices.
-        let whole = frame(ClipmapConfig::default().march_cells);
+        let whole = frame(Residency::default().march_texels);
         let difference = mean_difference(&starved, &whole);
         assert!(
             difference < 3.0,
@@ -698,14 +683,9 @@ mod tests {
             })
             .collect();
 
-        let contrast = |config: ClipmapConfig| {
+        let contrast = |residency: Residency| {
             let (pixels, _) = render_config(
-                ClipmapConfig {
-                    // Nothing rasterized, so every pixel of ground was found by
-                    // a ray and the comparison is of the march alone.
-                    near_rings: 0.0,
-                    ..config
-                },
+                residency,
                 vec![0.0; (RASTER * RASTER) as usize],
                 check.clone(),
                 low_and_looking_out,
@@ -727,122 +707,19 @@ mod tests {
             total as f64 / ground as f64
         };
 
-        let narrow = contrast(test_config());
-        // Four times the width, so that level zero's reach covers the whole of
-        // the raster this camera can see rather than only the near half of it.
-        let wide = contrast(ClipmapConfig {
-            window_texels: 256,
-            ..test_config()
+        // Four times the width, so level zero stays resident across the whole
+        // of the ground this camera can see rather than only the near part of
+        // it -- and a point is drawn at the finest level resident for it.
+        let narrow = contrast(Residency {
+            tiles_across: 4,
+            ..test_residency()
         });
+        let wide = contrast(wide_residency());
         assert!(
             wide > narrow * 1.8,
             "widening the window resolved {wide:.2} of contrast against {narrow:.2}, \
              which is not the detail it was supposed to buy"
         );
-    }
-
-    /// The far field on its own draws the ground the mesh would have drawn.
-    ///
-    /// The strongest statement available about the traversal: with the radius at
-    /// zero the mesh draws nothing at all and every lit pixel in the frame was
-    /// found by a ray, so holding it against the fully rasterized frame compares
-    /// the two halves of the renderer directly. They agree because they read the
-    /// same data at the same level -- a point belongs to the finest level whose
-    /// grid contains it, which is exactly the level whose ring the mesh would
-    /// have used.
-    ///
-    /// What is left over is the ring blend. The mesh fades each ring's outer
-    /// quarter into the level outside it and the march reads each level's texels
-    /// as they are, so the two disagree across those bands and nowhere else.
-    /// That is the accepted mismatch, not a defect being tolerated: the bound
-    /// below is set just above where it currently sits, so if it ever grows --
-    /// or if the traversal starts finding a different surface altogether -- this
-    /// fails.
-    #[test]
-    fn raymarching_the_whole_frame_matches_rasterizing_it() {
-        let (heights, colours) = rugged_painted();
-        let (rastered, base) = render_config(
-            cut_at(f32::INFINITY),
-            heights.clone(),
-            colours.clone(),
-            low_and_looking_out,
-            &[],
-        );
-        assert_eq!(base, 0, "the camera has to be low enough not to blend");
-        let marched = render_config(cut_at(0.0), heights, colours, low_and_looking_out, &[]).0;
-
-        // Guard against the happy case where both frames are empty sky and any
-        // comparison between them passes.
-        let (sky, marched_sky) = (count_sky(&rastered), count_sky(&marched));
-        let pixels = (SIZE * SIZE) as usize;
-        assert!(
-            pixels - marched_sky > pixels / 4,
-            "the marched frame should hold real terrain, got {marched_sky} sky pixels"
-        );
-
-        // The horizon has to land in the same place, which a mean cannot say:
-        // a few hundred pixels of sky where there should be terrain barely move
-        // one, and that is what a hole in the acceleration structure looks like.
-        assert!(
-            marched_sky.abs_diff(sky) * 50 < pixels,
-            "sky covers {marched_sky} pixels marched against {sky} rasterized"
-        );
-
-        let difference = mean_difference(&marched, &rastered);
-        assert!(
-            difference < 5.0,
-            "the two halves should draw the same ground, mean |difference| {difference:.3}"
-        );
-    }
-
-    /// Across the range it is actually used at, the radius costs nothing.
-    ///
-    /// Which level covers a point does not depend on where the cut falls, so
-    /// moving it changes how a frame was computed rather than what it shows --
-    /// and that is what makes the radius safe to tune by frame time alone. The
-    /// bound here is tight, a fiftieth of what the previous test allows, because
-    /// at these radii the mesh still owns the ring blend bands and the two halves
-    /// have nothing left to disagree about.
-    ///
-    /// It stops at the shipped default rather than sweeping to zero. Below it the
-    /// march takes over ground the mesh was still blending, and the disagreement
-    /// climbs to the several units the previous test measures; that is the
-    /// mismatch's shape, and pinning it here as well would only say it twice.
-    #[test]
-    fn no_choice_of_near_radius_changes_what_the_frame_shows() {
-        let (heights, colours) = rugged_painted();
-        let rastered = render_config(
-            cut_at(f32::INFINITY),
-            heights.clone(),
-            colours.clone(),
-            low_and_looking_out,
-            &[],
-        )
-        .0;
-        let sky = count_sky(&rastered);
-
-        for rings in [32.0, 16.0, 8.0, ClipmapConfig::default().near_rings] {
-            let frame = render_config(
-                cut_at(rings),
-                heights.clone(),
-                colours.clone(),
-                low_and_looking_out,
-                &[],
-            )
-            .0;
-            let difference = mean_difference(&frame, &rastered);
-            assert!(
-                difference < 0.1,
-                "cutting at {rings} rings moved the frame by {difference:.3}"
-            );
-            // A gap at the join, or a ray slipping between two cells, both show
-            // up here as sky that the mesh did not put there.
-            assert!(
-                count_sky(&frame).abs_diff(sky) * 500 < (SIZE * SIZE) as usize,
-                "cutting at {rings} rings left {} sky pixels against {sky}",
-                count_sky(&frame)
-            );
-        }
     }
 
     /// Looking straight down at rough ground, a ray must find it.
@@ -854,14 +731,14 @@ mod tests {
     fn the_far_field_does_not_let_pinholes_of_sky_through() {
         let (heights, _) = rugged();
         let rastered = render_config(
-            cut_at(f32::INFINITY),
+            test_residency(),
             heights.clone(),
             flat_ground(),
             straight_down,
             &[],
         )
         .0;
-        let marched = render_config(cut_at(0.0), heights, flat_ground(), straight_down, &[]).0;
+        let marched = render_config(test_residency(), heights, flat_ground(), straight_down, &[]).0;
 
         // Not zero either way: the frame's corners reach past the raster, and
         // that ground is cut by both halves alike. What matters is that marching
@@ -902,7 +779,7 @@ mod tests {
     /// the window's edge, so any such slip is far larger than a pixel.
     #[test]
     fn the_colour_raster_lands_where_the_georeferencing_puts_it() {
-        for config in [test_config(), wide_config()] {
+        for residency in [test_residency(), wide_residency()] {
             // A patch of a distinct colour, well away from the raster's centre
             // so that getting the axes or the origin wrong would move it
             // visibly.
@@ -917,7 +794,7 @@ mod tests {
 
             let mut camera = None;
             let (pixels, _) = render_config(
-                config,
+                residency,
                 vec![0.0; (RASTER * RASTER) as usize],
                 colours,
                 |c| {
@@ -927,7 +804,7 @@ mod tests {
                 &[],
             );
             let camera = camera.expect("camera captured");
-            let window = config.window_texels;
+            let window = residency.texels_across();
 
             let centre = world_of(f64::from(patch_col), f64::from(patch_row));
             let (x, y) = to_pixels(camera.view_projection(), centre, SIZE, SIZE);
@@ -989,61 +866,13 @@ mod tests {
         );
     }
 
+    /// Two plateaus, the near one standing in front of the far one.
+    ///
+    /// Exercises occlusion inside the traversal itself: nothing else is drawn,
+    /// so the only thing that can hide the far plateau is the march stopping at
+    /// the near ridge first.
     #[test]
     fn a_near_ridge_hides_what_is_behind_it() {
-        // Two plateaus across the view. The far one is low enough that the
-        // camera looks down onto its top; the near one is tall enough to block
-        // the line of sight to it entirely.
-        let ridges = |near: bool| {
-            let mut heights = vec![0.0f32; (RASTER * RASTER) as usize];
-            let mut colours = flat_ground();
-            for row in 0..RASTER {
-                let (height, colour) = match row {
-                    66..=73 if near => (900.0, RED),
-                    46..=53 => (250.0, MAGENTA),
-                    _ => continue,
-                };
-                for col in 0..RASTER {
-                    heights[(row * RASTER + col) as usize] = height;
-                    colours[(row * RASTER + col) as usize] = colour;
-                }
-            }
-            (heights, colours)
-        };
-
-        let aim = |camera: &mut Camera| {
-            camera.position = Vec3::new(0.0, 400.0, world_of(64.0, 76.0).z + 400.0);
-            camera.orientation = Camera::from_yaw_pitch_roll(0.0, -10f32.to_radians(), 0.0);
-        };
-        let count_far = |pixels: &[u8]| {
-            (0..SIZE)
-                .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
-                .filter(|&(x, y)| is_magenta(pixel(pixels, x, y)))
-                .count()
-        };
-
-        let (heights, colours) = ridges(false);
-        let alone = count_far(&render(heights, colours, aim));
-        assert!(
-            alone > 500,
-            "the far plateau should be plainly in shot on its own, got {alone} pixels"
-        );
-
-        let (heights, colours) = ridges(true);
-        let occluded = count_far(&render(heights, colours, aim));
-        assert_eq!(
-            occluded, 0,
-            "the near ridge should have depth-rejected every fragment behind it"
-        );
-    }
-
-    /// The same two plateaus, found by rays rather than drawn as triangles.
-    ///
-    /// Exercises occlusion inside the traversal: with the radius at zero the
-    /// depth buffer has nothing in it to reject the far plateau, so the only
-    /// thing that can hide it is the march stopping at the near ridge first.
-    #[test]
-    fn a_near_ridge_hides_what_is_behind_it_in_the_far_field() {
         let ridges = |near: bool| {
             let mut heights = vec![0.0f32; (RASTER * RASTER) as usize];
             let mut colours = flat_ground();
@@ -1072,14 +901,14 @@ mod tests {
         };
 
         let (heights, colours) = ridges(false);
-        let alone = count_far(&render_config(cut_at(0.0), heights, colours, aim, &[]).0);
+        let alone = count_far(&render_config(test_residency(), heights, colours, aim, &[]).0);
         assert!(
             alone > 500,
             "the far plateau should be plainly in shot on its own, got {alone} pixels"
         );
 
         let (heights, colours) = ridges(true);
-        let occluded = count_far(&render_config(cut_at(0.0), heights, colours, aim, &[]).0);
+        let occluded = count_far(&render_config(test_residency(), heights, colours, aim, &[]).0);
         assert_eq!(
             occluded, 0,
             "every ray should have stopped at the near ridge"
@@ -1106,7 +935,7 @@ mod tests {
 
         let solid = count_sky(
             &render_config(
-                cut_at(0.0),
+                test_residency(),
                 with_hole(false),
                 flat_ground(),
                 straight_down,
@@ -1118,7 +947,7 @@ mod tests {
 
         let punched = count_sky(
             &render_config(
-                cut_at(0.0),
+                test_residency(),
                 with_hole(true),
                 flat_ground(),
                 straight_down,
@@ -1149,7 +978,7 @@ mod tests {
         // invented ground rather than sky.
         let beyond = count_sky(
             &render_config(
-                cut_at(0.0),
+                test_residency(),
                 with_hole(false),
                 flat_ground(),
                 |camera| {
@@ -1225,17 +1054,16 @@ mod tests {
     /// a change confined to ground the default view does not reach renders
     /// byte-identical frames and looks like it did nothing.
     ///
-    /// `FLIGHT_SIM_NEAR_RINGS` overrides [`ClipmapConfig::near_rings`], so the
-    /// same view can be timed and dumped with the near field cut at different
-    /// radii -- including infinity, which rasterizes the lot, and zero, which
-    /// raymarches it. That comparison is the only way to choose the default.
+    /// `FLIGHT_SIM_TILES` overrides [`Residency::tiles_across`], which is how
+    /// the detail a wider square buys is measured against what it costs. It is
+    /// a knob here and nowhere else.
     #[test]
     #[ignore = "requires a tile pyramid, which is not in version control"]
     fn dump_installed_terrain() {
         const WIDE: u32 = 960;
         const TALL: u32 = 540;
 
-        // The clipmap reports what it chose and what that costs through `log`,
+        // The terrain reports what it chose and what that costs through `log`,
         // which is most of what this test exists to read. Before the device,
         // so that the adapter it picked is reported too.
         let _ = env_logger::Builder::from_env(
@@ -1251,37 +1079,25 @@ mod tests {
             std::env::var("FLIGHT_SIM_TERRAIN")
                 .expect("set FLIGHT_SIM_TERRAIN to a directory terrain-process wrote"),
         );
-        let mut config = ClipmapConfig {
-            pixel_angle: crate::terrain::clipmap::pixel_angle(
+        let mut residency = Residency {
+            pixel_angle: crate::terrain::residency::pixel_angle(
                 TALL,
                 f64::from(crate::camera::FOV_Y_DEGREES).to_radians(),
             ),
-            ..ClipmapConfig::default()
+            ..Residency::default()
         };
-        config.window_texels = config.window_for();
-        if let Ok(rings) = std::env::var("FLIGHT_SIM_NEAR_RINGS") {
-            config.near_rings = rings
+        if let Ok(tiles) = std::env::var("FLIGHT_SIM_TILES") {
+            residency.tiles_across = tiles
                 .parse()
-                .expect("FLIGHT_SIM_NEAR_RINGS must be a number");
+                .expect("FLIGHT_SIM_TILES must be a power of two");
         }
-        // Overriding the window is how the detail this whole arrangement buys
-        // is measured against what it costs, which is why it is a knob here and
-        // nowhere else.
-        if let Ok(window) = std::env::var("FLIGHT_SIM_WINDOW") {
-            config.window_texels = window
-                .parse()
-                .expect("FLIGHT_SIM_WINDOW must be a power of two");
-        }
-        eprintln!(
-            "rasterizing out to {} ring reaches, windows of {} texels",
-            config.near_rings, config.window_texels
-        );
-        let mut scene = Scene::with_config(
+        eprintln!("squares of {} tiles", residency.tiles_across);
+        let mut scene = Scene::with_residency(
             &device,
             crate::headless::CAPTURE_FORMAT,
             size,
             &root,
-            config,
+            residency,
         )
         .expect("failed to open the terrain pyramid");
         eprintln!("built the scene in {:.2?}", started.elapsed());
@@ -1310,9 +1126,9 @@ mod tests {
             }
             scene.camera.position = home;
         }
-        scene.update(&queue);
+        scene.settle(&queue);
         eprintln!(
-            "filled the windows in {:.2?}, finest level {}",
+            "filled every level in {:.2?}, finest level {}",
             started.elapsed(),
             scene.terrain.base_level()
         );
@@ -1346,68 +1162,10 @@ mod tests {
     /// means to see which level drew a patch of ground needs the ground to look
     /// different from place to place, so that both the shape and the texel it is
     /// coloured from show up in the pixels.
-    fn rugged_painted() -> (Vec<f32>, Vec<Srgb8>) {
-        let (heights, _) = rugged();
-        let colours = (0..RASTER * RASTER)
-            .map(|i| {
-                let (x, y) = ((i % RASTER) as f32, (i / RASTER) as f32);
-                // A few texels per cycle: fine enough that a coarser level's
-                // averaging of it is plainly a different colour, coarse enough
-                // not to alias into noise that would drown the difference.
-                let wave = |f: f32| (128.0 + 110.0 * f.sin()) as u8;
-                Srgb8([wave(x * 0.7), wave(y * 0.6), wave((x + y) * 0.45), 255])
-            })
-            .collect();
-        (heights, colours)
-    }
-
-    #[test]
-    fn no_sky_shows_through_the_joins_between_levels() {
-        // Looking straight down, across a ring boundary. A T-junction between
-        // two levels would let the sky through as a pinhole or a hairline.
-        //
-        // The altitude is chosen so the frame stays well inside the raster even
-        // at its corners: terrain below the camera's own height projects
-        // outwards, so the ground visible at the frame edge comes from further
-        // out than the frustum's footprint alone suggests. Straying past the
-        // data would show sky for the honest reason that the terrain ends
-        // there, and mask the seams this is looking for.
-        //
-        // It also has to stay under the height at which the finest level is
-        // dropped for being too far below the camera to be worth drawing --
-        // around 1060 m here, where the ground is a hundred-odd metres up and
-        // this small clipmap's finest level reaches only 480 m. Above that there
-        // are fewer levels left to have joins between, and the test would go
-        // quiet rather than fail. Hence the assertion on the base level below.
-        let (heights, colours) = rugged();
-        let (pixels, base) = render_probed(
-            heights,
-            colours,
-            |camera| {
-                camera.position = Vec3::new(70.0, 900.0, -110.0);
-                camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
-            },
-            &[],
-        );
-        assert_eq!(base, 0, "the frame under test has to hold every level");
-
-        let holes: Vec<(u32, u32)> = (0..SIZE)
-            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
-            .filter(|&(x, y)| is_sky(pixel(&pixels, x, y)))
-            .collect();
-
-        assert!(
-            holes.is_empty(),
-            "{} pixels of sky came through the terrain, first at {:?}",
-            holes.len(),
-            holes.first()
-        );
-    }
-
     #[test]
     fn the_terrain_stops_at_the_edge_of_the_data() {
-        // Clipmap rings deliberately reach past the raster so there is always a
-        // level coarse enough to cover the horizon. Out there every read clamps
+        // Resident squares deliberately reach past the raster so there is
+        // always a level coarse enough to cover the horizon. Out there every read clamps
         // to the border texel, which would otherwise draw the edge row smeared
         // outwards as a plateau indistinguishable from real ground.
         //
@@ -1457,34 +1215,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn crossing_a_ring_boundary_does_not_make_the_terrain_jump() {
-        // Window origins snap to even texels, so a level's grid shifts by a
-        // whole two texels at a time. Without the morph those shifts would land
-        // as visible pops; with it, each step should change the picture about as
-        // much as any other.
-        let (heights, colours) = rugged();
-        let aim = |camera: &mut Camera| {
-            camera.orientation = Camera::from_yaw_pitch_roll(0.0, -25f32.to_radians(), 0.0);
-        };
-
-        // Advance by a fraction of a texel at a time, so several steps fall
-        // between each snap of the finest window.
-        let step = (METRES_PER_TEXEL / 3.0) as f32;
-        let frames: Vec<Vec<u8>> = (0..12)
-            .map(|i| {
-                let moved = aim;
-                let z = 900.0 - f32::from(i as u16) * step;
-                render(heights.clone(), colours.clone(), move |camera| {
-                    moved(camera);
-                    camera.position = Vec3::new(0.0, 700.0, z);
-                })
-            })
-            .collect();
-
-        assert_no_step_stands_out(&frames, 4.0);
-    }
-
     /// Asserts that no one step between consecutive frames changed the picture
     /// far more than its neighbours did, which is what a pop looks like.
     ///
@@ -1497,28 +1227,6 @@ mod tests {
     /// frame to begin with: a camera flying along sees the picture turn over
     /// steadily and needs room, one climbing straight up mostly zooms and can be
     /// held to much less.
-    fn assert_no_step_stands_out(frames: &[Vec<u8>], tolerance: f64) {
-        let differences: Vec<f64> = frames
-            .windows(2)
-            .map(|pair| {
-                let total: u64 = pair[0]
-                    .iter()
-                    .zip(&pair[1])
-                    .map(|(a, b)| u64::from(a.abs_diff(*b)))
-                    .sum();
-                total as f64 / pair[0].len() as f64
-            })
-            .collect();
-
-        let worst = differences.iter().copied().fold(0.0, f64::max);
-        let typical = differences.iter().sum::<f64>() / differences.len() as f64;
-        assert!(
-            worst < typical * tolerance + 1.0,
-            "one step changed the frame far more than the others, which is what \
-             a pop looks like: worst {worst:.2}, typical {typical:.2}, all {differences:?}"
-        );
-    }
-
     /// Looks straight down from `altitude` over the same spot every time.
     fn from_altitude(altitude: f32) -> impl FnOnce(&mut Camera) {
         move |camera: &mut Camera| {
@@ -1561,40 +1269,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn climbing_past_the_height_a_level_is_dropped_does_not_make_the_terrain_jump() {
-        // A level does not simply vanish when the camera gets far enough from
-        // the ground for it to stop being worth drawing: it is blended into the
-        // level outside it on the way up, so that by the time it goes it is
-        // already drawing that level's surface and colour exactly. Without the
-        // blend, the whole middle of the frame would snap to a coarser shape in
-        // one frame.
-        //
-        // The sweep spans the height where this clipmap's finest level goes,
-        // around 1060 m over the hundred-odd metres of ground below the camera.
-        let (heights, colours) = rugged_painted();
-        let probed: Vec<(Vec<u8>, u32)> = (0..13)
-            .map(|i| {
-                let altitude = 900.0 + f32::from(i as u16) * 30.0;
-                render_probed(
-                    heights.clone(),
-                    colours.clone(),
-                    from_altitude(altitude),
-                    &[],
-                )
-            })
-            .collect();
-
-        let first = probed.first().expect("frames rendered").1;
-        assert!(
-            probed.iter().any(|(_, base)| *base != first),
-            "the sweep never crossed the height a level is dropped at"
-        );
-
-        let frames: Vec<Vec<u8>> = probed.into_iter().map(|(pixels, _)| pixels).collect();
-        assert_no_step_stands_out(&frames, 2.0);
-    }
-
     /// A raster source that notes which levels are read from it.
     struct Counted {
         inner: Box<dyn RasterSource>,
@@ -1631,7 +1305,7 @@ mod tests {
                     &device,
                     wgpu::TextureFormat::Rgba8UnormSrgb,
                     camera_layout,
-                    test_config(),
+                    test_residency(),
                     placement(),
                     Sources {
                         heights: Box::new(Counted {

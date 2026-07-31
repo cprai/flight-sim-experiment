@@ -1,11 +1,10 @@
 //! Terrain streamed from a pyramid of georeferenced tiles on disk.
 
-pub mod clipmap;
 pub mod geotiff;
 pub mod gpu;
 pub mod maxima;
-pub mod mesh;
 pub mod pyramid;
+pub mod residency;
 pub mod tiles;
 
 /// Bare-ground elevations, in metres, and the directory they are preferred from.
