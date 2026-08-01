@@ -30,7 +30,10 @@ pub const ATTEMPTS: usize = 5;
 
 /// How long to wait before the second attempt. Each wait after that doubles,
 /// so the sequence is 250 ms, 500 ms, 1 s, 2 s.
-const FIRST_BACKOFF: Duration = Duration::from_millis(250);
+///
+/// Public because `geofabrik::download` runs its own retry loop -- one whose
+/// budget resets on progress -- but should still pace itself the same way.
+pub const FIRST_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Whether a failed request is worth making again.
 ///

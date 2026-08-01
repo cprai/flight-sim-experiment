@@ -33,10 +33,16 @@
 //! 16 m -- upward, and the renderer magnifies them when it wants a finer level.
 //! Writing them at one metre would be storing sixteen times their own
 //! resolution in detail that is not there.
+//!
+//! The fourth product is not a raster at all: raw OpenStreetMap data, fetched
+//! as a single Geofabrik extract of whatever region contains the box, from
+//! which a later step will read ground cover and building shapes. See
+//! `geofabrik` for why a whole region rather than a clip.
 
 mod bbox;
 mod coverage;
 mod extent;
+mod geofabrik;
 mod mip;
 mod project;
 mod resample;
@@ -84,7 +90,8 @@ const ELEVATION_BLOCK_TILES: u32 = 8;
 const COLOUR_BLOCK_TILES: u32 = 4;
 
 #[derive(Parser, Debug)]
-#[command(about = "Fetch HRDEM elevation and Sentinel-2 colour as a tile pyramid", long_about = None)]
+#[command(about = "Fetch HRDEM elevation and Sentinel-2 colour as a tile pyramid, \
+                   and raw OpenStreetMap data", long_about = None)]
 struct Arguments {
     /// One corner of the box, as `lat,lon` in degrees.
     ///
@@ -105,7 +112,8 @@ struct Arguments {
     #[arg(short, long, value_name = "DIR")]
     output: PathBuf,
 
-    /// What to fetch: bare ground, the top of what the sensor saw, or colour.
+    /// What to fetch: bare ground, the top of what the sensor saw, colour, or
+    /// raw OpenStreetMap data.
     #[arg(long, value_enum, default_value = "dtm")]
     product: Product,
 
@@ -160,6 +168,19 @@ struct Arguments {
         value_name = "URL"
     )]
     stac_root: String,
+
+    /// Force this Geofabrik region id instead of choosing one by geometry,
+    /// for `--product osm`.
+    #[arg(long, value_name = "ID")]
+    osm_region: Option<String>,
+
+    /// Root of the Geofabrik download server, for `--product osm`.
+    #[arg(
+        long,
+        default_value = "https://download.geofabrik.de",
+        value_name = "URL"
+    )]
+    geofabrik_root: String,
 }
 
 fn main() -> Result<()> {
@@ -185,6 +206,21 @@ async fn run(arguments: Arguments) -> Result<()> {
 
     let box_ = LatLonBox::from_corners(arguments.from, arguments.to)?;
     let extent = TileExtent::cover(box_)?;
+
+    // Every product covers the ground the tiles will cover, which is the
+    // requested box snapped out to whole tiles -- often much larger. The
+    // catalogues are searched by it, and the OSM extract must contain it.
+    let search = extent.geographic_box()?;
+    let root = arguments.output.join(arguments.product.label());
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("terrain-download/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building the HTTP client")?;
+
+    if arguments.product == Product::Osm {
+        return fetch_osm(&arguments, &client, box_, search, &root).await;
+    }
+
     let base_level = if arguments.product.is_elevation() {
         0
     } else {
@@ -208,15 +244,6 @@ async fn run(arguments: Arguments) -> Result<()> {
         extent.height,
         extent.max_level
     );
-
-    // Both catalogues are searched by the ground the tiles will cover, which is
-    // the requested box snapped out to whole tiles -- often much larger.
-    let search = extent.geographic_box()?;
-    let root = arguments.output.join(arguments.product.label());
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("terrain-download/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building the HTTP client")?;
 
     if arguments.product == Product::Albedo {
         return fetch_albedo(&arguments, &client, search, &extent, &root).await;
@@ -619,6 +646,91 @@ async fn fetch_albedo(
     println!(
         "  {:.2}% imagery, {:.2}% no data",
         shares.one_metre, shares.missing
+    );
+    Ok(())
+}
+
+/// Fetches raw OpenStreetMap data covering the box, as one Geofabrik extract.
+///
+/// Nothing raster about this path: the output is a single `.osm.pbf` of the
+/// smallest indexed region containing the snapped box, and turning its
+/// landuse and buildings into terrain is a later processing step's job. Of
+/// the shared flags only `--yes` and `--resume` mean anything here; the
+/// tile, coverage and concurrency knobs govern machinery this path never
+/// runs.
+async fn fetch_osm(
+    arguments: &Arguments,
+    client: &reqwest::Client,
+    requested: LatLonBox,
+    search: LatLonBox,
+    root: &Path,
+) -> Result<()> {
+    let regions = geofabrik::fetch_index(client, &arguments.geofabrik_root).await?;
+    let region = match &arguments.osm_region {
+        Some(id) => {
+            let region = geofabrik::find_region(&regions, id)?;
+            if !region.contains_box(search) {
+                log::warn!(
+                    "region `{id}` does not cover the whole box; \
+                     some of the requested ground will be missing from the extract"
+                );
+            }
+            region
+        }
+        None => geofabrik::select_region(&regions, search)?,
+    };
+    let url = region
+        .pbf_url
+        .as_deref()
+        .expect("only regions with an extract are ever selected");
+    let file = url.rsplit('/').next().expect("a url is never empty");
+    let target = root.join(file);
+
+    if arguments.resume && target.exists() && root.join(geofabrik::RECORD_FILE).exists() {
+        println!(
+            "{} is already downloaded; run without --resume for a fresh publication",
+            target.display()
+        );
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
+    let probe = geofabrik::probe(client, url).await?;
+    let reused = geofabrik::reconcile_part(&target, &probe, arguments.resume);
+    if !geofabrik::confirm(region, &probe, reused, arguments.yes)? {
+        println!("Nothing downloaded.");
+        return Ok(());
+    }
+
+    let fetched = geofabrik::download(client, &probe, &target).await?;
+    let md5 = geofabrik::verify_md5(client, &probe, &target).await?;
+    geofabrik::finish(&target)?;
+
+    let downloaded_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    geofabrik::write_record(
+        root,
+        &geofabrik::SourceRecord {
+            region: region.id.clone(),
+            name: region.name.clone(),
+            url: probe.url.clone(),
+            latest_url: url.to_owned(),
+            file: file.to_owned(),
+            requested_box: requested.into(),
+            snapped_box: search.into(),
+            content_length: probe.length,
+            md5,
+            last_modified: probe.last_modified.clone(),
+            downloaded_at_unix,
+        },
+    )?;
+
+    println!("Wrote {}", target.display());
+    println!(
+        "  {} fetched, {} total, md5 verified",
+        coverage::describe_bytes(fetched),
+        coverage::describe_bytes(probe.length)
     );
     Ok(())
 }

@@ -24,8 +24,8 @@ use crate::retry;
 /// The projection every HRDEM mosaic item is published in.
 pub const EXPECTED_EPSG: u32 = 3979;
 
-/// What to fetch. The first two are elevation from HRDEM, the third is imagery
-/// from a different provider entirely.
+/// What to fetch. The first two are elevation from HRDEM; the others come from
+/// different providers entirely and never touch the STAC catalogue.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 pub enum Product {
     /// Digital terrain model: the bare ground, with vegetation and buildings
@@ -35,6 +35,8 @@ pub enum Product {
     Dsm,
     /// Cloud-free Sentinel-2 colour imagery, for the terrain's surface.
     Albedo,
+    /// Raw OpenStreetMap data covering the box, from a Geofabrik extract.
+    Osm,
 }
 
 impl Product {
@@ -45,7 +47,7 @@ impl Product {
         match self {
             Self::Dtm => Some("dtm"),
             Self::Dsm => Some("dsm"),
-            Self::Albedo => None,
+            Self::Albedo | Self::Osm => None,
         }
     }
 
@@ -58,6 +60,7 @@ impl Product {
             Self::Dtm => "dtm",
             Self::Dsm => "dsm",
             Self::Albedo => "albedo",
+            Self::Osm => "osm",
         }
     }
 }
