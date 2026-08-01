@@ -207,9 +207,10 @@ async fn run(arguments: Arguments) -> Result<()> {
     let box_ = LatLonBox::from_corners(arguments.from, arguments.to)?;
     let extent = TileExtent::cover(box_)?;
 
-    // Every product covers the ground the tiles will cover, which is the
-    // requested box snapped out to whole tiles -- often much larger. The
-    // catalogues are searched by it, and the OSM extract must contain it.
+    // Both catalogues are searched by the ground the tiles will cover, which
+    // is the requested box snapped out to whole tiles -- often much larger.
+    // The OSM path judges its region by the typed box instead; see
+    // `fetch_osm` for why.
     let search = extent.geographic_box()?;
     let root = arguments.output.join(arguments.product.label());
     let client = reqwest::Client::builder()
@@ -653,7 +654,7 @@ async fn fetch_albedo(
 /// Fetches raw OpenStreetMap data covering the box, as one Geofabrik extract.
 ///
 /// Nothing raster about this path: the output is a single `.osm.pbf` of the
-/// smallest indexed region containing the snapped box, and turning its
+/// smallest indexed region containing the requested box, and turning its
 /// landuse and buildings into terrain is a later processing step's job. Of
 /// the shared flags only `--yes` and `--resume` mean anything here; the
 /// tile, coverage and concurrency knobs govern machinery this path never
@@ -665,11 +666,20 @@ async fn fetch_osm(
     search: LatLonBox,
     root: &Path,
 ) -> Result<()> {
+    // Containment is judged on the box the user typed, not on `search`. The
+    // extent is axis-aligned in Lambert metres, so in geographic space it is
+    // a rotated quadrilateral whose corners reach well off the typed box --
+    // 27 km past its southern edge for a box the size of the committed DEM,
+    // across the US border. Judged on that ground, every Canadian extract
+    // was rejected and all of North America chosen: 17.9 GiB for what the
+    // typed box covers with a 108.8 MiB region. The corners are tiling
+    // spoil, not requested ground, so tiles out there simply go without OSM
+    // data when the region's boundary happens to exclude them.
     let regions = geofabrik::fetch_index(client, &arguments.geofabrik_root).await?;
     let region = match &arguments.osm_region {
         Some(id) => {
             let region = geofabrik::find_region(&regions, id)?;
-            if !region.contains_box(search) {
+            if !region.contains_box(requested) {
                 log::warn!(
                     "region `{id}` does not cover the whole box; \
                      some of the requested ground will be missing from the extract"
@@ -677,7 +687,7 @@ async fn fetch_osm(
             }
             region
         }
-        None => geofabrik::select_region(&regions, search)?,
+        None => geofabrik::select_region(&regions, requested)?,
     };
     let url = region
         .pbf_url

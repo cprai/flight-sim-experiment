@@ -5,10 +5,11 @@
 //! publishes daily `.osm.pbf` extracts of every administrative region,
 //! unauthenticated, and is the distribution point openstreetmap.org itself
 //! points bulk consumers at. So the tool downloads the smallest region that
-//! contains the whole box and leaves clipping to the processing step -- for
-//! this project's ground that is British Columbia, about 1.2 GB. Which region
-//! that is comes from the server's own machine-readable index, not from a
-//! hardcoded table, so the tool works anywhere Geofabrik covers.
+//! contains the whole requested box and leaves clipping to the processing
+//! step -- for this project's ground that is BC's South Coast administrative
+//! region, about 110 MB. Which region that is comes from the server's own
+//! machine-readable index, not from a hardcoded table, so the tool works
+//! anywhere Geofabrik covers.
 //!
 //! The `-latest.osm.pbf` name is not a file but a redirect to the dated
 //! publication of the day (`...-260731.osm.pbf`), which is immutable once
