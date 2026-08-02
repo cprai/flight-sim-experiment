@@ -1,20 +1,25 @@
 ---
 name: headless-render
-description: How to render a frame of the terrain to a PNG with no window, look at it, and use it for graphics debugging. Use whenever a change needs to be seen rather than asserted -- shader and clipmap work, "does this actually draw", "show me what it looks like", checking for seams, popping, holes, missing tiles, or wrong colour -- and whenever the app must be run at all in an environment with no display server, which is the normal case here. Covers placing the camera, reading the log the run prints, telling a GPU problem from a data problem, and the traps that make a frame look like nothing changed.
+description: How to render a frame of the terrain to a PNG with no window, look at it, and use it for graphics debugging. Use whenever a change needs to be *seen* rather than asserted -- shader and clipmap work, "does this actually draw", "show me what it looks like", checking for seams, popping, holes, missing tiles, or wrong colour -- and whenever the app must be run at all in an environment with no display server, which is the normal case here. Covers placing the camera, reading the log the run prints, telling a GPU problem from a data problem, and the traps that make a frame look like nothing changed. For what a frame *costs* rather than what it looks like, use headless-profile instead: this mode reports no timings at all.
 ---
 
 # Rendering a frame headless
 
 The windowed app cannot start without a display server: `EventLoop::new` fails
 outright when `DISPLAY` and `WAYLAND_DISPLAY` are unset, which they are in this
-container. `--screenshot` skips winit entirely, draws into a texture, and writes
-a PNG. It is the only way to run the renderer here, and the only way to *see* the
-result of a graphics change.
+container. The `render` subcommand skips winit entirely, draws into a texture,
+and writes a PNG. It is the only way to run the renderer here, and the only way
+to *see* the result of a graphics change.
 
 ```
 cargo build --release
-./target/release/flight-sim --terrain assets/terrain --screenshot /tmp/frame.png
+./target/release/flight-sim render --terrain assets/terrain --output /tmp/frame.png
 ```
+
+**This mode reports no timings, deliberately.** One cold frame carries first-use
+pipeline compilation and whatever the tile reads left behind, so it is an image
+and not a measurement. `flight-sim profile` is the mode that answers what a
+frame costs -- see the `headless-profile` skill.
 
 Then open it with the Read tool, which renders PNGs inline. Look at the frame.
 A description of what a shader change ought to do is not evidence that it did.
@@ -74,27 +79,16 @@ camera at [0, 11782.164, 57344] facing Quat(...)
 filled every level in 1.09s
 ```
 
-and the frame time on stdout:
+Nothing goes to stdout. A `render` run whose stdout is empty is working.
 
-```
-rendered one frame in 34.15 ms (29.3 fps)
-```
-
-- **`device_type`** decides whether any timing below it is worth quoting. If it
-  says `Cpu`, the software rasterizer took the job and the numbers describe
-  llvm, not the GPU. `WGPU_POWER_PREF` (already `high` in the devcontainer)
-  chooses; see ca3791f.
+- **`device_type`** decides whether the frame you are looking at came off the
+  GPU at all. If it says `Cpu`, the software rasterizer took the job.
+  `WGPU_POWER_PREF` (already `high` in the devcontainer) chooses; see ca3791f.
 - **`filled every level`** is disk: tile reads and pyramid reductions. It is
   routinely 20-40x the frame time and says nothing about the shaders. Do not
   report it as render cost.
 - **The second `terrain:` line** is what the clipmap allocated. It does not vary
   with `--size` -- see the trap below.
-- **`rendered one frame`** is the draw plus the readback. It is the one line on
-  stdout rather than in the log, because it is the measurement the run was asked
-  for and not a diagnostic -- it stands in for the counter the windowed app draws
-  in its corner. So `2>` does not capture it and `>` does. Read the fps beside it
-  as arithmetic on that one duration, not as a frame rate: a screenshot pays for
-  a readback and a buffer map that a presented frame does not, so it reads low.
 - **`camera at ...`** echoes where the view actually ended up, which is how you
   confirm `--camera` parsed the way you meant.
 
@@ -104,8 +98,8 @@ Output is deterministic: the same arguments over the same pyramid produce
 byte-identical PNGs across runs. So `cmp` is a real test.
 
 ```
-./target/release/flight-sim ... -o /tmp/before.png     # stash, then edit
-./target/release/flight-sim ... -o /tmp/after.png
+./target/release/flight-sim render ... -o /tmp/before.png   # stash, then edit
+./target/release/flight-sim render ... -o /tmp/after.png
 cmp -s /tmp/before.png /tmp/after.png && echo "no visible change"
 ```
 
@@ -144,7 +138,7 @@ Render the same view on the software rasterizer and compare:
 
 ```
 WGPU_BACKEND=vulkan VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp*.json) \
-  ./target/release/flight-sim --terrain assets/terrain -o /tmp/soft.png
+  ./target/release/flight-sim render --terrain assets/terrain -o /tmp/soft.png
 ```
 
 Same wrong picture on both means the shader or the data is wrong. Different
@@ -154,7 +148,7 @@ settle a question, not as a habit.
 
 ## Deeper clipmap experiments
 
-`--screenshot` deliberately exposes only camera and size. The knobs for
+`render` deliberately exposes only camera and size. The knobs for
 measuring the clipmap itself live in the ignored `dump_installed_terrain` test
 in `src/scene.rs`, which renders through the same `headless::capture` and writes
 `terrain.png` into the temp dir:
@@ -174,10 +168,9 @@ FLIGHT_SIM_TERRAIN=assets/terrain cargo test --release -- --ignored --nocapture 
   which exercises the incremental window updates instead of one cold fill.
 
 The size is fixed at 960x540 in the test itself. Its `filled every level` line
-also reports the finest level that survived `detail_base`, which the
-`--screenshot` path does not print. Everything it prints goes to stderr through
-`eprintln!`, its own `rendered one frame` included -- the move to stdout applies
-to `--screenshot` only, so `--nocapture` is what you need here, not `>`.
+also reports the finest level that survived `detail_base`, which `render` does
+not print. Everything it prints goes to stderr through `eprintln!`, so
+`--nocapture` is what reaches it, not `>`.
 
 `FLIGHT_SIM_TILES=4` on the installed pyramid gives `9 levels of 4 x 4 tiles,
 2048 texels each, 432 MiB` against the default `8 levels of 8 x 8 tiles, 4096
