@@ -13,6 +13,7 @@
 //! [`crate::deferred`]'s shading pass turns those into colour afterwards.
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::terrain::geotiff::Georeferencing;
 use crate::terrain::maxima::ceiling_half;
@@ -156,6 +157,13 @@ pub struct Terrain {
     tile_ceilings: Vec<Vec<f32>>,
     /// Reused between uploads so a moving camera allocates nothing.
     staging: Vec<u8>,
+    /// Where an update's time went, when a run asked to be told.
+    ///
+    /// [`None`] on an unprofiled run, so the clock is not read at all. This is
+    /// the only account there is of the streaming cost: the uploads leave
+    /// through `queue.write_texture` onto the staging belt rather than through
+    /// a command encoder, so no GPU timestamp scope can be put around them.
+    spans: Option<crate::profile::Terrain>,
 
     height_texture: wgpu::Texture,
     material_texture: wgpu::Texture,
@@ -545,6 +553,7 @@ impl Terrain {
             ground: vec![0.0; square],
             tile_ceilings: vec![vec![f32::NEG_INFINITY; slots]; level_count as usize],
             staging: vec![0; (residency.tile_texels as usize).pow(2) * size_of::<MaterialId>()],
+            spans: None,
             height_texture,
             material_texture,
             maxima_texture,
@@ -597,6 +606,12 @@ impl Terrain {
     /// takes as long as it needs -- there is no frame to protect yet, and a
     /// single-frame render would otherwise draw an empty world.
     pub fn update(&mut self, queue: &wgpu::Queue, camera: Vec3) {
+        // Cleared rather than accumulated: a row in the readout is what this
+        // frame cost, not what every frame since the run began cost.
+        if let Some(spans) = self.spans.as_mut() {
+            *spans = crate::profile::Terrain::default();
+        }
+
         let camera_texels = self
             .placement
             .texel_of_world(f64::from(camera.x), f64::from(camera.z));
@@ -606,9 +621,17 @@ impl Terrain {
         // keeping is read back out of its square. Taking it from the one level
         // that is never dropped keeps the decision independent of what the
         // decision itself makes resident.
+        // Accumulated into a local and merged once at the end: `advance` is
+        // measured either side of calls that borrow `self` mutably, so holding
+        // a borrow of `self.spans` across them would not compile.
+        let timed = self.spans.is_some();
+        let mut advance = Duration::ZERO;
+
         let coarsest = self.level_count() - 1;
         loop {
+            let clock = crate::profile::Clock::start(timed);
             let work = self.tiles.advance(camera_texels, coarsest);
+            advance += clock.elapsed();
             if work.is_empty() {
                 break;
             }
@@ -630,7 +653,9 @@ impl Terrain {
         );
 
         loop {
+            let clock = crate::profile::Clock::start(timed);
             let work = self.tiles.advance(camera_texels, self.base);
+            advance += clock.elapsed();
             let more = !work.is_empty();
             for wanted in work {
                 self.upload(queue, wanted);
@@ -643,7 +668,26 @@ impl Terrain {
         }
         self.started = true;
 
+        let clock = crate::profile::Clock::start(timed);
         self.write_uniform(queue);
+        let uniform = clock.elapsed();
+
+        if let Some(spans) = self.spans.as_mut() {
+            spans.advance += advance;
+            // The uniform is one small `write_buffer`, the same kind of work as
+            // the texture uploads and far too small to earn a row of its own.
+            spans.write += uniform;
+        }
+    }
+
+    /// Starts or stops accounting for where an update's time goes.
+    pub fn profile(&mut self, on: bool) {
+        self.spans = on.then(crate::profile::Terrain::default);
+    }
+
+    /// What the last [`Terrain::update`] spent, if it was being watched.
+    pub fn spans(&self) -> Option<crate::profile::Terrain> {
+        self.spans
     }
 
     /// Describes the current residency to the shader.
@@ -737,7 +781,15 @@ impl Terrain {
         let size = UVec2::splat(tile);
         let count = (tile as usize).pow(2);
 
+        let timed = self.spans.is_some();
+        let (mut read, mut convert) = (Duration::ZERO, Duration::ZERO);
+        // A `Cell` because `copy` is a closure called four times and the total
+        // has to outlive each call; it captures nothing of `self`, which is
+        // what lets the reads borrow `self.staging` mutably alongside it.
+        let write = std::cell::Cell::new(Duration::ZERO);
+
         let copy = |texture: &wgpu::Texture, bytes: u32, data: &[u8]| {
+            let clock = crate::profile::Clock::start(timed);
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture,
@@ -753,29 +805,39 @@ impl Terrain {
                 },
                 extent,
             );
+            write.set(write.get() + clock.elapsed());
         };
 
         let bytes = count * size_of::<f32>();
+        let clock = crate::profile::Clock::start(timed);
         self.heights
             .read_rect(wanted.level, texels, size, &mut self.staging[..bytes]);
+        read += clock.elapsed();
+        let clock = crate::profile::Clock::start(timed);
         if VERTICAL_EXAGGERATION != 1.0 {
             for height in bytemuck::cast_slice_mut::<u8, f32>(&mut self.staging[..bytes]) {
                 *height *= VERTICAL_EXAGGERATION;
             }
         }
+        convert += clock.elapsed();
         copy(&self.height_texture, 4, &self.staging[..bytes]);
         if wanted.level == self.level_count() - 1 {
             self.mirror_ground(slot, bytes);
         }
 
         let bytes = count * size_of::<MaterialId>();
+        let clock = crate::profile::Clock::start(timed);
         self.materials
             .read_rect(wanted.level, texels, size, &mut self.staging[..bytes]);
+        read += clock.elapsed();
         copy(&self.material_texture, 4, &self.staging[..bytes]);
 
         let bytes = count * size_of::<f32>();
+        let clock = crate::profile::Clock::start(timed);
         self.maxima
             .read_rect(wanted.level, texels, size, &mut self.staging[..bytes]);
+        read += clock.elapsed();
+        let clock = crate::profile::Clock::start(timed);
         // Narrowed in place, forwards, so the half float for a cell is written
         // over bytes the full-precision one has already been read out of. Two
         // bytes never overtake four.
@@ -790,11 +852,15 @@ impl Terrain {
             ceiling = ceiling.max(narrowed.to_f32());
             self.staging[cell * 2..cell * 2 + 2].copy_from_slice(&narrowed.to_bits().to_le_bytes());
         }
+        convert += clock.elapsed();
         copy(&self.maxima_texture, 2, &self.staging[..count * 2]);
 
         let bytes = count * size_of::<Normal>();
+        let clock = crate::profile::Clock::start(timed);
         self.normals
             .read_rect(wanted.level, texels, size, &mut self.staging[..bytes]);
+        read += clock.elapsed();
+        let clock = crate::profile::Clock::start(timed);
         if VERTICAL_EXAGGERATION != 1.0 {
             // Heights are stretched on the way in, so a normal baked at true
             // scale would describe a surface the march no longer draws.
@@ -808,7 +874,15 @@ impl Terrain {
                 *texel = Normal::from_unit(east, up / VERTICAL_EXAGGERATION, south);
             }
         }
+        convert += clock.elapsed();
         copy(&self.normal_texture, 2, &self.staging[..bytes]);
+
+        if let Some(spans) = self.spans.as_mut() {
+            spans.read += read;
+            spans.convert += convert;
+            spans.write += write.get();
+            spans.tiles += 1;
+        }
 
         // Read back out of the half floats rather than kept at full precision,
         // so the figure a ray clears a whole level with is the same bound the

@@ -66,6 +66,8 @@ pub struct Scene {
     /// Screen-sized; rebuilt by [`Scene::resize`], never mid-frame.
     gbuffer: GBuffer,
     shading: Shading,
+    /// What the last camera upload cost, zero unless a run asked to be timed.
+    camera_span: std::time::Duration,
 }
 
 impl Scene {
@@ -156,6 +158,7 @@ impl Scene {
             terrain,
             gbuffer,
             shading,
+            camera_span: std::time::Duration::ZERO,
         }
     }
 
@@ -178,12 +181,27 @@ impl Scene {
     /// rather than a stall, and a level that falls behind is drawn coarser at
     /// its outer edge rather than wrongly.
     pub fn update(&mut self, queue: &wgpu::Queue) {
+        let clock = crate::profile::Clock::start(self.terrain.spans().is_some());
         queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::bytes_of(&CameraUniform::new(&self.camera)),
         );
+        self.camera_span = clock.elapsed();
         self.terrain.update(queue, self.camera.position);
+    }
+
+    /// Starts or stops accounting for where an update's time goes.
+    ///
+    /// Off by default, and off costs nothing: see [`crate::profile`].
+    pub fn profile(&mut self, on: bool) {
+        self.terrain.profile(on);
+    }
+
+    /// Fills in the CPU side of `frame` from the update just run.
+    pub fn record(&self, frame: &mut crate::profile::Frame) {
+        frame.cpu.camera = self.camera_span;
+        frame.cpu.terrain = self.terrain.spans().unwrap_or_default();
     }
 
     /// Updates until every level holds all the tiles it wants.
@@ -203,7 +221,17 @@ impl Scene {
     /// the shading pass reads it back and writes the image. `view` must match
     /// the size the scene was built or last [`Scene::resize`]d to, because the
     /// G-buffer is looked up by pixel coordinate.
-    pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+    ///
+    /// Both passes are opened through `gpu` so each is timed at its boundaries.
+    /// That is the whole of the GPU side of [`crate::profile`], and it costs an
+    /// unprofiled run nothing: a disabled profiler writes no timestamps and the
+    /// scopes fall away. `gpu` derefs to the encoder it wraps for anything else
+    /// the caller wants to record.
+    pub fn draw(
+        &self,
+        gpu: &mut wgpu_profiler::Scope<'_, wgpu::CommandEncoder>,
+        view: &wgpu::TextureView,
+    ) {
         let target = |view, clear| {
             Some(wgpu::RenderPassColorAttachment {
                 view,
@@ -220,40 +248,46 @@ impl Scene {
             // Cleared to zeroes: material zero is Null and depth zero is the
             // reversed-Z far plane, so a pixel the march discards reads back
             // as "nothing here", which the shading pass draws as sky.
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("geometry pass"),
-                color_attachments: &[
-                    target(&self.gbuffer.material, wgpu::Color::TRANSPARENT),
-                    target(&self.gbuffer.position, wgpu::Color::TRANSPARENT),
-                    target(&self.gbuffer.normal, wgpu::Color::TRANSPARENT),
-                ],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.gbuffer.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
-                        // The shading pass reads it to tell ground from sky.
-                        store: wgpu::StoreOp::Store,
+            let mut pass = gpu.scoped_render_pass(
+                "geometry",
+                wgpu::RenderPassDescriptor {
+                    label: Some("geometry pass"),
+                    color_attachments: &[
+                        target(&self.gbuffer.material, wgpu::Color::TRANSPARENT),
+                        target(&self.gbuffer.position, wgpu::Color::TRANSPARENT),
+                        target(&self.gbuffer.normal, wgpu::Color::TRANSPARENT),
+                    ],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.gbuffer.depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
+                            // The shading pass reads it to tell ground from sky.
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                },
+            );
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             self.terrain.draw(&mut pass);
         }
 
         // The clear never survives -- the shading pass writes every pixel --
         // but an interrupted frame showing sky beats one showing garbage.
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("shading pass"),
-            color_attachments: &[target(view, CLEAR_COLOR)],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        let mut pass = gpu.scoped_render_pass(
+            "shading",
+            wgpu::RenderPassDescriptor {
+                label: Some("shading pass"),
+                color_attachments: &[target(view, CLEAR_COLOR)],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            },
+        );
         self.shading.draw(&mut pass);
     }
 }
@@ -606,8 +640,12 @@ mod tests {
             mapped_at_creation: false,
         });
 
+        let profiler = crate::profile::profiler(&device, false);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        scene.draw(&mut encoder, &view);
+        {
+            let mut gpu = profiler.scope("gpu", &mut encoder);
+            scene.draw(&mut gpu, &view);
+        }
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -1221,11 +1259,15 @@ mod tests {
             mapped_at_creation: false,
         });
 
+        let profiler = crate::profile::profiler(&device, false);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        scene.draw(
-            &mut encoder,
-            &target.create_view(&wgpu::TextureViewDescriptor::default()),
-        );
+        {
+            let mut gpu = profiler.scope("gpu", &mut encoder);
+            scene.draw(
+                &mut gpu,
+                &target.create_view(&wgpu::TextureViewDescriptor::default()),
+            );
+        }
         encoder.copy_texture_to_buffer(
             scene.gbuffer.normal_target.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -1856,5 +1898,43 @@ mod tests {
             -extent.y * 0.5,
             extent.y * 0.5
         );
+    }
+
+    /// The streaming spans are the only account there is of the tile reads --
+    /// no GPU timestamp can reach them -- so a regression that stopped filling
+    /// them would leave a profiled run reporting a frame that cost nothing.
+    #[test]
+    fn profiling_accounts_for_the_tiles_an_update_brought_in() {
+        use std::time::Duration;
+
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let heights = vec![0.0; (RASTER * RASTER) as usize];
+        let mut frame = crate::profile::Frame::default();
+
+        // Off is the default, and off keeps nothing at all rather than keeping
+        // a total nobody asked for.
+        let mut quiet = test_scene(
+            &device,
+            format,
+            test_residency(),
+            heights.clone(),
+            flat_ground(),
+        );
+        quiet.update(&queue);
+        quiet.record(&mut frame);
+        assert_eq!(frame.cpu.terrain, crate::profile::Terrain::default());
+
+        // On, and the first update is the one that fills every level, so it has
+        // plenty to report.
+        let mut watched = test_scene(&device, format, test_residency(), heights, flat_ground());
+        watched.profile(true);
+        watched.update(&queue);
+        watched.record(&mut frame);
+
+        let spans = frame.cpu.terrain;
+        assert!(spans.tiles > 0, "{spans:?}");
+        let total = spans.advance + spans.read + spans.convert + spans.write;
+        assert!(total > Duration::ZERO, "{spans:?}");
     }
 }

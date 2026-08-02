@@ -104,7 +104,7 @@ pub fn device() -> Result<(wgpu::Device, wgpu::Queue)> {
 
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("headless device"),
-        required_features: wgpu::Features::empty(),
+        required_features: crate::profile::timer_features(&adapter),
         required_limits: wgpu::Limits::default(),
         ..Default::default()
     }))
@@ -153,10 +153,14 @@ pub fn capture(
         mapped_at_creation: false,
     });
 
+    let profiler = crate::profile::profiler(device, false);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("capture"),
     });
-    scene.draw(&mut encoder, &view);
+    {
+        let mut gpu = profiler.scope("gpu", &mut encoder);
+        scene.draw(&mut gpu, &view);
+    }
     encoder.copy_texture_to_buffer(
         target.as_image_copy(),
         wgpu::TexelCopyBufferInfo {
@@ -221,23 +225,20 @@ pub fn write_png(path: &Path, size: UVec2, pixels: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Renders one frame of `terrain_root` and writes it to `output`.
+/// Opens `terrain_root`, points the camera, and fills every level.
 ///
-/// Without a `placement` the scene's own opening view is kept, which frames the
-/// whole extent.
-pub fn run(
+/// The shared prologue of both headless modes. Each stage is timed on its own
+/// because they fail differently: a scene that builds quickly can still stall
+/// reading tiles off disk.
+fn settled(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     terrain_root: &Path,
     size: UVec2,
     placement: Option<Placement>,
-    output: &Path,
-) -> Result<()> {
-    let (device, queue) = device()?;
-
-    // Each stage is timed on its own because they fail differently: a scene that
-    // builds quickly can still stall reading tiles, and a frame that draws
-    // slowly says something about the GPU that neither of the others does.
+) -> Result<Scene> {
     let started = std::time::Instant::now();
-    let mut scene = Scene::new(&device, CAPTURE_FORMAT, size, terrain_root)?;
+    let mut scene = Scene::new(device, CAPTURE_FORMAT, size, terrain_root)?;
     log::info!("built the scene in {:.2?}", started.elapsed());
 
     if let Some(placement) = placement {
@@ -250,20 +251,137 @@ pub fn run(
     );
 
     let started = std::time::Instant::now();
-    scene.settle(&queue);
+    scene.settle(queue);
     log::info!("filled every level in {:.2?}", started.elapsed());
+    Ok(scene)
+}
 
-    let started = std::time::Instant::now();
+/// Renders one frame of `terrain_root` and writes it to `output`.
+///
+/// Deliberately silent about timing. This mode exists to produce an image to
+/// look at, and one cold frame is not a measurement of anything: it carries
+/// first-use pipeline compilation and whatever the tile reads left behind.
+/// [`profile`] is the mode that answers what it costs.
+///
+/// Without a `placement` the scene's own opening view is kept, which frames the
+/// whole extent.
+pub fn render(
+    terrain_root: &Path,
+    size: UVec2,
+    placement: Option<Placement>,
+    output: &Path,
+) -> Result<()> {
+    let (device, queue) = device()?;
+    let scene = settled(&device, &queue, terrain_root, size, placement)?;
+
     let pixels = capture(&device, &queue, &scene, size)?;
-    // To stdout, not to the log beside the timings above it. There is no window
-    // to draw the frame time over here, so this line is the whole of what the
-    // overlay would have shown, and a measurement that was asked for should
-    // come back on the output stream rather than mixed into the diagnostics.
-    let (ms, fps) = crate::hud::ms_and_fps(started.elapsed());
-    println!("rendered one frame in {ms:.2} ms ({fps:.1} fps)");
-
     write_png(output, size, &pixels)?;
     log::info!("wrote {}", output.display());
+    Ok(())
+}
+
+/// Frames drawn and thrown away before any are counted.
+///
+/// The first use of a pipeline compiles it, the first use of a texture may move
+/// it, and neither is what a steady frame costs. Small because after
+/// [`Scene::settle`] there is nothing left to warm but the draw itself.
+const WARMUP: u32 = 8;
+
+/// Measures `frames` frames of a settled scene and prints where the time went.
+///
+/// Writes no image. What it draws into is a texture nobody reads back, because
+/// the readback is not part of the frame being measured -- the copy and the
+/// buffer map that follow it in [`capture`] cost more than the draw does.
+///
+/// The scene is settled first, so the tile streaming rows read near zero here:
+/// nothing is pending once every level is whole. That is the point of a
+/// measurement mode -- it holds the one variable that would otherwise swamp the
+/// others still -- but it does mean this cannot tell you what streaming costs.
+/// The windowed overlay while flying, or `FLIGHT_SIM_WALK` in
+/// `dump_installed_terrain`, is what shows that.
+pub fn profile(
+    terrain_root: &Path,
+    size: UVec2,
+    placement: Option<Placement>,
+    frames: u32,
+) -> Result<()> {
+    let (device, queue) = device()?;
+    let mut scene = settled(&device, &queue, terrain_root, size, placement)?;
+    scene.profile(true);
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("profile target"),
+        size: wgpu::Extent3d {
+            width: size.x,
+            height: size.y,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: CAPTURE_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let mut profiler = crate::profile::profiler(&device, true);
+    let mut measured: Vec<crate::profile::Frame> = Vec::with_capacity(frames as usize);
+    let mut last = std::time::Instant::now();
+
+    for index in 0..WARMUP + frames {
+        let mut frame = crate::profile::Frame::default();
+
+        scene.update(&queue);
+        scene.record(&mut frame);
+
+        let clock = crate::profile::Clock::start(true);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("profile frame"),
+        });
+        {
+            let mut gpu = profiler.scope("gpu", &mut encoder);
+            scene.draw(&mut gpu, &view);
+        }
+        profiler.resolve_queries(&mut encoder);
+        frame.cpu.encode = clock.elapsed();
+
+        let clock = crate::profile::Clock::start(true);
+        queue.submit(std::iter::once(encoder.finish()));
+        frame.cpu.submit = clock.elapsed();
+
+        // Nothing presents here, so there is no vsync and nothing else to wait
+        // on the GPU. Blocking makes each iteration a whole frame rather than a
+        // queue of them, which is what makes the interval mean anything and
+        // what lets the timestamps come back on the very next call.
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+
+        let now = std::time::Instant::now();
+        frame.interval = now.duration_since(last);
+        last = now;
+
+        profiler
+            .end_frame()
+            .context("the profiler was left with a scope open")?;
+        if let Some(results) = profiler.process_finished_frame(queue.get_timestamp_period()) {
+            frame.take_gpu(&results);
+        }
+
+        if index >= WARMUP {
+            measured.push(frame);
+        }
+    }
+
+    // The last frames' timestamps are still in flight; drain them so they are
+    // not silently dropped, and attach them to the frames still missing theirs.
+    for frame in measured.iter_mut().filter(|frame| frame.gpu.is_empty()) {
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+        if let Some(results) = profiler.process_finished_frame(queue.get_timestamp_period()) {
+            frame.take_gpu(&results);
+        }
+    }
+
+    print!("{}", crate::profile::table(&measured));
     Ok(())
 }
 

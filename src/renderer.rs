@@ -3,7 +3,8 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use crate::camera::Camera;
-use crate::hud::{FrameTimer, Hud};
+use crate::hud::Hud;
+use crate::profile;
 use crate::scene::Scene;
 
 /// Owns the GPU device and swapchain for a single window, and the scene it draws.
@@ -14,8 +15,14 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     scene: Scene,
-    timer: FrameTimer,
-    /// Absent when the machine has no fonts to draw the readout with.
+    /// Inert unless the run asked for profiling; see [`crate::profile`].
+    profiler: wgpu_profiler::GpuProfiler,
+    profiling: bool,
+    /// When the frame being drawn started, for the interval to the next one.
+    last_frame: Option<std::time::Instant>,
+    frame: profile::Frame,
+    readout: profile::Smoothed,
+    /// Absent unless profiling, or when the machine has no fonts to draw with.
     hud: Option<Hud>,
 }
 
@@ -24,6 +31,7 @@ impl Renderer {
         window: Arc<Window>,
         display: winit::event_loop::OwnedDisplayHandle,
         terrain_root: &std::path::Path,
+        profiling: bool,
     ) -> anyhow::Result<Self> {
         let size = window.inner_size();
 
@@ -51,9 +59,11 @@ impl Renderer {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("device"),
-                required_features: wgpu::Features::empty(),
+                // Only the timer queries, and only those the adapter has. The
+                // headless device asks for the same, so a frame measured there
+                // is evidence about the frame this draws.
+                required_features: profile::timer_features(&adapter),
                 // The WebGPU baseline, which every GPU on the target platforms clears.
-                // Nothing here needs an optional feature yet, so none are requested.
                 required_limits: wgpu::Limits::default(),
                 ..Default::default()
             })
@@ -84,14 +94,18 @@ impl Renderer {
         // screen-sized G-buffer but not the clipmap: its textures are
         // allocated once, and rebuilding them mid-flight would mean refilling
         // every window from disk.
-        let scene = Scene::new(
+        let mut scene = Scene::new(
             &device,
             format,
             glam::UVec2::new(config.width, config.height),
             terrain_root,
         )?;
+        scene.profile(profiling);
 
-        let hud = Hud::new(&device, &queue, format, window.scale_factor() as f32);
+        // No overlay at all on an unprofiled run: there is nothing to put in it.
+        let hud =
+            profiling.then(|| Hud::new(&device, &queue, format, window.scale_factor() as f32));
+        let profiler = profile::profiler(&device, profiling);
 
         Ok(Self {
             window,
@@ -100,8 +114,12 @@ impl Renderer {
             queue,
             config,
             scene,
-            timer: FrameTimer::default(),
-            hud,
+            profiler,
+            profiling,
+            last_frame: None,
+            frame: profile::Frame::default(),
+            readout: profile::Smoothed::default(),
+            hud: hud.flatten(),
         })
     }
 
@@ -155,10 +173,11 @@ impl Renderer {
 
         // Timed from here rather than from the top of the call: with vsync it is
         // `get_current_texture` above that blocks, and counting that wait as
-        // work would make this number agree with the frame interval and say
-        // nothing the frame interval does not already say.
+        // work would make the interval agree with itself and say nothing.
         let started = std::time::Instant::now();
-        self.timer.begin(started);
+        if let Some(previous) = self.last_frame.replace(started) {
+            self.frame.interval = started.duration_since(previous);
+        }
 
         let view = frame
             .texture
@@ -170,36 +189,78 @@ impl Renderer {
             });
 
         self.scene.update(&self.queue);
-        self.scene.draw(&mut encoder, &view);
+        self.scene.record(&mut self.frame);
 
-        // Over the top of the shaded frame, and only here: the overlay reports
-        // on the renderer rather than being part of what it renders, so the
-        // screenshot path in `crate::headless`, which shares `Scene::draw`,
-        // stays free of it. It also wants `&mut` to lay the text out, which
-        // `Scene::draw` does not take.
-        if let Some(hud) = self.hud.as_mut() {
-            // Last frame's submit cost paired with this frame's interval: the
-            // one being drawn cannot report a time it has not finished taking.
-            hud.draw(
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                crate::hud::Target {
-                    view: &view,
-                    resolution: glam::UVec2::new(self.config.width, self.config.height),
-                    scale_factor: self.window.scale_factor() as f32,
-                },
-                &self.timer.text(),
-            );
+        let clock = profile::Clock::start(self.profiling);
+        {
+            let mut gpu = self.profiler.scope("gpu", &mut encoder);
+            self.scene.draw(&mut gpu, &view);
+
+            // Over the top of the shaded frame, and only here: the overlay
+            // reports on the renderer rather than being part of what it
+            // renders, so the screenshot path in `crate::headless`, which
+            // shares `Scene::draw`, stays free of it. It also wants `&mut` to
+            // lay the text out, which `Scene::draw` does not take.
+            if let Some(hud) = self.hud.as_mut() {
+                // The rows are last frame's: the frame being drawn cannot
+                // report times it has not finished taking, and the GPU ones
+                // come back later still.
+                hud.draw(
+                    &self.device,
+                    &self.queue,
+                    &mut gpu,
+                    crate::hud::Target {
+                        view: &view,
+                        resolution: glam::UVec2::new(self.config.width, self.config.height),
+                        scale_factor: self.window.scale_factor() as f32,
+                    },
+                    &self.readout.text(),
+                );
+            }
         }
+        self.frame.cpu.encode = clock.elapsed();
 
+        // Has to follow every scope on this encoder and precede its `finish`:
+        // this is the copy that moves the query set into a readable buffer.
+        self.profiler.resolve_queries(&mut encoder);
+
+        let clock = profile::Clock::start(self.profiling);
         self.queue.submit(std::iter::once(encoder.finish()));
-        self.timer.end(started.elapsed());
+        self.frame.cpu.submit = clock.elapsed();
+
         self.queue.present(frame);
+        self.collect();
 
         // `present` consumed the frame, so the surface can be reconfigured now.
         if stale {
             self.reconfigure();
         }
+    }
+
+    /// Closes the profiler frame and folds whatever came back into the readout.
+    ///
+    /// The GPU results lag: timestamps are read back through a buffer mapping,
+    /// so a frame's own numbers are not available while it is being drawn and
+    /// [`GpuProfiler::process_finished_frame`] returns the oldest one that has
+    /// finished, or nothing yet. That is why the overlay shows the previous
+    /// frame's rows -- the alternative is showing none for the first few
+    /// frames and then always being a frame behind anyway.
+    ///
+    /// [`GpuProfiler::process_finished_frame`]: wgpu_profiler::GpuProfiler::process_finished_frame
+    fn collect(&mut self) {
+        if !self.profiling {
+            return;
+        }
+        if let Err(err) = self.profiler.end_frame() {
+            log::warn!("the profiler dropped a frame: {err}");
+            return;
+        }
+        if let Some(results) = self
+            .profiler
+            .process_finished_frame(self.queue.get_timestamp_period())
+        {
+            self.frame.take_gpu(&results);
+        }
+        self.readout.update(&self.frame);
     }
 }

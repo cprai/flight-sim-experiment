@@ -4,6 +4,7 @@ mod deferred;
 mod headless;
 mod hud;
 mod palette;
+mod profile;
 mod renderer;
 mod scene;
 mod terrain;
@@ -28,7 +29,7 @@ use crate::renderer::Renderer;
 /// Size of the window, and of a screenshot that does not ask for another.
 const DEFAULT_SIZE: UVec2 = UVec2::new(1280, 720);
 
-/// Where the terrain comes from, and whether to fly over it or photograph it.
+/// Fly over terrain, photograph it, or find out what drawing it costs.
 ///
 /// The pyramid is far too large to carry in the repository -- a box a few
 /// kilometres square is hundreds of megabytes -- so there is no default path to
@@ -38,34 +39,89 @@ const DEFAULT_SIZE: UVec2 = UVec2::new(1280, 720);
 #[derive(Parser, Debug)]
 #[command(about = "Fly over terrain streamed from a tile pyramid", long_about = None)]
 struct Arguments {
+    #[command(subcommand)]
+    mode: Mode,
+}
+
+/// Where the terrain comes from. Every mode needs it and none can guess it.
+///
+/// Repeated into each mode rather than made a global argument, because clap
+/// does not allow a global to be required and this genuinely is.
+#[derive(clap::Args, Debug)]
+struct Terrain {
     /// Directory holding the tile pyramid, with a subdirectory per product.
     #[arg(short, long, value_name = "DIR")]
     terrain: PathBuf,
+}
 
-    /// Render a single frame to this PNG and exit, without opening a window.
+/// Which of the four ways to run.
+///
+/// Subcommands rather than flags because the modes do not share arguments:
+/// `--camera` means nothing to a window you can steer, and an output path means
+/// nothing to a run that measures. As flags those had to be bound together with
+/// clap `requires` attributes that said so only after the fact.
+#[derive(clap::Subcommand, Debug)]
+enum Mode {
+    /// Open a window and fly.
+    Fly(Terrain),
+
+    /// Open a window and fly, with the frame breakdown drawn in the corner.
+    FlyProfile(Terrain),
+
+    /// Render a single frame to a PNG and exit, without opening a window.
     ///
     /// Presenting a swapchain needs a display server; drawing into a texture
     /// does not. This is the way in on a machine that has the GPU but no
-    /// screen -- a container given `/dev/dri` and nothing else.
-    #[arg(short = 'o', long, value_name = "FILE")]
-    screenshot: Option<PathBuf>,
+    /// screen -- a container given `/dev/dri` and nothing else. It reports no
+    /// timings: one cold frame is an image, not a measurement.
+    Render {
+        #[command(flatten)]
+        terrain: Terrain,
 
+        /// Where to write the PNG.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+
+        #[command(flatten)]
+        view: View,
+    },
+
+    /// Settle the terrain, then measure frames and print where the time went.
+    ///
+    /// Writes no image. Prints a table to stdout: one row per step of the
+    /// frame, GPU and CPU kept apart, with the spread across the run.
+    Profile {
+        #[command(flatten)]
+        terrain: Terrain,
+
+        #[command(flatten)]
+        view: View,
+
+        /// How many frames to measure, after a few discarded to warm up.
+        #[arg(long, default_value_t = 60, value_name = "N")]
+        frames: u32,
+    },
+}
+
+/// What a headless mode looks at, and how big the frame is.
+#[derive(clap::Args, Debug)]
+struct View {
     /// Where to put the camera, as `x,y,z,yaw,pitch`: metres, then degrees.
     ///
     /// Without it the opening view is kept, which frames the whole extent and
     /// so looks at whatever is most of the box rather than at any part of it.
-    #[arg(long, value_name = "X,Y,Z,YAW,PITCH", requires = "screenshot")]
+    #[arg(long, value_name = "X,Y,Z,YAW,PITCH")]
     camera: Option<Placement>,
 
-    /// Size of the screenshot, as `WIDTHxHEIGHT`. Defaults to the window's.
+    /// Size of the frame, as `WIDTHxHEIGHT`. Defaults to the window's.
     ///
-    /// Not merely a crop: how much ground the clipmap keeps resident is chosen
-    /// so a texel lands on about a pixel, so this changes what is loaded.
-    #[arg(long, value_name = "WxH", requires = "screenshot", value_parser = parse_size)]
+    /// Not merely a crop: the viewport decides the finest clipmap level worth
+    /// filling, so this changes what is drawn as well as how much of it.
+    #[arg(long, value_name = "WxH", value_parser = parse_size)]
     size: Option<UVec2>,
 }
 
-/// Reads `WIDTHxHEIGHT` for [`Arguments::size`].
+/// Reads `WIDTHxHEIGHT` for [`View::size`].
 fn parse_size(text: &str) -> Result<UVec2, String> {
     let (width, height) = text
         .split_once(['x', 'X'])
@@ -87,6 +143,8 @@ fn parse_size(text: &str) -> Result<UVec2, String> {
 struct App {
     display: OwnedDisplayHandle,
     terrain: PathBuf,
+    /// Whether to instrument the frame and draw the breakdown over it.
+    profiling: bool,
     renderer: Option<Renderer>,
     controls: FlyController,
     /// When the last frame was drawn, for the timestep the controls integrate over.
@@ -94,10 +152,11 @@ struct App {
 }
 
 impl App {
-    fn new(display: OwnedDisplayHandle, terrain: PathBuf) -> Self {
+    fn new(display: OwnedDisplayHandle, terrain: PathBuf, profiling: bool) -> Self {
         Self {
             display,
             terrain,
+            profiling,
             renderer: None,
             controls: FlyController::default(),
             last_frame: Instant::now(),
@@ -124,7 +183,12 @@ impl ApplicationHandler for App {
             }
         };
 
-        match pollster::block_on(Renderer::new(window, self.display.clone(), &self.terrain)) {
+        match pollster::block_on(Renderer::new(
+            window,
+            self.display.clone(),
+            &self.terrain,
+            self.profiling,
+        )) {
             Ok(renderer) => {
                 self.controls = FlyController::new(renderer.camera());
                 self.last_frame = Instant::now();
@@ -214,21 +278,42 @@ fn main() -> anyhow::Result<()> {
 
     let arguments = Arguments::parse();
 
-    // Before the event loop rather than inside it: building one already fails on
-    // a machine with no display server, which is exactly where this mode is for.
-    if let Some(output) = arguments.screenshot.as_deref() {
-        return headless::run(
-            &arguments.terrain,
-            arguments.size.unwrap_or(DEFAULT_SIZE),
-            arguments.camera,
+    // The headless modes run before the event loop is ever built, deliberately:
+    // `EventLoop::new` fails outright on a machine with no display server, which
+    // is exactly where those modes are for.
+    let (terrain, profiling) = match arguments.mode {
+        Mode::Render {
+            terrain,
             output,
-        );
-    }
+            view,
+        } => {
+            return headless::render(
+                &terrain.terrain,
+                view.size.unwrap_or(DEFAULT_SIZE),
+                view.camera,
+                &output,
+            );
+        }
+        Mode::Profile {
+            terrain,
+            view,
+            frames,
+        } => {
+            return headless::profile(
+                &terrain.terrain,
+                view.size.unwrap_or(DEFAULT_SIZE),
+                view.camera,
+                frames,
+            );
+        }
+        Mode::Fly(terrain) => (terrain.terrain, false),
+        Mode::FlyProfile(terrain) => (terrain.terrain, true),
+    };
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(event_loop.owned_display_handle(), arguments.terrain);
+    let mut app = App::new(event_loop.owned_display_handle(), terrain, profiling);
     event_loop.run_app(&mut app)?;
 
     Ok(())

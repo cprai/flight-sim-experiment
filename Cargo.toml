@@ -20,4 +20,5 @@ terrain-materials = { path = "crates/terrain-materials" }
 terrain-tiles = { path = "crates/terrain-tiles" }
 tiff = { version = "0.11", default-features = false, features = ["deflate"] }
 wgpu = "30.0.0"
+wgpu-profiler = "0.28"
 winit = "0.30"
