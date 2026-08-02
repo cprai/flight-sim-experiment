@@ -7,9 +7,10 @@
 //! past, its member ways (mostly untagged, so nothing marked them as wanted)
 //! are already gone. The reader makes three passes instead:
 //!
-//! 1. Ways and relations: classify every way's tags, keeping the node refs of
-//!    classified closed ways and of coastline ways, and keep every classified
-//!    multipolygon relation's member list.
+//! 1. Ways and relations: classify every way's tags, keeping the node refs
+//!    of classified closed ways, of ways to stroke (roads, rails, runways),
+//!    of island rings, and of coastline ways, and keep every classified or
+//!    island multipolygon relation's member list.
 //! 2. Member ways: node refs for the ways pass 1's relations named.
 //! 3. Nodes: coordinates for exactly the node ids the kept ways reference.
 //!
@@ -28,7 +29,7 @@ use serde::Deserialize;
 use terrain_materials::Material;
 use terrain_tiles::project::{EPSG_LAMBERT, Projector};
 
-use super::classify::classify;
+use super::classify::{carriageway, classify, island};
 
 /// The record `terrain-download` writes beside the extract.
 ///
@@ -63,6 +64,15 @@ pub struct Area {
     pub refs: Vec<i64>,
 }
 
+/// One way to stroke rather than fill: a road, rail line, or runway.
+pub struct Line {
+    pub material: Material,
+    /// Painted width in metres, from the way's class.
+    pub width: f64,
+    /// Node ids along the way, in order; open or closed.
+    pub refs: Vec<i64>,
+}
+
 /// One classified multipolygon relation, geometry still by reference.
 ///
 /// Member roles are not kept. Outer versus inner only matters to a fill rule
@@ -80,6 +90,14 @@ pub struct MultiPolygon {
 pub struct Extract {
     pub areas: Vec<Area>,
     pub relations: Vec<MultiPolygon>,
+    /// Roads, rail lines, and runways, to be stroked at a width.
+    pub lines: Vec<Line>,
+    /// Closed `place=island` ways: land, cover unknown. Kept apart from
+    /// `areas` because assembly paints them on the zone layer, under any
+    /// cover that is actually mapped.
+    pub islands: Vec<Vec<i64>>,
+    /// `place=island` multipolygon relations, geometry by reference.
+    pub island_relations: Vec<MultiPolygon>,
     /// `natural=coastline` ways, directed with land on the left.
     pub coastlines: Vec<Vec<i64>>,
     /// Node refs for every way a relation names, by way id.
@@ -132,9 +150,12 @@ impl Nodes {
 pub fn read_extract(path: &Path) -> Result<Extract> {
     let started = std::time::Instant::now();
 
-    // Pass 1: every way's tags meet the classifier once.
+    // Pass 1: every way's tags meet the classifiers once.
     let mut areas = Vec::new();
     let mut relations = Vec::new();
+    let mut lines = Vec::new();
+    let mut islands = Vec::new();
+    let mut island_relations = Vec::new();
     let mut coastlines = Vec::new();
     let mut unclosed = 0u64;
     reader(path)?
@@ -147,17 +168,37 @@ pub fn read_extract(path: &Path) -> Result<Extract> {
                     coastlines.push(way.refs().collect());
                     return;
                 }
-                let Some(material) = classify(&tags) else {
+                if let Some(material) = classify(&tags) {
+                    let refs: Vec<i64> = way.refs().collect();
+                    // A lone way must close on itself to hold ground. Open
+                    // ones are either mapping errors or rings the region
+                    // clip cut, and a guessed closure would paint ground
+                    // that is not there.
+                    if refs.len() >= 4 && refs.first() == refs.last() {
+                        areas.push(Area { material, refs });
+                    } else {
+                        unclosed += 1;
+                    }
                     return;
-                };
-                let refs: Vec<i64> = way.refs().collect();
-                // A lone way must close on itself to hold ground. Open ones
-                // are either mapping errors or rings the region clip cut,
-                // and a guessed closure would paint ground that is not there.
-                if refs.len() >= 4 && refs.first() == refs.last() {
-                    areas.push(Area { material, refs });
-                } else {
-                    unclosed += 1;
+                }
+                if let Some((material, width)) = carriageway(&tags) {
+                    let refs: Vec<i64> = way.refs().collect();
+                    // Two nodes are a segment to stroke; closure does not
+                    // matter -- a roundabout strokes as a ring of road.
+                    if refs.len() >= 2 {
+                        lines.push(Line {
+                            material,
+                            width,
+                            refs,
+                        });
+                    }
+                    return;
+                }
+                if island(&tags) {
+                    let refs: Vec<i64> = way.refs().collect();
+                    if refs.len() >= 4 && refs.first() == refs.last() {
+                        islands.push(refs);
+                    }
                 }
             }
             Element::Relation(relation) => {
@@ -165,16 +206,26 @@ pub fn read_extract(path: &Path) -> Result<Extract> {
                 if !tags.iter().any(|&(k, v)| k == "type" && v == "multipolygon") {
                     return;
                 }
-                let Some(material) = classify(&tags) else {
+                let classified = classify(&tags);
+                if classified.is_none() && !island(&tags) {
                     return;
-                };
+                }
                 let members: Vec<i64> = relation
                     .members()
                     .filter(|member| member.member_type == osmpbf::RelMemberType::Way)
                     .map(|member| member.member_id)
                     .collect();
-                if !members.is_empty() {
-                    relations.push(MultiPolygon { material, members });
+                if members.is_empty() {
+                    return;
+                }
+                match classified {
+                    Some(material) => relations.push(MultiPolygon { material, members }),
+                    // The material stands for "land, cover unknown"; the
+                    // zone-layer override happens at assembly.
+                    None => island_relations.push(MultiPolygon {
+                        material: Material::ForestUnknown,
+                        members,
+                    }),
                 }
             }
             Element::Node(_) | Element::DenseNode(_) => {}
@@ -184,6 +235,7 @@ pub fn read_extract(path: &Path) -> Result<Extract> {
     // Pass 2: geometry for the ways the relations named.
     let mut wanted_ways: Vec<i64> = relations
         .iter()
+        .chain(island_relations.iter())
         .flat_map(|relation| relation.members.iter().copied())
         .collect();
     wanted_ways.sort_unstable();
@@ -203,6 +255,8 @@ pub fn read_extract(path: &Path) -> Result<Extract> {
     let mut ids: Vec<i64> = areas
         .iter()
         .map(|area| &area.refs)
+        .chain(lines.iter().map(|line| &line.refs))
+        .chain(islands.iter())
         .chain(coastlines.iter())
         .chain(members.values())
         .flatten()
@@ -226,12 +280,14 @@ pub fn read_extract(path: &Path) -> Result<Extract> {
 
     let missing = positions.iter().filter(|p| p.0.is_nan()).count();
     log::info!(
-        "read {}: {} areas, {} multipolygons over {} member ways, {} coastline ways, \
-         {} nodes in {:.1?}",
+        "read {}: {} areas, {} multipolygons over {} member ways, {} lines, {} islands, \
+         {} coastline ways, {} nodes in {:.1?}",
         path.display(),
         areas.len(),
         relations.len(),
         members.len(),
+        lines.len(),
+        islands.len() + island_relations.len(),
         coastlines.len(),
         ids.len(),
         started.elapsed()
@@ -247,6 +303,9 @@ pub fn read_extract(path: &Path) -> Result<Extract> {
     Ok(Extract {
         areas,
         relations,
+        lines,
+        islands,
+        island_relations,
         coastlines,
         members,
         nodes: Nodes { ids, positions },

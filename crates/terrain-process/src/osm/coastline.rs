@@ -489,6 +489,9 @@ mod tests {
         Extract {
             areas: Vec::new(),
             relations: Vec::new(),
+            lines: Vec::new(),
+            islands: Vec::new(),
+            island_relations: Vec::new(),
             coastlines,
             members: std::collections::HashMap::new(),
             nodes: Nodes::for_tests((0..points.len() as i64).collect(), points.to_vec()),

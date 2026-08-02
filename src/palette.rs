@@ -114,6 +114,8 @@ pub(crate) fn flat_colour(material: Material) -> [u8; 3] {
         Landfill => [125, 110, 90],
         Quarry => [150, 140, 130],
         Cemetery => [110, 130, 105],
+        Paved => [75, 75, 78],
+        Building => [178, 170, 162],
 
         // Maintained leisure ground: the brightest greens on the map,
         // except the bunkers, which are sand.

@@ -7,9 +7,11 @@
 //!
 //! - [`read`]: three passes over the `.osm.pbf`, keeping only what paints.
 //! - [`classify`]: OSM's tag vocabulary folded onto the material enum.
-//! - [`assemble`]: ids into rings, rings into polygons with holes.
+//! - [`assemble`]: ids into rings, rings into polygons with holes, ways
+//!   into strokes for the roads.
 //! - [`coastline`]: the sea, which OSM implies rather than maps.
-//! - [`rasterize`]: polygons painted into base-level tiles, in layers.
+//! - [`rasterize`]: polygons and strokes painted into base tiles, in layers.
+//! - [`fill`]: unmapped ground takes the nearest mapped cover, to a limit.
 //! - [`mip`]: coarse levels, each texel the commonest id beneath it.
 //!
 //! The grid is not the extract's to choose: the manifest is cloned from
@@ -27,6 +29,7 @@ use terrain_tiles::{MATERIAL_BASE_LEVEL, MATERIAL_PRODUCT, Manifest};
 pub mod assemble;
 pub mod classify;
 pub mod coastline;
+pub mod fill;
 pub mod mip;
 pub mod rasterize;
 pub mod read;
@@ -61,12 +64,14 @@ pub fn build(input: &Path, output: &Path, reference: &Manifest) -> Result<()> {
     extract.nodes.project()?;
 
     let mut polygons = assemble::polygons(&extract);
+    let strokes = assemble::strokes(&extract);
     match coastline::ocean(&extract, coastline::Rect::of_manifest(&manifest)) {
         Some(sea) => polygons.push(sea),
         None => log::warn!("no sea could be closed; the ocean will be unpainted"),
     }
 
-    let base = rasterize::rasterize(&polygons, &manifest, &root)?;
+    let base = rasterize::rasterize(&polygons, &strokes, &manifest, &root)?;
+    fill::fill(&manifest, &root)?;
     let coarse = mip::build_levels(&manifest, &root)?;
     manifest.write(&root)?;
     log::info!(

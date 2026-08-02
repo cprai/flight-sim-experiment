@@ -98,9 +98,9 @@ pub enum Material {
     PlantNursery = 0x0605,
     Greenhouses = 0x0606,
 
-    // Developed ground, 0x07xx. Broad zones, not individual works: roads and
-    // buildings are deliberately absent, waiting on mesh geometry rather than
-    // ground texture.
+    // Developed ground, 0x07xx. Mostly broad zones; `Paved` and `Building`
+    // are the stand-in ground under roads and buildings until each grows
+    // mesh geometry of its own.
     Residential = 0x0700,
     Commercial = 0x0701,
     Retail = 0x0702,
@@ -116,6 +116,13 @@ pub enum Material {
     Landfill = 0x070b,
     Quarry = 0x070c,
     Cemetery = 0x070d,
+    /// Sealed surface: roads, parking, aprons. A stand-in until roads become
+    /// meshes with directional texturing; the ground under them is asphalt
+    /// either way.
+    Paved = 0x070e,
+    /// A building's footprint. A stand-in until buildings become meshes; the
+    /// ground a building sits on is roof-coloured from above, never terrain.
+    Building = 0x070f,
 
     // Maintained leisure ground, 0x08xx.
     Park = 0x0800,
@@ -202,6 +209,8 @@ impl Material {
         Material::Landfill,
         Material::Quarry,
         Material::Cemetery,
+        Material::Paved,
+        Material::Building,
         Material::Park,
         Material::Garden,
         Material::RecreationGround,
@@ -246,7 +255,7 @@ mod tests {
     /// here and must be bumped together with any addition.
     #[test]
     fn the_list_holds_every_variant_exactly_once() {
-        assert_eq!(Material::ALL.len(), 75);
+        assert_eq!(Material::ALL.len(), 77);
         let ids: HashSet<u32> = Material::ALL.iter().map(|m| m.id()).collect();
         assert_eq!(ids.len(), Material::ALL.len(), "a duplicate id");
     }

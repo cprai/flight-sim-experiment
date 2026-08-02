@@ -14,9 +14,12 @@
 //! wrong material paints confidently forever, while a skipped area leaves the
 //! layer below showing, which is at worst incomplete.
 //!
-//! Roads and buildings are deliberately not here. They are urban structure
-//! rather than ground cover, and will be built as meshes with directional
-//! texturing later; painting them flat now would only have to be undone.
+//! Roads and buildings get stand-in materials rather than real treatment.
+//! Both will be built as meshes with directional texturing later, but until
+//! then the ground they occupy has to shade as *something*: a building
+//! footprint paints [`Material::Building`], and roads -- which arrive as
+//! lines, not areas -- are classified by [`carriageway`] into a material and
+//! a width for the rasterizer to stroke.
 //!
 //! Precedence orders overlapping areas into layers, because the output is one
 //! flat raster: a lake inside a forest inside a residential zone must come out
@@ -66,14 +69,37 @@ pub fn classify(tags: &[(&str, &str)]) -> Option<Material> {
     if get(tags, "man_made") == Some("clearcut") {
         return Some(Material::Clearcut);
     }
+    // Before the zones: a building polygon inside a campus or a retail zone
+    // is the building, whatever else the parcel is tagged.
+    if let Some(value) = get(tags, "building")
+        && value != "no"
+    {
+        return Some(Material::Building);
+    }
     if let Some(value) = get(tags, "landuse") {
         return landuse(value, tags);
     }
     if let Some(value) = get(tags, "leisure") {
         return leisure(value, tags);
     }
+    if let Some(value) = get(tags, "aeroway") {
+        return aeroway(value);
+    }
+    if let Some(value) = get(tags, "amenity") {
+        return amenity(value);
+    }
+    // Campgrounds: pitches and grass between trees the wood polygons cover.
+    if matches!(get(tags, "tourism"), Some("camp_site" | "caravan_site")) {
+        return Some(Material::Grass);
+    }
     if get(tags, "landcover") == Some("grass") {
         return Some(Material::Grass);
+    }
+    // A closed highway way is only ground when the mapper said so; without
+    // `area=yes` it is a loop of road -- a roundabout, a circular drive --
+    // and stroking it as a line is [`carriageway`]'s business.
+    if get(tags, "highway").is_some() && get(tags, "area") == Some("yes") {
+        return Some(Material::Paved);
     }
     None
 }
@@ -173,6 +199,33 @@ fn landuse(value: &str, tags: &[(&str, &str)]) -> Option<Material> {
         "recreation_ground" => Material::RecreationGround,
         "basin" => Material::Basin,
         "reservoir" => Material::Reservoir,
+        // Ski areas: cleared runs and lift corridors between the woods,
+        // which are mapped separately and paint over this.
+        "winter_sports" => Material::Heath,
+        // Airport grounds are mown grass; runways and aprons paint on top.
+        "airport" => Material::Grass,
+        _ => return None,
+    })
+}
+
+fn aeroway(value: &str) -> Option<Material> {
+    Some(match value {
+        // The aerodrome polygon is the grass the pavement sits in.
+        "aerodrome" => Material::Grass,
+        "apron" | "runway" | "taxiway" | "helipad" => Material::Paved,
+        _ => return None,
+    })
+}
+
+fn amenity(value: &str) -> Option<Material> {
+    Some(match value {
+        "parking" | "parking_space" => Material::Paved,
+        // Campus polygons: grounds, not buildings, which paint over them.
+        "school" | "university" | "college" | "kindergarten" | "hospital" => {
+            Material::Institutional
+        }
+        // The churchyard spelling of a cemetery.
+        "grave_yard" => Material::Cemetery,
         _ => return None,
     })
 }
@@ -218,6 +271,100 @@ fn golf(value: &str) -> Option<Material> {
     })
 }
 
+/// The material and painted width, in metres, of a way that is a road, a
+/// rail line, or a runway -- or `None` for a way that is not one, or that is
+/// not on the ground.
+///
+/// These are lines, not areas: the rasterizer strokes them at the returned
+/// width. Widths are typical carriageways for the class, kerb to kerb --
+/// there is no per-way survey to read, and a flat number per class is the
+/// same fidelity as the flat colour it will be shaded with. Bridges and
+/// tunnels are refused: the ground under a bridge is the water or the ravine
+/// below it, and the ground over a tunnel is whatever is mapped there. Ways
+/// the mapper drew as areas (`area=yes`) are refused too -- [`classify`]
+/// paints those as polygons.
+pub fn carriageway(tags: &[(&str, &str)]) -> Option<(Material, f64)> {
+    if get(tags, "area") == Some("yes")
+        || get(tags, "covered").is_some_and(|value| value != "no")
+        || get(tags, "tunnel").is_some_and(|value| value != "no")
+        || get(tags, "bridge").is_some_and(|value| value != "no")
+    {
+        return None;
+    }
+    // Surfaces that make a nominally paved class dirt, and vice versa.
+    let unpaved = matches!(
+        get(tags, "surface").unwrap_or(""),
+        "unpaved" | "gravel" | "fine_gravel" | "compacted" | "dirt" | "earth" | "ground"
+            | "grass" | "sand" | "mud" | "woodchips" | "pebblestone" | "rock"
+    );
+    let surfaced = |width: f64| {
+        Some(if unpaved {
+            (Material::BareEarth, width)
+        } else {
+            (Material::Paved, width)
+        })
+    };
+
+    if let Some(value) = get(tags, "highway") {
+        return match value {
+            "motorway" => surfaced(22.0),
+            "trunk" => surfaced(18.0),
+            "primary" => surfaced(14.0),
+            "secondary" => surfaced(11.0),
+            "tertiary" => surfaced(9.0),
+            "motorway_link" | "trunk_link" | "primary_link" | "secondary_link"
+            | "tertiary_link" => surfaced(7.0),
+            "residential" | "unclassified" | "living_street" | "busway" | "road" => {
+                surfaced(7.0)
+            }
+            "service" => surfaced(4.0),
+            "pedestrian" => surfaced(5.0),
+            "cycleway" => surfaced(2.5),
+            "footway" => surfaced(2.0),
+            // Dirt unless the mapper says otherwise.
+            "track" => Some((
+                if unpaved || get(tags, "surface").is_none() {
+                    Material::BareEarth
+                } else {
+                    Material::Paved
+                },
+                3.5,
+            )),
+            "path" | "bridleway" => Some((Material::BareEarth, 2.0)),
+            _ => None,
+        };
+    }
+    if let Some(value) = get(tags, "railway") {
+        return match value {
+            // Subway included: the tunnel check above already removed the
+            // underground stretches, and what is left is elevated guideway.
+            "rail" | "light_rail" | "narrow_gauge" | "subway" => Some((Material::Railway, 6.0)),
+            _ => None,
+        };
+    }
+    if let Some(value) = get(tags, "aeroway") {
+        return match value {
+            // Runways drawn as centrelines rather than areas.
+            "runway" => Some((Material::Paved, 45.0)),
+            "taxiway" => Some((Material::Paved, 15.0)),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Whether these tags label an island, which is a promise of land and
+/// nothing more specific.
+///
+/// Islands matter because the sea is filled by implication: an island whose
+/// coastline lives in a *different* extract -- Gabriola, for this project's
+/// region clip -- would otherwise be flooded by the ocean fill. The polygon
+/// paints as unclassified forest, the region's default ground, on the zone
+/// layer, so any cover that is actually mapped paints over it.
+pub fn island(tags: &[(&str, &str)]) -> bool {
+    matches!(get(tags, "place"), Some("island" | "islet"))
+}
+
 /// Which layer a material paints on. Higher paints later, and so on top.
 ///
 /// The layers, low to high: the ocean floor everything else sits on; broad
@@ -235,7 +382,8 @@ pub fn precedence(material: Material) -> u8 {
         | Allotments | PlantNursery | Greenhouses | Farmyard | Garden | VillageGreen => 2,
         BareRock | Scree | Shingle | Sand | Beach | Glacier | BareEarth | Mud | Quarry
         | Landfill | Construction | Cemetery | FlowerBed | GolfFairway | GolfGreen | GolfTee
-        | GolfBunker | GolfRough | PitchGrass | PitchArtificial | Playground | DogPark => 3,
+        | GolfBunker | GolfRough | PitchGrass | PitchArtificial | Playground | DogPark
+        | Paved | Building => 3,
         Marsh | Swamp | Bog | Fen | TidalFlat | SaltMarsh | WetMeadow | Reedbed
         | WetlandUnknown => 4,
         Lake | Pond | River | Stream | Reservoir | Basin | Canal | Lagoon | WaterUnknown => 5,
@@ -326,16 +474,78 @@ mod tests {
         );
     }
 
-    /// Linear features and urban structure must not become ground cover: a
-    /// cliff is a line, a pool is furniture, a building is a later mesh.
+    /// Linear features and furniture must not become ground cover: a cliff
+    /// is a line, a pool is a structure, a bare road loop is a stroke.
     #[test]
     fn linear_and_structural_features_do_not_classify() {
         assert_eq!(of(&[("natural", "cliff")]), None);
         assert_eq!(of(&[("natural", "coastline")]), None);
         assert_eq!(of(&[("natural", "tree_row")]), None);
         assert_eq!(of(&[("leisure", "swimming_pool")]), None);
-        assert_eq!(of(&[("building", "yes")]), None);
         assert_eq!(of(&[("highway", "pedestrian")]), None);
+    }
+
+    /// The stand-ins for later meshes: buildings paint their footprints, and
+    /// a highway is an area only when the mapper said `area=yes`.
+    #[test]
+    fn buildings_and_declared_road_areas_get_stand_in_ground() {
+        assert_eq!(of(&[("building", "yes")]), Some(Material::Building));
+        assert_eq!(of(&[("building", "retail")]), Some(Material::Building));
+        assert_eq!(of(&[("building", "no")]), None);
+        assert_eq!(
+            of(&[("building", "school"), ("amenity", "school")]),
+            Some(Material::Building),
+            "the building wins over the campus it sits on"
+        );
+        assert_eq!(
+            of(&[("highway", "pedestrian"), ("area", "yes")]),
+            Some(Material::Paved)
+        );
+    }
+
+    #[test]
+    fn campuses_parking_and_camps_classify_as_their_ground() {
+        assert_eq!(of(&[("amenity", "parking")]), Some(Material::Paved));
+        assert_eq!(of(&[("amenity", "school")]), Some(Material::Institutional));
+        assert_eq!(of(&[("amenity", "grave_yard")]), Some(Material::Cemetery));
+        assert_eq!(of(&[("tourism", "camp_site")]), Some(Material::Grass));
+        assert_eq!(of(&[("landuse", "winter_sports")]), Some(Material::Heath));
+        assert_eq!(of(&[("aeroway", "aerodrome")]), Some(Material::Grass));
+        assert_eq!(of(&[("aeroway", "apron")]), Some(Material::Paved));
+        assert_eq!(of(&[("amenity", "restaurant")]), None, "not ground");
+    }
+
+    #[test]
+    fn carriageways_stroke_by_class_and_surface() {
+        let paved = |tags: &[(&str, &str)]| carriageway(tags);
+        assert_eq!(paved(&[("highway", "motorway")]), Some((Material::Paved, 22.0)));
+        assert_eq!(paved(&[("highway", "residential")]), Some((Material::Paved, 7.0)));
+        assert_eq!(paved(&[("highway", "track")]), Some((Material::BareEarth, 3.5)));
+        assert_eq!(
+            paved(&[("highway", "footway"), ("surface", "gravel")]),
+            Some((Material::BareEarth, 2.0))
+        );
+        assert_eq!(paved(&[("railway", "rail")]), Some((Material::Railway, 6.0)));
+        assert_eq!(paved(&[("aeroway", "runway")]), Some((Material::Paved, 45.0)));
+        assert_eq!(paved(&[("highway", "bus_stop")]), None, "a point dressed as a way");
+    }
+
+    /// The ground under a bridge is the ravine, the ground over a tunnel is
+    /// the hill, and an `area=yes` way is a polygon for [`classify`].
+    #[test]
+    fn bridges_tunnels_and_areas_do_not_stroke() {
+        assert_eq!(carriageway(&[("highway", "primary"), ("bridge", "yes")]), None);
+        assert_eq!(carriageway(&[("highway", "primary"), ("tunnel", "yes")]), None);
+        assert_eq!(carriageway(&[("railway", "subway"), ("tunnel", "yes")]), None);
+        assert_eq!(carriageway(&[("highway", "pedestrian"), ("area", "yes")]), None);
+    }
+
+    #[test]
+    fn islands_are_recognised_and_cities_are_not() {
+        assert!(island(&[("place", "island")]));
+        assert!(island(&[("place", "islet")]));
+        assert!(!island(&[("place", "city")]));
+        assert!(!island(&[("natural", "wood")]));
     }
 
     #[test]

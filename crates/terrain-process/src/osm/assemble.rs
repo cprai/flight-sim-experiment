@@ -168,6 +168,69 @@ pub fn resolve(chain: &[i64], nodes: &Nodes) -> Option<Vec<(f64, f64)>> {
     chain.iter().map(|&id| nodes.get(id)).collect()
 }
 
+/// The painter's layer for an island polygon: with the broad zones, under
+/// everything actually mapped.
+///
+/// An island's own precedence would be its material's -- vegetation -- but
+/// the polygon is a *promise of land*, not an observation of cover: it must
+/// sit under any zone or cover a mapper did record on the island, and its
+/// only real job is to out-paint the ocean fill where the island's coastline
+/// lives in a neighbouring extract.
+const ISLAND_LAYER: u8 = 1;
+
+/// One way to stroke into the raster: a road, rail line, or runway.
+pub struct Stroke {
+    pub material: Material,
+    /// Full painted width in metres.
+    pub width: f64,
+    /// The way's points in grid metres, in order.
+    pub points: Vec<(f64, f64)>,
+    /// `[min_x, min_y, max_x, max_y]` over the points, *not* inflated by the
+    /// width; the painter inflates when it rejects.
+    pub bbox: [f64; 4],
+}
+
+/// Every line in the extract as strokes ready to paint.
+///
+/// A node the region clip removed splits its way rather than dropping it:
+/// each maximal run of resolved points at least two long becomes a stroke,
+/// so a highway whose far end is clipped still paints up to the clip.
+pub fn strokes(extract: &Extract) -> Vec<Stroke> {
+    let mut out = Vec::with_capacity(extract.lines.len());
+    for line in &extract.lines {
+        let mut run: Vec<(f64, f64)> = Vec::new();
+        let mut flush = |run: &mut Vec<(f64, f64)>| {
+            if run.len() >= 2 {
+                let mut bbox =
+                    [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+                for &(x, y) in run.iter() {
+                    bbox[0] = bbox[0].min(x);
+                    bbox[1] = bbox[1].min(y);
+                    bbox[2] = bbox[2].max(x);
+                    bbox[3] = bbox[3].max(y);
+                }
+                out.push(Stroke {
+                    material: line.material,
+                    width: line.width,
+                    points: std::mem::take(run),
+                    bbox,
+                });
+            } else {
+                run.clear();
+            }
+        };
+        for &id in &line.refs {
+            match extract.nodes.get(id) {
+                Some(point) => run.push(point),
+                None => flush(&mut run),
+            }
+        }
+        flush(&mut run);
+    }
+    log::info!("assembled {} strokes", out.len());
+    out
+}
+
 /// Every classified area in the extract, as paintable polygons.
 pub fn polygons(extract: &Extract) -> Vec<Polygon> {
     let mut out = Vec::with_capacity(extract.areas.len() + extract.relations.len());
@@ -183,7 +246,17 @@ pub fn polygons(extract: &Extract) -> Vec<Polygon> {
         }
     }
 
-    for relation in &extract.relations {
+    for (relation, layer) in extract
+        .relations
+        .iter()
+        .map(|relation| (relation, None))
+        .chain(
+            extract
+                .island_relations
+                .iter()
+                .map(|relation| (relation, Some(ISLAND_LAYER))),
+        )
+    {
         let fragments: Vec<Vec<i64>> = relation
             .members
             .iter()
@@ -205,7 +278,24 @@ pub fn polygons(extract: &Extract) -> Vec<Polygon> {
             })
             .collect();
         match Polygon::new(relation.material, rings) {
-            Some(polygon) => out.push(polygon),
+            Some(mut polygon) => {
+                if let Some(layer) = layer {
+                    polygon.layer = layer;
+                }
+                out.push(polygon);
+            }
+            None => dropped_polygons += 1,
+        }
+    }
+
+    for ring in &extract.islands {
+        match resolve(ring, &extract.nodes)
+            .and_then(|ring| Polygon::new(Material::ForestUnknown, vec![ring]))
+        {
+            Some(mut polygon) => {
+                polygon.layer = ISLAND_LAYER;
+                out.push(polygon);
+            }
             None => dropped_polygons += 1,
         }
     }
@@ -291,5 +381,63 @@ mod tests {
     #[test]
     fn a_polygon_with_no_rings_is_none() {
         assert!(Polygon::new(Material::Lake, vec![]).is_none());
+    }
+
+    /// A node the region clip removed splits its way into two strokes rather
+    /// than dropping the whole road.
+    #[test]
+    fn a_missing_node_splits_a_way_into_strokes() {
+        use super::super::read::{Extract, Line, Nodes};
+        let extract = Extract {
+            areas: Vec::new(),
+            relations: Vec::new(),
+            lines: vec![Line {
+                material: Material::Paved,
+                width: 7.0,
+                // Node 99 is not in the table: the clip took it.
+                refs: vec![1, 2, 99, 3, 4],
+            }],
+            islands: Vec::new(),
+            island_relations: Vec::new(),
+            coastlines: Vec::new(),
+            members: std::collections::HashMap::new(),
+            nodes: Nodes::for_tests(
+                vec![1, 2, 3, 4],
+                vec![(0.0, 0.0), (10.0, 0.0), (20.0, 0.0), (30.0, 0.0)],
+            ),
+        };
+        let strokes = strokes(&extract);
+        assert_eq!(strokes.len(), 2);
+        assert_eq!(strokes[0].points, vec![(0.0, 0.0), (10.0, 0.0)]);
+        assert_eq!(strokes[1].points, vec![(20.0, 0.0), (30.0, 0.0)]);
+        assert_eq!(strokes[0].bbox, [0.0, 0.0, 10.0, 0.0]);
+    }
+
+    /// An island polygon paints on the zone layer, under mapped cover, not
+    /// on its stand-in material's own vegetation layer.
+    #[test]
+    fn an_island_way_lands_on_the_zone_layer() {
+        use super::super::read::{Extract, Nodes};
+        let extract = Extract {
+            areas: Vec::new(),
+            relations: Vec::new(),
+            lines: Vec::new(),
+            islands: vec![vec![1, 2, 3, 1]],
+            island_relations: Vec::new(),
+            coastlines: Vec::new(),
+            members: std::collections::HashMap::new(),
+            nodes: Nodes::for_tests(
+                vec![1, 2, 3],
+                vec![(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)],
+            ),
+        };
+        let polygons = polygons(&extract);
+        assert_eq!(polygons.len(), 1);
+        assert_eq!(polygons[0].material, Material::ForestUnknown);
+        assert_eq!(polygons[0].layer, ISLAND_LAYER);
+        assert!(
+            polygons[0].layer < precedence(Material::ForestUnknown),
+            "the promise of land sits under an observation of cover"
+        );
     }
 }
