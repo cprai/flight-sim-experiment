@@ -86,10 +86,11 @@ struct Terrain {
 @group(1) @binding(0) var<uniform> terrain: Terrain;
 // Non-filterable on purpose: heights and ceilings are only ever fetched at
 // exact texel centres, never sampled, so no float-filtering support is needed.
+// Materials could not be filtered even in principle: ids are labels, and a
+// blend of two labels is a third, wrong, label.
 @group(1) @binding(1) var heights: texture_2d_array<f32>;
-@group(1) @binding(2) var colours: texture_2d_array<f32>;
-@group(1) @binding(3) var colour_sampler: sampler;
-@group(1) @binding(4) var maxima: texture_2d_array<f32>;
+@group(1) @binding(2) var materials: texture_2d_array<u32>;
+@group(1) @binding(3) var maxima: texture_2d_array<f32>;
 
 // Elevations below this are the raster's nodata rather than ground.
 //
@@ -156,15 +157,6 @@ fn height_bilinear(level: u32, w: vec2<f32>) -> Sample {
     return sample;
 }
 
-// Texture coordinates for a position in a level's own texels.
-//
-// The sampler repeats, so dividing the raster-relative index by the square's
-// width wraps it onto the right slot on its own and bilinear taps stay correct
-// across the seam.
-fn colour_uv(w: vec2<f32>) -> vec2<f32> {
-    return (w + 0.5) / f32(terrain.texel_mask + 1u);
-}
-
 struct ScreenOut {
     @builtin(position) clip: vec4<f32>,
     // Normalized device coordinates, which is what the camera's ray basis wants.
@@ -189,7 +181,7 @@ struct Hit {
     // Where the ray met the ground, in world space.
     position: vec3<f32>,
     // And which level it was found at, and where in that level's texels, so the
-    // colour is looked up from the same place the height came from.
+    // material is looked up from the same place the height came from.
     level: u32,
     w: vec2<f32>,
 };
@@ -375,17 +367,23 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     return out;
 }
 
-struct TerrainHit {
-    @location(0) colour: vec4<f32>,
+// One pixel of the G-buffer the shading pass reads. A pixel this shader
+// discards keeps the cleared values -- material zero, depth zero -- and depth
+// zero is how the shading pass knows a pixel is sky.
+struct GBufferOut {
+    @location(0) material: u32,
+    // Where the ray met the ground, in world space; `w` is 1 to say so.
+    @location(1) position: vec4<f32>,
     // Written rather than interpolated, so the ground takes its place in the
     // depth buffer at the distance it was actually found at.
     @builtin(frag_depth) depth: f32,
 };
 
 @fragment
-fn fs_terrain(in: ScreenOut) -> TerrainHit {
-    var out: TerrainHit;
-    out.colour = vec4<f32>(0.0);
+fn fs_terrain(in: ScreenOut) -> GBufferOut {
+    var out: GBufferOut;
+    out.material = 0u;
+    out.position = vec4<f32>(0.0);
     out.depth = 0.0;
 
     let eye = camera.position.xyz;
@@ -418,11 +416,11 @@ fn fs_terrain(in: ScreenOut) -> TerrainHit {
 
     let clip = camera.view_proj * vec4<f32>(hit.position, 1.0);
     out.depth = clip.z / clip.w;
-    // The colour raster is imagery whose own lighting and shadows are already in
-    // the pixels, so it is shown as-is rather than lit a second time.
-    out.colour = vec4<f32>(
-        textureSampleLevel(colours, colour_sampler, colour_uv(hit.w), hit.level, 0.0).rgb,
-        1.0,
-    );
+    // The nearest texel to the hit: sample centres sit at integer `w`, the
+    // convention the height bilinear reads by, so the texel whose centre is
+    // closest is the rounded index.
+    let cell = vec2<i32>(floor(hit.w + 0.5));
+    out.material = textureLoad(materials, slot(cell), i32(hit.level), 0).r;
+    out.position = vec4<f32>(hit.position, 1.0);
     return out;
 }

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use glam::{IVec2, UVec2};
-use terrain_tiles::{Manifest, Srgb8, TILE_SIZE, Texel, Tile, TileGrid};
+use terrain_tiles::{Manifest, TILE_SIZE, Texel, Tile, TileGrid};
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 
 use crate::terrain::geotiff::Georeferencing;
@@ -31,7 +31,7 @@ use crate::terrain::pyramid::RasterSource;
 /// A texel type that knows how to come back out of a stored tile.
 pub trait TileSample: Texel {
     /// How many samples per texel the file holds, which need not be how many
-    /// the GPU wants: colour is stored as three bytes and read as four.
+    /// the GPU wants -- the albedo tiles, for one, store three bytes a texel.
     const BANDS: usize;
 
     /// The texel meaning "nothing known here".
@@ -57,22 +57,63 @@ impl TileSample for f32 {
     }
 }
 
-impl TileSample for Srgb8 {
-    const BANDS: usize = 3;
+/// A ground-cover material id, as painted by `terrain-process`.
+///
+/// The value is a `terrain_materials::Material` discriminant, but the store
+/// does not depend on the enum: to the reader an id is an opaque label, and
+/// a tile holding ids the enum has not heard of is still a readable tile --
+/// what to *show* for such an id is the palette's problem, not the reader's.
+#[repr(transparent)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MaterialId(pub u32);
+
+impl Texel for MaterialId {
+    /// The commonest id among the children; ties go to the lowest id.
+    ///
+    /// Ids are labels, so averaging is meaningless -- the mode is the only
+    /// fold that returns an id that was actually there. This deliberately
+    /// differs from the exact counted mode `terrain-process` builds the
+    /// on-disk levels with (`osm/mip.rs`), which breaks ties by paint
+    /// precedence: precedence is OSM classification policy and lives with
+    /// the tool, while this fold only continues the chain above the stored
+    /// top level, where a texel covers half a kilometre of horizon. Lowest
+    /// id incidentally favours water over vegetation, the same direction as
+    /// the tool's precedence.
+    fn box_filter(samples: &[Self]) -> Self {
+        let mut best = samples[0];
+        let mut best_count = 0;
+        for &candidate in samples {
+            let count = samples.iter().filter(|&&sample| sample == candidate).count();
+            if count > best_count || (count == best_count && candidate.0 < best.0) {
+                best = candidate;
+                best_count = count;
+            }
+        }
+        best
+    }
+
+    fn is_nodata(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// `Material::Null`: no way covered this ground.
+    const NODATA: Self = MaterialId(0);
+}
+
+impl TileSample for MaterialId {
+    const BANDS: usize = 1;
 
     fn nodata(_: f32) -> Self {
-        // Black is the mosaics' own nodata, and opaque so the shader's test is
-        // about the colour rather than about coverage.
-        Srgb8([0, 0, 0, 255])
+        Self::NODATA
     }
 
     fn read_span(row: &DecodingResult, first: usize, out: &mut [Self]) -> Result<()> {
-        let DecodingResult::U8(values) = row else {
-            bail!("a colour tile decoded to something other than bytes");
+        let DecodingResult::U32(values) = row else {
+            bail!("a material tile decoded to something other than 32-bit integers");
         };
-        for (index, texel) in out.iter_mut().enumerate() {
-            let at = (first + index) * 3;
-            *texel = Srgb8([values[at], values[at + 1], values[at + 2], 255]);
+        let span = &values[first..first + out.len()];
+        for (texel, &value) in out.iter_mut().zip(span) {
+            *texel = MaterialId(value);
         }
         Ok(())
     }
@@ -350,7 +391,7 @@ fn open_tile(path: &Path) -> Result<Decoder<std::io::BufReader<std::fs::File>>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terrain_tiles::COLOUR_BASE_LEVEL;
+    use terrain_tiles::MATERIAL_BASE_LEVEL;
 
     const NODATA: f32 = -32767.0;
 
@@ -606,39 +647,57 @@ mod tests {
         assert!(got.iter().all(|&v| v == 1.0), "got {got:?}");
     }
 
-    /// Colour is stored from level 4 up, so the clipmap's finer levels have to
-    /// be served by magnifying it. Sixteen level-0 texels share one stored texel.
     #[test]
-    fn colour_magnifies_the_finest_level_it_actually_has() {
-        let root = temp_root("colour");
-        let manifest = manifest("albedo", COLOUR_BASE_LEVEL, 1, 3);
+    fn the_material_fold_picks_the_commonest_id() {
+        let lake = MaterialId(0x0101);
+        let forest = MaterialId(0x03ff);
+        assert_eq!(MaterialId::box_filter(&[forest, lake, forest, forest]), forest);
+        assert_eq!(MaterialId::box_filter(&[lake]), lake);
+    }
+
+    /// With four children a two-two split is common; the fold has to settle it
+    /// the same way every time or coarse ground would shimmer between builds.
+    #[test]
+    fn a_material_tie_goes_to_the_lowest_id() {
+        let lake = MaterialId(0x0101);
+        let forest = MaterialId(0x03ff);
+        assert_eq!(MaterialId::box_filter(&[forest, lake, forest, lake]), lake);
+        assert_eq!(MaterialId::box_filter(&[lake, forest]), lake);
+    }
+
+    #[test]
+    fn a_material_span_refuses_a_row_of_the_wrong_type() {
+        let row = DecodingResult::F32(vec![1.0; 4]);
+        let mut out = [MaterialId::default(); 4];
+        let error = MaterialId::read_span(&row, 0, &mut out).expect_err("should refuse floats");
+        assert!(error.to_string().contains("material tile"), "{error}");
+    }
+
+    /// Materials are stored from level 2 up, so the clipmap's two finest levels
+    /// are served by magnifying them. Four level-0 texels share one stored texel.
+    #[test]
+    fn materials_magnify_the_finest_level_they_actually_have() {
+        let root = temp_root("materials");
+        let manifest = manifest("materials", MATERIAL_BASE_LEVEL, 1, 1);
         manifest.write(&root).expect("failed to write the manifest");
         let grid = manifest.grid();
 
-        let (tile, _, _) = manifest.tile_of_texel(COLOUR_BASE_LEVEL, 0, 0);
-        let mut data = vec![0u8; (TILE_SIZE as usize).pow(2) * 3];
-        // A distinct colour per stored column, so magnification is visible.
-        for i in 0..(TILE_SIZE as usize).pow(2) {
-            let column = (i % TILE_SIZE as usize) as u8;
-            data[i * 3..i * 3 + 3].copy_from_slice(&[column, 40, 200]);
-        }
-        write_tile::<tiff::encoder::colortype::RGB8>(
-            &grid.tile_path(&root, COLOUR_BASE_LEVEL, tile),
+        let (tile, _, _) = manifest.tile_of_texel(MATERIAL_BASE_LEVEL, 0, 0);
+        // A distinct id per stored column, so magnification is visible.
+        let data: Vec<u32> = (0..(TILE_SIZE as usize).pow(2))
+            .map(|i| (i % TILE_SIZE as usize) as u32 + 1)
+            .collect();
+        write_tile::<tiff::encoder::colortype::Gray32>(
+            &grid.tile_path(&root, MATERIAL_BASE_LEVEL, tile),
             &grid,
-            COLOUR_BASE_LEVEL,
+            MATERIAL_BASE_LEVEL,
             tile,
             &data,
         );
 
-        let store = TileStore::<Srgb8>::open(&root).expect("failed to open");
-        assert_eq!(
-            store.level_count(),
-            COLOUR_BASE_LEVEL + 1,
-            "levels are numbered from zero even where nothing is stored"
-        );
-
-        let magnified = 1 << COLOUR_BASE_LEVEL;
-        let mut out = vec![Srgb8::default(); 64];
+        let store = TileStore::<MaterialId>::open(&root).expect("failed to open");
+        let magnified = 1 << MATERIAL_BASE_LEVEL;
+        let mut out = vec![MaterialId::default(); 64];
         store.read_rect(
             0,
             IVec2::ZERO,
@@ -646,10 +705,10 @@ mod tests {
             bytemuck::cast_slice_mut(&mut out),
         );
         for (index, texel) in out.iter().enumerate() {
-            let stored_column = (index / magnified) as u8;
+            let stored_column = (index / magnified) as u32;
             assert_eq!(
                 *texel,
-                Srgb8([stored_column, 40, 200, 255]),
+                MaterialId(stored_column + 1),
                 "level-0 texel {index} should come from stored column {stored_column}"
             );
         }

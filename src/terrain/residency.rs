@@ -120,9 +120,9 @@ impl Residency {
 
     /// Bytes of texture this shape occupies at `levels` levels.
     ///
-    /// Heights are four bytes a texel, colour four, and the max pyramid two --
-    /// one cell per texel, because the level array is the quadtree and no level
-    /// carries a mip chain of its own.
+    /// Heights are four bytes a texel, material ids four, and the max pyramid
+    /// two -- one cell per texel, because the level array is the quadtree and
+    /// no level carries a mip chain of its own.
     pub fn texture_bytes(&self, levels: u32) -> usize {
         let side = self.texels_across() as usize;
         side * side * (size_of::<f32>() + 4 + size_of::<u16>()) * levels as usize

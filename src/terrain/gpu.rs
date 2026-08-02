@@ -7,14 +7,18 @@
 //! crossing out of one costs a bounded number of whole-tile reads. See
 //! [`crate::terrain::residency`] for how the squares move and `src/terrain.wgsl`
 //! for what the march does with them.
+//!
+//! The pass draws into the G-buffer rather than the screen: each pixel gets
+//! the material id and world position of the ground its ray met, and
+//! [`crate::deferred`]'s shading pass turns those into colour afterwards.
 
 use std::path::Path;
 
 use crate::terrain::geotiff::Georeferencing;
 use crate::terrain::maxima::ceiling_half;
-use crate::terrain::pyramid::{RasterSource, Resident, Srgb8};
+use crate::terrain::pyramid::{RasterSource, Resident};
 use crate::terrain::residency::{Residency, TileResidency, Wanted, detail_base};
-use crate::terrain::tiles::TileStore;
+use crate::terrain::tiles::{MaterialId, TileStore};
 use anyhow::{Context, Result};
 use glam::{DVec2, IVec2, UVec2, Vec2, Vec3};
 use terrain_tiles::maxima::highest;
@@ -95,17 +99,17 @@ fn wall_nudge(raster: UVec2) -> f32 {
 /// to get wrong. See [`Terrain::maxima`].
 pub struct Sources {
     pub heights: Box<dyn RasterSource>,
-    pub colours: Box<dyn RasterSource>,
+    pub materials: Box<dyn RasterSource>,
     pub maxima: Box<dyn RasterSource>,
 }
 
-/// A height raster and a matching colour raster, raymarched through a max
+/// A height raster and a matching material raster, raymarched through a max
 /// pyramid.
 pub struct Terrain {
     residency: Residency,
     placement: Georeferencing,
     heights: Box<dyn RasterSource>,
-    colours: Box<dyn RasterSource>,
+    materials: Box<dyn RasterSource>,
     /// The quadtree the march is walked through, written by `terrain-process`.
     ///
     /// Level `l` holds one ceiling per level-`l` texel, bounding every surface
@@ -144,7 +148,7 @@ pub struct Terrain {
     staging: Vec<u8>,
 
     height_texture: wgpu::Texture,
-    colour_texture: wgpu::Texture,
+    material_texture: wgpu::Texture,
     maxima_texture: wgpu::Texture,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -154,13 +158,12 @@ pub struct Terrain {
 impl Terrain {
     /// Opens the tile pyramids and builds the terrain around them.
     ///
-    /// `root` holds one directory per product: elevation, colour, and the max
-    /// pyramid `terrain-process` reduced from the elevation. Nothing is decoded
-    /// here beyond three manifests -- the tiles themselves are read as the
-    /// camera reaches them.
+    /// `root` holds one directory per product: elevation, materials, and the
+    /// max pyramid `terrain-process` reduced from the elevation. Nothing is
+    /// decoded here beyond three manifests -- the tiles themselves are read as
+    /// the camera reaches them.
     pub fn from_tiles(
         device: &wgpu::Device,
-        format: wgpu::TextureFormat,
         camera_layout: &wgpu::BindGroupLayout,
         residency: Residency,
         root: &Path,
@@ -176,13 +179,19 @@ impl Terrain {
                 )
             })?;
         let elevation = root.join(product);
-        let colour = root.join(crate::terrain::COLOUR_PRODUCT);
+        let material = root.join(terrain_tiles::MATERIAL_PRODUCT);
         // Named after the elevation it was reduced from, because `dtm` and `dsm`
         // are different surfaces and a bound over one does not cover the other.
         let ceilings = root.join(terrain_tiles::maxima_product(product));
 
         let heights = TileStore::<f32>::open(&elevation)?;
-        let colours = TileStore::<Srgb8>::open(&colour)?;
+        let materials = TileStore::<MaterialId>::open(&material).with_context(|| {
+            format!(
+                "{} holds no ground-cover materials; run terrain-process over a download \
+                 with an osm extract",
+                root.display()
+            )
+        })?;
         let maxima = TileStore::<f32>::open(&ceilings).with_context(|| {
             format!(
                 "{} holds no max pyramid for {product}; run terrain-process over the download",
@@ -194,7 +203,7 @@ impl Terrain {
         // one download over one snapped extent, so they either describe the same
         // ground exactly or one of them is from a different run.
         for (directory, manifest) in [
-            (&colour, colours.manifest()),
+            (&material, materials.manifest()),
             (&ceilings, maxima.manifest()),
         ] {
             anyhow::ensure!(
@@ -223,13 +232,12 @@ impl Terrain {
         let raster = UVec2::new(placement.width, placement.height);
         Ok(Self::new(
             device,
-            format,
             camera_layout,
             residency,
             placement,
             Sources {
                 heights: Box::new(Resident::<f32>::over(Box::new(heights), raster)),
-                colours: Box::new(Resident::<Srgb8>::over(Box::new(colours), raster)),
+                materials: Box::new(Resident::<MaterialId>::over(Box::new(materials), raster)),
                 maxima: Box::new(Resident::<f32>::over_with(
                     Box::new(maxima),
                     raster,
@@ -241,7 +249,6 @@ impl Terrain {
 
     pub fn new(
         device: &wgpu::Device,
-        format: wgpu::TextureFormat,
         camera_layout: &wgpu::BindGroupLayout,
         residency: Residency,
         placement: Georeferencing,
@@ -249,14 +256,14 @@ impl Terrain {
     ) -> Self {
         let Sources {
             heights,
-            colours,
+            materials,
             maxima,
         } = sources;
         let raster = UVec2::new(placement.width, placement.height);
         // Only the sources whose levels *are* terrain levels. The max pyramid's
         // run further -- it is a quadtree over the same raster -- and folding it
         // in here would cost real levels of terrain.
-        let available = heights.level_count().min(colours.level_count());
+        let available = heights.level_count().min(materials.level_count());
         // The caller asks for the square the screen would like; how much of it
         // is affordable depends on the raster, which only becomes known here.
         let residency = Residency {
@@ -312,11 +319,8 @@ impl Terrain {
         // a differently-shaped texture under `cfg(test)`.
         let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
         let height_texture = layer_texture("terrain heights", wgpu::TextureFormat::R32Float, usage);
-        let colour_texture = layer_texture(
-            "terrain colours",
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage,
-        );
+        let material_texture =
+            layer_texture("terrain materials", wgpu::TextureFormat::R32Uint, usage);
         let maxima_texture = layer_texture(
             "terrain maxima",
             // Half precision, which is worth a third of the memory. `ceiling_half`
@@ -332,17 +336,6 @@ impl Terrain {
                 ..Default::default()
             })
         };
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("terrain colour sampler"),
-            // Repeating is what makes the wrap free: a texel index divided by
-            // the square's width lands on the right slot with no arithmetic, and
-            // bilinear taps stay correct across the seam.
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
 
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terrain uniform"),
@@ -377,8 +370,10 @@ impl Terrain {
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
+                    // Integer texels: material ids can only be loaded, never
+                    // sampled, so there is no sampler anywhere in this layout.
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        sample_type: wgpu::TextureSampleType::Uint,
                         view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
@@ -386,12 +381,6 @@ impl Terrain {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
@@ -416,14 +405,10 @@ impl Terrain {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&array_view(&colour_texture)),
+                    resource: wgpu::BindingResource::TextureView(&array_view(&material_texture)),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
                     resource: wgpu::BindingResource::TextureView(&array_view(&maxima_texture)),
                 },
             ],
@@ -452,15 +437,26 @@ impl Terrain {
                 module: &shader,
                 entry_point: Some("fs_terrain"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                // The G-buffer, not the screen: what the march found, for the
+                // shading pass to colour. `blend: None` on both -- an integer
+                // target cannot blend at all, and blending `Rgba32Float` is an
+                // optional feature this stays off.
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: crate::deferred::MATERIAL_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: crate::deferred::POSITION_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
             }),
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: crate::scene::DEPTH_FORMAT,
+                format: crate::deferred::DEPTH_FORMAT,
                 // The fragment stage writes its own depth, from the distance the
                 // ray actually met the ground, so anything drawn afterwards
                 // sorts against the terrain properly.
@@ -481,7 +477,7 @@ impl Terrain {
             residency,
             placement,
             heights,
-            colours,
+            materials,
             maxima,
             height_range,
             tiles: TileResidency::new(residency, level_count),
@@ -489,9 +485,9 @@ impl Terrain {
             started: false,
             ground: vec![0.0; square],
             tile_ceilings: vec![vec![f32::NEG_INFINITY; slots]; level_count as usize],
-            staging: vec![0; (residency.tile_texels as usize).pow(2) * size_of::<Srgb8>()],
+            staging: vec![0; (residency.tile_texels as usize).pow(2) * size_of::<MaterialId>()],
             height_texture,
-            colour_texture,
+            material_texture,
             maxima_texture,
             uniform,
             bind_group,
@@ -712,10 +708,10 @@ impl Terrain {
             self.mirror_ground(slot, bytes);
         }
 
-        let bytes = count * size_of::<Srgb8>();
-        self.colours
+        let bytes = count * size_of::<MaterialId>();
+        self.materials
             .read_rect(wanted.level, texels, size, &mut self.staging[..bytes]);
-        copy(&self.colour_texture, 4, &self.staging[..bytes]);
+        copy(&self.material_texture, 4, &self.staging[..bytes]);
 
         let bytes = count * size_of::<f32>();
         self.maxima
@@ -928,16 +924,15 @@ mod tests {
         let raster = Pyramid::build(Level::new(RASTER, RASTER, rugged()));
         let mut terrain = Terrain::new(
             &device,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
             &camera_layout,
             residency,
             Georeferencing::square(RASTER, RASTER, 30.0),
             Sources {
                 heights: Box::new(Pyramid::build(Level::new(RASTER, RASTER, rugged()))),
-                colours: Box::new(Pyramid::build(Level::new(
+                materials: Box::new(Pyramid::build(Level::new(
                     RASTER,
                     RASTER,
-                    vec![Srgb8([0, 0, 0, 255]); (RASTER * RASTER) as usize],
+                    vec![MaterialId(0); (RASTER * RASTER) as usize],
                 ))),
                 maxima: Box::new(max_pyramid(&raster)),
             },

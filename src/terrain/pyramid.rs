@@ -15,10 +15,6 @@
 
 use glam::{IVec2, UVec2};
 
-/// The texel types, re-exported so callers need not know they are shared with
-/// the tool that writes the tiles.
-pub use terrain_tiles::Srgb8;
-
 use terrain_tiles::Texel;
 
 /// A rectangular window of texels, at some level of detail.
@@ -311,6 +307,7 @@ impl<T: Texel> RasterSource for Resident<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use terrain_tiles::Srgb8;
 
     fn ramp(width: u32, height: u32) -> Level<f32> {
         let texels = (0..width * height).map(|i| i as f32).collect();

@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use glam::{UVec2, Vec3};
 
 use crate::camera::Camera;
-use crate::scene::{Scene, create_depth_view};
+use crate::scene::Scene;
 
 /// Format of the captured frame.
 ///
@@ -115,7 +115,9 @@ pub fn device() -> Result<(wgpu::Device, wgpu::Queue)> {
 /// Draws `scene` into a fresh texture and returns it as tightly packed RGBA8.
 ///
 /// `scene` must have been built with [`CAPTURE_FORMAT`] and a viewport of
-/// `size`, and [`Scene::update`] must have run since the camera last moved.
+/// `size` -- its G-buffer is that size and the shading pass looks pixels up
+/// by coordinate -- and [`Scene::update`] must have run since the camera
+/// last moved.
 pub fn capture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -138,7 +140,6 @@ pub fn capture(
         view_formats: &[],
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-    let depth = create_depth_view(device, size.x, size.y);
 
     // A texture-to-buffer copy wants its rows on a 256-byte stride, which only
     // widths that are a multiple of 64 give for free. Padding the buffer and
@@ -155,7 +156,7 @@ pub fn capture(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("capture"),
     });
-    scene.draw(&mut encoder, &view, &depth);
+    scene.draw(&mut encoder, &view);
     encoder.copy_texture_to_buffer(
         target.as_image_copy(),
         wgpu::TexelCopyBufferInfo {

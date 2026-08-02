@@ -3,10 +3,15 @@ use glam::UVec2;
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
+use crate::deferred::{GBuffer, Shading};
 use crate::terrain::gpu::Terrain;
 use crate::terrain::residency::Residency;
 
 /// Sky the terrain is drawn against.
+///
+/// Kept in step with `SKY` in `src/shading.wgsl`, which is what actually
+/// paints it: the shading pass writes every pixel, so the clear only shows
+/// if a frame is somehow interrupted between the passes.
 pub const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     r: 0.30,
     g: 0.55,
@@ -14,41 +19,13 @@ pub const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
-/// Format of the depth buffer the scene draws against.
+/// Depth value the G-buffer is cleared to.
 ///
-/// Float depth rather than the more compact `Depth24Plus` because the camera
-/// projects with reversed depth, which only pays off when the buffer's own
-/// precision is concentrated near zero the way a float exponent is.
-pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-
-/// Depth value the buffer is cleared to.
-///
-/// Reversed depth puts the far distance at 0, so "nothing drawn yet" is 0 and
-/// fragments pass when their depth is [`wgpu::CompareFunction::Greater`].
+/// Reversed depth puts the far distance at 0, so "nothing drawn yet" is 0,
+/// fragments pass when their depth is [`wgpu::CompareFunction::Greater`], and
+/// a pixel still at 0 is one the march never wrote -- which is how the
+/// shading pass knows it is sky.
 const DEPTH_CLEAR: f32 = 0.0;
-
-/// Creates a depth buffer view sized to match a render target.
-///
-/// Lives here beside the pipeline state that has to agree with it, and is
-/// called both by the renderer on resize and by the offscreen tests.
-pub fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
-    device
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("depth buffer"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        })
-        .create_view(&wgpu::TextureViewDescriptor::default())
-}
 
 /// Mirrors the `Camera` uniform block in `terrain.wgsl`.
 #[repr(C)]
@@ -86,6 +63,9 @@ pub struct Scene {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     terrain: Terrain,
+    /// Screen-sized; rebuilt by [`Scene::resize`], never mid-frame.
+    gbuffer: GBuffer,
+    shading: Shading,
 }
 
 impl Scene {
@@ -123,12 +103,14 @@ impl Scene {
         residency: Residency,
     ) -> Result<Self> {
         let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
-        let terrain = Terrain::from_tiles(device, format, &camera_layout, residency, terrain_root)?;
+        let terrain = Terrain::from_tiles(device, &camera_layout, residency, terrain_root)?;
         Ok(Self::assemble(
+            device,
+            format,
+            viewport,
             camera_buffer,
             camera_bind_group,
             terrain,
-            viewport.x as f32 / viewport.y.max(1) as f32,
         ))
     }
 
@@ -139,27 +121,54 @@ impl Scene {
     #[cfg(test)]
     pub fn from_terrain(
         device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        viewport: UVec2,
         terrain: impl FnOnce(&wgpu::BindGroupLayout) -> Terrain,
-        aspect: f32,
     ) -> Self {
         let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
         let terrain = terrain(&camera_layout);
-        Self::assemble(camera_buffer, camera_bind_group, terrain, aspect)
+        Self::assemble(
+            device,
+            format,
+            viewport,
+            camera_buffer,
+            camera_bind_group,
+            terrain,
+        )
     }
 
     fn assemble(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        viewport: UVec2,
         camera_buffer: wgpu::Buffer,
         camera_bind_group: wgpu::BindGroup,
         terrain: Terrain,
-        aspect: f32,
     ) -> Self {
+        let aspect = viewport.x as f32 / viewport.y.max(1) as f32;
         let camera = Camera::overlooking(terrain.world_extent(), terrain.height_range().1, aspect);
+        let gbuffer = GBuffer::new(device, viewport);
+        let shading = Shading::new(device, format, &gbuffer);
         Self {
             camera,
             camera_buffer,
             camera_bind_group,
             terrain,
+            gbuffer,
+            shading,
         }
+    }
+
+    /// Follows the render target to a new size.
+    ///
+    /// The G-buffer has to match the target pixel for pixel, and the shading
+    /// pass reads the G-buffer, so both are rebuilt together. The camera's
+    /// aspect follows too -- without that the projection would stretch the
+    /// scene to fit rather than widen the view.
+    pub fn resize(&mut self, device: &wgpu::Device, viewport: UVec2) {
+        self.gbuffer = GBuffer::new(device, viewport);
+        self.shading.rebind(device, &self.gbuffer);
+        self.camera.aspect = viewport.x as f32 / viewport.y.max(1) as f32;
     }
 
     /// Uploads the current camera and brings residency up to date with it.
@@ -188,47 +197,63 @@ impl Scene {
         }
     }
 
-    /// Records a sky clear plus the terrain into `view`.
+    /// Records the two passes that make a frame into `view`.
     ///
-    /// One pass: every pixel of ground is raymarched, so there is no near field
-    /// to sort against and nothing to load a half-written depth buffer for.
-    ///
-    /// `depth` must be a [`DEPTH_FORMAT`] view matching `view`'s dimensions; see
-    /// [`create_depth_view`].
-    pub fn draw(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        view: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
-    ) {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("scene pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+    /// The geometry pass raymarches every pixel of ground into the G-buffer;
+    /// the shading pass reads it back and writes the image. `view` must match
+    /// the size the scene was built or last [`Scene::resize`]d to, because the
+    /// G-buffer is looked up by pixel coordinate.
+    pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+        let target = |view, clear| {
+            Some(wgpu::RenderPassColorAttachment {
                 view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                    load: wgpu::LoadOp::Clear(clear),
                     store: wgpu::StoreOp::Store,
                 },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
-                    // Nothing reads the depth buffer after the pass yet, but
-                    // discarding it would break as soon as anything does.
-                    store: wgpu::StoreOp::Store,
+            })
+        };
+
+        {
+            // Cleared to zeroes: material zero is Null and depth zero is the
+            // reversed-Z far plane, so a pixel the march discards reads back
+            // as "nothing here", which the shading pass draws as sky.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("geometry pass"),
+                color_attachments: &[
+                    target(&self.gbuffer.material, wgpu::Color::TRANSPARENT),
+                    target(&self.gbuffer.position, wgpu::Color::TRANSPARENT),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.gbuffer.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
+                        // The shading pass reads it to tell ground from sky.
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
                 }),
-                stencil_ops: None,
-            }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            self.terrain.draw(&mut pass);
+        }
+
+        // The clear never survives -- the shading pass writes every pixel --
+        // but an interrupted frame showing sky beats one showing garbage.
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("shading pass"),
+            color_attachments: &[target(view, CLEAR_COLOR)],
+            depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
         });
-
-        pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        self.terrain.draw(&mut pass);
+        self.shading.draw(&mut pass);
     }
 }
 
@@ -309,11 +334,13 @@ fn to_pixels(view_proj: glam::Mat4, point: glam::Vec3, width: u32, height: u32) 
 #[cfg(test)]
 mod tests {
     use glam::{IVec2, UVec2, Vec2, Vec3};
+    use terrain_materials::Material;
 
     use super::*;
     use crate::terrain::geotiff::Georeferencing;
     use crate::terrain::gpu::Sources;
-    use crate::terrain::pyramid::{Level, Pyramid, RasterSource, Srgb8, max_pyramid};
+    use crate::terrain::pyramid::{Level, Pyramid, RasterSource, max_pyramid};
+    use crate::terrain::tiles::MaterialId;
 
     /// Side of the offscreen render target.
     const SIZE: u32 = 256;
@@ -350,34 +377,54 @@ mod tests {
         Georeferencing::square(RASTER, RASTER, METRES_PER_TEXEL)
     }
 
-    const GREEN: Srgb8 = Srgb8([60, 140, 50, 255]);
-    const RED: Srgb8 = Srgb8([220, 30, 30, 255]);
-    /// Deliberately unlike the sky, the ground and the red: nothing else in a
-    /// frame has a high red *and* blue with almost no green.
-    const MAGENTA: Srgb8 = Srgb8([220, 20, 220, 255]);
+    const GRASS: MaterialId = MaterialId(Material::Grass.id());
+    const SAND: MaterialId = MaterialId(Material::Sand.id());
+    const LAKE: MaterialId = MaterialId(Material::Lake.id());
+    const ROCK: MaterialId = MaterialId(Material::BareRock.id());
+    /// An id inside the water block that no version of the enum has assigned.
+    const UNASSIGNED: MaterialId = MaterialId(0x0109);
 
+    /// Missing data, as the shading pass paints it: pure magenta. Loose on
+    /// purpose, matching anything with strong red and blue and little green,
+    /// which no material's flat colour and no sky is allowed to have.
     fn is_magenta([r, g, b, _]: [u8; 4]) -> bool {
         r > 100 && b > 100 && g < 80
     }
 
-    fn flat_ground() -> Vec<Srgb8> {
-        vec![GREEN; (RASTER * RASTER) as usize]
+    /// Whether a rendered pixel is the flat colour `material` shades as.
+    ///
+    /// A small tolerance per channel, because the palette rides through a
+    /// linearise-and-re-encode round trip whose rounding is the driver's.
+    fn shows(material: Material, pixel: [u8; 4]) -> bool {
+        let want = crate::palette::flat_colour(material);
+        pixel[..3]
+            .iter()
+            .zip(want)
+            .all(|(&got, want)| got.abs_diff(want) <= 8)
+    }
+
+    fn flat_ground() -> Vec<MaterialId> {
+        vec![GRASS; (RASTER * RASTER) as usize]
     }
 
     /// Builds terrain from raw texels and renders one frame of it.
-    fn render(heights: Vec<f32>, colours: Vec<Srgb8>, aim: impl FnOnce(&mut Camera)) -> Vec<u8> {
-        render_after(heights, colours, aim, &[])
+    fn render(
+        heights: Vec<f32>,
+        materials: Vec<MaterialId>,
+        aim: impl FnOnce(&mut Camera),
+    ) -> Vec<u8> {
+        render_after(heights, materials, aim, &[])
     }
 
     /// As [`render`], but stepping the camera through `path` first so residency
     /// has to swap tiles in and out before the frame that is captured.
     fn render_after(
         heights: Vec<f32>,
-        colours: Vec<Srgb8>,
+        materials: Vec<MaterialId>,
         aim: impl FnOnce(&mut Camera),
         path: &[Vec3],
     ) -> Vec<u8> {
-        render_probed(heights, colours, aim, path).0
+        render_probed(heights, materials, aim, path).0
     }
 
     /// As [`render_after`], but also reporting the base level the clipmap chose.
@@ -388,11 +435,11 @@ mod tests {
     /// only the coarsest and the test would pass on an empty promise.
     fn render_probed(
         heights: Vec<f32>,
-        colours: Vec<Srgb8>,
+        materials: Vec<MaterialId>,
         aim: impl FnOnce(&mut Camera),
         path: &[Vec3],
     ) -> (Vec<u8>, u32) {
-        render_config(test_residency(), heights, colours, aim, path)
+        render_config(test_residency(), heights, materials, aim, path)
     }
 
     /// The same shape with twice the ground resident at every level.
@@ -411,7 +458,7 @@ mod tests {
     fn render_config(
         residency: Residency,
         heights: Vec<f32>,
-        colours: Vec<Srgb8>,
+        materials: Vec<MaterialId>,
         aim: impl FnOnce(&mut Camera),
         path: &[Vec3],
     ) -> (Vec<u8>, u32) {
@@ -433,14 +480,14 @@ mod tests {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let depth = create_depth_view(&device, SIZE, SIZE);
 
         let mut scene = Scene::from_terrain(
             &device,
+            format,
+            UVec2::splat(SIZE),
             |camera_layout| {
                 Terrain::new(
                     &device,
-                    format,
                     camera_layout,
                     residency,
                     placement(),
@@ -450,14 +497,13 @@ mod tests {
                             RASTER,
                             heights.clone(),
                         ))),
-                        colours: Box::new(Pyramid::build(Level::new(RASTER, RASTER, colours))),
+                        materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
                         maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
                             RASTER, RASTER, heights,
                         )))),
                     },
                 )
             },
-            1.0,
         );
         aim(&mut scene.camera);
 
@@ -481,7 +527,7 @@ mod tests {
         });
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        scene.draw(&mut encoder, &view, &depth);
+        scene.draw(&mut encoder, &view);
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -522,15 +568,22 @@ mod tests {
         b > r && b > g
     }
 
-    /// The exact bytes a pixel nothing drew over is left holding.
+    /// The bytes of a pixel the march never wrote, which the shading pass
+    /// paints as sky.
     ///
     /// Stricter than [`is_sky`], and it has to be for counting holes: the
-    /// imagery has water in it, which is bluer than it is red or green, so a
-    /// test on the channels alone finds every lake and river as well.
+    /// water materials are bluer than they are red or green, so a test on the
+    /// channel order alone finds every lake and river as well. One count of
+    /// slack per channel, because the sky is written by a shader from the
+    /// same constant rather than loaded from the clear, and the encoding's
+    /// last bit belongs to the driver.
     fn untouched(pixel: [u8; 4]) -> bool {
         let clear = [CLEAR_COLOR.r, CLEAR_COLOR.g, CLEAR_COLOR.b]
             .map(|channel| terrain_tiles::linear_to_srgb(channel as f32));
-        pixel[..3] == clear
+        pixel[..3]
+            .iter()
+            .zip(clear)
+            .all(|(&got, want)| got.abs_diff(want) <= 1)
     }
 
     /// Pixels nothing drew that have ground both above and below them.
@@ -610,7 +663,7 @@ mod tests {
     /// rather than reporting sky when the budget does run out.
     #[test]
     fn a_grazing_ray_never_leaves_a_hole_in_the_ground() {
-        let (heights, colours) = rugged();
+        let (heights, materials) = rugged();
         // Aimed *into* the raster, from its north-west corner towards the far
         // one. A grazing ray that leaves the data is cut by the bounds test
         // however much budget it had -- ground outside the survey is invented
@@ -629,7 +682,7 @@ mod tests {
                     ..wide_residency()
                 },
                 heights.clone(),
-                colours.clone(),
+                materials.clone(),
                 grazing,
                 &[],
             )
@@ -666,24 +719,26 @@ mod tests {
     /// A wider window is the only thing that buys the far field more detail.
     ///
     /// The whole arrangement rests on this and nothing else measures it. The
-    /// ground is flat and painted in a one-texel check, so a ray's hit position
-    /// is identical either way and the only thing that can differ is which
-    /// level's colours it reads there. Coarse levels are box filters, so the
-    /// check averages towards a flat wash; a window that keeps finer levels
-    /// resident further out reads it before it has been averaged away.
+    /// ground is flat and painted in a one-texel check of two materials, so a
+    /// ray's hit position is identical either way and the only thing that can
+    /// differ is which level's ids it reads there. Ids do not blend the way
+    /// colours did: the mode fold makes every coarse level of a two-way check
+    /// *uniform* -- each two-by-two holds two of each and the tie always goes
+    /// the same way -- so the check is visible exactly where level zero is
+    /// resident and vanishes beyond it.
     ///
-    /// Measured as the contrast between horizontally adjacent pixels, which is
-    /// what a check surviving looks like and what a wash does not.
+    /// Measured as the number of horizontally adjacent pixel pairs showing
+    /// the two different materials, which only level zero can produce.
     #[test]
     fn a_wider_window_reads_finer_ground_at_the_same_distance() {
-        let check: Vec<Srgb8> = (0..RASTER * RASTER)
+        let check: Vec<MaterialId> = (0..RASTER * RASTER)
             .map(|index| {
                 let (x, y) = (index % RASTER, index / RASTER);
-                if (x + y) % 2 == 0 { RED } else { GREEN }
+                if (x + y) % 2 == 0 { SAND } else { GRASS }
             })
             .collect();
 
-        let contrast = |residency: Residency| {
+        let transitions = |residency: Residency| {
             let (pixels, _) = render_config(
                 residency,
                 vec![0.0; (RASTER * RASTER) as usize],
@@ -691,7 +746,7 @@ mod tests {
                 low_and_looking_out,
                 &[],
             );
-            let mut total = 0u64;
+            let mut changes = 0u64;
             let mut ground = 0u64;
             for y in 0..SIZE {
                 for x in 0..SIZE - 1 {
@@ -699,25 +754,29 @@ mod tests {
                     if is_sky(here) || is_sky(next) {
                         continue;
                     }
-                    total += u64::from(here[0].abs_diff(next[0]));
                     ground += 1;
+                    let flipped = (shows(Material::Sand, here) && shows(Material::Grass, next))
+                        || (shows(Material::Grass, here) && shows(Material::Sand, next));
+                    if flipped {
+                        changes += 1;
+                    }
                 }
             }
             assert!(ground > 10_000, "only {ground} pixels of ground to measure");
-            total as f64 / ground as f64
+            changes
         };
 
         // Four times the width, so level zero stays resident across the whole
         // of the ground this camera can see rather than only the near part of
         // it -- and a point is drawn at the finest level resident for it.
-        let narrow = contrast(Residency {
+        let narrow = transitions(Residency {
             tiles_across: 4,
             ..test_residency()
         });
-        let wide = contrast(wide_residency());
+        let wide = transitions(wide_residency());
         assert!(
-            wide > narrow * 1.8,
-            "widening the window resolved {wide:.2} of contrast against {narrow:.2}, \
+            wide > narrow * 2,
+            "widening the window showed {wide} material transitions against {narrow}, \
              which is not the detail it was supposed to buy"
         );
     }
@@ -764,8 +823,8 @@ mod tests {
             "bottom of frame should be ground, got {ground:?}"
         );
         assert!(
-            ground[1] > ground[0] && ground[1] > ground[2],
-            "ground should show the colour raster, got {ground:?}"
+            shows(Material::Grass, ground),
+            "ground should shade as the material it is painted, got {ground:?}"
         );
     }
 
@@ -773,22 +832,24 @@ mod tests {
     ///
     /// Registration is what a margin could break: the vertex stage offsets grid
     /// coordinates into window coordinates before reading either texture, so a
-    /// margin applied to the heights and not to the colours -- or to either and
-    /// not to the world position -- would slide the imagery off the ground it
-    /// belongs to. The wide window puts thirty-two texels between the grid and
-    /// the window's edge, so any such slip is far larger than a pixel.
+    /// margin applied to the heights and not to the materials -- or to either
+    /// and not to the world position -- would slide the ground cover off the
+    /// ground it belongs to. The wide window puts thirty-two texels between
+    /// the grid and the window's edge, so any such slip is far larger than a
+    /// pixel. This is also what pins the shader's nearest-texel lookup to the
+    /// same texel-centre convention the heights read by.
     #[test]
-    fn the_colour_raster_lands_where_the_georeferencing_puts_it() {
+    fn materials_land_where_the_georeferencing_puts_them() {
         for residency in [test_residency(), wide_residency()] {
-            // A patch of a distinct colour, well away from the raster's centre
-            // so that getting the axes or the origin wrong would move it
-            // visibly.
+            // A patch of a distinct material, well away from the raster's
+            // centre so that getting the axes or the origin wrong would move
+            // it visibly.
             let (patch_col, patch_row) = (32u32, 96u32);
             let half = 8u32;
-            let mut colours = flat_ground();
+            let mut materials = flat_ground();
             for row in patch_row - half..patch_row + half {
                 for col in patch_col - half..patch_col + half {
-                    colours[(row * RASTER + col) as usize] = RED;
+                    materials[(row * RASTER + col) as usize] = SAND;
                 }
             }
 
@@ -796,7 +857,7 @@ mod tests {
             let (pixels, _) = render_config(
                 residency,
                 vec![0.0; (RASTER * RASTER) as usize],
-                colours,
+                materials,
                 |c| {
                     straight_down(c);
                     camera = Some(*c);
@@ -811,17 +872,17 @@ mod tests {
             let found = pixel(&pixels, x.round() as u32, y.round() as u32);
 
             assert!(
-                found[0] > found[1] + 40 && found[0] > found[2] + 40,
-                "window {window}: expected the red patch at ({x:.0}, {y:.0}), got {found:?}"
+                shows(Material::Sand, found),
+                "window {window}: expected the sand patch at ({x:.0}, {y:.0}), got {found:?}"
             );
 
-            // ... and the rest of the ground is still the background colour, so
-            // the patch has not simply been smeared over everything.
+            // ... and the rest of the ground is still the background material,
+            // so the patch has not simply been smeared over everything.
             let elsewhere = world_of(f64::from(patch_col), f64::from(RASTER - patch_row));
             let (x, y) = to_pixels(camera.view_projection(), elsewhere, SIZE, SIZE);
             let found = pixel(&pixels, x.round() as u32, y.round() as u32);
             assert!(
-                found[1] > found[0],
+                shows(Material::Grass, found),
                 "window {window}: expected background at ({x:.0}, {y:.0}), got {found:?}"
             );
         }
@@ -875,19 +936,19 @@ mod tests {
     fn a_near_ridge_hides_what_is_behind_it() {
         let ridges = |near: bool| {
             let mut heights = vec![0.0f32; (RASTER * RASTER) as usize];
-            let mut colours = flat_ground();
+            let mut materials = flat_ground();
             for row in 0..RASTER {
-                let (height, colour) = match row {
-                    66..=73 if near => (900.0, RED),
-                    46..=53 => (250.0, MAGENTA),
+                let (height, material) = match row {
+                    66..=73 if near => (900.0, ROCK),
+                    46..=53 => (250.0, LAKE),
                     _ => continue,
                 };
                 for col in 0..RASTER {
                     heights[(row * RASTER + col) as usize] = height;
-                    colours[(row * RASTER + col) as usize] = colour;
+                    materials[(row * RASTER + col) as usize] = material;
                 }
             }
-            (heights, colours)
+            (heights, materials)
         };
         let aim = |camera: &mut Camera| {
             camera.position = Vec3::new(0.0, 400.0, world_of(64.0, 76.0).z + 400.0);
@@ -896,19 +957,19 @@ mod tests {
         let count_far = |pixels: &[u8]| {
             (0..SIZE)
                 .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
-                .filter(|&(x, y)| is_magenta(pixel(pixels, x, y)))
+                .filter(|&(x, y)| shows(Material::Lake, pixel(pixels, x, y)))
                 .count()
         };
 
-        let (heights, colours) = ridges(false);
-        let alone = count_far(&render_config(test_residency(), heights, colours, aim, &[]).0);
+        let (heights, materials) = ridges(false);
+        let alone = count_far(&render_config(test_residency(), heights, materials, aim, &[]).0);
         assert!(
             alone > 500,
             "the far plateau should be plainly in shot on its own, got {alone} pixels"
         );
 
-        let (heights, colours) = ridges(true);
-        let occluded = count_far(&render_config(test_residency(), heights, colours, aim, &[]).0);
+        let (heights, materials) = ridges(true);
+        let occluded = count_far(&render_config(test_residency(), heights, materials, aim, &[]).0);
         assert_eq!(
             occluded, 0,
             "every ray should have stopped at the near ridge"
@@ -995,6 +1056,53 @@ mod tests {
         );
     }
 
+    /// Ground the materials product says nothing about is missing data, and
+    /// missing data is magenta -- not sky. A hole in the *heights* is the
+    /// opposite: no ground at all, honestly sky. The pair proves the depth
+    /// buffer is what separates the two, because the material id is Null in
+    /// both cases and only the depth differs.
+    #[test]
+    fn unmapped_ground_is_magenta_where_a_height_hole_is_sky() {
+        let null = vec![MaterialId(0); (RASTER * RASTER) as usize];
+
+        let flat = vec![0.0f32; (RASTER * RASTER) as usize];
+        let pixels = render(flat.clone(), null.clone(), straight_down);
+        let centre = pixel(&pixels, SIZE / 2, SIZE / 2);
+        assert_eq!(
+            centre,
+            [255, 0, 255, 255],
+            "unmapped ground should be pure magenta"
+        );
+        assert!(is_magenta(centre) && !untouched(centre));
+
+        let mut holed = flat;
+        for row in 56..72 {
+            for col in 56..72 {
+                holed[(row * RASTER + col) as usize] = -32767.0;
+            }
+        }
+        let pixels = render(holed, null, straight_down);
+        let centre = pixel(&pixels, SIZE / 2, SIZE / 2);
+        assert!(
+            untouched(centre),
+            "a hole in the heights should read as sky, got {centre:?}"
+        );
+    }
+
+    /// An id this binary has never heard of -- a tile painted by a newer
+    /// material enum, or a corrupt texel -- draws as missing data rather than
+    /// as whatever colour a neighbouring table slot happens to hold.
+    #[test]
+    fn an_unassigned_id_draws_as_missing_data() {
+        let pixels = render(
+            vec![0.0; (RASTER * RASTER) as usize],
+            vec![UNASSIGNED; (RASTER * RASTER) as usize],
+            straight_down,
+        );
+        let centre = pixel(&pixels, SIZE / 2, SIZE / 2);
+        assert_eq!(centre, [255, 0, 255, 255], "unassigned ids are magenta");
+    }
+
     #[test]
     fn walking_the_camera_there_looks_the_same_as_arriving_directly() {
         // The incremental toroidal update path is only correct if it agrees
@@ -1006,11 +1114,10 @@ mod tests {
                 120.0 * ((x * 0.21).sin() + (y * 0.17).cos()) + 60.0 * (x * 0.05 + y * 0.03).sin()
             })
             .collect();
-        let colours: Vec<Srgb8> = (0..RASTER * RASTER)
-            .map(|i| {
-                let (x, y) = ((i % RASTER) as u8, (i / RASTER) as u8);
-                Srgb8([x.wrapping_mul(3), y.wrapping_mul(5), x ^ y, 255])
-            })
+        // Every material in the book, tiled: any misregistered window shows
+        // as one id where another belongs, and ids compare exactly.
+        let materials: Vec<MaterialId> = (0..RASTER * RASTER)
+            .map(|i| MaterialId(Material::ALL[i as usize % Material::ALL.len()].id()))
             .collect();
 
         let aim = |camera: &mut Camera| {
@@ -1018,7 +1125,7 @@ mod tests {
             camera.orientation = Camera::from_yaw_pitch_roll(0.0, -30f32.to_radians(), 0.0);
         };
 
-        let direct = render(heights.clone(), colours.clone(), aim);
+        let direct = render(heights.clone(), materials.clone(), aim);
 
         let steps: Vec<Vec3> = (0..200)
             .map(|i| {
@@ -1026,7 +1133,7 @@ mod tests {
                 Vec3::new(-1400.0 + t * 9.0, 900.0, 1500.0 - t * 6.0)
             })
             .collect();
-        let walked = render_after(heights, colours, aim, &steps);
+        let walked = render_after(heights, materials, aim, &steps);
 
         assert_eq!(
             direct, walked,
@@ -1145,7 +1252,7 @@ mod tests {
 
     /// Rough terrain, so that neighbouring clipmap levels genuinely disagree
     /// about where the surface is and any seam between them would show.
-    fn rugged() -> (Vec<f32>, Vec<Srgb8>) {
+    fn rugged() -> (Vec<f32>, Vec<MaterialId>) {
         let heights = (0..RASTER * RASTER)
             .map(|i| {
                 let (x, y) = ((i % RASTER) as f32, (i / RASTER) as f32);
@@ -1242,10 +1349,10 @@ mod tests {
         // well as from the horizon. Drawing the finest level from high up spends
         // full-resolution triangles on ground that covers a fraction of a pixel,
         // and a fine window's worth of tile reads on fetching it.
-        let (heights, colours) = rugged();
+        let (heights, materials) = rugged();
 
-        let (_, low) = render_probed(heights.clone(), colours.clone(), from_altitude(900.0), &[]);
-        let (pixels, high) = render_probed(heights, colours, from_altitude(4000.0), &[]);
+        let (_, low) = render_probed(heights.clone(), materials.clone(), from_altitude(900.0), &[]);
+        let (pixels, high) = render_probed(heights, materials, from_altitude(4000.0), &[]);
 
         assert_eq!(low, 0, "close to the ground every level is worth drawing");
         assert!(
@@ -1295,15 +1402,16 @@ mod tests {
         // and are refilled whole when the camera comes back down to them --
         // their textures having gone stale in the meantime.
         let (device, queue) = test_device();
-        let (heights, colours) = rugged();
+        let (heights, materials) = rugged();
         let reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
         let mut scene = Scene::from_terrain(
             &device,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            UVec2::splat(SIZE),
             |camera_layout| {
                 Terrain::new(
                     &device,
-                    wgpu::TextureFormat::Rgba8UnormSrgb,
                     camera_layout,
                     test_residency(),
                     placement(),
@@ -1316,14 +1424,13 @@ mod tests {
                             ))),
                             levels: reads.clone(),
                         }),
-                        colours: Box::new(Pyramid::build(Level::new(RASTER, RASTER, colours))),
+                        materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
                         maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
                             RASTER, RASTER, heights,
                         )))),
                     },
                 )
             },
-            1.0,
         );
 
         let mut read_levels = |at: Vec3| {

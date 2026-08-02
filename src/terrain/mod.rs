@@ -10,9 +10,6 @@ pub mod tiles;
 /// Bare-ground elevations, in metres, and the directory they are preferred from.
 pub const ELEVATION_PRODUCTS: [&str; 2] = ["dtm", "dsm"];
 
-/// Surface colour, over the same ground as the elevation.
-pub const COLOUR_PRODUCT: &str = "albedo";
-
 /// Any elevation below this means "no measurement here".
 ///
 /// Defined beside the filter that has to drop such texels when it builds a

@@ -1,6 +1,8 @@
 mod camera;
 mod controls;
+mod deferred;
 mod headless;
+mod palette;
 mod renderer;
 mod scene;
 mod terrain;

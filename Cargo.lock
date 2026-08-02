@@ -784,6 +784,7 @@ dependencies = [
  "log",
  "png",
  "pollster",
+ "terrain-materials",
  "terrain-tiles",
  "tiff",
  "wgpu",

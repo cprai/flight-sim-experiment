@@ -3,7 +3,7 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use crate::camera::Camera;
-use crate::scene::{Scene, create_depth_view};
+use crate::scene::Scene;
 
 /// Owns the GPU device and swapchain for a single window, and the scene it draws.
 pub struct Renderer {
@@ -12,8 +12,6 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    /// Sized to match the swapchain, so it is rebuilt whenever that is.
-    depth: wgpu::TextureView,
     scene: Scene,
 }
 
@@ -78,10 +76,10 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let depth = create_depth_view(&device, config.width, config.height);
-        // Sized for the surface as it is now. A later resize only changes the
-        // aspect: the clipmap's textures are allocated once, and rebuilding
-        // them mid-flight would mean refilling every window from disk.
+        // Sized for the surface as it is now. A later resize rebuilds the
+        // screen-sized G-buffer but not the clipmap: its textures are
+        // allocated once, and rebuilding them mid-flight would mean refilling
+        // every window from disk.
         let scene = Scene::new(
             &device,
             format,
@@ -95,7 +93,6 @@ impl Renderer {
             device,
             queue,
             config,
-            depth,
             scene,
         })
     }
@@ -120,12 +117,10 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        // A depth attachment has to match the colour target's dimensions exactly,
-        // so it cannot outlive the old swapchain size.
-        self.depth = create_depth_view(&self.device, width, height);
-        // Without this the projection would stretch the scene to fit the new
-        // viewport instead of widening the field of view.
-        self.scene.camera.aspect = aspect_ratio(&self.config);
+        // The G-buffer has to match the swapchain's dimensions exactly, and
+        // the camera's aspect follows the viewport; the scene owns both.
+        self.scene
+            .resize(&self.device, glam::UVec2::new(width, height));
     }
 
     /// Reconfigures the swapchain at its current size, e.g. after it goes stale.
@@ -160,7 +155,7 @@ impl Renderer {
             });
 
         self.scene.update(&self.queue);
-        self.scene.draw(&mut encoder, &view, &self.depth);
+        self.scene.draw(&mut encoder, &view);
 
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);
@@ -170,9 +165,4 @@ impl Renderer {
             self.reconfigure();
         }
     }
-}
-
-/// Viewport aspect ratio the camera should project with.
-fn aspect_ratio(config: &wgpu::SurfaceConfiguration) -> f32 {
-    config.width as f32 / config.height as f32
 }
