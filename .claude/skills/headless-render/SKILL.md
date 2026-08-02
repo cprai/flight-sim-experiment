@@ -68,10 +68,10 @@ Every run prints, at `info` on stderr:
 ```
 using adapter: AdapterInfo { ..., device_type: DiscreteGpu, backend: Vulkan, ... }
 terrain: 98304 x 114688 texels at 1 m, levels up to 8
-clipmap: 7 levels of 4096 texels, 1195 MiB of texture, reaching 114688 texels from the camera
-built the scene in 9.61ms
+terrain: 8 levels of 8 x 8 tiles, 4096 texels each, 1536 MiB of texture, reaching 196608 texels from the camera
+built the scene in 11.35ms
 camera at [0, 11782.164, 57344] facing Quat(...)
-filled the windows in 968.39ms
+filled every level in 1.09s
 ```
 
 and the frame time on stdout:
@@ -84,9 +84,11 @@ rendered one frame in 34.15 ms (29.3 fps)
   says `Cpu`, the software rasterizer took the job and the numbers describe
   llvm, not the GPU. `WGPU_POWER_PREF` (already `high` in the devcontainer)
   chooses; see ca3791f.
-- **`filled the windows`** is disk: tile reads and pyramid reductions. It is
+- **`filled every level`** is disk: tile reads and pyramid reductions. It is
   routinely 20-40x the frame time and says nothing about the shaders. Do not
   report it as render cost.
+- **The second `terrain:` line** is what the clipmap allocated. It does not vary
+  with `--size` -- see the trap below.
 - **`rendered one frame`** is the draw plus the readback. It is the one line on
   stdout rather than in the log, because it is the measurement the run was asked
   for and not a diagnostic -- it stands in for the counter the windowed app draws
@@ -120,12 +122,21 @@ the code is dead.
   settles over several frames -- streaming that catches up, hysteresis, an
   incremental update path -- will not appear. Use the `FLIGHT_SIM_WALK` harness
   below for those.
-- **`--size` is not a crop.** The clipmap sizes its windows so a texel lands on
-  about a pixel, so the viewport changes what is resident: `480x270` gives 9
-  levels of 1024 texels and 96 MiB of texture, `1280x720` gives 7 levels of 4096
-  and 1195 MiB. A small render is cheap and quick to look at, but it is a
-  different clipmap -- never compare frames taken at different sizes, and never
-  conclude from a small one that the big one is fine.
+- **`--size` is not a crop.** The viewport's pixel angle decides the *finest*
+  level worth filling at a given altitude -- `detail_base` in
+  `src/terrain/residency.rs` -- so a small render can be reading coarser ground
+  than a big one from the same camera. That is what
+  `a_wider_window_reads_finer_ground_at_the_same_distance` in `src/scene.rs`
+  pins down. So a small render is cheap and quick to look at, but never compare
+  frames taken at different sizes, and never conclude from a small one that the
+  big one is fine.
+
+  What `--size` does *not* change is the allocation. `Residency::level_count` is
+  a function of the raster and the tile square alone, clamped to the levels the
+  pyramid actually has; the viewport never enters it. Every size from `160x90`
+  to `2560x1440` reports the same `8 levels of 8 x 8 tiles, 4096 texels each,
+  1536 MiB` on this pyramid. If you are looking for a memory or reach effect
+  from the viewport, there is not one -- `FLIGHT_SIM_TILES` below is the knob.
 
 ## Telling a GPU or driver problem from a shader or data problem
 
@@ -152,15 +163,26 @@ in `src/scene.rs`, which renders through the same `headless::capture` and writes
 FLIGHT_SIM_TERRAIN=assets/terrain cargo test --release -- --ignored --nocapture dump_installed
 ```
 
+- `FLIGHT_SIM_TERRAIN` -- the pyramid to open. Required; the test panics
+  without it rather than defaulting anywhere.
 - `FLIGHT_SIM_CAMERA` -- same `x,y,z,yaw,pitch` as `--camera`.
-- `FLIGHT_SIM_NEAR_RINGS` -- how far the rasterized near field reaches before
-  the raymarched far field takes over. Infinity rasterizes everything, zero
-  raymarches everything; rendering the same view at both is how the two paths
-  get checked against each other.
-- `FLIGHT_SIM_WINDOW` -- window size in texels, for weighing detail against the
-  texture memory and fill time it costs.
+- `FLIGHT_SIM_TILES` -- overrides `Residency::tiles_across`, a power of two. The
+  one knob that trades texture memory for reach, and the only place it is
+  reachable at all. This is what to reach for when `--size` did not move the
+  clipmap, because it never does.
 - `FLIGHT_SIM_WALK` -- steps the camera in one-metre increments before drawing,
   which exercises the incremental window updates instead of one cold fill.
+
+The size is fixed at 960x540 in the test itself. Its `filled every level` line
+also reports the finest level that survived `detail_base`, which the
+`--screenshot` path does not print. Everything it prints goes to stderr through
+`eprintln!`, its own `rendered one frame` included -- the move to stdout applies
+to `--screenshot` only, so `--nocapture` is what you need here, not `>`.
+
+`FLIGHT_SIM_TILES=4` on the installed pyramid gives `9 levels of 4 x 4 tiles,
+2048 texels each, 432 MiB` against the default `8 levels of 8 x 8 tiles, 4096
+texels each, 1536 MiB`: a level finer and a third of the memory, reaching
+131072 texels instead of 196608.
 
 ## Cost
 
