@@ -105,6 +105,14 @@ struct Terrain {
 // these texels when it builds a coarse level reads the same threshold.
 const NODATA_BELOW: f32 = -30000.0;
 
+// The finest level the normals are stored at.
+//
+// Requests for anything finer are served by repeating texels, so this is where
+// they stop being distinct and interpolating below it would only ramp between
+// copies of one value. Kept in step with `NORMAL_BASE_LEVEL` in
+// `crates/terrain-tiles/src/manifest.rs`.
+const NORMAL_BASE_LEVEL: u32 = 3u;
+
 // Halvings used to place the intercept once the texel holding it is known.
 // Eight takes a texel to a two-hundred-and-fiftieth of its width, far finer
 // than the pixel that asked.
@@ -385,19 +393,56 @@ struct GBufferOut {
     @builtin(frag_depth) depth: f32,
 };
 
-// The stored normal of a texel, rebuilt into a world-space unit vector.
+// Whether a stored pair is a direction at all.
 //
-// Only two components are stored, and a height field's normal always points
-// upwards, so the third is what is left of unit length. The pair that no real
-// normal can reach means no elevation was measured here; flat is the answer
-// that cannot mislead, and the ray did not hit anything to shade in any case.
-fn normal_at(level: u32, cell: vec2<i32>) -> vec3<f32> {
-    let stored = textureLoad(normals, slot(cell), i32(level), 0).rg;
-    let flat = dot(stored, stored);
-    if (flat > 1.0) {
+// Both components of a unit normal fit inside the unit disc, so the sentinel
+// the tools write for unmeasured ground -- the most negative pair the format
+// holds -- is the one value that cannot be mistaken for one.
+fn measured(stored: vec2<f32>) -> f32 {
+    return select(0.0, 1.0, dot(stored, stored) <= 1.0);
+}
+
+// The ground's unit normal at a fractional position, in world space.
+//
+// Bilinear over the four surrounding texels rather than the nearest of them.
+// Nearest is flat shading: every texel is one constant normal, so the ground
+// breaks into facets that the eye reads as blocks however smooth the surface
+// under them is. Interpolating turns the same data into a normal that varies
+// continuously across a texel, which is the smooth-shading half of what a
+// stored normal is for.
+//
+// The two stored components are what gets mixed, and the third is rebuilt from
+// them afterwards. A height field's normal always points upwards, so the
+// vertical component is whatever is left of unit length -- and a mean of pairs
+// inside the unit disc is inside it too, so the result comes out unit without
+// a normalize. Mixing three components and renormalising would be the same
+// thing with a step added.
+//
+// Nodata is not a direction and must not be averaged into one: those corners
+// are dropped and the weight redistributed over the rest, so ground beside a
+// hole takes the normal of the ground that was measured. Flat is the answer
+// where nothing was.
+fn normal_bilinear(level: u32, w: vec2<f32>) -> vec3<f32> {
+    let base = vec2<i32>(floor(w));
+    let f = fract(w);
+    let a = textureLoad(normals, slot(base), i32(level), 0).rg;
+    let b = textureLoad(normals, slot(base + vec2<i32>(1, 0)), i32(level), 0).rg;
+    let c = textureLoad(normals, slot(base + vec2<i32>(0, 1)), i32(level), 0).rg;
+    let d = textureLoad(normals, slot(base + vec2<i32>(1, 1)), i32(level), 0).rg;
+
+    let corner = vec4<f32>(
+        (1.0 - f.x) * (1.0 - f.y) * measured(a),
+        f.x * (1.0 - f.y) * measured(b),
+        (1.0 - f.x) * f.y * measured(c),
+        f.x * f.y * measured(d),
+    );
+    let total = corner.x + corner.y + corner.z + corner.w;
+    if (total <= 0.0) {
         return vec3<f32>(0.0, 1.0, 0.0);
     }
-    return vec3<f32>(stored.r, sqrt(1.0 - flat), stored.g);
+
+    let mean = (a * corner.x + b * corner.y + c * corner.z + d * corner.w) / total;
+    return vec3<f32>(mean.r, sqrt(max(1.0 - dot(mean, mean), 0.0)), mean.g);
 }
 
 @fragment
@@ -444,11 +489,22 @@ fn fs_terrain(in: ScreenOut) -> GBufferOut {
     let cell = vec2<i32>(floor(hit.w + 0.5));
     out.material = textureLoad(materials, slot(cell), i32(hit.level), 0).r;
     out.position = vec4<f32>(hit.position, 1.0);
-    // From the same texel the material came from. It is not the gradient of the
-    // bilinear patch the ray actually intersected: that patch is a smoothing of
-    // the ground, and it flattens as the level coarsens, where this carries the
-    // mean of the finest normals there are. The far field keeps its relief at
-    // the cost of shading and silhouette parting company a little.
-    out.normal = vec4<f32>(normal_at(hit.level, cell), 0.0);
+    // Read the normals where they are still distinct rather than at the hit's
+    // own level: they are stored no finer than level 3 and the store serves
+    // finer requests by repeating texels, so interpolating below it would ramp
+    // between copies of one value and leave the eight-metre grid on show.
+    //
+    // Never a square the clipmap does not hold. The level asked for is at least
+    // the hit's, which was resident, and a coarser level's window covers twice
+    // the ground of the next finer one from the same camera. The min is for a
+    // raster with no level 3 at all, which only a test builds.
+    let normal_level = min(max(hit.level, NORMAL_BASE_LEVEL), terrain.level_count - 1u);
+    let normal_w = hit.w * exp2(f32(hit.level) - f32(normal_level));
+    // Still not the gradient of the bilinear patch the ray actually
+    // intersected: that patch is a smoothing of the ground, and it flattens as
+    // the level coarsens, where this carries the mean of the finest normals
+    // there are. The far field keeps its relief at the cost of shading and
+    // silhouette parting company a little.
+    out.normal = vec4<f32>(normal_bilinear(normal_level, normal_w), 0.0);
     return out;
 }

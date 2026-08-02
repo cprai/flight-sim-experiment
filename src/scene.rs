@@ -1191,8 +1191,8 @@ mod tests {
 
     /// Renders one frame and reads the normal buffer back as world vectors.
     ///
-    /// Nothing on screen is drawn from the normals yet, so this is the only
-    /// way to see what the march wrote.
+    /// The shading reduces a normal to one number, so this is the only way to
+    /// see the vector the march actually wrote.
     fn render_normals(heights: Vec<f32>, aim: impl FnOnce(&mut Camera)) -> Vec<[f32; 4]> {
         let (device, queue) = test_device();
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -1311,6 +1311,74 @@ mod tests {
         assert!(
             written > 1000,
             "only {written} pixels of the frame hit the ground"
+        );
+    }
+
+    /// Curved ground must shade as a curve, not as a staircase of facets.
+    ///
+    /// Reading the nearest normal texel is flat shading: every texel holds one
+    /// constant direction, so the ground breaks into facets and reads as
+    /// blocks -- which is what it did look like, and the reason the march
+    /// interpolates. What separates the two is not whether the normals are
+    /// right on average but whether they are continuous, so this measures the
+    /// step between neighbouring pixels rather than the value at any of them.
+    #[test]
+    fn a_curved_surface_gives_a_continuous_normal_not_facets() {
+        // A dome over the whole raster: every direction of slope, none of it
+        // flat, and the curvature gentle enough that the stored normals of
+        // adjacent texels are genuinely different rather than a step apart.
+        let metres = METRES_PER_TEXEL as f32;
+        let radius = 0.5 * RASTER as f32 * metres;
+        let heights: Vec<f32> = (0..RASTER * RASTER)
+            .map(|index| {
+                let (x, y) = ((index % RASTER) as f32, (index / RASTER) as f32);
+                let half = 0.5 * (RASTER - 1) as f32;
+                let offset = Vec2::new(x - half, y - half) * metres / radius;
+                600.0 * (1.0 - offset.length_squared())
+            })
+            .collect();
+
+        let normals = render_normals(heights, straight_down);
+        let at = |x: u32, y: u32| {
+            let [nx, ny, nz, _] = normals[(y * SIZE + x) as usize];
+            Vec3::new(nx, ny, nz)
+        };
+
+        // Along the middle row, where the dome's slope sweeps from tilted one
+        // way through level to tilted the other.
+        let row = SIZE / 2;
+        let mut step = 0.0f32;
+        let mut sweep = 0.0f32;
+        let mut ground = 0;
+        for x in 1..SIZE {
+            let (before, here) = (at(x - 1, row), at(x, row));
+            // The buffer clears to zero, so a pixel the march discarded holds
+            // no direction and neither it nor its neighbour is a step.
+            if before.length() < 0.5 || here.length() < 0.5 {
+                continue;
+            }
+            ground += 1;
+            step = step.max((here - before).length());
+            sweep = sweep.max((here - at(1, row)).length());
+        }
+
+        assert!(
+            ground > 200,
+            "only {ground} pixels of ground across the row"
+        );
+        // The dome has to be curved enough for the measurement to mean
+        // something: a flat plane would pass any smoothness test there is.
+        assert!(
+            sweep > 0.6,
+            "the row only turns through {sweep}, which is too flat to judge"
+        );
+        // One stored texel covers many pixels at this distance, so flat
+        // shading would hold the normal still and then jump by the whole
+        // difference between neighbouring texels -- a step far larger than
+        // this. Interpolating spreads that difference over the texel.
+        assert!(
+            step < 0.02,
+            "neighbouring pixels differ by up to {step}, which is a facet edge"
         );
     }
 
