@@ -25,6 +25,7 @@
 //! ```
 
 mod build;
+mod normals;
 mod osm;
 mod tiles;
 
@@ -33,7 +34,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
-use terrain_tiles::{MATERIAL_PRODUCT, MAXIMA_SUFFIX, Manifest, maxima_product};
+use terrain_tiles::{
+    MATERIAL_PRODUCT, MAXIMA_SUFFIX, Manifest, NORMAL_BASE_LEVEL, NORMAL_SUFFIX, Normal, Texel,
+    maxima_product, normal_product,
+};
 
 use build::tile_range;
 
@@ -52,12 +56,25 @@ struct Arguments {
     #[arg(long, value_name = "NAME")]
     product: Vec<String>,
 
-    /// Skip copying the source products, and only build the max pyramids.
+    /// Skip copying the source products, and only build the derived pyramids.
     ///
-    /// For a re-run after a change to how the pyramid is reduced, where the
-    /// tens of gigabytes of measurements beside it have not moved.
+    /// For a re-run after a change to how a pyramid is reduced, where the tens
+    /// of gigabytes of measurements beside it have not moved.
     #[arg(long)]
     no_copy: bool,
+
+    /// Skip building the max pyramids.
+    #[arg(long)]
+    no_maxima: bool,
+
+    /// Skip building the surface normals.
+    ///
+    /// Together with `--no-copy` these are what make one derived pyramid
+    /// rebuildable on its own: each reads every level-0 tile of an elevation
+    /// product, which is tens of gigabytes, and a change to one of them is no
+    /// reason to redo the other.
+    #[arg(long)]
+    no_normals: bool,
 }
 
 fn main() -> Result<()> {
@@ -87,11 +104,18 @@ fn main() -> Result<()> {
         if !arguments.no_copy {
             copy_product(&arguments.input.join(name), &arguments.output.join(name))?;
         }
-        // Colour has nothing to bound, and neither do material ids. Only a
-        // single-band *elevation* product does, and a pyramid already
-        // reduced from one is not reduced again.
-        if manifest.bands == 1 && !name.ends_with(MAXIMA_SUFFIX) && name != MATERIAL_PRODUCT {
+        // Colour has nothing to bound or to slope, and neither do material
+        // ids. Only a single-band *elevation* product does, and a pyramid
+        // already derived from one is not derived from again.
+        let elevation = manifest.bands == 1
+            && !name.ends_with(MAXIMA_SUFFIX)
+            && !name.ends_with(NORMAL_SUFFIX)
+            && name != MATERIAL_PRODUCT;
+        if elevation && !arguments.no_maxima {
             build_maxima(&arguments.input, &arguments.output, name, manifest)?;
+        }
+        if elevation && !arguments.no_normals {
+            build_normals(&arguments.input, &arguments.output, name, manifest)?;
         }
     }
 
@@ -230,6 +254,43 @@ fn build_maxima(input: &Path, output: &Path, product: &str, source: &Manifest) -
     // Written last, so a run killed partway leaves a directory the renderer
     // refuses to open rather than one it opens and reads holes out of.
     manifest.write(&maxima_root)?;
+    log::info!("built {name}: {written} tiles in {:.1?}", started.elapsed());
+    Ok(())
+}
+
+/// Builds one elevation product's surface normals, reading `input` and writing
+/// beside the copies under `output`.
+///
+/// Read from the download for the same reason the max pyramid is: `--no-copy`
+/// has to be a complete run on its own.
+fn build_normals(input: &Path, output: &Path, product: &str, source: &Manifest) -> Result<()> {
+    let name = normal_product(product);
+    let source_root = input.join(product);
+    let normal_root = output.join(&name);
+
+    // The same ground and the same lattice as the elevation, but stored from a
+    // coarser level up, and holding packed directions rather than metres. A
+    // box too small to reach the base level keeps its coarsest level rather
+    // than writing nothing at all.
+    let base = NORMAL_BASE_LEVEL.min(source.max_level());
+    let manifest = Manifest {
+        product: name.clone(),
+        base_level: base,
+        level_count: source.max_level() - base + 1,
+        nodata: f32::from(Normal::NODATA.to_sample()),
+        ..source.clone()
+    };
+
+    log::info!(
+        "building {name}: levels {base} to {} from level-0 elevation",
+        manifest.max_level()
+    );
+    let started = std::time::Instant::now();
+    let written = normals::build(&source_root, &normal_root, source, &manifest)?;
+
+    // Written last, so a run killed partway leaves a directory the renderer
+    // refuses to open rather than one it opens and reads holes out of.
+    manifest.write(&normal_root)?;
     log::info!("built {name}: {written} tiles in {:.1?}", started.elapsed());
     Ok(())
 }
