@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 
 pub mod manifest;
 pub mod maxima;
+#[cfg(feature = "project")]
+pub mod project;
 pub mod read;
 pub mod texel;
 pub mod write;

@@ -13,10 +13,6 @@ log = "0.4.33"
 # Geofabrik publishes an .md5 beside every extract; hashing the assembled file
 # is what proves a download resumed across runs is exactly one publication.
 md5 = "0.8.1"
-proj4rs = { version = "0.1.10", default-features = false, features = [
-    "crs-definitions",
-    "multi-thread",
-] }
 rayon = "1.11.0"
 # Default features carry rustls, so there is no system OpenSSL to find. Left on
 # rather than pinned to a TLS backend, so async-tiff's own reqwest dependency
@@ -25,7 +21,10 @@ rayon = "1.11.0"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-terrain-tiles = { path = "../terrain-tiles" }
+# "project" carries the proj4rs-backed CRS conversions this tool projects its
+# boxes and blocks through; the module lived here before terrain-process
+# needed it too.
+terrain-tiles = { path = "../terrain-tiles", features = ["project"] }
 tiff = { version = "0.11", default-features = false, features = ["deflate"] }
 # "time" is for the backoff between retries; see `retry`. "fs" and "io-util"
 # stream the Geofabrik extract to disk without holding it in memory.

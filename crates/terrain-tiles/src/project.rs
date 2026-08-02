@@ -28,10 +28,12 @@ use proj4rs::proj::Proj;
 
 /// EPSG code for NAD83(CSRS) as longitude and latitude in degrees.
 pub const EPSG_GEOGRAPHIC: u16 = 4617;
-/// NAD83(CSRS) / Canada Atlas Lambert, in metres. The output grid, and HRDEM.
-pub const EPSG_LAMBERT: u16 = 3979;
 /// WGS 84 / Pseudo-Mercator. The Sentinel-2 cloud-free mosaics.
 pub const EPSG_WEB_MERCATOR: u16 = 3857;
+
+// The output grid's own code lives beside the writer that stamps it into every
+// tile; re-exported here so projection callers need only this module.
+pub use crate::write::EPSG_LAMBERT;
 
 /// Transforms points from one CRS to another.
 pub struct Projector {
@@ -117,8 +119,8 @@ impl Projector {
         Ok(())
     }
 
-    /// Projects one point. The pipeline works in rows; this is for tests.
-    #[cfg(test)]
+    /// Projects one point. The pipelines work in batches; this is for tests
+    /// and one-off lookups.
     pub fn point_to_source(&self, x: f64, y: f64) -> Result<(f64, f64)> {
         let mut one = [(x, y)];
         self.to_source(&mut one)?;

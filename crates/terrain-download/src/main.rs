@@ -44,11 +44,15 @@ mod coverage;
 mod extent;
 mod geofabrik;
 mod mip;
-mod project;
 mod resample;
 mod retry;
 mod source;
 mod stac;
+
+// Shared with `terrain-process`, which projects OSM geometry onto the same
+// grid; aliased at the crate root so module paths read as they did when it
+// lived here.
+use terrain_tiles::project;
 
 use std::path::{Path, PathBuf};
 

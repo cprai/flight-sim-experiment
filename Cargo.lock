@@ -2924,7 +2924,6 @@ dependencies = [
  "http",
  "log",
  "md5",
- "proj4rs",
  "rayon",
  "reqwest",
  "serde",
@@ -2952,6 +2951,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "proj4rs",
  "serde",
  "serde_json",
  "tiff",
