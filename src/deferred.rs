@@ -9,9 +9,16 @@
 //! without the traversal being touched.
 //!
 //! For now the shading is one flat colour per material from
-//! [`crate::palette`]. The world-space position is written and bound but not
-//! yet read; it is the input every later shading feature starts from, so the
-//! plumbing is laid now while the pipeline is being shaped.
+//! [`crate::palette`]. The world-space position and the surface normal are
+//! written and bound but not yet read; they are the inputs every later shading
+//! feature starts from, so the plumbing is laid now while the pipeline is
+//! being shaped.
+//!
+//! The three colour targets cost 4, 16 and 8 bytes a sample, and the alignment
+//! rule rounds each up to its own component size, so the pass sits at 28 of
+//! the 32 bytes `wgpu::Limits::default` guarantees. A fourth target does not
+//! fit; the thing to reclaim first is the position, which depth and the
+//! camera's inverse projection can reconstruct.
 //!
 //! Sky is a pixel the march never wrote: the buffers clear to depth zero,
 //! which a real hit can never produce -- the camera projects with reversed
@@ -29,6 +36,13 @@ pub const MATERIAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 /// World-space hit position per pixel; `w` is 1 where a hit was written.
 pub const POSITION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
+/// Unit surface normal per pixel, in world space.
+///
+/// Half floats rather than the two bytes the stored normals themselves take:
+/// `Rg8Snorm` is not a format anything is guaranteed to be able to render to,
+/// and this buffer holds a decoded direction rather than the packed one.
+pub const NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
 /// Format of the depth buffer the geometry pass writes.
 ///
 /// Float depth rather than the more compact `Depth24Plus` because the camera
@@ -44,34 +58,47 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub struct GBuffer {
     pub material: wgpu::TextureView,
     pub position: wgpu::TextureView,
+    pub normal: wgpu::TextureView,
     pub depth: wgpu::TextureView,
+    /// The normal target itself, rather than a view of it.
+    ///
+    /// Nothing draws with the normals yet, so the only way to see whether the
+    /// march writes the right ones is to copy the buffer back and look, and a
+    /// copy needs the texture. The same reasoning as the `COPY_SRC` on the max
+    /// pyramid's texture: cheap enough to pay for always rather than build a
+    /// differently-shaped G-buffer under `cfg(test)`.
+    #[allow(dead_code, reason = "read only by the G-buffer readback test")]
+    pub normal_target: wgpu::Texture,
 }
 
 impl GBuffer {
     pub fn new(device: &wgpu::Device, size: UVec2) -> Self {
         let target = |label, format| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d {
-                        width: size.x.max(1),
-                        height: size.y.max(1),
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-                .create_view(&wgpu::TextureViewDescriptor::default())
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size.x.max(1),
+                    height: size.y.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
         };
+        let view = |texture: &wgpu::Texture| texture.create_view(&Default::default());
+        let normal_target = target("gbuffer normal", NORMAL_FORMAT);
         Self {
-            material: target("gbuffer material", MATERIAL_FORMAT),
-            position: target("gbuffer position", POSITION_FORMAT),
-            depth: target("gbuffer depth", DEPTH_FORMAT),
+            material: view(&target("gbuffer material", MATERIAL_FORMAT)),
+            position: view(&target("gbuffer position", POSITION_FORMAT)),
+            normal: view(&normal_target),
+            depth: view(&target("gbuffer depth", DEPTH_FORMAT)),
+            normal_target,
         }
     }
 }
@@ -121,6 +148,7 @@ impl Shading {
                 entry(1, texture(wgpu::TextureSampleType::Uint)),
                 entry(2, texture(wgpu::TextureSampleType::Float { filterable: false })),
                 entry(3, texture(wgpu::TextureSampleType::Depth)),
+                entry(4, texture(wgpu::TextureSampleType::Float { filterable: false })),
             ],
         });
         let bind_group = Self::bind(device, &layout, &palette, gbuffer);
@@ -190,6 +218,7 @@ impl Shading {
                 entry(1, wgpu::BindingResource::TextureView(&gbuffer.material)),
                 entry(2, wgpu::BindingResource::TextureView(&gbuffer.position)),
                 entry(3, wgpu::BindingResource::TextureView(&gbuffer.depth)),
+                entry(4, wgpu::BindingResource::TextureView(&gbuffer.normal)),
             ],
         })
     }

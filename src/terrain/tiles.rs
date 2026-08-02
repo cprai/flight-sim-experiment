@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use glam::{IVec2, UVec2};
-use terrain_tiles::{Manifest, TILE_SIZE, Texel, Tile, TileGrid};
+use terrain_tiles::{Manifest, Normal, TILE_SIZE, Texel, Tile, TileGrid};
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 
 use crate::terrain::geotiff::Georeferencing;
@@ -114,6 +114,27 @@ impl TileSample for MaterialId {
         let span = &values[first..first + out.len()];
         for (texel, &value) in out.iter_mut().zip(span) {
             *texel = MaterialId(value);
+        }
+        Ok(())
+    }
+}
+
+impl TileSample for Normal {
+    const BANDS: usize = 1;
+
+    /// The manifest's own value is the sentinel written as a number, which is
+    /// no use as a texel; the sentinel itself is.
+    fn nodata(_: f32) -> Self {
+        Self::NODATA
+    }
+
+    fn read_span(row: &DecodingResult, first: usize, out: &mut [Self]) -> Result<()> {
+        let DecodingResult::U16(values) = row else {
+            bail!("a normal tile decoded to something other than 16-bit samples");
+        };
+        let span = &values[first..first + out.len()];
+        for (texel, &value) in out.iter_mut().zip(span) {
+            *texel = Normal::from_sample(value);
         }
         Ok(())
     }
@@ -391,7 +412,7 @@ fn open_tile(path: &Path) -> Result<Decoder<std::io::BufReader<std::fs::File>>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terrain_tiles::MATERIAL_BASE_LEVEL;
+    use terrain_tiles::{MATERIAL_BASE_LEVEL, NORMAL_BASE_LEVEL};
 
     const NODATA: f32 = -32767.0;
 
@@ -709,6 +730,65 @@ mod tests {
             assert_eq!(
                 *texel,
                 MaterialId(stored_column + 1),
+                "level-0 texel {index} should come from stored column {stored_column}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_normal_span_refuses_a_row_of_the_wrong_type() {
+        let row = DecodingResult::F32(vec![1.0; 4]);
+        let mut out = [Normal::default(); 4];
+        let error = Normal::read_span(&row, 0, &mut out).expect_err("should refuse floats");
+        assert!(error.to_string().contains("normal tile"), "{error}");
+    }
+
+    /// Normals are stored coarser still, from level 3, so the clipmap's three
+    /// finest levels are served by magnifying them: eight level-0 texels share
+    /// one stored texel, and the closest ground shades in facets that size.
+    #[test]
+    fn normals_magnify_the_finest_level_they_actually_have() {
+        let root = temp_root("normals");
+        let manifest = manifest("dtm-normal", NORMAL_BASE_LEVEL, 1, 1);
+        manifest.write(&root).expect("failed to write the manifest");
+        let grid = manifest.grid();
+
+        let (tile, _, _) = manifest.tile_of_texel(NORMAL_BASE_LEVEL, 0, 0);
+        // A distinct direction per stored column, so magnification is visible.
+        let data: Vec<u16> = (0..(TILE_SIZE as usize).pow(2))
+            .map(|i| {
+                Normal {
+                    east: (i % TILE_SIZE as usize) as i8,
+                    south: 7,
+                }
+                .to_sample()
+            })
+            .collect();
+        write_tile::<tiff::encoder::colortype::Gray16>(
+            &grid.tile_path(&root, NORMAL_BASE_LEVEL, tile),
+            &grid,
+            NORMAL_BASE_LEVEL,
+            tile,
+            &data,
+        );
+
+        let store = TileStore::<Normal>::open(&root).expect("failed to open");
+        let magnified = 1 << NORMAL_BASE_LEVEL;
+        let mut out = vec![Normal::default(); 64];
+        store.read_rect(
+            0,
+            IVec2::ZERO,
+            UVec2::new(64, 1),
+            bytemuck::cast_slice_mut(&mut out),
+        );
+        for (index, texel) in out.iter().enumerate() {
+            let stored_column = index / magnified;
+            assert_eq!(
+                *texel,
+                Normal {
+                    east: stored_column as i8,
+                    south: 7
+                },
                 "level-0 texel {index} should come from stored column {stored_column}"
             );
         }

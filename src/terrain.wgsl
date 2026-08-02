@@ -91,6 +91,10 @@ struct Terrain {
 @group(1) @binding(1) var heights: texture_2d_array<f32>;
 @group(1) @binding(2) var materials: texture_2d_array<u32>;
 @group(1) @binding(3) var maxima: texture_2d_array<f32>;
+// The east and south components of the ground's unit normal, signed and
+// normalised by the texture format. See `Normal` in
+// `crates/terrain-tiles/src/texel.rs` for why the third one is not stored.
+@group(1) @binding(4) var normals: texture_2d_array<f32>;
 
 // Elevations below this are the raster's nodata rather than ground.
 //
@@ -374,16 +378,34 @@ struct GBufferOut {
     @location(0) material: u32,
     // Where the ray met the ground, in world space; `w` is 1 to say so.
     @location(1) position: vec4<f32>,
+    // The unit normal of that ground, in world space.
+    @location(2) normal: vec4<f32>,
     // Written rather than interpolated, so the ground takes its place in the
     // depth buffer at the distance it was actually found at.
     @builtin(frag_depth) depth: f32,
 };
+
+// The stored normal of a texel, rebuilt into a world-space unit vector.
+//
+// Only two components are stored, and a height field's normal always points
+// upwards, so the third is what is left of unit length. The pair that no real
+// normal can reach means no elevation was measured here; flat is the answer
+// that cannot mislead, and the ray did not hit anything to shade in any case.
+fn normal_at(level: u32, cell: vec2<i32>) -> vec3<f32> {
+    let stored = textureLoad(normals, slot(cell), i32(level), 0).rg;
+    let flat = dot(stored, stored);
+    if (flat > 1.0) {
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+    return vec3<f32>(stored.r, sqrt(1.0 - flat), stored.g);
+}
 
 @fragment
 fn fs_terrain(in: ScreenOut) -> GBufferOut {
     var out: GBufferOut;
     out.material = 0u;
     out.position = vec4<f32>(0.0);
+    out.normal = vec4<f32>(0.0);
     out.depth = 0.0;
 
     let eye = camera.position.xyz;
@@ -422,5 +444,11 @@ fn fs_terrain(in: ScreenOut) -> GBufferOut {
     let cell = vec2<i32>(floor(hit.w + 0.5));
     out.material = textureLoad(materials, slot(cell), i32(hit.level), 0).r;
     out.position = vec4<f32>(hit.position, 1.0);
+    // From the same texel the material came from. It is not the gradient of the
+    // bilinear patch the ray actually intersected: that patch is a smoothing of
+    // the ground, and it flattens as the level coarsens, where this carries the
+    // mean of the finest normals there are. The far field keeps its relief at
+    // the cost of shading and silhouette parting company a little.
+    out.normal = vec4<f32>(normal_at(hit.level, cell), 0.0);
     return out;
 }

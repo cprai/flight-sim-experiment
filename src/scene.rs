@@ -225,6 +225,7 @@ impl Scene {
                 color_attachments: &[
                     target(&self.gbuffer.material, wgpu::Color::TRANSPARENT),
                     target(&self.gbuffer.position, wgpu::Color::TRANSPARENT),
+                    target(&self.gbuffer.normal, wgpu::Color::TRANSPARENT),
                 ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.gbuffer.depth,
@@ -335,6 +336,7 @@ fn to_pixels(view_proj: glam::Mat4, point: glam::Vec3, width: u32, height: u32) 
 mod tests {
     use glam::{IVec2, UVec2, Vec2, Vec3};
     use terrain_materials::Material;
+    use terrain_tiles::{Normal, Texel};
 
     use super::*;
     use crate::terrain::geotiff::Georeferencing;
@@ -407,6 +409,46 @@ mod tests {
         vec![GRASS; (RASTER * RASTER) as usize]
     }
 
+    /// The normals `terrain-process` would derive from a height raster.
+    ///
+    /// The same central difference the tool takes, one-sided at the raster's
+    /// edge, so a fixture's normals and its ground are the same surface. The
+    /// tool then averages these down to a coarser base level, which is its own
+    /// business; here they stay at the raster's own resolution.
+    fn normals_of(heights: &[f32]) -> Vec<Normal> {
+        let side = RASTER as usize;
+        let metres = METRES_PER_TEXEL as f32;
+        (0..side * side)
+            .map(|index| {
+                let (x, y) = (index % side, index / side);
+                let at = |x: usize, y: usize| heights[y * side + x];
+                let here = at(x, y);
+                if here < terrain_tiles::NODATA_BELOW {
+                    return Normal::NODATA;
+                }
+                let (west, east) = (x.saturating_sub(1), (x + 1).min(side - 1));
+                let (north, south) = (y.saturating_sub(1), (y + 1).min(side - 1));
+                // Whichever neighbours are ground, over however far apart the
+                // two of them are; a texel between two holes is flat.
+                let axis = |low: f32, high: f32, from: usize, to: usize| {
+                    let ground =
+                        |value: f32| (value >= terrain_tiles::NODATA_BELOW).then_some(value);
+                    match (ground(low), ground(high)) {
+                        (Some(low), Some(high)) => (high - low) / ((to - from) as f32 * metres),
+                        (Some(low), None) => (here - low) / metres,
+                        (None, Some(high)) => (high - here) / metres,
+                        (None, None) => 0.0,
+                    }
+                };
+                Normal::from_unit(
+                    -axis(at(west, y), at(east, y), west, east),
+                    1.0,
+                    -axis(at(x, north), at(x, south), north, south),
+                )
+            })
+            .collect()
+    }
+
     /// Builds terrain from raw texels and renders one frame of it.
     fn render(
         heights: Vec<f32>,
@@ -454,6 +496,43 @@ mod tests {
         }
     }
 
+    /// A scene over synthetic rasters, with the normals derived from the
+    /// heights the way `terrain-process` derives them.
+    fn test_scene(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        residency: Residency,
+        heights: Vec<f32>,
+        materials: Vec<MaterialId>,
+    ) -> Scene {
+        Scene::from_terrain(device, format, UVec2::splat(SIZE), |camera_layout| {
+            Terrain::new(
+                device,
+                camera_layout,
+                residency,
+                placement(),
+                Sources {
+                    heights: Box::new(Pyramid::build(Level::new(
+                        RASTER,
+                        RASTER,
+                        heights.clone(),
+                    ))),
+                    materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
+                    maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
+                        RASTER,
+                        RASTER,
+                        heights.clone(),
+                    )))),
+                    normals: Box::new(Pyramid::build(Level::new(
+                        RASTER,
+                        RASTER,
+                        normals_of(&heights),
+                    ))),
+                },
+            )
+        })
+    }
+
     /// As [`render_probed`], but over a residency configured by the caller.
     fn render_config(
         residency: Residency,
@@ -481,30 +560,7 @@ mod tests {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut scene = Scene::from_terrain(
-            &device,
-            format,
-            UVec2::splat(SIZE),
-            |camera_layout| {
-                Terrain::new(
-                    &device,
-                    camera_layout,
-                    residency,
-                    placement(),
-                    Sources {
-                        heights: Box::new(Pyramid::build(Level::new(
-                            RASTER,
-                            RASTER,
-                            heights.clone(),
-                        ))),
-                        materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
-                        maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
-                            RASTER, RASTER, heights,
-                        )))),
-                    },
-                )
-            },
-        );
+        let mut scene = test_scene(&device, format, residency, heights, materials);
         aim(&mut scene.camera);
 
         // Walk the requested path first, so the windows arrive at the captured
@@ -1103,6 +1159,131 @@ mod tests {
         assert_eq!(centre, [255, 0, 255, 255], "unassigned ids are magenta");
     }
 
+    /// Renders one frame and reads the normal buffer back as world vectors.
+    ///
+    /// Nothing on screen is drawn from the normals yet, so this is the only
+    /// way to see what the march wrote.
+    fn render_normals(heights: Vec<f32>, aim: impl FnOnce(&mut Camera)) -> Vec<[f32; 4]> {
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen target"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+
+        let mut scene = test_scene(&device, format, test_residency(), heights, flat_ground());
+        aim(&mut scene.camera);
+        scene.update(&queue);
+
+        // Four half floats a texel, and `SIZE * 8` is already a multiple of
+        // the 256-byte copy alignment.
+        let bytes_per_row = SIZE * 8;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("normal readback"),
+            size: u64::from(bytes_per_row * SIZE),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        scene.draw(
+            &mut encoder,
+            &target.create_view(&wgpu::TextureViewDescriptor::default()),
+        );
+        encoder.copy_texture_to_buffer(
+            scene.gbuffer.normal_target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(SIZE),
+                },
+            },
+            wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll failed");
+        let bytes = readback
+            .get_mapped_range(..)
+            .expect("buffer not mapped")
+            .to_vec();
+        readback.unmap();
+
+        bytes
+            .chunks_exact(8)
+            .map(|texel| {
+                std::array::from_fn(|channel| {
+                    let at = channel * 2;
+                    half::f16::from_le_bytes([texel[at], texel[at + 1]]).to_f32()
+                })
+            })
+            .collect()
+    }
+
+    /// A tilted plane has one normal, and the march must write that one.
+    ///
+    /// This is the only test that can catch a sign flipped between a raster
+    /// row and world +Z, or a column and +X: nothing is shaded from the normal
+    /// yet, so such a flip would sit in the buffer unnoticed until the first
+    /// light source arrives and lit the terrain backwards.
+    #[test]
+    fn the_march_writes_the_normal_of_the_ground_it_hit() {
+        // Rising eastward and falling southward, at different rates, so the
+        // two axes cannot be swapped or negated without this noticing.
+        let (east, south) = (0.2f32, -0.35f32);
+        let metres = METRES_PER_TEXEL as f32;
+        let heights: Vec<f32> = (0..RASTER * RASTER)
+            .map(|index| {
+                let (x, y) = ((index % RASTER) as f32, (index / RASTER) as f32);
+                (east * x + south * y) * metres
+            })
+            .collect();
+
+        let normals = render_normals(heights, straight_down);
+        let expected = Vec3::new(-east, 1.0, -south).normalize();
+
+        let mut written = 0;
+        for (index, normal) in normals.iter().enumerate() {
+            let got = Vec3::new(normal[0], normal[1], normal[2]);
+            // The buffer clears to zero, so a pixel the march discarded is a
+            // vector of no length rather than a direction.
+            if got.length() < 0.5 {
+                continue;
+            }
+            written += 1;
+            let (x, y) = (index as u32 % SIZE, index as u32 / SIZE);
+            // Two bytes an axis on disk and half floats here, so a fortieth is
+            // comfortably outside the rounding and well inside a wrong sign.
+            assert!(
+                (got - expected).length() < 0.025,
+                "pixel ({x}, {y}) holds {got:?}, not {expected:?}"
+            );
+        }
+        assert!(
+            written > 1000,
+            "only {written} pixels of the frame hit the ground"
+        );
+    }
+
     #[test]
     fn walking_the_camera_there_looks_the_same_as_arriving_directly() {
         // The incremental toroidal update path is only correct if it agrees
@@ -1426,8 +1607,15 @@ mod tests {
                         }),
                         materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
                         maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
-                            RASTER, RASTER, heights,
+                            RASTER,
+                            RASTER,
+                            heights.clone(),
                         )))),
+                        normals: Box::new(Pyramid::build(Level::new(
+                            RASTER,
+                            RASTER,
+                            normals_of(&heights),
+                        ))),
                     },
                 )
             },

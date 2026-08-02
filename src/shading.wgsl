@@ -1,11 +1,11 @@
 // Shading: the G-buffer in, the image out.
 //
 // The geometry pass has already done the expensive part -- every pixel holds
-// the material id and world position of the ground its ray met, or depth zero
-// where it met nothing. This pass is one fetch and one table lookup per
-// pixel. For now the table is a flat colour per material; lighting and real
-// material texture belong here later, which is the point of the split -- they
-// will not touch the march.
+// the material id, world position and surface normal of the ground its ray
+// met, or depth zero where it met nothing. This pass is one fetch and one
+// table lookup per pixel. For now the table is a flat colour per material;
+// lighting and real material texture belong here later, which is the point of
+// the split -- they will not touch the march.
 
 // Must match `PALETTE_SIZE` in `src/palette.rs`: one slot per id up to the
 // last assigned category block.
@@ -25,10 +25,11 @@ struct Palette {
 
 @group(0) @binding(0) var<uniform> palette: Palette;
 @group(0) @binding(1) var material: texture_2d<u32>;
-// Bound but not yet read: the world-space position is the input every later
-// shading feature starts from.
+// Bound but not yet read: the world-space position and the surface normal are
+// the inputs every later shading feature starts from.
 @group(0) @binding(2) var position: texture_2d<f32>;
 @group(0) @binding(3) var depth: texture_depth_2d;
+@group(0) @binding(4) var normal: texture_2d<f32>;
 
 @vertex
 fn vs_shade(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {

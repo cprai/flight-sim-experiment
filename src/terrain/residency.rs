@@ -120,12 +120,21 @@ impl Residency {
 
     /// Bytes of texture this shape occupies at `levels` levels.
     ///
-    /// Heights are four bytes a texel, material ids four, and the max pyramid
-    /// two -- one cell per texel, because the level array is the quadtree and
-    /// no level carries a mip chain of its own.
+    /// Heights are four bytes a texel, material ids four, the max pyramid two,
+    /// and the surface normals two -- one cell per texel each, because the
+    /// level array is the quadtree and no level carries a mip chain of its own.
+    ///
+    /// Twelve is close to the ceiling. On the raster this flies, eight tiles a
+    /// side over eight levels comes to 1536 MiB against a 1600 MiB budget;
+    /// fourteen bytes would not fit, [`Residency::fit_tiles`] would halve the
+    /// square, and the finest level's reach would fall from 1536 texels to 512.
+    /// Anything added here should be checked against that, which is what
+    /// `eight_tiles_still_fit_the_budget` does.
     pub fn texture_bytes(&self, levels: u32) -> usize {
         let side = self.texels_across() as usize;
-        side * side * (size_of::<f32>() + 4 + size_of::<u16>()) * levels as usize
+        side * side
+            * (size_of::<f32>() + 4 + size_of::<u16>() + size_of::<terrain_tiles::Normal>())
+            * levels as usize
     }
 
     /// The widest square no wider than this one whose textures fit the budget.
@@ -400,6 +409,28 @@ mod tests {
             tiles_per_update: 64,
             ..Default::default()
         }
+    }
+
+    /// The whole clipmap shape hangs off how many bytes a texel costs, and it
+    /// is nearer the edge than it looks: the raster this project flies takes
+    /// 1536 MiB of the 1600 MiB budget at twelve bytes, and fourteen would not
+    /// fit. Overflowing it does not fail -- [`Residency::fit_tiles`] quietly
+    /// halves the square, and the finest level's reach falls from 1536 texels
+    /// to 512 -- so the next byte anyone adds should fail here instead.
+    #[test]
+    fn eight_tiles_still_fit_the_budget() {
+        let residency = Residency::default();
+        // The installed download: 98304 by 114688 level-0 texels.
+        let raster = glam::UVec2::new(98304, 114688);
+        let available = 9;
+        assert_eq!(
+            residency.fit_tiles(raster, available),
+            8,
+            "{:.0} MiB of texture does not fit {:.0} MiB",
+            residency.texture_bytes(residency.level_count(raster, available)) as f64
+                / (1 << 20) as f64,
+            residency.memory_budget as f64 / (1 << 20) as f64
+        );
     }
 
     /// Texels within a tile of the camera are in the middle of the square, so a
