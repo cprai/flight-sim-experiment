@@ -3,6 +3,7 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use crate::camera::Camera;
+use crate::hud::{FrameTimer, Hud};
 use crate::scene::Scene;
 
 /// Owns the GPU device and swapchain for a single window, and the scene it draws.
@@ -13,6 +14,9 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     scene: Scene,
+    timer: FrameTimer,
+    /// Absent when the machine has no fonts to draw the readout with.
+    hud: Option<Hud>,
 }
 
 impl Renderer {
@@ -87,6 +91,8 @@ impl Renderer {
             terrain_root,
         )?;
 
+        let hud = Hud::new(&device, &queue, format, window.scale_factor() as f32);
+
         Ok(Self {
             window,
             surface,
@@ -94,6 +100,8 @@ impl Renderer {
             queue,
             config,
             scene,
+            timer: FrameTimer::default(),
+            hud,
         })
     }
 
@@ -145,6 +153,13 @@ impl Renderer {
             | wgpu::CurrentSurfaceTexture::Validation => return,
         };
 
+        // Timed from here rather than from the top of the call: with vsync it is
+        // `get_current_texture` above that blocks, and counting that wait as
+        // work would make this number agree with the frame interval and say
+        // nothing the frame interval does not already say.
+        let started = std::time::Instant::now();
+        self.timer.begin(started);
+
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -157,7 +172,29 @@ impl Renderer {
         self.scene.update(&self.queue);
         self.scene.draw(&mut encoder, &view);
 
+        // Over the top of the shaded frame, and only here: the overlay reports
+        // on the renderer rather than being part of what it renders, so the
+        // screenshot path in `crate::headless`, which shares `Scene::draw`,
+        // stays free of it. It also wants `&mut` to lay the text out, which
+        // `Scene::draw` does not take.
+        if let Some(hud) = self.hud.as_mut() {
+            // Last frame's submit cost paired with this frame's interval: the
+            // one being drawn cannot report a time it has not finished taking.
+            hud.draw(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                crate::hud::Target {
+                    view: &view,
+                    resolution: glam::UVec2::new(self.config.width, self.config.height),
+                    scale_factor: self.window.scale_factor() as f32,
+                },
+                &self.timer.text(),
+            );
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
+        self.timer.end(started.elapsed());
         self.queue.present(frame);
 
         // `present` consumed the frame, so the surface can be reconfigured now.

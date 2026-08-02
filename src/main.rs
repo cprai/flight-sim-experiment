@@ -2,6 +2,7 @@ mod camera;
 mod controls;
 mod deferred;
 mod headless;
+mod hud;
 mod palette;
 mod renderer;
 mod scene;
