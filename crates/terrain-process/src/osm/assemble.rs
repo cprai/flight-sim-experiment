@@ -18,7 +18,7 @@
 //! count, keeping the rest of its polygon, because a lake missing one shore
 //! fragment still holds more truth as a partial lake than as nothing.
 
-use terrain_tiles::Material;
+use terrain_materials::Material;
 
 use super::classify::precedence;
 use super::read::{Extract, Nodes};

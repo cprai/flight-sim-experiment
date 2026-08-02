@@ -2,7 +2,7 @@
 //!
 //! The downloader leaves a raw regional extract beside the rasters it
 //! fetches; this module turns that extract into the `materials` product: one
-//! `u32` [`terrain_tiles::Material`] id per texel, on the same grid as every
+//! `u32` [`terrain_materials::Material`] id per texel, on the same grid as every
 //! other product, mip levels included. The stages, each its own submodule:
 //!
 //! - [`read`]: three passes over the `.osm.pbf`, keeping only what paints.
@@ -21,7 +21,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use terrain_tiles::{MATERIAL_BASE_LEVEL, MATERIAL_PRODUCT, Manifest, Material};
+use terrain_materials::Material;
+use terrain_tiles::{MATERIAL_BASE_LEVEL, MATERIAL_PRODUCT, Manifest};
 
 pub mod assemble;
 pub mod classify;

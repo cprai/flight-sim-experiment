@@ -1,0 +1,8 @@
+[package]
+name = "terrain-materials"
+edition = "2024"
+
+[dependencies]
+# None, deliberately. This crate is one enum, depended on from both ends of
+# the pipeline -- the tool that paints ids and the renderer that will shade
+# them -- and it must never drag either side's machinery into the other.

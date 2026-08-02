@@ -31,7 +31,8 @@
 //! the ocean fill paints over them. The fix is merging a second extract,
 //! deliberately not attempted yet.
 
-use terrain_tiles::{Manifest, Material};
+use terrain_materials::Material;
+use terrain_tiles::Manifest;
 
 use super::assemble::{Polygon, resolve, stitch};
 use super::read::Extract;
@@ -471,7 +472,7 @@ fn inside(rings: &[Vec<(f64, f64)>], (x, y): (f64, f64)) -> bool {
 mod tests {
     use super::*;
     use crate::osm::read::Nodes;
-    use terrain_tiles::Material;
+    use terrain_materials::Material;
 
     fn rect() -> Rect {
         Rect {

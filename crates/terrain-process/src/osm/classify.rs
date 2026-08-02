@@ -25,7 +25,7 @@
 //! greens, everything under wetland, wetland under open water. Ocean is the
 //! floor: every mapped area sits on top of the coastline fill.
 
-use terrain_tiles::Material;
+use terrain_materials::Material;
 
 /// The value a tag lookup finds, or nothing.
 fn get<'a>(tags: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {

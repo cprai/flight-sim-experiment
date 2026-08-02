@@ -3036,6 +3036,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "terrain-materials"
+version = "0.0.0"
+
+[[package]]
 name = "terrain-process"
 version = "0.0.0"
 dependencies = [
@@ -3047,6 +3051,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "terrain-materials",
  "terrain-tiles",
 ]
 

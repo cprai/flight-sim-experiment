@@ -219,7 +219,7 @@ pub fn write_colour_tile(path: &Path, placement: TilePlacement, samples: &[u8]) 
 
 /// Writes one material tile: a single band of 32-bit unsigned ids.
 ///
-/// The ids are [`crate::Material`] discriminants, but the writer takes plain
+/// The ids are `terrain-materials` discriminants, but the writer takes plain
 /// numbers: by the time a tile is being written the classification already
 /// happened, and refusing an id here could only turn a finished raster into
 /// an error after the expensive part is done.
@@ -244,7 +244,7 @@ pub fn write_material_tile(path: &Path, placement: TilePlacement, samples: &[u32
         .rows_per_strip(ROWS_PER_STRIP)
         .context("setting the strip height")?;
 
-    // Zero is `Material::Null`, ground no mapped area covers.
+    // Zero is the null material, ground no mapped area covers.
     write_placement(&mut image, placement, Some(0.0))?;
 
     image

@@ -43,7 +43,7 @@ const BAND_THREADS: usize = 4;
 /// Paints every polygon into base-level tiles under `root`.
 ///
 /// Returns how many tiles were written. Tiles that end up entirely
-/// [`terrain_tiles::Material::Null`] are not written at all, matching the
+/// [`terrain_materials::Material::Null`] are not written at all, matching the
 /// convention that absence means "nothing known here".
 pub fn rasterize(polygons: &[Polygon], manifest: &Manifest, root: &Path) -> Result<u64> {
     let level = MATERIAL_BASE_LEVEL;
@@ -240,7 +240,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use terrain_tiles::read::read_material_tile;
-    use terrain_tiles::{Material, TileGrid};
+    use terrain_materials::Material;
+    use terrain_tiles::TileGrid;
 
     /// Two tiles across, one down, at level 2: 1024 x 512 texels of 4 m.
     fn manifest() -> Manifest {

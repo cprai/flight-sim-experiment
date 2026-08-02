@@ -1,11 +1,13 @@
 //! What kind of ground a texel is, as an id the whole project agrees on.
 //!
 //! The materials product stores one of these per texel where the albedo
-//! product stores a colour. The enum lives in this crate for the same reason
-//! the grid does: the tool that rasterizes OpenStreetMap ground cover and the
-//! renderer that will one day turn ids into shading have to mean the same
-//! thing by every number, and a disagreement would draw the wrong terrain
-//! without reporting an error.
+//! product stores a colour. The enum is a crate of its own, with nothing
+//! else in it, because it is the one vocabulary both ends of the pipeline
+//! speak: the tool that rasterizes OpenStreetMap ground cover and the
+//! renderer that turns ids into shading must mean the same thing by every
+//! number -- a disagreement would draw the wrong terrain without reporting
+//! an error -- and neither side should link the other's machinery to get
+//! the words.
 //!
 //! Ids are `u32` and blocked by category -- water `0x01xx`, wetland `0x02xx`,
 //! forest `0x03xx`, and so on -- rather than densely packed from 1. The blocks

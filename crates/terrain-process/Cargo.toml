@@ -15,6 +15,7 @@ rayon = "1.11.0"
 # For `osm/source.json`, the record the downloader leaves beside the extract.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+terrain-materials = { path = "../terrain-materials" }
 # "project" carries the proj4rs conversions that put OSM's longitudes and
 # latitudes onto the tile grid's metres.
 terrain-tiles = { path = "../terrain-tiles", features = ["project"] }

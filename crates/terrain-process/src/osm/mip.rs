@@ -30,7 +30,8 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use terrain_tiles::read::read_material_tile;
 use terrain_tiles::write::{TilePlacement, write_material_tile};
-use terrain_tiles::{MATERIAL_BASE_LEVEL, Manifest, Material, TILE_SIZE, Tile};
+use terrain_materials::Material;
+use terrain_tiles::{MATERIAL_BASE_LEVEL, Manifest, TILE_SIZE, Tile};
 
 use super::classify::precedence;
 use crate::build::tile_range;

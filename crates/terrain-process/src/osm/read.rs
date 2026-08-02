@@ -25,7 +25,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use osmpbf::{Element, ElementReader};
 use serde::Deserialize;
-use terrain_tiles::Material;
+use terrain_materials::Material;
 use terrain_tiles::project::{EPSG_LAMBERT, Projector};
 
 use super::classify::classify;

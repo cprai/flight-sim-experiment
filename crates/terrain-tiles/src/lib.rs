@@ -24,7 +24,6 @@
 use std::path::{Path, PathBuf};
 
 pub mod manifest;
-pub mod material;
 pub mod maxima;
 #[cfg(feature = "project")]
 pub mod project;
@@ -33,7 +32,6 @@ pub mod texel;
 pub mod write;
 
 pub use manifest::{COLOUR_BASE_LEVEL, MATERIAL_BASE_LEVEL, Manifest};
-pub use material::Material;
 pub use texel::{
     COLOUR_IS_SRGB_ENCODED, NODATA_BELOW, Srgb8, Texel, linear_to_srgb, srgb_to_linear,
 };
