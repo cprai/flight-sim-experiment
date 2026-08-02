@@ -31,9 +31,9 @@ pub mod read;
 pub mod texel;
 pub mod write;
 
-pub use manifest::{COLOUR_BASE_LEVEL, MATERIAL_BASE_LEVEL, Manifest};
+pub use manifest::{COLOUR_BASE_LEVEL, MATERIAL_BASE_LEVEL, Manifest, NORMAL_BASE_LEVEL};
 pub use texel::{
-    COLOUR_IS_SRGB_ENCODED, NODATA_BELOW, Srgb8, Texel, linear_to_srgb, srgb_to_linear,
+    COLOUR_IS_SRGB_ENCODED, NODATA_BELOW, Normal, Srgb8, Texel, linear_to_srgb, srgb_to_linear,
 };
 
 /// What the ground-cover product's directory is called.
@@ -55,6 +55,19 @@ pub const MAXIMA_SUFFIX: &str = "-max";
 /// opens it cannot spell it differently.
 pub fn maxima_product(elevation: &str) -> String {
     format!("{elevation}{MAXIMA_SUFFIX}")
+}
+
+/// What marks a product directory as surface normals rather than a measurement.
+pub const NORMAL_SUFFIX: &str = "-normal";
+
+/// What a normal pyramid's product directory is called, given the elevation it
+/// was derived from.
+///
+/// A suffix for the same reason [`maxima_product`] is one: `dtm` and `dsm` are
+/// different surfaces, and the renderer must shade whichever one it is drawing
+/// rather than the other.
+pub fn normal_product(elevation: &str) -> String {
+    format!("{elevation}{NORMAL_SUFFIX}")
 }
 
 /// Side length of every tile, in texels, at every level.

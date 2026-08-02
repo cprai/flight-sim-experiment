@@ -35,6 +35,19 @@ pub const COLOUR_BASE_LEVEL: u32 = 4;
 /// serves finer requests by repeating texels, as it already does for colour.
 pub const MATERIAL_BASE_LEVEL: u32 = 2;
 
+/// Level at which surface normals are stored.
+///
+/// Normals are computed from the finest elevation there is and then averaged
+/// down, so this is where the pyramid starts being *written*, not where it
+/// stops carrying full-resolution detail: a level-3 texel is the mean of the
+/// sixty-four one-metre normals under it, roughness and all. Storing the finer
+/// levels as well would cost sixty-four times the disk to describe lighting
+/// that no camera close enough to see it would be looking at, so they are
+/// computed and dropped. Level 3 -- 8 m texels, 918 tiles, about 480 MB for
+/// this project's box -- sits one step coarser than materials, and the
+/// renderer serves finer requests by repeating texels as it does for those.
+pub const NORMAL_BASE_LEVEL: u32 = 3;
+
 /// Describes one product's tile tree.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Manifest {

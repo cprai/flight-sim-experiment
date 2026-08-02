@@ -21,11 +21,11 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tiff::encoder::colortype::{Gray32, Gray32Float, RGB8};
+use tiff::encoder::colortype::{Gray16, Gray32, Gray32Float, RGB8};
 use tiff::encoder::{Compression, TiffEncoder};
 use tiff::tags::Tag;
 
-use crate::TILE_SIZE;
+use crate::{Normal, TILE_SIZE, Texel};
 
 /// GeoTIFF places a raster with private tags read by number.
 const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
@@ -253,6 +253,49 @@ pub fn write_material_tile(path: &Path, placement: TilePlacement, samples: &[u32
     Ok(())
 }
 
+/// Writes one normal tile: a single band of 16-bit samples, each a packed
+/// [`Normal`].
+///
+/// Two bytes rather than three bands of one, because the `tiff` encoder has no
+/// two-channel type and a third band would cost the renderer a byte a texel it
+/// has no budget for. The packing is [`Normal::to_sample`]'s, so the bytes
+/// arrive at the GPU already in the order an `Rg8Snorm` texel reads them.
+pub fn write_normal_tile(path: &Path, placement: TilePlacement, samples: &[Normal]) -> Result<()> {
+    let expected = expected_samples(1);
+    anyhow::ensure!(
+        samples.len() == expected,
+        "expected {expected} samples for a {TILE_SIZE} x {TILE_SIZE} tile, got {}",
+        samples.len()
+    );
+    prepare(path)?;
+
+    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut encoder = TiffEncoder::new(BufWriter::new(file))
+        .with_context(|| format!("starting {}", path.display()))?
+        .with_compression(Compression::Uncompressed);
+
+    let mut image = encoder
+        .new_image::<Gray16>(TILE_SIZE, TILE_SIZE)
+        .context("starting the image")?;
+    image
+        .rows_per_strip(ROWS_PER_STRIP)
+        .context("setting the strip height")?;
+
+    // The one sample pair no direction can reach, so the tag is true rather
+    // than merely conventional.
+    write_placement(
+        &mut image,
+        placement,
+        Some(f32::from(Normal::NODATA.to_sample())),
+    )?;
+
+    let packed: Vec<u16> = samples.iter().map(|normal| normal.to_sample()).collect();
+    image
+        .write_data(&packed)
+        .with_context(|| format!("writing texels to {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -410,6 +453,48 @@ mod tests {
             panic!("expected 32-bit unsigned ids");
         };
         assert_eq!(read, samples);
+    }
+
+    /// One strip per row matters more here than anywhere: the renderer reads
+    /// normals a strip at a time in the middle of a frame, the same way it
+    /// reads heights.
+    #[test]
+    fn a_normal_tile_round_trips_one_row_per_strip() {
+        let samples: Vec<Normal> = (0..expected_samples(1))
+            .map(|i| Normal {
+                east: (i % 255) as i8,
+                south: (i % 199) as i8,
+            })
+            .collect();
+        let path = temp_path("normal-round-trip");
+        write_normal_tile(&path, placement(), &samples).expect("failed to write");
+        let bytes = std::fs::read(&path).expect("failed to read back");
+        let _ = std::fs::remove_dir_all(path.parent().and_then(|p| p.parent()).expect("no root"));
+
+        let mut decoder = Decoder::new(Cursor::new(bytes)).expect("failed to decode");
+        assert_eq!(
+            decoder.colortype().expect("no colour type"),
+            tiff::ColorType::Gray(16)
+        );
+        assert_eq!(
+            decoder.strip_count().expect("no strips"),
+            TILE_SIZE,
+            "one strip per row"
+        );
+        assert_eq!(
+            decoder
+                .get_tag_ascii_string(Tag::Unknown(TAG_GDAL_NODATA))
+                .expect("no nodata"),
+            "32896"
+        );
+
+        let tiff::decoder::DecodingResult::U16(read) =
+            decoder.read_image().expect("failed to read the image")
+        else {
+            panic!("expected 16-bit samples");
+        };
+        let unpacked: Vec<Normal> = read.into_iter().map(Normal::from_sample).collect();
+        assert_eq!(unpacked, samples);
     }
 
     #[test]

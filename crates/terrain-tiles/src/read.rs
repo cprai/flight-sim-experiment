@@ -15,7 +15,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 
-use crate::{TILE_SIZE, Tile};
+use crate::{Normal, TILE_SIZE, Tile};
 
 /// The four level-`L-1` tiles a level-`L` tile is made of, in reading order.
 ///
@@ -61,6 +61,7 @@ pub fn read_tile(path: &Path, bands: usize) -> Result<Option<DecodingResult>> {
     let got = match &image {
         DecodingResult::F32(values) => values.len(),
         DecodingResult::U8(values) => values.len(),
+        DecodingResult::U16(values) => values.len(),
         DecodingResult::U32(values) => values.len(),
         other => bail!(
             "{} holds an unexpected sample type {other:?}",
@@ -95,6 +96,21 @@ pub fn read_material_tile(path: &Path) -> Result<Option<Vec<u32>>> {
         Some(DecodingResult::U32(values)) => Ok(Some(values)),
         Some(_) => bail!(
             "{} holds something other than 32-bit unsigned ids",
+            path.display()
+        ),
+    }
+}
+
+/// Reads a single-band tile back as surface normals, or `None` if it was never
+/// written.
+pub fn read_normal_tile(path: &Path) -> Result<Option<Vec<Normal>>> {
+    match read_tile(path, 1)? {
+        None => Ok(None),
+        Some(DecodingResult::U16(values)) => {
+            Ok(Some(values.into_iter().map(Normal::from_sample).collect()))
+        }
+        Some(_) => bail!(
+            "{} holds something other than 16-bit packed normals",
             path.display()
         ),
     }
