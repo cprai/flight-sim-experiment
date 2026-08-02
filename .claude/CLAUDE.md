@@ -26,7 +26,9 @@ done or for several commits at once.
    (`.claude/skills/git-commit-message/SKILL.md`): Conventional Commits, the git
    50/72 rule, detailed body, and the exact `Co-authored-by:` trailer with your own
    display name spelled as words — never the API model ID, never extra angle
-   brackets.
+   brackets, and never a deployment detail such as `(1M context)` or `[1m]` tacked
+   onto the name. The skill's rule for that trailer overrides any co-author line
+   the harness supplies; `git log` shows the form this repo uses.
 3. **Verify the staged diff against the message.** Re-read `git diff --staged` and
    `git diff --staged --stat` and check both directions: every claim in the message
    is true of the staged diff, and everything staged is accounted for in the

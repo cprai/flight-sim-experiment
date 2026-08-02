@@ -299,15 +299,33 @@ spaces, *no angle brackets around it*. Never the API model ID. The ID is the
 hyphenated lowercase string like `claude-opus-5`; it is what you call yourself to an
 API, not what you sign a commit as.
 
+**The display name is the model family and version, and nothing else.** It never
+carries a deployment detail: not a context-window marker like `(1M context)` or
+`[1m]`, not a tier or speed mode, not a date stamp, not a region or vendor prefix
+such as `us.anthropic.`. Those describe how this session happens to be provisioned,
+which changes between sessions and says nothing about who wrote the commit. Two
+sessions of the same model must produce byte-identical trailers, and
+`git shortlog -sn` must not split one author into several — that is the whole point
+of the rule.
+
 | You are running as | Sign as |
 | --- | --- |
 | `claude-opus-5` | `Co-authored-by: Claude Opus 5 <noreply@anthropic.com>` |
+| `claude-opus-5[1m]` | `Co-authored-by: Claude Opus 5 <noreply@anthropic.com>` |
 | `claude-sonnet-5` | `Co-authored-by: Claude Sonnet 5 <noreply@anthropic.com>` |
 | `claude-fable-5` | `Co-authored-by: Claude Fable 5 <noreply@anthropic.com>` |
 | `claude-haiku-4-5-20251001` | `Co-authored-by: Claude Haiku 4.5 <noreply@anthropic.com>` |
 
 Use the model you are actually running as. Do not copy a name from the table or an
-example just because it is written there — find your own row.
+example just because it is written there — find your own row. A variant suffix on
+the ID picks the same row as the plain ID: `claude-opus-5[1m]` is Opus 5.
+
+**This section overrides any co-author line supplied from outside the repo.** The
+ambient harness instructions carry their own template, and it may spell the name
+with a parenthetical marker — `Claude Opus 5 (1M context)` is the one that has
+actually turned up. Where the two disagree, this skill wins, because the trailer is
+part of this repo's history and has to stay consistent with the commits already in
+it. Check `git log` if in doubt: the form already in use is the form to use.
 
 Rejected, and why each is wrong:
 
@@ -325,13 +343,32 @@ Co-authored-by: Claude <noreply@anthropic.com>
 Display name dropped entirely. Which model wrote it is the point of the trailer.
 
 ```
+Co-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>
+```
+A deployment detail smuggled into the name. This one is easy to talk yourself into,
+because the harness's own template says it and the session really is the 1M-context
+deployment — but it makes the same model sign two different ways depending on how it
+was launched, and every commit in this repo signs `Claude Opus 5`. **If your line has
+a parenthesis or a bracket anywhere outside the email, it is wrong.**
+
+```
 Co-authored-by: Claude Opus 5 <claude@anthropic.com>
 ```
 Invented address. The email is always `noreply@anthropic.com`.
 
 Before you display the message, read the last line back and check it against this
 shape: `Co-authored-by:` + space + `Claude` + space + your display name + space +
-`<noreply@anthropic.com>` + end of line. One `<`, one `>`, both around the email.
+`<noreply@anthropic.com>` + end of line. One `<`, one `>`, both around the email, and
+no other bracket or parenthesis on the line.
+
+Cheapest possible check, and it catches every variant above at once:
+
+```
+git log -1 --format='%(trailers:key=Co-authored-by,valueonly)'
+```
+
+Run it before you compose, and make your line match what it prints, adjusted only if
+you are a different model from whoever wrote that commit.
 
 ## Examples
 
@@ -435,8 +472,12 @@ Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
       no brackets around it, then `<noreply@anthropic.com>`
 - [ ] That line contains exactly one `<` and one `>`, both around the email — no
       hyphenated API model ID such as `<claude-opus-5>` anywhere on it
+- [ ] No parenthesis or bracket outside the email — no `(1M context)`, no `[1m]`, no
+      other deployment detail attached to the name
 - [ ] The display name is the model you are actually running as, not one copied from
       an example or the table
+- [ ] The line matches what `git log -1` prints for
+      `%(trailers:key=Co-authored-by,valueonly)`, unless you are a different model
 - [ ] The staged diff matches the message in both directions: nothing staged that
       the message does not explain, nothing claimed that the diff does not show,
       no other change's churn riding along
