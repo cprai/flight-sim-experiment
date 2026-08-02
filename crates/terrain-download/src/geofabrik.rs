@@ -90,8 +90,12 @@ struct Urls {
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum Geometry {
-    Polygon { coordinates: Vec<Vec<Vec<f64>>> },
-    MultiPolygon { coordinates: Vec<Vec<Vec<Vec<f64>>>> },
+    Polygon {
+        coordinates: Vec<Vec<Vec<f64>>>,
+    },
+    MultiPolygon {
+        coordinates: Vec<Vec<Vec<Vec<f64>>>>,
+    },
 }
 
 fn ring(positions: Vec<Vec<f64>>) -> Vec<(f64, f64)> {
@@ -107,21 +111,16 @@ fn polygon(mut rings: Vec<Vec<Vec<f64>>>) -> Option<Polygon> {
     }
     let exterior = ring(rings.remove(0));
     let holes = rings.into_iter().map(ring).collect();
-    Some(Polygon {
-        exterior,
-        holes,
-    })
+    Some(Polygon { exterior, holes })
 }
 
 impl From<Feature> for Region {
     fn from(feature: Feature) -> Self {
         let polygons = match feature.geometry {
-            Geometry::Polygon {
-                coordinates,
-            } => polygon(coordinates).into_iter().collect(),
-            Geometry::MultiPolygon {
-                coordinates,
-            } => coordinates.into_iter().filter_map(polygon).collect(),
+            Geometry::Polygon { coordinates } => polygon(coordinates).into_iter().collect(),
+            Geometry::MultiPolygon { coordinates } => {
+                coordinates.into_iter().filter_map(polygon).collect()
+            }
         };
         Self {
             id: feature.properties.id,
@@ -224,8 +223,7 @@ fn ring_contains(ring: &[(f64, f64)], longitude: f64, latitude: f64) -> bool {
     };
     for &(x, y) in ring {
         let (px, py) = previous;
-        if (y > latitude) != (py > latitude)
-            && longitude < (px - x) * (latitude - y) / (py - y) + x
+        if (y > latitude) != (py > latitude) && longitude < (px - x) * (latitude - y) / (py - y) + x
         {
             inside = !inside;
         }
@@ -555,12 +553,7 @@ pub async fn download(client: &reqwest::Client, probe: &Probe, target: &Path) ->
 /// One request: ask for everything past `offset` and stream it to disk.
 /// Returns cleanly when the body ends, however short; the caller measures the
 /// file to see what that meant.
-async fn attempt(
-    client: &reqwest::Client,
-    probe: &Probe,
-    part: &Path,
-    offset: u64,
-) -> Result<()> {
+async fn attempt(client: &reqwest::Client, probe: &Probe, part: &Path, offset: u64) -> Result<()> {
     let mut request = client.get(&probe.url);
     if offset > 0 {
         request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
@@ -825,14 +818,27 @@ mod tests {
             ..region("split", None, true, Vec::new())
         };
         assert!(split.contains_point(5.5, 5.5));
-        assert!(!split.contains_point(3.0, 3.0), "between the parts is outside");
+        assert!(
+            !split.contains_point(3.0, 3.0),
+            "between the parts is outside"
+        );
     }
 
     fn fixture() -> Vec<Region> {
         vec![
             region("continent", None, true, square(0.0, 0.0, 100.0, 100.0)),
-            region("country", Some("continent"), true, square(10.0, 10.0, 60.0, 60.0)),
-            region("province", Some("country"), true, square(20.0, 20.0, 40.0, 40.0)),
+            region(
+                "country",
+                Some("continent"),
+                true,
+                square(10.0, 10.0, 60.0, 60.0),
+            ),
+            region(
+                "province",
+                Some("country"),
+                true,
+                square(20.0, 20.0, 40.0, 40.0),
+            ),
         ]
     }
 
@@ -933,16 +939,34 @@ mod tests {
             last_modified: None,
         };
 
-        let same = probe("https://example.test/bc-260731.osm.pbf", Some("\"abc\""), 100);
+        let same = probe(
+            "https://example.test/bc-260731.osm.pbf",
+            Some("\"abc\""),
+            100,
+        );
         assert!(part_matches(&meta, &same));
 
-        let republished = probe("https://example.test/bc-260801.osm.pbf", Some("\"abc\""), 100);
-        assert!(!part_matches(&meta, &republished), "a new date is a new file");
+        let republished = probe(
+            "https://example.test/bc-260801.osm.pbf",
+            Some("\"abc\""),
+            100,
+        );
+        assert!(
+            !part_matches(&meta, &republished),
+            "a new date is a new file"
+        );
 
-        let mutated = probe("https://example.test/bc-260731.osm.pbf", Some("\"xyz\""), 100);
+        let mutated = probe(
+            "https://example.test/bc-260731.osm.pbf",
+            Some("\"xyz\""),
+            100,
+        );
         assert!(!part_matches(&meta, &mutated), "same name, different bytes");
 
         let unstamped = probe("https://example.test/bc-260731.osm.pbf", None, 100);
-        assert!(part_matches(&meta, &unstamped), "a missing etag is not a mismatch");
+        assert!(
+            part_matches(&meta, &unstamped),
+            "a missing etag is not a mismatch"
+        );
     }
 }

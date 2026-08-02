@@ -46,7 +46,12 @@ impl Polygon {
         if rings.is_empty() {
             return None;
         }
-        let mut bbox = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        let mut bbox = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
         let mut area = 0.0;
         for ring in &rings {
             for &(x, y) in ring {
@@ -201,8 +206,12 @@ pub fn strokes(extract: &Extract) -> Vec<Stroke> {
         let mut run: Vec<(f64, f64)> = Vec::new();
         let mut flush = |run: &mut Vec<(f64, f64)>| {
             if run.len() >= 2 {
-                let mut bbox =
-                    [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+                let mut bbox = [
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ];
                 for &(x, y) in run.iter() {
                     bbox[0] = bbox[0].min(x);
                     bbox[1] = bbox[1].min(y);
@@ -238,9 +247,9 @@ pub fn polygons(extract: &Extract) -> Vec<Polygon> {
     let mut dropped_polygons = 0u64;
 
     for area in &extract.areas {
-        match resolve(&area.refs, &extract.nodes).and_then(|ring| {
-            Polygon::new(area.material, vec![ring])
-        }) {
+        match resolve(&area.refs, &extract.nodes)
+            .and_then(|ring| Polygon::new(area.material, vec![ring]))
+        {
             Some(polygon) => out.push(polygon),
             None => dropped_polygons += 1,
         }
@@ -368,7 +377,13 @@ mod tests {
 
     #[test]
     fn a_polygons_bbox_and_area_span_all_its_rings() {
-        let outer = vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)];
+        let outer = vec![
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (0.0, 10.0),
+            (0.0, 0.0),
+        ];
         let hole = vec![(2.0, 2.0), (4.0, 2.0), (4.0, 4.0), (2.0, 4.0), (2.0, 2.0)];
         let polygon =
             Polygon::new(Material::Lake, vec![outer, hole]).expect("two rings is a polygon");
@@ -426,10 +441,7 @@ mod tests {
             island_relations: Vec::new(),
             coastlines: Vec::new(),
             members: std::collections::HashMap::new(),
-            nodes: Nodes::for_tests(
-                vec![1, 2, 3],
-                vec![(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)],
-            ),
+            nodes: Nodes::for_tests(vec![1, 2, 3], vec![(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)]),
         };
         let polygons = polygons(&extract);
         assert_eq!(polygons.len(), 1);

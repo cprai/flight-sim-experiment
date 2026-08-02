@@ -250,10 +250,8 @@ fn leisure(value: &str, tags: &[(&str, &str)]) -> Option<Material> {
 
 fn pitch(tags: &[(&str, &str)]) -> Material {
     match get(tags, "surface").unwrap_or("") {
-        "artificial_turf" | "tartan" | "acrylic" | "asphalt" | "concrete" | "hard"
-        | "rubber" | "clay" | "metal_grid" | "paved" | "paving_stones" | "wood" => {
-            Material::PitchArtificial
-        }
+        "artificial_turf" | "tartan" | "acrylic" | "asphalt" | "concrete" | "hard" | "rubber"
+        | "clay" | "metal_grid" | "paved" | "paving_stones" | "wood" => Material::PitchArtificial,
         _ => Material::PitchGrass,
     }
 }
@@ -294,8 +292,19 @@ pub fn carriageway(tags: &[(&str, &str)]) -> Option<(Material, f64)> {
     // Surfaces that make a nominally paved class dirt, and vice versa.
     let unpaved = matches!(
         get(tags, "surface").unwrap_or(""),
-        "unpaved" | "gravel" | "fine_gravel" | "compacted" | "dirt" | "earth" | "ground"
-            | "grass" | "sand" | "mud" | "woodchips" | "pebblestone" | "rock"
+        "unpaved"
+            | "gravel"
+            | "fine_gravel"
+            | "compacted"
+            | "dirt"
+            | "earth"
+            | "ground"
+            | "grass"
+            | "sand"
+            | "mud"
+            | "woodchips"
+            | "pebblestone"
+            | "rock"
     );
     let surfaced = |width: f64| {
         Some(if unpaved {
@@ -314,9 +323,7 @@ pub fn carriageway(tags: &[(&str, &str)]) -> Option<(Material, f64)> {
             "tertiary" => surfaced(9.0),
             "motorway_link" | "trunk_link" | "primary_link" | "secondary_link"
             | "tertiary_link" => surfaced(7.0),
-            "residential" | "unclassified" | "living_street" | "busway" | "road" => {
-                surfaced(7.0)
-            }
+            "residential" | "unclassified" | "living_street" | "busway" | "road" => surfaced(7.0),
             "service" => surfaced(4.0),
             "pedestrian" => surfaced(5.0),
             "cycleway" => surfaced(2.5),
@@ -377,13 +384,13 @@ pub fn precedence(material: Material) -> u8 {
         Null | Ocean => 0,
         Residential | Commercial | Retail | Industrial | Institutional | Religious | Railway
         | Military | Brownfield | Greenfield | Farmland | Park | RecreationGround => 1,
-        ForestNeedleleaved | ForestBroadleaved | ForestMixed | ForestUnknown | Clearcut
-        | Scrub | Shrubbery | Heath | Grassland | Grass | Meadow | Fell | Orchard | Vineyard
+        ForestNeedleleaved | ForestBroadleaved | ForestMixed | ForestUnknown | Clearcut | Scrub
+        | Shrubbery | Heath | Grassland | Grass | Meadow | Fell | Orchard | Vineyard
         | Allotments | PlantNursery | Greenhouses | Farmyard | Garden | VillageGreen => 2,
         BareRock | Scree | Shingle | Sand | Beach | Glacier | BareEarth | Mud | Quarry
         | Landfill | Construction | Cemetery | FlowerBed | GolfFairway | GolfGreen | GolfTee
-        | GolfBunker | GolfRough | PitchGrass | PitchArtificial | Playground | DogPark
-        | Paved | Building => 3,
+        | GolfBunker | GolfRough | PitchGrass | PitchArtificial | Playground | DogPark | Paved
+        | Building => 3,
         Marsh | Swamp | Bog | Fen | TidalFlat | SaltMarsh | WetMeadow | Reedbed
         | WetlandUnknown => 4,
         Lake | Pond | River | Stream | Reservoir | Basin | Canal | Lagoon | WaterUnknown => 5,
@@ -518,26 +525,57 @@ mod tests {
     #[test]
     fn carriageways_stroke_by_class_and_surface() {
         let paved = |tags: &[(&str, &str)]| carriageway(tags);
-        assert_eq!(paved(&[("highway", "motorway")]), Some((Material::Paved, 22.0)));
-        assert_eq!(paved(&[("highway", "residential")]), Some((Material::Paved, 7.0)));
-        assert_eq!(paved(&[("highway", "track")]), Some((Material::BareEarth, 3.5)));
+        assert_eq!(
+            paved(&[("highway", "motorway")]),
+            Some((Material::Paved, 22.0))
+        );
+        assert_eq!(
+            paved(&[("highway", "residential")]),
+            Some((Material::Paved, 7.0))
+        );
+        assert_eq!(
+            paved(&[("highway", "track")]),
+            Some((Material::BareEarth, 3.5))
+        );
         assert_eq!(
             paved(&[("highway", "footway"), ("surface", "gravel")]),
             Some((Material::BareEarth, 2.0))
         );
-        assert_eq!(paved(&[("railway", "rail")]), Some((Material::Railway, 6.0)));
-        assert_eq!(paved(&[("aeroway", "runway")]), Some((Material::Paved, 45.0)));
-        assert_eq!(paved(&[("highway", "bus_stop")]), None, "a point dressed as a way");
+        assert_eq!(
+            paved(&[("railway", "rail")]),
+            Some((Material::Railway, 6.0))
+        );
+        assert_eq!(
+            paved(&[("aeroway", "runway")]),
+            Some((Material::Paved, 45.0))
+        );
+        assert_eq!(
+            paved(&[("highway", "bus_stop")]),
+            None,
+            "a point dressed as a way"
+        );
     }
 
     /// The ground under a bridge is the ravine, the ground over a tunnel is
     /// the hill, and an `area=yes` way is a polygon for [`classify`].
     #[test]
     fn bridges_tunnels_and_areas_do_not_stroke() {
-        assert_eq!(carriageway(&[("highway", "primary"), ("bridge", "yes")]), None);
-        assert_eq!(carriageway(&[("highway", "primary"), ("tunnel", "yes")]), None);
-        assert_eq!(carriageway(&[("railway", "subway"), ("tunnel", "yes")]), None);
-        assert_eq!(carriageway(&[("highway", "pedestrian"), ("area", "yes")]), None);
+        assert_eq!(
+            carriageway(&[("highway", "primary"), ("bridge", "yes")]),
+            None
+        );
+        assert_eq!(
+            carriageway(&[("highway", "primary"), ("tunnel", "yes")]),
+            None
+        );
+        assert_eq!(
+            carriageway(&[("railway", "subway"), ("tunnel", "yes")]),
+            None
+        );
+        assert_eq!(
+            carriageway(&[("highway", "pedestrian"), ("area", "yes")]),
+            None
+        );
     }
 
     #[test]

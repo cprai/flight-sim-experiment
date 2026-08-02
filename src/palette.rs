@@ -141,8 +141,14 @@ pub(crate) fn flat_colour(material: Material) -> [u8; 3] {
 /// id from a newer enum than this binary -- or a corrupt texel -- draws as
 /// missing data rather than as whatever the neighbouring slot holds.
 pub fn build() -> Vec<[f32; 4]> {
-    let linearise =
-        |colour: [u8; 3]| [srgb_to_linear(colour[0]), srgb_to_linear(colour[1]), srgb_to_linear(colour[2]), 1.0];
+    let linearise = |colour: [u8; 3]| {
+        [
+            srgb_to_linear(colour[0]),
+            srgb_to_linear(colour[1]),
+            srgb_to_linear(colour[2]),
+            1.0,
+        ]
+    };
     let mut table = vec![linearise(MAGENTA); PALETTE_SIZE];
     for &material in Material::ALL {
         table[material.id() as usize] = linearise(flat_colour(material));
@@ -171,7 +177,12 @@ mod tests {
     #[test]
     fn null_and_unassigned_ids_are_magenta() {
         let table = build();
-        let magenta = [srgb_to_linear(255), srgb_to_linear(0), srgb_to_linear(255), 1.0];
+        let magenta = [
+            srgb_to_linear(255),
+            srgb_to_linear(0),
+            srgb_to_linear(255),
+            1.0,
+        ];
         assert_eq!(table[0], magenta, "Null");
         assert_eq!(table[0x0109], magenta, "an id inside the water block gap");
         assert_eq!(table[0x08ff], magenta, "the last slot");
@@ -200,7 +211,11 @@ mod tests {
     #[test]
     fn no_material_wears_the_skys_exact_colour() {
         use terrain_tiles::linear_to_srgb;
-        let sky = [linear_to_srgb(0.30), linear_to_srgb(0.55), linear_to_srgb(0.85)];
+        let sky = [
+            linear_to_srgb(0.30),
+            linear_to_srgb(0.55),
+            linear_to_srgb(0.85),
+        ];
         for &material in Material::ALL {
             assert_ne!(flat_colour(material), sky, "{material:?}");
         }

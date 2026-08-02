@@ -59,7 +59,10 @@ pub fn build(input: &Path, output: &Path, reference: &Manifest) -> Result<()> {
 
     let osm_dir = input.join("osm");
     let record = read::SourceRecord::read(&osm_dir)?;
-    log::info!("building {MATERIAL_PRODUCT} from the {} extract", record.region);
+    log::info!(
+        "building {MATERIAL_PRODUCT} from the {} extract",
+        record.region
+    );
     let mut extract = read::read_extract(&osm_dir.join(&record.file))?;
     extract.nodes.project()?;
 
@@ -108,10 +111,7 @@ fn log_histogram(manifest: &Manifest, root: &Path) -> Result<()> {
         .filter(|&(&id, _)| id != 0)
         .map(|(_, &count)| count)
         .sum();
-    let mut sorted: Vec<(u32, u64)> = counts
-        .into_iter()
-        .filter(|&(id, _)| id != 0)
-        .collect();
+    let mut sorted: Vec<(u32, u64)> = counts.into_iter().filter(|&(id, _)| id != 0).collect();
     sorted.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
     let summary: Vec<String> = sorted
         .iter()

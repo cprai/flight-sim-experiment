@@ -128,9 +128,7 @@ pub fn fill(manifest: &Manifest, root: &Path) -> Result<(u64, u64)> {
             previous = Some((distance, nearest));
         }
     }
-    let mut spill = spill
-        .into_inner()
-        .context("flushing the fill spill file")?;
+    let mut spill = spill.into_inner().context("flushing the fill spill file")?;
 
     // Backward pass: south to north, east to west, finishing each row
     // against the row below and writing the filled tiles as bands complete.
@@ -381,7 +379,10 @@ mod tests {
         );
         fill(&manifest, &root).expect("failed to fill");
 
-        assert_eq!(texel(&root, &manifest, 110, 100), Material::ForestUnknown.id());
+        assert_eq!(
+            texel(&root, &manifest, 110, 100),
+            Material::ForestUnknown.id()
+        );
         assert_eq!(texel(&root, &manifest, 130, 100), Material::BareRock.id());
         assert_eq!(
             texel(&root, &manifest, 100, 130),

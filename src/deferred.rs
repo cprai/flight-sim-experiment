@@ -147,9 +147,15 @@ impl Shading {
                     },
                 ),
                 entry(1, texture(wgpu::TextureSampleType::Uint)),
-                entry(2, texture(wgpu::TextureSampleType::Float { filterable: false })),
+                entry(
+                    2,
+                    texture(wgpu::TextureSampleType::Float { filterable: false }),
+                ),
                 entry(3, texture(wgpu::TextureSampleType::Depth)),
-                entry(4, texture(wgpu::TextureSampleType::Float { filterable: false })),
+                entry(
+                    4,
+                    texture(wgpu::TextureSampleType::Float { filterable: false }),
+                ),
             ],
         });
         let bind_group = Self::bind(device, &layout, &palette, gbuffer);

@@ -51,8 +51,8 @@ impl SourceRecord {
     /// Reads the record out of the download's `osm` directory.
     pub fn read(osm_dir: &Path) -> Result<Self> {
         let path = osm_dir.join(RECORD_FILE);
-        let text =
-            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 }
@@ -164,7 +164,10 @@ pub fn read_extract(path: &Path) -> Result<Extract> {
                 let tags: Vec<(&str, &str)> = way.tags().collect();
                 // `refs()`, never `raw_refs()`: the raw slice is delta coded,
                 // and reading it as ids would scatter every vertex.
-                if tags.iter().any(|&(k, v)| k == "natural" && v == "coastline") {
+                if tags
+                    .iter()
+                    .any(|&(k, v)| k == "natural" && v == "coastline")
+                {
                     coastlines.push(way.refs().collect());
                     return;
                 }
@@ -203,7 +206,10 @@ pub fn read_extract(path: &Path) -> Result<Extract> {
             }
             Element::Relation(relation) => {
                 let tags: Vec<(&str, &str)> = relation.tags().collect();
-                if !tags.iter().any(|&(k, v)| k == "type" && v == "multipolygon") {
+                if !tags
+                    .iter()
+                    .any(|&(k, v)| k == "type" && v == "multipolygon")
+                {
                     return;
                 }
                 let classified = classify(&tags);

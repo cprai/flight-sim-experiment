@@ -83,7 +83,10 @@ impl Texel for MaterialId {
         let mut best = samples[0];
         let mut best_count = 0;
         for &candidate in samples {
-            let count = samples.iter().filter(|&&sample| sample == candidate).count();
+            let count = samples
+                .iter()
+                .filter(|&&sample| sample == candidate)
+                .count();
             if count > best_count || (count == best_count && candidate.0 < best.0) {
                 best = candidate;
                 best_count = count;
@@ -672,7 +675,10 @@ mod tests {
     fn the_material_fold_picks_the_commonest_id() {
         let lake = MaterialId(0x0101);
         let forest = MaterialId(0x03ff);
-        assert_eq!(MaterialId::box_filter(&[forest, lake, forest, forest]), forest);
+        assert_eq!(
+            MaterialId::box_filter(&[forest, lake, forest, forest]),
+            forest
+        );
         assert_eq!(MaterialId::box_filter(&[lake]), lake);
     }
 

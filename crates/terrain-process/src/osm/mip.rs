@@ -28,9 +28,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
+use terrain_materials::Material;
 use terrain_tiles::read::read_material_tile;
 use terrain_tiles::write::{TilePlacement, write_material_tile};
-use terrain_materials::Material;
 use terrain_tiles::{MATERIAL_BASE_LEVEL, Manifest, TILE_SIZE, Tile};
 
 use super::classify::precedence;
@@ -93,9 +93,8 @@ pub fn build_levels(manifest: &Manifest, root: &Path) -> Result<u64> {
         let (first, across, down) = tile_range(manifest, level);
         let tiles: Vec<Tile> = (0..down)
             .flat_map(|row| {
-                (0..across).map(move |column| {
-                    Tile::new(first.x + column as i32, first.y + row as i32)
-                })
+                (0..across)
+                    .map(move |column| Tile::new(first.x + column as i32, first.y + row as i32))
             })
             .collect();
         let total = tiles.len() as u64;
@@ -145,10 +144,7 @@ fn build_tile(
     let mut counts = vec![0u16; (TILE_SIZE as usize).pow(2) * materials];
 
     // The base tiles under this tile: indices double per level of descent.
-    let base_first = (
-        i64::from(tile.x) << shift,
-        i64::from(tile.y) << shift,
-    );
+    let base_first = (i64::from(tile.x) << shift, i64::from(tile.y) << shift);
     let mut any = false;
     for base_y in 0..1i64 << shift {
         for base_x in 0..1i64 << shift {
@@ -250,10 +246,8 @@ mod tests {
     }
 
     fn temp_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "terrain-process-mip-{}-{name}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("terrain-process-mip-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         root
     }
@@ -298,7 +292,11 @@ mod tests {
         write_base(&root, &manifest, |x, y| {
             if y % 4 < 2 {
                 // Three Lake and one Forest per 2 x 2.
-                if x % 2 == 1 && y % 2 == 1 { forest } else { lake }
+                if x % 2 == 1 && y % 2 == 1 {
+                    forest
+                } else {
+                    lake
+                }
             } else {
                 forest
             }
@@ -326,7 +324,11 @@ mod tests {
         let manifest = manifest();
         let root = temp_root("null");
         let lake = Material::Lake.id();
-        write_base(&root, &manifest, |x, y| if x == 0 && y == 0 { lake } else { 0 });
+        write_base(
+            &root,
+            &manifest,
+            |x, y| if x == 0 && y == 0 { lake } else { 0 },
+        );
         build_levels(&manifest, &root).expect("failed to build");
 
         let level4 = read_level(&root, &manifest, 4);
@@ -343,7 +345,11 @@ mod tests {
         let root = temp_root("ties");
         let lake = Material::Lake.id();
         let grass = Material::Grass.id();
-        write_base(&root, &manifest, |x, _| if x % 2 == 0 { grass } else { lake });
+        write_base(
+            &root,
+            &manifest,
+            |x, _| if x % 2 == 0 { grass } else { lake },
+        );
         build_levels(&manifest, &root).expect("failed to build");
 
         let level3 = read_level(&root, &manifest, 3);

@@ -211,8 +211,8 @@ fn paint_polygon(polygon: &Polygon, at: &Band, cells: &mut [u32], crossings: &mu
                 // Rows whose centre northing sits in `low <= y < high`. Row
                 // centres run south as rows grow, so `high` bounds the first
                 // row and `low` the last.
-                let first_row = (((north - high) / metres - 0.5).floor() as i64 + 1)
-                    .max(i64::from(rows_start));
+                let first_row =
+                    (((north - high) / metres - 0.5).floor() as i64 + 1).max(i64::from(rows_start));
                 let last_row = (((north - low) / metres - 0.5).floor() as i64)
                     .min(i64::from(rows_start + rows) - 1);
                 for row in first_row..=last_row {
@@ -237,8 +237,8 @@ fn paint_polygon(polygon: &Polygon, at: &Band, cells: &mut [u32], crossings: &mu
             for span in crossings[cursor..end].chunks_exact(2) {
                 // Both ends clamp to the raster: a span can lie entirely
                 // outside it, and an unclamped start walks off the buffer.
-                let from = (((span[0].1 - west) / metres - 0.5).ceil() as i64)
-                    .clamp(0, i64::from(width));
+                let from =
+                    (((span[0].1 - west) / metres - 0.5).ceil() as i64).clamp(0, i64::from(width));
                 let to = (((span[1].1 - west) / metres - 0.5).ceil() as i64)
                     .clamp(from, i64::from(width));
                 let line = row as usize * width as usize;
@@ -284,8 +284,8 @@ fn paint_stroke(stroke: &Stroke, at: &Band, cells: &mut [u32]) {
 
         // Rows whose centre northing the capsule can reach.
         let (low, high) = (y1.min(y2) - radius, y1.max(y2) + radius);
-        let first_row = (((north - high) / metres - 0.5).ceil() as i64)
-            .max(i64::from(at.rows_start));
+        let first_row =
+            (((north - high) / metres - 0.5).ceil() as i64).max(i64::from(at.rows_start));
         let last_row = (((north - low) / metres - 0.5).floor() as i64)
             .min(i64::from(at.rows_start + at.rows) - 1);
         for row in first_row..=last_row {
@@ -323,8 +323,7 @@ fn paint_stroke(stroke: &Stroke, at: &Band, cells: &mut [u32]) {
             }
 
             let Some((lo, hi)) = span else { continue };
-            let from = (((lo - west) / metres - 0.5).ceil() as i64)
-                .clamp(0, i64::from(at.width));
+            let from = (((lo - west) / metres - 0.5).ceil() as i64).clamp(0, i64::from(at.width));
             let to = ((((hi - west) / metres - 0.5).floor() + 1.0) as i64)
                 .clamp(from, i64::from(at.width));
             let line = (row - i64::from(at.rows_start)) as usize * at.width as usize;
@@ -385,9 +384,9 @@ fn write_band(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use terrain_tiles::read::read_material_tile;
     use terrain_materials::Material;
     use terrain_tiles::TileGrid;
+    use terrain_tiles::read::read_material_tile;
 
     /// Two tiles across, one down, at level 2: 1024 x 512 texels of 4 m.
     fn manifest() -> Manifest {
@@ -443,11 +442,8 @@ mod tests {
         let manifest = manifest();
         let root = temp_root("centres");
         // Covers x in [0, 40), y in [-8, 0): columns 0..10, rows 0..2.
-        let polygon = Polygon::new(
-            Material::Lake,
-            vec![rectangle(0.0, -8.0, 40.0, 0.0)],
-        )
-        .expect("a ring");
+        let polygon =
+            Polygon::new(Material::Lake, vec![rectangle(0.0, -8.0, 40.0, 0.0)]).expect("a ring");
         let written = rasterize(&[polygon], &[], &manifest, &root).expect("failed to paint");
         assert_eq!(written, 1, "one tile holds paint");
 
@@ -469,8 +465,11 @@ mod tests {
             vec![rectangle(0.0, -400.0, 400.0, 0.0)],
         )
         .expect("a ring");
-        let lake = Polygon::new(Material::Lake, vec![rectangle(100.0, -300.0, 300.0, -100.0)])
-            .expect("a ring");
+        let lake = Polygon::new(
+            Material::Lake,
+            vec![rectangle(100.0, -300.0, 300.0, -100.0)],
+        )
+        .expect("a ring");
         // Deliberately hand the lake over first.
         rasterize(&[lake, forest], &[], &manifest, &root).expect("failed to paint");
 
@@ -490,8 +489,11 @@ mod tests {
             vec![rectangle(0.0, -400.0, 400.0, 0.0)],
         )
         .expect("a ring");
-        let clearing = Polygon::new(Material::Grass, vec![rectangle(100.0, -300.0, 300.0, -100.0)])
-            .expect("a ring");
+        let clearing = Polygon::new(
+            Material::Grass,
+            vec![rectangle(100.0, -300.0, 300.0, -100.0)],
+        )
+        .expect("a ring");
         rasterize(&[wood, clearing], &[], &manifest, &root).expect("failed to paint");
 
         assert_eq!(texel(&root, &manifest, 1, 1), Material::ForestUnknown.id());
@@ -547,15 +549,43 @@ mod tests {
         };
         rasterize(&[], &[stroke], &manifest, &root).expect("failed to paint");
 
-        assert_eq!(texel(&root, &manifest, 37, 24), Material::Paved.id(), "on the line");
-        assert_eq!(texel(&root, &manifest, 37, 23), Material::Paved.id(), "6 m north");
-        assert_eq!(texel(&root, &manifest, 37, 26), Material::Paved.id(), "6 m south");
-        assert_eq!(texel(&root, &manifest, 37, 22), 0, "10 m north is past the edge");
-        assert_eq!(texel(&root, &manifest, 37, 27), 0, "10 m south is past the edge");
+        assert_eq!(
+            texel(&root, &manifest, 37, 24),
+            Material::Paved.id(),
+            "on the line"
+        );
+        assert_eq!(
+            texel(&root, &manifest, 37, 23),
+            Material::Paved.id(),
+            "6 m north"
+        );
+        assert_eq!(
+            texel(&root, &manifest, 37, 26),
+            Material::Paved.id(),
+            "6 m south"
+        );
+        assert_eq!(
+            texel(&root, &manifest, 37, 22),
+            0,
+            "10 m north is past the edge"
+        );
+        assert_eq!(
+            texel(&root, &manifest, 37, 27),
+            0,
+            "10 m south is past the edge"
+        );
         // The cap disc rounds the end: the centreline reach is x in
         // [92, 208], and column centres run 4c + 2.
-        assert_eq!(texel(&root, &manifest, 23, 24), Material::Paved.id(), "west cap");
-        assert_eq!(texel(&root, &manifest, 51, 24), Material::Paved.id(), "east cap");
+        assert_eq!(
+            texel(&root, &manifest, 23, 24),
+            Material::Paved.id(),
+            "west cap"
+        );
+        assert_eq!(
+            texel(&root, &manifest, 51, 24),
+            Material::Paved.id(),
+            "east cap"
+        );
         assert_eq!(texel(&root, &manifest, 22, 24), 0, "beyond the west cap");
         assert_eq!(texel(&root, &manifest, 52, 24), 0, "beyond the east cap");
         let _ = std::fs::remove_dir_all(&root);
@@ -577,9 +607,21 @@ mod tests {
         };
         rasterize(&[river], &[road], &manifest, &root).expect("failed to paint");
 
-        assert_eq!(texel(&root, &manifest, 30, 24), Material::Paved.id(), "west of the river");
-        assert_eq!(texel(&root, &manifest, 37, 24), Material::River.id(), "the crossing");
-        assert_eq!(texel(&root, &manifest, 45, 24), Material::Paved.id(), "east of the river");
+        assert_eq!(
+            texel(&root, &manifest, 30, 24),
+            Material::Paved.id(),
+            "west of the river"
+        );
+        assert_eq!(
+            texel(&root, &manifest, 37, 24),
+            Material::River.id(),
+            "the crossing"
+        );
+        assert_eq!(
+            texel(&root, &manifest, 45, 24),
+            Material::Paved.id(),
+            "east of the river"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -588,8 +630,8 @@ mod tests {
     fn untouched_tiles_are_absent() {
         let manifest = manifest();
         let root = temp_root("absent");
-        let polygon = Polygon::new(Material::Lake, vec![rectangle(0.0, -40.0, 40.0, 0.0)])
-            .expect("a ring");
+        let polygon =
+            Polygon::new(Material::Lake, vec![rectangle(0.0, -40.0, 40.0, 0.0)]).expect("a ring");
         rasterize(&[polygon], &[], &manifest, &root).expect("failed to paint");
 
         let grid = manifest.grid();

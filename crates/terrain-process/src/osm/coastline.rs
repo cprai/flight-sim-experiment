@@ -269,9 +269,8 @@ pub fn ocean(extract: &Extract, rect: Rect) -> Option<Polygon> {
         }
         order.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-        let violation = (0..order.len()).find(|&pair| {
-            order[pair].2 == order[(pair + 1) % order.len()].2
-        });
+        let violation =
+            (0..order.len()).find(|&pair| order[pair].2 == order[(pair + 1) % order.len()].2);
         let Some(pair) = violation else {
             break;
         };
@@ -327,9 +326,7 @@ pub fn ocean(extract: &Extract, rect: Rect) -> Option<Polygon> {
             visited[current] = true;
             ring.extend_from_slice(&crossings[current].points);
             let following = next_entry[&current];
-            ring.extend(
-                rect.corners_between(crossings[current].exit, crossings[following].entry),
-            );
+            ring.extend(rect.corners_between(crossings[current].exit, crossings[following].entry));
             if following == start {
                 break;
             }
@@ -507,7 +504,10 @@ mod tests {
         assert_eq!(sea.material, Material::Ocean);
         assert_eq!(sea.rings.len(), 1);
         assert!(inside(&sea.rings, (5.0, 2.0)), "south of the coast is sea");
-        assert!(!inside(&sea.rings, (5.0, 8.0)), "north of the coast is land");
+        assert!(
+            !inside(&sea.rings, (5.0, 8.0)),
+            "north of the coast is land"
+        );
     }
 
     /// The same coast drawn the other way round encloses the north instead:
@@ -635,10 +635,8 @@ mod tests {
         let rect = rect();
         // From the middle of the west edge, clockwise past the north-west
         // and north-east corners to the middle of the east edge.
-        let passed = rect.corners_between(
-            rect.perimeter_t((0.0, 5.0)),
-            rect.perimeter_t((10.0, 5.0)),
-        );
+        let passed =
+            rect.corners_between(rect.perimeter_t((0.0, 5.0)), rect.perimeter_t((10.0, 5.0)));
         assert_eq!(passed, vec![(0.0, 10.0), (10.0, 10.0)]);
     }
 }

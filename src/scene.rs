@@ -540,11 +540,7 @@ mod tests {
                 residency,
                 placement(),
                 Sources {
-                    heights: Box::new(Pyramid::build(Level::new(
-                        RASTER,
-                        RASTER,
-                        heights.clone(),
-                    ))),
+                    heights: Box::new(Pyramid::build(Level::new(RASTER, RASTER, heights.clone()))),
                     materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
                     maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
                         RASTER,
@@ -1698,7 +1694,12 @@ mod tests {
         // and a fine window's worth of tile reads on fetching it.
         let (heights, materials) = rugged();
 
-        let (_, low) = render_probed(heights.clone(), materials.clone(), from_altitude(900.0), &[]);
+        let (_, low) = render_probed(
+            heights.clone(),
+            materials.clone(),
+            from_altitude(900.0),
+            &[],
+        );
         let (pixels, high) = render_probed(heights, materials, from_altitude(4000.0), &[]);
 
         assert_eq!(low, 0, "close to the ground every level is worth drawing");
