@@ -63,7 +63,7 @@ and a trap -- see below.
 
 ## Reading the log
 
-Every run prints, at `info`:
+Every run prints, at `info` on stderr:
 
 ```
 using adapter: AdapterInfo { ..., device_type: DiscreteGpu, backend: Vulkan, ... }
@@ -72,7 +72,12 @@ clipmap: 7 levels of 4096 texels, 1195 MiB of texture, reaching 114688 texels fr
 built the scene in 9.61ms
 camera at [0, 11782.164, 57344] facing Quat(...)
 filled the windows in 968.39ms
-rendered one frame in 34.15ms
+```
+
+and the frame time on stdout:
+
+```
+rendered one frame in 34.15 ms (29.3 fps)
 ```
 
 - **`device_type`** decides whether any timing below it is worth quoting. If it
@@ -82,7 +87,12 @@ rendered one frame in 34.15ms
 - **`filled the windows`** is disk: tile reads and pyramid reductions. It is
   routinely 20-40x the frame time and says nothing about the shaders. Do not
   report it as render cost.
-- **`rendered one frame`** is the draw plus the readback.
+- **`rendered one frame`** is the draw plus the readback. It is the one line on
+  stdout rather than in the log, because it is the measurement the run was asked
+  for and not a diagnostic -- it stands in for the counter the windowed app draws
+  in its corner. So `2>` does not capture it and `>` does. Read the fps beside it
+  as arithmetic on that one duration, not as a frame rate: a screenshot pays for
+  a readback and a buffer map that a presented frame does not, so it reads low.
 - **`camera at ...`** echoes where the view actually ended up, which is how you
   confirm `--camera` parsed the way you meant.
 

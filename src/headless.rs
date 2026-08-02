@@ -255,7 +255,12 @@ pub fn run(
 
     let started = std::time::Instant::now();
     let pixels = capture(&device, &queue, &scene, size)?;
-    log::info!("rendered one frame in {:.2?}", started.elapsed());
+    // To stdout, not to the log beside the timings above it. There is no window
+    // to draw the frame time over here, so this line is the whole of what the
+    // overlay would have shown, and a measurement that was asked for should
+    // come back on the output stream rather than mixed into the diagnostics.
+    let (ms, fps) = crate::hud::ms_and_fps(started.elapsed());
+    println!("rendered one frame in {ms:.2} ms ({fps:.1} fps)");
 
     write_png(output, size, &pixels)?;
     log::info!("wrote {}", output.display());
