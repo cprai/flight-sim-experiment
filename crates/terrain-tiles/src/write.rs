@@ -21,7 +21,7 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tiff::encoder::colortype::{Gray32Float, RGB8};
+use tiff::encoder::colortype::{Gray32, Gray32Float, RGB8};
 use tiff::encoder::{Compression, TiffEncoder};
 use tiff::tags::Tag;
 
@@ -217,6 +217,42 @@ pub fn write_colour_tile(path: &Path, placement: TilePlacement, samples: &[u8]) 
     Ok(())
 }
 
+/// Writes one material tile: a single band of 32-bit unsigned ids.
+///
+/// The ids are [`crate::Material`] discriminants, but the writer takes plain
+/// numbers: by the time a tile is being written the classification already
+/// happened, and refusing an id here could only turn a finished raster into
+/// an error after the expensive part is done.
+pub fn write_material_tile(path: &Path, placement: TilePlacement, samples: &[u32]) -> Result<()> {
+    let expected = expected_samples(1);
+    anyhow::ensure!(
+        samples.len() == expected,
+        "expected {expected} samples for a {TILE_SIZE} x {TILE_SIZE} tile, got {}",
+        samples.len()
+    );
+    prepare(path)?;
+
+    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut encoder = TiffEncoder::new(BufWriter::new(file))
+        .with_context(|| format!("starting {}", path.display()))?
+        .with_compression(Compression::Uncompressed);
+
+    let mut image = encoder
+        .new_image::<Gray32>(TILE_SIZE, TILE_SIZE)
+        .context("starting the image")?;
+    image
+        .rows_per_strip(ROWS_PER_STRIP)
+        .context("setting the strip height")?;
+
+    // Zero is `Material::Null`, ground no mapped area covers.
+    write_placement(&mut image, placement, Some(0.0))?;
+
+    image
+        .write_data(samples)
+        .with_context(|| format!("writing texels to {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -351,6 +387,27 @@ mod tests {
             decoder.read_image().expect("failed to read the image")
         else {
             panic!("expected bytes");
+        };
+        assert_eq!(read, samples);
+    }
+
+    #[test]
+    fn a_material_tile_round_trips() {
+        let samples: Vec<u32> = (0..expected_samples(1)).map(|i| (i as u32) * 7).collect();
+        let path = temp_path("material-round-trip");
+        write_material_tile(&path, placement(), &samples).expect("failed to write");
+        let bytes = std::fs::read(&path).expect("failed to read back");
+        let _ = std::fs::remove_dir_all(path.parent().and_then(|p| p.parent()).expect("no root"));
+
+        let mut decoder = Decoder::new(Cursor::new(bytes)).expect("failed to decode");
+        assert_eq!(
+            decoder.colortype().expect("no colour type"),
+            tiff::ColorType::Gray(32)
+        );
+        let tiff::decoder::DecodingResult::U32(read) =
+            decoder.read_image().expect("failed to read the image")
+        else {
+            panic!("expected 32-bit unsigned ids");
         };
         assert_eq!(read, samples);
     }

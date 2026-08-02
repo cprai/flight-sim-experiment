@@ -61,6 +61,7 @@ pub fn read_tile(path: &Path, bands: usize) -> Result<Option<DecodingResult>> {
     let got = match &image {
         DecodingResult::F32(values) => values.len(),
         DecodingResult::U8(values) => values.len(),
+        DecodingResult::U32(values) => values.len(),
         other => bail!(
             "{} holds an unexpected sample type {other:?}",
             path.display()
@@ -81,6 +82,19 @@ pub fn read_height_tile(path: &Path) -> Result<Option<Vec<f32>>> {
         Some(DecodingResult::F32(values)) => Ok(Some(values)),
         Some(_) => bail!(
             "{} holds something other than 32-bit floats",
+            path.display()
+        ),
+    }
+}
+
+/// Reads a single-band tile back as material ids, or `None` if it was never
+/// written.
+pub fn read_material_tile(path: &Path) -> Result<Option<Vec<u32>>> {
+    match read_tile(path, 1)? {
+        None => Ok(None),
+        Some(DecodingResult::U32(values)) => Ok(Some(values)),
+        Some(_) => bail!(
+            "{} holds something other than 32-bit unsigned ids",
             path.display()
         ),
     }

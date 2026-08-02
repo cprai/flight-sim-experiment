@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 
 pub mod manifest;
+pub mod material;
 pub mod maxima;
 #[cfg(feature = "project")]
 pub mod project;
@@ -31,10 +32,17 @@ pub mod read;
 pub mod texel;
 pub mod write;
 
-pub use manifest::{COLOUR_BASE_LEVEL, Manifest};
+pub use manifest::{COLOUR_BASE_LEVEL, MATERIAL_BASE_LEVEL, Manifest};
+pub use material::Material;
 pub use texel::{
     COLOUR_IS_SRGB_ENCODED, NODATA_BELOW, Srgb8, Texel, linear_to_srgb, srgb_to_linear,
 };
+
+/// What the ground-cover product's directory is called.
+///
+/// Named here for the same reason [`maxima_product`] is: the tool that writes
+/// it and the renderer that will open it must not spell it differently.
+pub const MATERIAL_PRODUCT: &str = "materials";
 
 /// What marks a product directory as a max pyramid rather than a measurement.
 pub const MAXIMA_SUFFIX: &str = "-max";

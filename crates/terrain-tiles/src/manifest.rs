@@ -26,6 +26,15 @@ pub const MANIFEST_NAME: &str = "manifest.json";
 /// manifests be compared for equality rather than for approximate agreement.
 pub const COLOUR_BASE_LEVEL: u32 = 4;
 
+/// Level at which ground-cover materials are stored.
+///
+/// Materials come from OpenStreetMap vector data, which has no resolution of
+/// its own, so this is a choice rather than a snap to a source. Level 2 --
+/// 4 m texels -- keeps the shoreline of a pond and the edge of a pitch
+/// legible while costing a quarter of what level 0 would, and the renderer
+/// serves finer requests by repeating texels, as it already does for colour.
+pub const MATERIAL_BASE_LEVEL: u32 = 2;
+
 /// Describes one product's tile tree.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Manifest {
