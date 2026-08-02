@@ -12,9 +12,11 @@
 //! maxima over the same ground on every launch. The ground does not change.
 //!
 //! The output is a complete tree: the source products copied across, plus a
-//! `<product>-max` pyramid for each elevation product. The renderer opens this
-//! directory and nothing else, so what it draws is one directory's worth of
-//! files rather than two trees that have to be kept in step.
+//! `<product>-max` pyramid for each elevation product, plus a `materials`
+//! pyramid of ground-cover ids built from the raw OpenStreetMap extract when
+//! the download carries one -- see `osm`. The renderer opens this directory
+//! and nothing else, so what it draws is one directory's worth of files
+//! rather than two trees that have to be kept in step.
 //!
 //! ```text
 //! terrain-download --output assets/download ...
@@ -23,6 +25,7 @@
 //! ```
 
 mod build;
+mod osm;
 mod tiles;
 
 use std::path::{Path, PathBuf};
@@ -30,7 +33,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
-use terrain_tiles::{MAXIMA_SUFFIX, Manifest, maxima_product};
+use terrain_tiles::{MATERIAL_PRODUCT, MAXIMA_SUFFIX, Manifest, maxima_product};
 
 use build::tile_range;
 
@@ -65,8 +68,16 @@ fn main() -> Result<()> {
 
     let arguments = Arguments::parse();
     let products = discover(&arguments.input, &arguments.product)?;
+    // Materials are built rather than copied: raw OpenStreetMap data under
+    // `osm/`, recognised by the record the downloader leaves there, becomes
+    // a product directory that does not exist under `--input` at all.
+    let wants = |name: &str| {
+        arguments.product.is_empty() || arguments.product.iter().any(|wanted| wanted == name)
+    };
+    let osm_record = arguments.input.join("osm").join(osm::read::RECORD_FILE);
+    let build_materials = osm_record.exists() && wants(MATERIAL_PRODUCT);
     anyhow::ensure!(
-        !products.is_empty(),
+        !products.is_empty() || build_materials,
         "{} holds no product directory with a {} in it",
         arguments.input.display(),
         terrain_tiles::manifest::MANIFEST_NAME
@@ -76,11 +87,22 @@ fn main() -> Result<()> {
         if !arguments.no_copy {
             copy_product(&arguments.input.join(name), &arguments.output.join(name))?;
         }
-        // Colour has nothing to bound. Only a single-band elevation product
-        // does, and a pyramid already reduced from one is not reduced again.
-        if manifest.bands == 1 && !name.ends_with(MAXIMA_SUFFIX) {
+        // Colour has nothing to bound, and neither do material ids. Only a
+        // single-band *elevation* product does, and a pyramid already
+        // reduced from one is not reduced again.
+        if manifest.bands == 1 && !name.ends_with(MAXIMA_SUFFIX) && name != MATERIAL_PRODUCT {
             build_maxima(&arguments.input, &arguments.output, name, manifest)?;
         }
+    }
+
+    if build_materials {
+        // The grid comes from whichever product is already there --
+        // unfiltered, so `--product materials` alone still finds one.
+        let (_, reference) = discover(&arguments.input, &[])?
+            .into_iter()
+            .next()
+            .context("materials need an existing product to take the grid from")?;
+        osm::build(&arguments.input, &arguments.output, &reference)?;
     }
     Ok(())
 }
