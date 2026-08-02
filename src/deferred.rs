@@ -9,10 +9,10 @@
 //! without the traversal being touched.
 //!
 //! For now the shading is one flat colour per material from
-//! [`crate::palette`]. The world-space position and the surface normal are
-//! written and bound but not yet read; they are the inputs every later shading
-//! feature starts from, so the plumbing is laid now while the pipeline is
-//! being shaped.
+//! [`crate::palette`], scaled by how squarely the surface normal faces a fixed
+//! sun. The world-space position is written and bound but not yet read; it is
+//! the input every shading feature that cares where a pixel is will start
+//! from, so the plumbing is laid now while the pipeline is being shaped.
 //!
 //! The three colour targets cost 4, 16 and 8 bytes a sample, and the alignment
 //! rule rounds each up to its own component size, so the pass sits at 28 of
@@ -62,10 +62,11 @@ pub struct GBuffer {
     pub depth: wgpu::TextureView,
     /// The normal target itself, rather than a view of it.
     ///
-    /// Nothing draws with the normals yet, so the only way to see whether the
-    /// march writes the right ones is to copy the buffer back and look, and a
-    /// copy needs the texture. The same reasoning as the `COPY_SRC` on the max
-    /// pyramid's texture: cheap enough to pay for always rather than build a
+    /// The shading only ever reduces a normal to one number, so a frame says
+    /// little about which normal the march wrote; the way to check that is to
+    /// copy the buffer back and read the vectors, and a copy needs the
+    /// texture. The same reasoning as the `COPY_SRC` on the max pyramid's
+    /// texture: cheap enough to pay for always rather than build a
     /// differently-shaped G-buffer under `cfg(test)`.
     #[allow(dead_code, reason = "read only by the G-buffer readback test")]
     pub normal_target: wgpu::Texture,

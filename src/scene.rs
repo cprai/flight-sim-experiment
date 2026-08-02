@@ -386,19 +386,47 @@ mod tests {
     /// An id inside the water block that no version of the enum has assigned.
     const UNASSIGNED: MaterialId = MaterialId(0x0109);
 
-    /// Missing data, as the shading pass paints it: pure magenta. Loose on
-    /// purpose, matching anything with strong red and blue and little green,
-    /// which no material's flat colour and no sky is allowed to have.
+    /// Missing data, as the shading pass paints it: magenta, at whatever
+    /// brightness the light left it. Loose on purpose, matching anything with
+    /// strong red and blue and little green, which no material's flat colour
+    /// and no sky is allowed to have.
     fn is_magenta([r, g, b, _]: [u8; 4]) -> bool {
         r > 100 && b > 100 && g < 80
     }
 
-    /// Whether a rendered pixel is the flat colour `material` shades as.
+    /// The two halves of the light, kept in step by hand with `AMBIENT` and
+    /// `SUNLIGHT` in `src/shading.wgsl`.
+    const AMBIENT: f32 = 0.35;
+    const SUNLIGHT: f32 = 0.65;
+
+    /// A flat colour as the shading pass paints it under `light`: linearise,
+    /// scale, re-encode, which is what the shader and the sRGB target between
+    /// them do.
+    fn shade(colour: [u8; 3], light: f32) -> [u8; 3] {
+        colour.map(|channel| {
+            terrain_tiles::linear_to_srgb(terrain_tiles::srgb_to_linear(channel) * light)
+        })
+    }
+
+    /// The same, on ground facing straight up -- which every fixture below
+    /// that checks a colour is built out of. `SUN` in the shader sits 45
+    /// degrees above the horizon, so a level surface collects `cos 45` of it.
+    ///
+    /// Working the shade out here rather than writing the resulting bytes
+    /// down keeps these tests about which material was drawn where: moving the
+    /// sun should not send anyone hunting through the assertions for
+    /// hard-coded greens.
+    fn lit(colour: [u8; 3]) -> [u8; 3] {
+        shade(colour, AMBIENT + SUNLIGHT * std::f32::consts::FRAC_1_SQRT_2)
+    }
+
+    /// Whether a rendered pixel is the flat colour `material` shades as on
+    /// level ground.
     ///
     /// A small tolerance per channel, because the palette rides through a
     /// linearise-and-re-encode round trip whose rounding is the driver's.
     fn shows(material: Material, pixel: [u8; 4]) -> bool {
-        let want = crate::palette::flat_colour(material);
+        let want = lit(crate::palette::flat_colour(material));
         pixel[..3]
             .iter()
             .zip(want)
@@ -1124,10 +1152,11 @@ mod tests {
         let flat = vec![0.0f32; (RASTER * RASTER) as usize];
         let pixels = render(flat.clone(), null.clone(), straight_down);
         let centre = pixel(&pixels, SIZE / 2, SIZE / 2);
+        let [r, g, b] = lit(crate::palette::MAGENTA);
         assert_eq!(
             centre,
-            [255, 0, 255, 255],
-            "unmapped ground should be pure magenta"
+            [r, g, b, 255],
+            "unmapped ground should be magenta, lit like the level ground it is"
         );
         assert!(is_magenta(centre) && !untouched(centre));
 
@@ -1156,7 +1185,8 @@ mod tests {
             straight_down,
         );
         let centre = pixel(&pixels, SIZE / 2, SIZE / 2);
-        assert_eq!(centre, [255, 0, 255, 255], "unassigned ids are magenta");
+        let [r, g, b] = lit(crate::palette::MAGENTA);
+        assert_eq!(centre, [r, g, b, 255], "unassigned ids are magenta");
     }
 
     /// Renders one frame and reads the normal buffer back as world vectors.
@@ -1241,10 +1271,10 @@ mod tests {
 
     /// A tilted plane has one normal, and the march must write that one.
     ///
-    /// This is the only test that can catch a sign flipped between a raster
-    /// row and world +Z, or a column and +X: nothing is shaded from the normal
-    /// yet, so such a flip would sit in the buffer unnoticed until the first
-    /// light source arrives and lit the terrain backwards.
+    /// The shading reduces a normal to a single number, so a frame can only
+    /// say that the vector was about right; this reads the buffer back and
+    /// checks the direction itself, which is what catches a sign flipped
+    /// between a raster row and world +Z, or a column and +X.
     #[test]
     fn the_march_writes_the_normal_of_the_ground_it_hit() {
         // Rising eastward and falling southward, at different rates, so the
@@ -1282,6 +1312,74 @@ mod tests {
             written > 1000,
             "only {written} pixels of the frame hit the ground"
         );
+    }
+
+    /// Both ends of the light, on the two slopes that produce them exactly.
+    ///
+    /// The sun sits 45 degrees above the horizon in the south-east, so ground
+    /// falling away to the south-east at 45 degrees has the sun's own
+    /// direction for its normal and takes the whole of it, and the same slope
+    /// the other way misses it entirely. The first pins the light down at its
+    /// brightest -- the palette's colour and no more, which is what makes a
+    /// material's entry mean something -- and the second at its darkest, which
+    /// is the case worth having a test for: with no shadows to fall back on,
+    /// a slope facing away is lit by the ambient constant alone and would be
+    /// black if that constant were ever dropped.
+    #[test]
+    fn a_slope_facing_the_sun_takes_it_all_and_one_facing_away_keeps_the_ambient() {
+        // A plane through the middle of the raster, so it stays under the
+        // camera whichever way it tilts. `normals_of` takes the same central
+        // difference `terrain-process` does, so the normal the shading dots
+        // against the sun is the gradient written here.
+        let plane = |fall: f32| -> Vec<f32> {
+            let metres = METRES_PER_TEXEL as f32;
+            (0..RASTER * RASTER)
+                .map(|index| {
+                    let (x, y) = ((index % RASTER) as f32, (index / RASTER) as f32);
+                    let across = x + y - (RASTER - 1) as f32;
+                    fall * std::f32::consts::FRAC_1_SQRT_2 * across * metres
+                })
+                .collect()
+        };
+        // High enough to clear the corner of a plane that reaches 2.7 km, and
+        // still close enough that the finest level is the one drawn.
+        let aim = |camera: &mut Camera| {
+            camera.position = Vec3::new(0.0, 9000.0, 0.0);
+            camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+        };
+
+        let check = |fall: f32, light: f32, slope: &str| {
+            let (pixels, _) = render_config(test_residency(), plane(fall), flat_ground(), aim, &[]);
+            let want = shade(crate::palette::flat_colour(Material::Grass), light);
+            let mut ground = 0;
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    let got = pixel(&pixels, x, y);
+                    if untouched(got) {
+                        continue;
+                    }
+                    ground += 1;
+                    assert!(
+                        got[..3]
+                            .iter()
+                            .zip(want)
+                            .all(|(&got, want)| got.abs_diff(want) <= 8),
+                        "{slope}: pixel ({x}, {y}) shades as {got:?}, not {want:?}"
+                    );
+                }
+            }
+            assert!(
+                ground > 1000,
+                "{slope}: only {ground} pixels of ground drawn"
+            );
+        };
+
+        check(
+            -1.0,
+            AMBIENT + SUNLIGHT,
+            "falling south-east, square-on to the sun",
+        );
+        check(1.0, AMBIENT, "rising south-east, turned away from the sun");
     }
 
     #[test]
