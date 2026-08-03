@@ -994,6 +994,16 @@ fn cs_args() {
 // The maximum of each rather than the mean, because a cell is dropped or kept
 // whole and the worst pixel in it is what decides whether keeping it shows.
 //
+// The two maxima are taken *independently*, so the pair reported for a cell
+// need not come from any one pixel of it: a cell holding fast far ground and
+// still near ground is described as fast and near. That is deliberate. It
+// errs towards saying something could have arrived, which costs march time and
+// never leaves a wrong pixel standing, where the other way round would. Pairing
+// them -- carrying the depth of the fastest pixel -- was tried and is worse:
+// flying a low camera into a hillside at 200 m/s, it leaves 101 pixels showing
+// ground more than half again too far away against 94 for this, because the
+// nearest thing in a cell is often not the fastest thing in it.
+//
 // One workgroup per cell, which is why the workgroup *is* the cell: the
 // reduction is over exactly the pixels whose fate the answer decides.
 var<workgroup> worst: array<vec2<f32>, 64>;
