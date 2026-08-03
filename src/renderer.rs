@@ -24,6 +24,9 @@ pub struct Renderer {
     readout: profile::Smoothed,
     /// Absent unless profiling, or when the machine has no fonts to draw with.
     hud: Option<Hud>,
+    /// Absent unless profiling: an unprofiled run has nowhere to show this and
+    /// no reason to spend a copy a frame producing it.
+    coverage: Option<crate::reproject::CoverageReader>,
 }
 
 impl Renderer {
@@ -107,6 +110,7 @@ impl Renderer {
         // No overlay at all on an unprofiled run: there is nothing to put in it.
         let hud =
             profiling.then(|| Hud::new(&device, &queue, format, window.scale_factor() as f32));
+        let coverage = profiling.then(|| crate::reproject::CoverageReader::new(&device));
         let profiler = profile::profiler(&device, profiling);
 
         Ok(Self {
@@ -122,6 +126,7 @@ impl Renderer {
             frame: profile::Frame::default(),
             readout: profile::Smoothed::default(),
             hud: hud.flatten(),
+            coverage,
         })
     }
 
@@ -222,6 +227,12 @@ impl Renderer {
         }
         self.frame.cpu.encode = clock.elapsed();
 
+        // Outside the `gpu` scope closed just above, so the twelve-byte copy is
+        // not charged to the passes it reports on.
+        if let Some(coverage) = self.coverage.as_mut() {
+            coverage.record(&mut encoder, self.scene.tally());
+        }
+
         // Has to follow every scope on this encoder and precede its `finish`:
         // this is the copy that moves the query set into a readable buffer.
         self.profiler.resolve_queries(&mut encoder);
@@ -262,6 +273,13 @@ impl Renderer {
             .process_finished_frame(self.queue.get_timestamp_period())
         {
             self.frame.take_gpu(&results);
+        }
+        // Lags further than the timestamps do -- one read is in flight at a
+        // time, so a fresh number lands every few frames -- and the reader
+        // holds the last one, so this keeps showing it in between rather than
+        // blinking out.
+        if let Some(coverage) = self.coverage.as_mut() {
+            self.frame.coverage = coverage.collect();
         }
         self.readout.update(&self.frame);
     }

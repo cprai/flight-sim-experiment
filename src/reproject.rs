@@ -221,6 +221,120 @@ impl Coverage {
     }
 }
 
+/// Reads [`Coverage`] back frame after frame without the frame waiting on it.
+///
+/// A buffer map does not complete until the work that wrote the buffer has run,
+/// so asking a frame for its own coverage means blocking on the GPU -- which in
+/// a windowed run is most of the frame, and would make the overlay cost far
+/// more than the thing it reports on. `crate::headless::profile` can afford to
+/// block because it does the read once, outside the measured run; a window
+/// cannot.
+///
+/// So one read is in flight at a time and the answer arrives when it arrives,
+/// two or three frames late. That is the same trade [`wgpu_profiler`] makes for
+/// the timestamps shown beside it, and for the same reason the overlay already
+/// shows the previous frame's rows.
+pub struct CoverageReader {
+    readback: wgpu::Buffer,
+    /// Cloned into each map callback. Held here as well so the receiver can
+    /// never see the channel as disconnected.
+    sender: std::sync::mpsc::Sender<Result<(), wgpu::BufferAsyncError>>,
+    arrivals: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    /// A copy has been recorded and is waiting for its submit, after which it
+    /// can be mapped.
+    copied: bool,
+    /// A map is outstanding. What stops a second copy being recorded over a
+    /// buffer that is still being read out of.
+    mapping: bool,
+    latest: Option<Coverage>,
+}
+
+impl CoverageReader {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let (sender, arrivals) = std::sync::mpsc::channel();
+        Self {
+            readback: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("coverage readback"),
+                size: Coverage::BYTES,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            sender,
+            arrivals,
+            copied: false,
+            mapping: false,
+            latest: None,
+        }
+    }
+
+    /// Copies `tally` out, if the last read has finished with the buffer.
+    ///
+    /// Rides on the frame's own encoder rather than taking one of its own: a
+    /// twelve-byte copy is not worth a second submit, and the submit is a row
+    /// the overlay reports.
+    ///
+    /// Call after the passes are recorded and before the encoder is finished;
+    /// [`Self::collect`] then goes after the submit.
+    pub fn record(&mut self, encoder: &mut wgpu::CommandEncoder, tally: &wgpu::Buffer) {
+        if self.copied || self.mapping {
+            return;
+        }
+        encoder.copy_buffer_to_buffer(tally, 0, &self.readback, 0, Coverage::BYTES);
+        self.copied = true;
+    }
+
+    /// Takes whatever has come back, and starts the next read.
+    ///
+    /// Returns the most recent coverage read rather than only a fresh one, so a
+    /// caller can show it every frame without holding a copy of its own. [`None`]
+    /// until the first read lands, which is a few frames into a run.
+    ///
+    /// Nothing here polls the device, and nothing needs to: a map callback runs
+    /// from inside a poll, and `Queue::submit` ends with
+    /// `device.maintain(PollType::Poll)` followed by `callbacks.fire()`
+    /// (`wgpu-core-30.0.0/src/device/queue.rs:1541`). So a frame loop that
+    /// submits is polling whether it says so or not, which is already what
+    /// delivers [`wgpu_profiler`]'s timestamps to the same overlay. A blocking
+    /// poll here would defeat the entire arrangement.
+    pub fn collect(&mut self) -> Option<Coverage> {
+        if self.mapping {
+            match self.arrivals.try_recv() {
+                Ok(Ok(())) => {
+                    match self.readback.get_mapped_range(..) {
+                        Ok(mapped) => self.latest = Some(Coverage::from_bytes(&mapped)),
+                        // Cannot happen -- the map has just succeeded -- but
+                        // losing a debug readout is not worth a panic in a
+                        // frame loop.
+                        Err(err) => log::warn!("the coverage readback would not open: {err}"),
+                    }
+                    self.readback.unmap();
+                    self.mapping = false;
+                }
+                Ok(Err(err)) => {
+                    log::warn!("failed to read the coverage back: {err}");
+                    self.mapping = false;
+                }
+                // Still in flight. The next frame asks again.
+                Err(_) => {}
+            }
+        }
+
+        // Only now, because a map is only legal once the copy feeding it has
+        // been submitted, which is what the caller has just done.
+        if self.copied && !self.mapping {
+            let sender = self.sender.clone();
+            self.readback
+                .map_async(wgpu::MapMode::Read, .., move |result| {
+                    let _ = sender.send(result);
+                });
+            self.copied = false;
+            self.mapping = true;
+        }
+
+        self.latest
+    }
+}
+
 /// Where the reprojection puts what it carried, and the work list it leaves.
 ///
 /// Screen-sized, so it is rebuilt with the G-buffer whenever the target

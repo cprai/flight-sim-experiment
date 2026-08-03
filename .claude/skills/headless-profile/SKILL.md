@@ -94,6 +94,12 @@ and submits. A frame is roughly `max` of the two, not the sum.
   A `march` row that moved without the marched share moving is a real shader
   change; both moving together usually means the reprojection's share changed
   instead.
+
+  `fly-profile` draws the same three as rows under `tiles`, so the share can be
+  watched changing as the camera moves. There they lag further than the timing
+  rows -- one read is in flight at a time, so a fresh number lands every few
+  frames -- and they are not smoothed, because they are shares of the screen
+  rather than times and only move when the flight does.
 - **`cpu`** is the recording side, and on a settled scene it is noise.
   - **`terrain`** and its four children are the tile streaming: `advance`
     decides what is wanted, `read` pulls tiles off disk, `convert` narrows the

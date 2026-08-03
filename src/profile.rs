@@ -156,6 +156,12 @@ pub struct Frame {
     pub cpu: Cpu,
     /// GPU scopes, parent before child, as the profiler nested them.
     pub gpu: Vec<Row>,
+    /// How the pixels were settled, when a read has come back.
+    ///
+    /// A count rather than a duration, so it is not a [`Row`]. It also lags
+    /// further than the GPU rows do -- see [`crate::reproject::CoverageReader`]
+    /// -- and is [`None`] until the first read lands.
+    pub coverage: Option<crate::reproject::Coverage>,
 }
 
 /// Flattens the profiler's tree into rows, keeping the nesting as `depth`.
@@ -241,6 +247,7 @@ fn line(row: &Row) -> String {
 pub struct Smoothed {
     rows: Vec<Row>,
     tiles: u32,
+    coverage: Option<crate::reproject::Coverage>,
 }
 
 impl Smoothed {
@@ -248,6 +255,11 @@ impl Smoothed {
     pub fn update(&mut self, frame: &Frame) {
         let incoming = frame.rows();
         self.tiles = frame.cpu.terrain.tiles;
+        // Not smoothed, and not for want of somewhere to keep the state: these
+        // are shares of the screen rather than times, and they move only when
+        // the flight does. What makes a timing row unreadable raw is that it
+        // jitters every frame around a level that is not moving at all.
+        self.coverage = frame.coverage;
         // The GPU rows appear a frame or two late and the hud scope comes and
         // goes, so the row set is not fixed. Smoothing across a changed shape
         // would pair a value with the wrong label.
@@ -274,6 +286,25 @@ impl Smoothed {
             text.push('\n');
         }
         text.push_str(&format!("{:<LABEL$}{:>7}", "tiles", self.tiles));
+        // What the reprojection is buying, which no timing row can show: the
+        // `march` row moves when the shader changes and when the share of the
+        // frame handed to it changes, and these are how the two are told apart
+        // while flying.
+        //
+        // Against the pixels the compaction accounted for rather than the
+        // pixels on screen. The read lags by a frame or two, so just after a
+        // resize the two disagree, and shares that fail to add up to a hundred
+        // would be the more alarming of the two ways to be briefly wrong.
+        if let Some(coverage) = self.coverage {
+            let pixels = f64::from(coverage.total().max(1));
+            let mut share = |label: &str, count: u32| {
+                let percent = 100.0 * f64::from(count) / pixels;
+                text.push_str(&format!("\n{label:<LABEL$}{percent:>8.1} %"));
+            };
+            share("reprojected", coverage.reprojected);
+            share("sky", coverage.sky);
+            share("marched", coverage.marched);
+        }
         text
     }
 }
@@ -406,6 +437,7 @@ mod tests {
                 ..Cpu::default()
             },
             gpu: Vec::new(),
+            coverage: None,
         }
     }
 
@@ -433,6 +465,46 @@ mod tests {
             smoothed.text().lines().map(str::len).collect::<Vec<_>>()
         };
         assert_eq!(widths(&frame(2, 1)), widths(&frame(120, 115)));
+    }
+
+    /// The overlay is the only place the reprojection's share is visible while
+    /// flying, which is the only place the ground it carries can be *seen*
+    /// going stale at the same time.
+    #[test]
+    fn the_overlay_reports_how_the_pixels_were_settled() {
+        let mut sample = frame(16, 4);
+        let mut smoothed = Smoothed::default();
+
+        // Nothing until a read has come back, rather than three zeroes that
+        // would read as a reprojection carrying nothing at all.
+        smoothed.update(&sample);
+        assert!(
+            !smoothed.text().contains("reprojected"),
+            "{}",
+            smoothed.text()
+        );
+
+        sample.coverage = Some(crate::reproject::Coverage {
+            marched: 200,
+            reprojected: 700,
+            sky: 100,
+        });
+        smoothed.update(&sample);
+        let text = smoothed.text();
+        for (label, percent) in [("reprojected", 70.0), ("sky", 10.0), ("marched", 20.0)] {
+            let expected = format!("{label:<LABEL$}{percent:>8.1} %");
+            assert!(text.contains(&expected), "no {expected:?} in {text}");
+        }
+
+        // Same width as the timing rows, so the right-aligned block does not
+        // grow a third ragged edge.
+        let width = |label: &str| {
+            text.lines()
+                .find(|line| line.starts_with(label))
+                .unwrap_or_else(|| panic!("no {label} line in {text}"))
+                .len()
+        };
+        assert_eq!(width("reprojected"), width("cpu"));
     }
 
     #[test]

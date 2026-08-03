@@ -2262,4 +2262,68 @@ mod tests {
         // is, so there is always something left to march.
         assert!(second.marched > 0, "{second:?}");
     }
+
+    /// The overlay's reader, driven exactly the way `Renderer::render` drives
+    /// it: record on the frame's encoder, submit, collect. **No poll**, on
+    /// purpose -- the windowed loop has none either, and relies on the one
+    /// `Queue::submit` performs internally to fire the map callback. Adding one
+    /// here would test a path the window never takes and hide the failure it is
+    /// meant to catch: a reader that never delivers leaves the overlay blank
+    /// for the whole run, and there is no window in a test to notice that in.
+    #[test]
+    fn the_overlay_reader_gets_a_number_back_without_blocking() {
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut scene = test_scene(
+            &device,
+            format,
+            test_residency(),
+            vec![0.0; (RASTER * RASTER) as usize],
+            flat_ground(),
+        );
+        straight_down(&mut scene.camera);
+        scene.settle(&queue);
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("coverage target"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut reader = crate::reproject::CoverageReader::new(&device);
+        let profiler = crate::profile::profiler(&device, false);
+        let mut arrived = None;
+        // Generous: one read is in flight at a time, so an answer takes a few
+        // frames. Bounded so a reader that never delivers fails rather than
+        // hanging.
+        for _ in 0..16 {
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut gpu = profiler.scope("gpu", &mut encoder);
+                scene.draw(&mut gpu, &view);
+            }
+            reader.record(&mut encoder, scene.tally());
+            queue.submit(std::iter::once(encoder.finish()));
+
+            arrived = reader.collect();
+            if arrived.is_some() {
+                break;
+            }
+            scene.update(&queue);
+        }
+
+        let coverage = arrived.expect("the reader never delivered a coverage in 16 frames");
+        assert_eq!(coverage.total(), SIZE * SIZE, "{coverage:?}");
+    }
 }
