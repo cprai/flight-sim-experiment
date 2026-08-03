@@ -1473,6 +1473,129 @@ mod tests {
         assert_eq!(centre, [r, g, b, 255], "unassigned ids are magenta");
     }
 
+    /// Renders one frame and reads the depth buffer back.
+    ///
+    /// Nothing in a frame shows a depth: the shading reads it only to tell
+    /// ground from sky, so a hit at the wrong distance draws in exactly the
+    /// right colour. This is the only way to see what the march wrote.
+    fn render_depths(heights: Vec<f32>, aim: impl FnOnce(&mut Camera)) -> Vec<f32> {
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen target"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+
+        let mut scene = test_scene(&device, format, test_residency(), heights, flat_ground());
+        aim(&mut scene.camera);
+        scene.update(&queue);
+
+        // One float a texel, and `SIZE * 4` is already a multiple of the
+        // 256-byte copy alignment.
+        let bytes_per_row = SIZE * 4;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("depth readback"),
+            size: u64::from(bytes_per_row * SIZE),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let profiler = crate::profile::profiler(&device, false);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut gpu = profiler.scope("gpu", &mut encoder);
+            scene.draw(
+                &mut gpu,
+                &target.create_view(&wgpu::TextureViewDescriptor::default()),
+            );
+        }
+        encoder.copy_texture_to_buffer(
+            scene.gbuffer.targets.depth.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(SIZE),
+                },
+            },
+            wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll failed");
+        let bytes = readback
+            .get_mapped_range(..)
+            .expect("buffer not mapped")
+            .to_vec();
+        readback.unmap();
+
+        bytes
+            .chunks_exact(4)
+            .map(|texel| f32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]))
+            .collect()
+    }
+
+    /// Level ground seen from straight above is all at one depth.
+    ///
+    /// Reversed-Z depth is `z_near` over the distance along the *view axis*, and
+    /// looking straight down at a plane that distance is the altitude, the same
+    /// for every pixel however far off centre it is. So the whole frame is one
+    /// number, and any pixel that is not is the march placing a hit somewhere
+    /// the ground is not.
+    ///
+    /// The one that would is the ray too close to vertical to cross a texel
+    /// wall. It has no wall to stop at, so the segment the crossing is bracketed
+    /// over comes back as the whole march budget, and halving that eight times
+    /// leaves the hit a long way under the ground -- invisible in the frame,
+    /// because the material and the normal are read at the texel the ray is
+    /// standing in and come out right, and wrong in the buffer the reprojection
+    /// and the motion field are built from. Straight down over a plane is where
+    /// those rays are, in a disc of a few pixels around the centre.
+    #[test]
+    fn ground_square_on_to_the_camera_is_all_at_one_depth() {
+        let depths = render_depths(vec![0.0; (RASTER * RASTER) as usize], |camera| {
+            camera.position = Vec3::new(0.0, 3000.0, 0.0);
+            camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+        });
+        // The corners of a square frame reach past a square raster, and what is
+        // out there is sky rather than ground.
+        let ground: Vec<f32> = depths.iter().copied().filter(|&d| d != 0.0).collect();
+        assert!(
+            ground.len() > depths.len() / 2,
+            "only {} of {} pixels found ground; the camera has to be over it",
+            ground.len(),
+            depths.len()
+        );
+        let want = 1.0 / 3000.0;
+        let worst = ground
+            .iter()
+            .map(|&d| (d - want).abs() / want)
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-4,
+            "the furthest pixel is {:.3}% off the {want} every pixel should read",
+            worst * 100.0
+        );
+    }
+
     /// Renders one frame and reads the normal buffer back as world vectors.
     ///
     /// The shading reduces a normal to one number, so this is the only way to

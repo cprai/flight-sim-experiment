@@ -156,14 +156,13 @@ const REFINE_STEPS: u32 = 8u;
 // Stand-in for an infinite distance, in a form arithmetic can still be done on.
 const NEVER: f32 = 1e30;
 
-// A height and the worst of the texels that went into it.
-struct Sample {
-    height: f32,
-    // The lowest texel sampled. Interpolating first would bury a hole: three
-    // real metres averaged with one -32767 comes out around -7800, which is far
-    // below any ground but nowhere near the nodata value, so a test on the
-    // result alone would let it through.
-    lowest: f32,
+// The lowest of four corners.
+//
+// Interpolating first would bury a hole: three real metres averaged with one
+// -32767 comes out around -7800, which is far below any ground but nowhere near
+// the nodata value, so a test on the result alone would let it through.
+fn lowest(corner: vec4<f32>) -> f32 {
+    return min(min(corner.x, corner.y), min(corner.z, corner.w));
 }
 
 // Whether a texel of a level is loaded and safe to read.
@@ -187,21 +186,34 @@ fn height_at(level: u32, cell: vec2<i32>) -> f32 {
     return textureLoad(heights, slot(cell), i32(level), 0).r;
 }
 
-// Height at a fractional position in a level's own texels.
-fn height_bilinear(level: u32, w: vec2<f32>) -> Sample {
-    let base = vec2<i32>(floor(w));
-    let f = fract(w);
-    let a = height_at(level, base);
-    let b = height_at(level, base + vec2<i32>(1, 0));
-    let c = height_at(level, base + vec2<i32>(0, 1));
-    let d = height_at(level, base + vec2<i32>(1, 1));
-    let top = mix(a, b, f.x);
-    let bottom = mix(c, d, f.x);
+// The four corner heights of one texel, in the order [`surface`] expects: the
+// texel itself, then east, south, and south-east of it.
+fn corners(level: u32, cell: vec2<i32>) -> vec4<f32> {
+    return vec4<f32>(
+        height_at(level, cell),
+        height_at(level, cell + vec2<i32>(1, 0)),
+        height_at(level, cell + vec2<i32>(0, 1)),
+        height_at(level, cell + vec2<i32>(1, 1)),
+    );
+}
 
-    var sample: Sample;
-    sample.height = mix(top, bottom, f.y);
-    sample.lowest = min(min(a, b), min(c, d));
-    return sample;
+// The bilinear patch through four corners, at a fractional position inside the
+// texel they belong to.
+//
+// Separated from the fetch because the march evaluates one texel's patch many
+// times over -- at both ends of a segment and at every halving between them --
+// and the four heights do not change while the ray is inside the texel. It is
+// the same arithmetic a combined fetch-and-interpolate did, with the fetches
+// hoisted out.
+//
+// Clamped rather than taken as read. The far end of a segment sits exactly on
+// the texel wall, where rounding can put the fraction a hair outside; a bilinear
+// is continuous across that edge, so clamping there gives the value the
+// neighbouring texel's patch would -- without reading a texel this level may not
+// have loaded.
+fn surface(corner: vec4<f32>, at: vec2<f32>) -> f32 {
+    let f = clamp(at, vec2<f32>(0.0), vec2<f32>(1.0));
+    return mix(mix(corner.x, corner.y, f.x), mix(corner.z, corner.w, f.x), f.y);
 }
 
 // Normalized device coordinates of a pixel's centre, which is what the camera's
@@ -395,12 +407,28 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
 
         // The finest level there is here, so this texel is the leaf and the
         // ground across it is the bilinear patch through its four corners.
+        //
+        // Read once. The ray is inside this texel for the whole segment, so
+        // every height wanted below -- both ends and every halving between them
+        // -- comes out of the same four numbers, and fetching them per
+        // evaluation was forty texture reads a hit instead of four.
+        //
+        // It is also the only way to keep the far end inside what residency
+        // promised. That end sits on the texel wall, so interpolating it from
+        // where it lands reads the *next* texel's corners, one past the square
+        // -- and while the height is unaffected, because the out-of-range
+        // corners carry no weight there, `lowest` is a minimum over all four at
+        // full weight. A tile of somewhere else sharing that slot could hold
+        // nodata, and the ray would skip ground that is really there.
         let w = p / size;
-        let enter = height_bilinear(level, w);
-        let leave = height_bilinear(level, (p0 + d0 * exit) / size);
+        let corner = corners(level, cell);
+        let deepest = lowest(corner);
+        let base = vec2<f32>(cell);
+        let enter = surface(corner, w - base);
+        let leave = surface(corner, (p0 + d0 * exit) / size - base);
 
         // Ground nothing is known about is not ground.
-        if (min(enter.lowest, leave.lowest) < NODATA_BELOW) {
+        if (deepest < NODATA_BELOW) {
             hole = true;
             t = exit + nudge;
             moved = true;
@@ -409,7 +437,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
             continue;
         }
 
-        if (eye.y + dir.y * t <= enter.height) {
+        if (eye.y + dir.y * t <= enter) {
             if (!moved || hole) {
                 // Either the ray began below the surface -- where it went in is
                 // behind the eye and cannot be found from here -- or it has just
@@ -438,7 +466,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         // behind it now and cannot be what a later descent is coming up under.
         hole = false;
 
-        if (eye.y + dir.y * exit > leave.height) {
+        if (eye.y + dir.y * exit > leave) {
             // The ceiling allowed a hit somewhere in the texel; the surface
             // itself does not reach the ray.
             t = exit + nudge;
@@ -448,12 +476,27 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
             continue;
         }
 
-        // Above at one end and below at the other, so the crossing is bracketed.
+        // Above at one end and below at the other, so the crossing is
+        // bracketed -- but not necessarily as tightly as `exit` suggests. A ray
+        // too close to vertical to cross a wall inside the whole march budget
+        // has no wall to stop at, so `exit` came back as the budget itself and
+        // halving that eight times resolves the crossing to a fifth of it. The
+        // hit would land kilometres under the ground, with a depth that
+        // underflows and a texel index read from somewhere else entirely --
+        // invisible in the frame, because the material and normal are taken at
+        // the texel the ray is standing in and come out right, and wrong in the
+        // G-buffer the reprojection and the motion field are built from.
+        //
+        // So bound the far end by where the ray falls past the lowest corner of
+        // the patch. Below that it is below every height the patch can take, so
+        // the crossing is behind it, and for a ray that is climbing or level
+        // there is nothing to bound: it cannot fall to meet anything.
+        let fall = (eye.y + dir.y * t - deepest) / max(-dir.y, 1.0 / NEVER);
         var above = t;
-        var below = exit;
+        var below = min(exit, t + max(fall, 0.0));
         for (var i = 0u; i < REFINE_STEPS; i += 1u) {
             let middle = 0.5 * (above + below);
-            let ground = height_bilinear(level, (p0 + d0 * middle) / size).height;
+            let ground = surface(corner, (p0 + d0 * middle) / size - base);
             if (eye.y + dir.y * middle > ground) {
                 above = middle;
             } else {
