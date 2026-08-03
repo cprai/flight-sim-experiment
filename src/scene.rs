@@ -26,11 +26,15 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     /// `w` is unused padding; uniform members are aligned to 16 bytes anyway.
     position: [f32; 4],
-    /// [`Camera::ray_basis`], one vector per row, `w` unused on each.
+    /// [`Camera::ray_basis`], one vector per row.
     ///
     /// Carried alongside the matrix rather than derived from it because the
     /// raymarched far field needs a ray per pixel and inverting `view_proj` on
     /// the GPU to get one would cost far more than three vectors of uniform.
+    ///
+    /// `w` is unused on the first two. On the third it carries the near plane,
+    /// which is what turns a depth back into a distance -- see `distance_at` in
+    /// `src/terrain.wgsl`.
     ray_right: [f32; 4],
     ray_up: [f32; 4],
     ray_forward: [f32; 4],
@@ -44,7 +48,7 @@ impl CameraUniform {
             position: camera.position.extend(1.0).to_array(),
             ray_right: right.extend(0.0).to_array(),
             ray_up: up.extend(0.0).to_array(),
-            ray_forward: forward.extend(0.0).to_array(),
+            ray_forward: forward.extend(camera.z_near).to_array(),
         }
     }
 }
@@ -63,6 +67,24 @@ pub struct Scene {
     /// compiled with -- so it is kept to rebind against on resize.
     storage_layout: wgpu::BindGroupLayout,
     storage_bind_group: wgpu::BindGroup,
+    /// Where last frame's ground is scattered to, and the work list the march
+    /// is dispatched over. Screen-sized, so rebuilt with the G-buffer.
+    carried: crate::reproject::Carried,
+    work_layout: wgpu::BindGroupLayout,
+    work_bind_group: wgpu::BindGroup,
+    args_layout: wgpu::BindGroupLayout,
+    args_bind_group: wgpu::BindGroup,
+    reproject: crate::reproject::Reprojection,
+    /// Which frame this is, which is all the dither needs to move its pattern
+    /// on. Wraps freely: only the low six bits are ever read.
+    frame: u32,
+    /// The ray basis of the camera that drew what is now the history.
+    ///
+    /// Only carried sky needs it -- ground reprojects from its own world
+    /// position, which is absolute and needs no camera at all -- but sky has
+    /// only a direction, and the direction it had is the one the previous
+    /// camera gave it.
+    was_basis: [glam::Vec3; 3],
     shading: Shading,
     /// What the last camera upload cost, zero unless a run asked to be timed.
     camera_span: std::time::Duration,
@@ -104,10 +126,14 @@ impl Scene {
     ) -> Result<Self> {
         let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
         let storage_layout = crate::deferred::storage_layout(device);
+        let work_layout = crate::reproject::work_layout(device);
+        let args_layout = crate::reproject::args_layout(device);
         let terrain = Terrain::from_tiles(
             device,
             &camera_layout,
             &storage_layout,
+            &work_layout,
+            &args_layout,
             residency,
             viewport,
             terrain_root,
@@ -119,6 +145,9 @@ impl Scene {
             camera_buffer,
             camera_bind_group,
             storage_layout,
+            work_layout,
+            args_layout,
+            &camera_layout,
             terrain,
         ))
     }
@@ -132,11 +161,18 @@ impl Scene {
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         viewport: UVec2,
-        terrain: impl FnOnce(&wgpu::BindGroupLayout, &wgpu::BindGroupLayout) -> Terrain,
+        terrain: impl FnOnce(
+            &wgpu::BindGroupLayout,
+            &wgpu::BindGroupLayout,
+            &wgpu::BindGroupLayout,
+            &wgpu::BindGroupLayout,
+        ) -> Terrain,
     ) -> Self {
         let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
         let storage_layout = crate::deferred::storage_layout(device);
-        let terrain = terrain(&camera_layout, &storage_layout);
+        let work_layout = crate::reproject::work_layout(device);
+        let args_layout = crate::reproject::args_layout(device);
+        let terrain = terrain(&camera_layout, &storage_layout, &work_layout, &args_layout);
         Self::assemble(
             device,
             format,
@@ -144,6 +180,9 @@ impl Scene {
             camera_buffer,
             camera_bind_group,
             storage_layout,
+            work_layout,
+            args_layout,
+            &camera_layout,
             terrain,
         )
     }
@@ -155,12 +194,19 @@ impl Scene {
         camera_buffer: wgpu::Buffer,
         camera_bind_group: wgpu::BindGroup,
         storage_layout: wgpu::BindGroupLayout,
+        work_layout: wgpu::BindGroupLayout,
+        args_layout: wgpu::BindGroupLayout,
+        camera_layout: &wgpu::BindGroupLayout,
         terrain: Terrain,
     ) -> Self {
         let aspect = viewport.x as f32 / viewport.y.max(1) as f32;
         let camera = Camera::overlooking(terrain.world_extent(), terrain.height_range().1, aspect);
         let gbuffer = GBuffer::new(device, viewport);
         let storage_bind_group = crate::deferred::bind_storage(device, &storage_layout, &gbuffer);
+        let carried = crate::reproject::Carried::new(device, viewport);
+        let work_bind_group = crate::reproject::bind_work(device, &work_layout, &carried);
+        let args_bind_group = crate::reproject::bind_args(device, &args_layout, &carried);
+        let reproject = crate::reproject::Reprojection::new(device, camera_layout, &gbuffer);
         let shading = Shading::new(device, format, &gbuffer);
         Self {
             camera,
@@ -170,6 +216,14 @@ impl Scene {
             gbuffer,
             storage_layout,
             storage_bind_group,
+            carried,
+            work_layout,
+            work_bind_group,
+            args_layout,
+            args_bind_group,
+            reproject,
+            frame: 0,
+            was_basis: camera.ray_basis(),
             shading,
             camera_span: std::time::Duration::ZERO,
         }
@@ -185,6 +239,12 @@ impl Scene {
         self.gbuffer = GBuffer::new(device, viewport);
         self.storage_bind_group =
             crate::deferred::bind_storage(device, &self.storage_layout, &self.gbuffer);
+        self.carried = crate::reproject::Carried::new(device, viewport);
+        self.work_bind_group =
+            crate::reproject::bind_work(device, &self.work_layout, &self.carried);
+        self.args_bind_group =
+            crate::reproject::bind_args(device, &self.args_layout, &self.carried);
+        self.reproject.rebind(device, &self.gbuffer);
         self.shading.rebind(device, &self.gbuffer);
         self.terrain.resize(viewport);
         self.camera.aspect = viewport.x as f32 / viewport.y.max(1) as f32;
@@ -204,7 +264,25 @@ impl Scene {
             bytemuck::bytes_of(&CameraUniform::new(&self.camera)),
         );
         self.camera_span = clock.elapsed();
+        // Wrapping is fine and deliberate: the dither reads the low six bits,
+        // and its pattern is periodic in sixty-four frames anyway.
+        self.frame = self.frame.wrapping_add(1);
+        self.reproject.set_frame(queue, self.frame, self.was_basis);
+        // What this frame draws becomes the next one's history, so the basis it
+        // is drawn with is the basis that history will have to be read back
+        // through.
+        self.was_basis = self.camera.ray_basis();
         self.terrain.update(queue, self.camera.position);
+    }
+
+    /// How many pixels the last frame handed to the march.
+    ///
+    /// The whole of the coverage measurement: every pixel not on this list was
+    /// either carried over from an earlier frame or settled as sky without a
+    /// ray being cast. Lives on the GPU and is only worth reading back outside
+    /// a measured frame -- see [`crate::headless::profile`].
+    pub fn hole_count(&self) -> &wgpu::Buffer {
+        &self.carried.hole_count
     }
 
     /// Starts or stops accounting for where an update's time goes.
@@ -225,10 +303,18 @@ impl Scene {
     /// For anything that draws one frame and stops -- a screenshot, a test --
     /// where streaming in over the next second is no use to anybody.
     pub fn settle(&mut self, queue: &wgpu::Queue) {
+        // Settling is not time passing. It runs an unpredictable number of
+        // updates -- however many the tiles happen to need -- and the dither's
+        // phase belongs to frames that are actually drawn, so it is put back
+        // afterwards. Without this the pattern at the first drawn frame would
+        // depend on how much of the pyramid was on disk.
+        let frame = self.frame;
         self.update(queue);
         while self.terrain.pending() {
             self.update(queue);
         }
+        self.frame = frame;
+        self.reproject.set_frame(queue, self.frame, self.was_basis);
     }
 
     /// Records the two passes that make a frame into `view`.
@@ -262,16 +348,72 @@ impl Scene {
             })
         };
 
+        // Counted up from nothing every frame by `cs_compact`.
+        gpu.clear_buffer(&self.carried.hole_count, 0, None);
+
         {
-            // Nothing is cleared, because nothing needs to be: the dispatch
-            // covers every pixel exactly once and writes each one, and a pixel
-            // whose ray found no ground writes zeroes itself. Material zero is
-            // Null and depth zero is the reversed-Z far plane, so those zeroes
-            // read back as "nothing here", which the shading pass draws as sky.
-            let mut pass = gpu.scoped_compute_pass("geometry");
+            // Reads the G-buffer -- still holding last frame, because nothing
+            // has written this one yet -- and scatters it into buffers of its
+            // own. The two sets swap roles rather than contents, so there is no
+            // ping-pong to keep straight, and wgpu puts the barrier in at the
+            // pass boundary.
+            //
+            // Cleared to zero depth, which is the reversed-Z far plane and
+            // therefore "no point reached this pixel": a carried point always
+            // writes something greater.
+            let mut pass = gpu.scoped_render_pass(
+                "reproject",
+                wgpu::RenderPassDescriptor {
+                    label: Some("reprojection pass"),
+                    color_attachments: &[
+                        target(&self.carried.material, wgpu::Color::TRANSPARENT),
+                        target(&self.carried.normal, wgpu::Color::TRANSPARENT),
+                    ],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.carried.depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(crate::reproject::NOTHING_CARRIED),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                },
+            );
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            let size = self.gbuffer.size;
+            self.reproject.draw(&mut pass, size.x * size.y);
+        }
+
+        {
+            // Nothing clears the G-buffer, because nothing needs to: between
+            // them these two dispatches write every pixel exactly once. A pixel
+            // whose ray found no ground writes zeroes itself, and depth zero is
+            // the reversed-Z far plane, which the shading pass reads as sky.
+            let mut pass = gpu.scoped_compute_pass("compact");
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(2, &self.storage_bind_group, &[]);
-            self.terrain.march(&mut pass);
+            pass.set_bind_group(3, &self.work_bind_group, &[]);
+            self.terrain.compact(&mut pass);
+        }
+
+        {
+            // Its own pass, not another dispatch in the one above: the count is
+            // only final once every workgroup of the compaction has run, and a
+            // pass boundary is what guarantees that.
+            let mut pass = gpu.scoped_compute_pass("args");
+            pass.set_bind_group(3, &self.args_bind_group, &[]);
+            self.terrain.args(&mut pass);
+        }
+
+        {
+            let mut pass = gpu.scoped_compute_pass("march");
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.storage_bind_group, &[]);
+            pass.set_bind_group(3, &self.work_bind_group, &[]);
+            self.terrain.march(&mut pass, &self.carried.march_args);
         }
 
         // The clear never survives -- the shading pass writes every pixel --
@@ -312,7 +454,10 @@ fn camera_binding(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::BindGroupLayout
         label: Some("camera bind group layout"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
+            // The march reads it in compute; the reprojection reads it in the
+            // vertex stage, where it decides which pixel a carried point lands
+            // on.
+            visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -570,11 +715,13 @@ mod tests {
             device,
             format,
             UVec2::splat(SIZE),
-            |camera_layout, storage_layout| {
+            |camera_layout, storage_layout, work_layout, args_layout| {
                 Terrain::new(
                     device,
                     camera_layout,
                     storage_layout,
+                    work_layout,
+                    args_layout,
                     residency,
                     UVec2::splat(SIZE),
                     placement(),
@@ -1636,8 +1783,17 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let pixels = crate::headless::capture(&device, &queue, &scene, size)
-            .expect("failed to read the frame back");
+        let pixels = crate::headless::capture(
+            &device,
+            &queue,
+            &mut scene,
+            size,
+            crate::headless::Flight {
+                frames: 1,
+                speed: 0.0,
+            },
+        )
+        .expect("failed to read the frame back");
         eprintln!("rendered one frame in {:.2?}", started.elapsed());
 
         let path = std::env::temp_dir().join("terrain.png");
@@ -1809,11 +1965,13 @@ mod tests {
             &device,
             wgpu::TextureFormat::Rgba8UnormSrgb,
             UVec2::splat(SIZE),
-            |camera_layout, storage_layout| {
+            |camera_layout, storage_layout, work_layout, args_layout| {
                 Terrain::new(
                     &device,
                     camera_layout,
                     storage_layout,
+                    work_layout,
+                    args_layout,
                     test_residency(),
                     UVec2::splat(SIZE),
                     placement(),

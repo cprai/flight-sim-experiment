@@ -6,6 +6,7 @@ mod hud;
 mod palette;
 mod profile;
 mod renderer;
+mod reproject;
 mod scene;
 mod terrain;
 
@@ -84,6 +85,14 @@ enum Mode {
 
         #[command(flatten)]
         view: View,
+
+        /// How many frames to draw before the one that is written.
+        ///
+        /// One frame cannot show anything carried between frames -- there is no
+        /// frame before it to carry from -- so a run that wants to see what
+        /// reuse looks like has to draw a few and keep the last.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        frames: u32,
     },
 
     /// Settle the terrain, then measure frames and print where the time went.
@@ -119,6 +128,16 @@ struct View {
     /// filling, so this changes what is drawn as well as how much of it.
     #[arg(long, value_name = "WxH", value_parser = parse_size)]
     size: Option<UVec2>,
+
+    /// How fast to fly forward, in metres per second.
+    ///
+    /// Zero, the default, holds the camera exactly still. A still camera is the
+    /// best case for anything a frame reuses from the one before it: every
+    /// pixel of ground lands back where it came from, and nothing is left for
+    /// the march. Flying is what says whether that survives ground coming into
+    /// view for the first time.
+    #[arg(long, default_value_t = 0.0, value_name = "M/S")]
+    motion: f32,
 }
 
 /// Reads `WIDTHxHEIGHT` for [`View::size`].
@@ -286,11 +305,16 @@ fn main() -> anyhow::Result<()> {
             terrain,
             output,
             view,
+            frames,
         } => {
             return headless::render(
                 &terrain.terrain,
                 view.size.unwrap_or(DEFAULT_SIZE),
                 view.camera,
+                headless::Flight {
+                    frames,
+                    speed: view.motion,
+                },
                 &output,
             );
         }
@@ -303,7 +327,10 @@ fn main() -> anyhow::Result<()> {
                 &terrain.terrain,
                 view.size.unwrap_or(DEFAULT_SIZE),
                 view.camera,
-                frames,
+                headless::Flight {
+                    frames,
+                    speed: view.motion,
+                },
             );
         }
         Mode::Fly(terrain) => (terrain.terrain, false),

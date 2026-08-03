@@ -81,6 +81,12 @@ pub struct GBuffer {
     /// rather than build a differently-shaped G-buffer under `cfg(test)`.
     #[allow(dead_code, reason = "read only by the G-buffer readback tests")]
     pub targets: Targets,
+    /// The size every target was built at.
+    ///
+    /// The reprojection draws one point per pixel of this, so the count has to
+    /// come from the buffer being read rather than from a viewport the caller
+    /// would otherwise have to remember separately and could get wrong.
+    pub size: UVec2,
 }
 
 /// The G-buffer's four textures, kept beside their views.
@@ -129,6 +135,7 @@ impl GBuffer {
             normal: view(&targets.normal),
             depth: view(&targets.depth),
             targets,
+            size,
         }
     }
 }

@@ -34,6 +34,13 @@ struct Camera {
 // Must match `MAX_LEVELS` in `src/terrain/gpu.rs`.
 const MAX_LEVELS: u32 = 16u;
 
+// Threads per workgroup of the compacted march, which `cs_args` divides the
+// hole count by to size the dispatch.
+//
+// Must match `MARCH_GROUP` in `src/reproject.rs` and `@workgroup_size` on
+// `cs_march` below, which WGSL will not let this constant stand in for.
+const MARCH_GROUP: u32 = 64u;
+
 struct Level {
     // The texels resident at this level, as a half-open range measured in this
     // level's own texels from the raster's origin. A point outside it has to be
@@ -192,6 +199,34 @@ fn ndc_of(pixel: vec2<f32>) -> vec2<f32> {
         pixel.x / size.x * 2.0 - 1.0,
         1.0 - pixel.y / size.y * 2.0,
     );
+}
+
+// The ray through the centre of a pixel, before it is normalised.
+//
+// The centre is where the ray goes through it, and is what the rasterizer used
+// to hand the march as the fragment coordinate. One function so that nothing
+// asking about a pixel's ray can end up with a different one.
+//
+// Unnormalised, its component along the view axis is exactly one, because the
+// basis is the near plane at unit distance. That is what makes [`distance_at`]
+// a multiply rather than a divide by a length.
+fn ray_raw(pixel: vec2<u32>) -> vec3<f32> {
+    let ndc = ndc_of(vec2<f32>(pixel) + 0.5);
+    return camera.ray_right.xyz * ndc.x + camera.ray_up.xyz * ndc.y + camera.ray_forward.xyz;
+}
+
+fn ray_through(pixel: vec2<u32>) -> vec3<f32> {
+    return normalize(ray_raw(pixel));
+}
+
+// How far along [`ray_raw`] a reversed-Z depth puts a point.
+//
+// The projection writes `z_near / d`, where `d` is the distance along the view
+// axis, so this inverts it. Multiplying the raw ray by the result lands on the
+// point exactly, with no normalise and no length: the raw ray advances one unit
+// along the view axis per unit of `s`.
+fn distance_at(depth: f32) -> f32 {
+    return camera.ray_forward.w / depth;
 }
 
 struct Hit {
@@ -400,6 +435,36 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
 // The distance the ground was actually found at, as reversed-Z depth.
 @group(2) @binding(3) var out_depth: texture_storage_2d<r32float, write>;
 
+// What the reprojection carried over from the last frame, already placed where
+// this camera sees it. See `src/reproject.wgsl` for how it got here.
+//
+// Depth zero is the reversed-Z far plane, which no carried point can write, so
+// it is exactly "nothing landed on this pixel" -- the same test, for the same
+// reason, that the shading pass applies to the G-buffer.
+@group(3) @binding(0) var carried_material: texture_2d<u32>;
+// No carried position: it is sixteen bytes a point for something the depth
+// below already determines. See `carried_at`.
+@group(3) @binding(2) var carried_normal: texture_2d<f32>;
+@group(3) @binding(3) var carried_depth: texture_depth_2d;
+
+// The pixels the reprojection did not reach, packed as `x | y << 16`, and how
+// many of them there are.
+//
+// This is the point of the whole arrangement. A wave costs as much as the
+// longest ray in it, so a march that runs a thread per pixel and lets most of
+// them return early does not get faster for having less to do -- the lanes go
+// idle but the wave still waits. Compacting the misses into a list lets the
+// dispatch be sized to the work rather than to the screen, so every wave that
+// runs is full of rays that actually had to be cast.
+//
+// What it costs is locality: consecutive entries are wherever on screen the
+// reprojection failed, so the rays in a wave no longer walk neighbouring cells
+// of the quadtree the way a rectangle of pixels did.
+@group(3) @binding(4) var<storage, read_write> holes: array<u32>;
+@group(3) @binding(5) var<storage, read_write> hole_count: atomic<u32>;
+// `[workgroups, 1, 1]`, written by `cs_args` for the march to be dispatched by.
+@group(3) @binding(6) var<storage, read_write> march_args: array<u32, 3>;
+
 // Whether a stored pair is a direction at all.
 //
 // Both components of a unit normal fit inside the unit disc, so the sentinel
@@ -452,10 +517,21 @@ fn normal_bilinear(level: u32, w: vec2<f32>) -> vec3<f32> {
     return vec3<f32>(mean.r, sqrt(max(1.0 - dot(mean, mean), 0.0)), mean.g);
 }
 
+// What `position.w` says about a pixel of the G-buffer.
+//
+// Three states rather than two, because the reprojection has to tell a pixel
+// whose ray found nothing from a pixel nothing has ever been written to. Sky is
+// worth carrying between frames -- it is most of a horizon view and none of it
+// can be carried by world position, because it has none -- but a buffer that
+// has only just been allocated must carry nothing at all. Zero is what wgpu
+// leaves a fresh texture as, so zero is the one that means "not yet".
+const GROUND_HERE: f32 = 1.0;
+const SKY_HERE: f32 = -1.0;
+
 // What one ray found, in the form the G-buffer stores it.
 //
-// Zeroes are sky: material zero is `Null`, and depth zero is the reversed-Z far
-// plane, which no finite hit can produce.
+// Material zero is `Null` and depth zero is the reversed-Z far plane, which no
+// finite hit can produce, so those two are what the shading pass reads as sky.
 struct Ground {
     material: u32,
     position: vec4<f32>,
@@ -464,7 +540,7 @@ struct Ground {
 };
 
 fn nothing() -> Ground {
-    return Ground(0u, vec4<f32>(0.0), vec4<f32>(0.0), 0.0);
+    return Ground(0u, vec4<f32>(0.0, 0.0, 0.0, SKY_HERE), vec4<f32>(0.0), 0.0);
 }
 
 // The ground down the ray through one pixel, or `nothing()` for sky.
@@ -472,13 +548,8 @@ fn nothing() -> Ground {
 // Split out from the dispatch so that the answer for a pixel depends on the
 // pixel alone, however the caller came to be asking about it.
 fn ground_at(pixel: vec2<u32>) -> Ground {
-    // The centre of the pixel, which is where the ray goes through it -- and
-    // what the rasterizer used to hand this shader as the fragment coordinate.
-    let ndc = ndc_of(vec2<f32>(pixel) + 0.5);
     let eye = camera.position.xyz;
-    let dir = normalize(
-        camera.ray_right.xyz * ndc.x + camera.ray_up.xyz * ndc.y + camera.ray_forward.xyz,
-    );
+    let dir = ray_through(pixel);
 
     // A ray already above the highest ground anywhere resident, and still
     // climbing, is never coming back down. Worth one comparison: at any horizon
@@ -508,7 +579,7 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // closest is the rounded index.
     let cell = vec2<i32>(floor(hit.w + 0.5));
     out.material = textureLoad(materials, slot(cell), i32(hit.level), 0).r;
-    out.position = vec4<f32>(hit.position, 1.0);
+    out.position = vec4<f32>(hit.position, GROUND_HERE);
     // Read the normals where they are still distinct rather than at the hit's
     // own level: they are stored no finer than level 3 and the store serves
     // finer requests by repeating texels, so interpolating below it would ramp
@@ -529,6 +600,39 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     return out;
 }
 
+// What a pixel the reprojection reached should be written as.
+//
+// The splat carries a material and a normal but no position, because a position
+// is sixteen bytes a point of export bandwidth and the depth it also carries
+// already determines one: the point is wherever this pixel's ray reaches at
+// that depth. Rebuilding it here costs a multiply-add and saves the splat more
+// than half of what it writes.
+//
+// Not quite the point the march originally found. That point sat on the ray
+// through whichever pixel it was found in, and this puts it on the ray through
+// the pixel it has landed in, so it slides by up to half a pixel across the
+// view. The error is re-taken from the current camera every frame rather than
+// accumulated, and it is the same sub-pixel resampling the material and the
+// normal already suffer.
+//
+// Sky is told from ground by the normal: the march writes a unit vector for
+// ground and zeroes for sky, and no ground normal can be short.
+fn carried_at(pixel: vec2<u32>, depth: f32) -> Ground {
+    let normal = textureLoad(carried_normal, vec2<i32>(pixel), 0);
+    if (dot(normal.xyz, normal.xyz) < 0.5) {
+        return nothing();
+    }
+    var out: Ground;
+    out.material = textureLoad(carried_material, vec2<i32>(pixel), 0).r;
+    out.position = vec4<f32>(
+        camera.position.xyz + ray_raw(pixel) * distance_at(depth),
+        GROUND_HERE,
+    );
+    out.normal = normal;
+    out.depth = depth;
+    return out;
+}
+
 // Writes one pixel's worth of ground into the G-buffer.
 fn store(pixel: vec2<u32>, ground: Ground) {
     let at = vec2<i32>(pixel);
@@ -538,18 +642,64 @@ fn store(pixel: vec2<u32>, ground: Ground) {
     textureStore(out_depth, at, vec4<f32>(ground.depth, 0.0, 0.0, 0.0));
 }
 
-// One thread per pixel of the target.
+// One thread per pixel: settle what can be settled, and list the rest.
 //
-// Eight by eight rather than a flat sixty-four so that the threads of a wave
-// are neighbours on screen: adjacent rays walk almost the same cells of the
-// quadtree, which is what keeps the texture reads in cache and the traversal
-// lengths within a wave close to each other.
+// Eight by eight rather than a flat sixty-four because this one *is* indexed by
+// screen position, and neighbouring pixels take the same branch far more often
+// than distant ones do.
+//
+// Three outcomes, and every pixel has exactly one of them, which is what lets
+// the G-buffer go uncleared: it is either written from what the reprojection
+// carried, written as sky, or handed to the march, which writes it.
 @compute @workgroup_size(8, 8)
-fn cs_march(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_compact(@builtin(global_invocation_id) id: vec3<u32>) {
     // The dispatch is rounded up to whole workgroups, so the last row and
     // column of them run past the target.
     if (any(id.xy >= terrain.viewport)) {
         return;
     }
-    store(id.xy, ground_at(id.xy));
+    let pixel = id.xy;
+    let at = vec2<i32>(pixel);
+
+    // Already answered by a ray cast on an earlier frame.
+    let depth = textureLoad(carried_depth, at, 0);
+    if (depth != 0.0) {
+        store(pixel, carried_at(pixel, depth));
+        return;
+    }
+
+    // Sky the ceiling test can settle without walking anything. Only fires with
+    // the camera above every resident peak; below them a ray heading for the
+    // horizon has to be walked to the end of its budget before it can be called
+    // sky, which is why carrying sky across frames is worth as much as it is.
+    let eye = camera.position.xyz;
+    if (ray_through(pixel).y >= 0.0 && eye.y >= terrain.ceiling) {
+        store(pixel, nothing());
+        return;
+    }
+
+    holes[atomicAdd(&hole_count, 1u)] = pixel.x | (pixel.y << 16u);
+}
+
+// Turns the hole count into a dispatch size for the march.
+//
+// A whole pass for three integers, because the count is not known until every
+// workgroup of `cs_compact` has finished and the CPU never sees it at all.
+@compute @workgroup_size(1)
+fn cs_args() {
+    march_args[0] = (atomicLoad(&hole_count) + MARCH_GROUP - 1u) / MARCH_GROUP;
+    march_args[1] = 1u;
+    march_args[2] = 1u;
+}
+
+// One thread per pixel the reprojection could not answer.
+@compute @workgroup_size(64)
+fn cs_march(@builtin(global_invocation_id) id: vec3<u32>) {
+    // The dispatch is whole workgroups, so the last one runs past the list.
+    if (id.x >= atomicLoad(&hole_count)) {
+        return;
+    }
+    let packed = holes[id.x];
+    let pixel = vec2<u32>(packed & 0xffffu, packed >> 16u);
+    store(pixel, ground_at(pixel));
 }

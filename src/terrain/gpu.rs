@@ -178,13 +178,18 @@ pub struct Terrain {
     normal_texture: wgpu::Texture,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    pipeline: wgpu::ComputePipeline,
+    /// Settles every pixel it can from the reprojection and lists the rest.
+    compact: wgpu::ComputePipeline,
+    /// Turns that list's length into a dispatch size for `march`.
+    args: wgpu::ComputePipeline,
+    /// Casts a ray for each pixel on the list, and nothing for any other.
+    march: wgpu::ComputePipeline,
 }
 
-/// Side of the square of pixels one workgroup of the march covers.
+/// Side of the square of pixels one workgroup of the compaction covers.
 ///
-/// Must match `@workgroup_size` on `cs_march` in `src/terrain.wgsl`.
-const MARCH_TILE: u32 = 8;
+/// Must match `@workgroup_size` on `cs_compact` in `src/terrain.wgsl`.
+const COMPACT_TILE: u32 = 8;
 
 impl Terrain {
     /// Opens the tile pyramids and builds the terrain around them.
@@ -197,6 +202,8 @@ impl Terrain {
         device: &wgpu::Device,
         camera_layout: &wgpu::BindGroupLayout,
         storage_layout: &wgpu::BindGroupLayout,
+        work_layout: &wgpu::BindGroupLayout,
+        args_layout: &wgpu::BindGroupLayout,
         residency: Residency,
         viewport: UVec2,
         root: &Path,
@@ -275,6 +282,8 @@ impl Terrain {
             device,
             camera_layout,
             storage_layout,
+            work_layout,
+            args_layout,
             residency,
             viewport,
             placement,
@@ -295,6 +304,8 @@ impl Terrain {
         device: &wgpu::Device,
         camera_layout: &wgpu::BindGroupLayout,
         storage_layout: &wgpu::BindGroupLayout,
+        work_layout: &wgpu::BindGroupLayout,
+        args_layout: &wgpu::BindGroupLayout,
         residency: Residency,
         viewport: UVec2,
         placement: Georeferencing,
@@ -499,7 +510,21 @@ impl Terrain {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("terrain pipeline layout"),
-            bind_group_layouts: &[Some(camera_layout), Some(&layout), Some(storage_layout)],
+            bind_group_layouts: &[
+                Some(camera_layout),
+                Some(&layout),
+                Some(storage_layout),
+                Some(work_layout),
+            ],
+            immediate_size: 0,
+        });
+        // `cs_args` gets its own, holding only the count and the dispatch size
+        // it writes. It cannot share the one above: that binds `march_args` as
+        // writable storage, and the march reads the same buffer as its indirect
+        // argument, which wgpu refuses to allow in one dispatch.
+        let args_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("terrain args pipeline layout"),
+            bind_group_layouts: &[None, None, None, Some(args_layout)],
             immediate_size: 0,
         });
         // Compute rather than a fullscreen triangle. The march never needed
@@ -507,14 +532,24 @@ impl Terrain {
         // blending, and a depth test that could reject nothing because each
         // pixel was covered exactly once -- and a dispatch is the only shape
         // that can be given a list of pixels rather than a screen to cover.
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("terrain pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("cs_march"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        //
+        // All three share one layout. `args` needs almost none of it and
+        // `march` never touches the carried textures, but a pipeline may leave
+        // its layout's entries alone, and one description the three agree on
+        // cannot drift between them.
+        let stage = |label, entry_point, layout| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                module: &shader,
+                entry_point: Some(entry_point),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let compact = stage("terrain compact pipeline", "cs_compact", &pipeline_layout);
+        let args = stage("terrain args pipeline", "cs_args", &args_pipeline_layout);
+        let march = stage("terrain march pipeline", "cs_march", &pipeline_layout);
 
         let height_range = Self::coarsest_height_range(heights.as_ref(), &placement);
         let slots = (residency.tiles_across * residency.tiles_across) as usize;
@@ -541,7 +576,9 @@ impl Terrain {
             normal_texture,
             uniform,
             bind_group,
-            pipeline,
+            compact,
+            args,
+            march,
         }
     }
 
@@ -938,18 +975,38 @@ impl Terrain {
         }
     }
 
-    /// Records the march into an already-started compute pass.
+    /// Settles every pixel the reprojection answered, and lists the rest.
     ///
-    /// The caller has set group 0 (the camera) and group 2 (the G-buffer being
-    /// written); this adds group 1, which is the terrain itself.
-    pub fn march(&self, pass: &mut wgpu::ComputePass<'_>) {
-        pass.set_pipeline(&self.pipeline);
+    /// The caller has set group 0 (the camera), group 2 (the G-buffer being
+    /// written) and group 3 (the carried buffers and the work list); each of
+    /// these adds group 1, which is the terrain itself.
+    pub fn compact(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.compact);
         pass.set_bind_group(1, &self.bind_group, &[]);
         pass.dispatch_workgroups(
-            self.viewport.x.div_ceil(MARCH_TILE),
-            self.viewport.y.div_ceil(MARCH_TILE),
+            self.viewport.x.div_ceil(COMPACT_TILE),
+            self.viewport.y.div_ceil(COMPACT_TILE),
             1,
         );
+    }
+
+    /// Sizes the march's dispatch from the list [`Terrain::compact`] left.
+    ///
+    /// Binds nothing itself: its whole layout is the one group the caller sets.
+    pub fn args(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.args);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+
+    /// Casts a ray for each pixel on that list.
+    ///
+    /// Indirect, because how many there are is decided on the GPU and never
+    /// travels back to the CPU -- which is the whole point: a round trip would
+    /// cost a stall per frame and buy nothing.
+    pub fn march(&self, pass: &mut wgpu::ComputePass<'_>, args: &wgpu::Buffer) {
+        pass.set_pipeline(&self.march);
+        pass.set_bind_group(1, &self.bind_group, &[]);
+        pass.dispatch_workgroups_indirect(args, 0);
     }
 }
 
@@ -1065,6 +1122,8 @@ mod tests {
         let (device, queue) = crate::scene::test_device();
         let camera_layout = crate::scene::test_camera_layout(&device);
         let storage_layout = crate::deferred::storage_layout(&device);
+        let work_layout = crate::reproject::work_layout(&device);
+        let args_layout = crate::reproject::args_layout(&device);
         let residency = test_residency();
         let across = residency.texels_across();
 
@@ -1076,6 +1135,8 @@ mod tests {
             &device,
             &camera_layout,
             &storage_layout,
+            &work_layout,
+            &args_layout,
             residency,
             UVec2::splat(RASTER),
             Georeferencing::square(RASTER, RASTER, 30.0),

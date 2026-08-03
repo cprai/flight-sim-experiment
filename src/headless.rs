@@ -112,17 +112,59 @@ pub fn device() -> Result<(wgpu::Device, wgpu::Queue)> {
     Ok((device, queue))
 }
 
+/// How far the camera is taken to move between one frame and the next, per
+/// metre per second of [`Flight::speed`].
+///
+/// A nominal sixtieth of a second rather than the frame's own measured time.
+/// The path flown has to come out the same on a fast machine and a slow one, or
+/// two runs would be looking at two different flights and could not be
+/// compared -- which is the only reason either mode can fly at all.
+const STEP_SECONDS: f32 = 1.0 / 60.0;
+
+/// A camera that moves, for the modes that draw more than one frame.
+///
+/// One frame says nothing about anything carried between frames, so both
+/// headless modes can fly forward instead of standing still. The default is
+/// still, which is what every run before this existed did.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Flight {
+    /// Frames to draw. The last one is the one that counts.
+    pub frames: u32,
+    /// Metres per second along the camera's forward vector.
+    pub speed: f32,
+}
+
+impl Flight {
+    /// Moves the camera on by one frame.
+    ///
+    /// Called *between* frames rather than before the first, so the opening
+    /// frame is always at the camera that was asked for and a single-frame run
+    /// is unaffected by the speed.
+    fn advance(self, scene: &mut Scene) {
+        if self.speed != 0.0 {
+            let forward = scene.camera.ray_basis()[2];
+            scene.camera.position += forward * self.speed * STEP_SECONDS;
+        }
+    }
+}
+
 /// Draws `scene` into a fresh texture and returns it as tightly packed RGBA8.
 ///
 /// `scene` must have been built with [`CAPTURE_FORMAT`] and a viewport of
 /// `size` -- its G-buffer is that size and the shading pass looks pixels up
 /// by coordinate -- and [`Scene::update`] must have run since the camera
 /// last moved.
+///
+/// Draws `flight.frames` frames and reads back the last. Each gets its own
+/// submit rather than several passes on one encoder, because
+/// `queue.write_buffer` is ordered at submit: batched, every frame would march
+/// against the last frame's camera instead of its own.
 pub fn capture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    scene: &Scene,
+    scene: &mut Scene,
     size: UVec2,
+    flight: Flight,
 ) -> Result<Vec<u8>> {
     let extent = wgpu::Extent3d {
         width: size.x,
@@ -154,6 +196,19 @@ pub fn capture(
     });
 
     let profiler = crate::profile::profiler(device, false);
+    for _ in 1..flight.frames.max(1) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("capture"),
+        });
+        {
+            let mut gpu = profiler.scope("gpu", &mut encoder);
+            scene.draw(&mut gpu, &view);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        flight.advance(scene);
+        scene.update(queue);
+    }
+
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("capture"),
     });
@@ -265,16 +320,21 @@ fn settled(
 ///
 /// Without a `placement` the scene's own opening view is kept, which frames the
 /// whole extent.
+///
+/// `flight` is what makes this able to show anything a frame carries over from
+/// the one before it: with a single frame there is no previous frame, so the
+/// reprojection has nothing to work from and the image is the march's alone.
 pub fn render(
     terrain_root: &Path,
     size: UVec2,
     placement: Option<Placement>,
+    flight: Flight,
     output: &Path,
 ) -> Result<()> {
     let (device, queue) = device()?;
-    let scene = settled(&device, &queue, terrain_root, size, placement)?;
+    let mut scene = settled(&device, &queue, terrain_root, size, placement)?;
 
-    let pixels = capture(&device, &queue, &scene, size)?;
+    let pixels = capture(&device, &queue, &mut scene, size, flight)?;
     write_png(output, size, &pixels)?;
     log::info!("wrote {}", output.display());
     Ok(())
@@ -303,8 +363,9 @@ pub fn profile(
     terrain_root: &Path,
     size: UVec2,
     placement: Option<Placement>,
-    frames: u32,
+    flight: Flight,
 ) -> Result<()> {
+    let frames = flight.frames;
     let (device, queue) = device()?;
     let mut scene = settled(&device, &queue, terrain_root, size, placement)?;
     scene.profile(true);
@@ -332,6 +393,9 @@ pub fn profile(
     for index in 0..WARMUP + frames {
         let mut frame = crate::profile::Frame::default();
 
+        if index > 0 {
+            flight.advance(&mut scene);
+        }
         scene.update(&queue);
         scene.record(&mut frame);
 
@@ -382,7 +446,63 @@ pub fn profile(
     }
 
     print!("{}", crate::profile::table(&measured));
+
+    let holes = count_holes(&device, &queue, &mut scene, &view)?;
+    let pixels = size.x * size.y;
+    println!(
+        "{} of {pixels} pixels marched ({:.1}%); {:.1}% carried over or sky",
+        holes,
+        100.0 * f64::from(holes) / f64::from(pixels),
+        100.0 * f64::from(pixels - holes) / f64::from(pixels),
+    );
     Ok(())
+}
+
+/// Draws one more frame and reads back how much of it the march did.
+///
+/// After the measured run rather than during it: the copy and the buffer map
+/// cost more than the frame does, and a measurement that waits on a readback is
+/// measuring the readback. The extra frame is drawn on the settled, already
+/// warm scene, so it is representative of the ones just timed.
+fn count_holes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene: &mut Scene,
+    view: &wgpu::TextureView,
+) -> Result<u32> {
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("hole count readback"),
+        size: 4,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    scene.update(queue);
+    let profiler = crate::profile::profiler(device, false);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("coverage"),
+    });
+    {
+        let mut gpu = profiler.scope("gpu", &mut encoder);
+        scene.draw(&mut gpu, view);
+    }
+    encoder.copy_buffer_to_buffer(scene.hole_count(), 0, &readback, 0, 4);
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    readback.map_async(wgpu::MapMode::Read, .., move |result| {
+        let _ = sender.send(result);
+    });
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    receiver
+        .recv()
+        .context("the buffer was never mapped")?
+        .context("failed to map the hole count")?;
+    let mapped = readback.get_mapped_range(..).context("not mapped")?;
+    let holes = u32::from_le_bytes(mapped[..4].try_into().expect("four bytes"));
+    drop(mapped);
+    readback.unmap();
+    Ok(holes)
 }
 
 #[cfg(test)]
