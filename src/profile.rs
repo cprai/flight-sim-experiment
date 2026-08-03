@@ -338,9 +338,20 @@ impl Smoothed {
             // Both are subsets of `marched`, so they do not join the sum.
             share("  abandoned", coverage.abandoned);
             share("  spent", coverage.spent);
-            let unaccounted =
-                f64::from(self.pixels.max(coverage.total())) - f64::from(coverage.total());
-            text.push_str(&format!("\n{:<LABEL$}{unaccounted:>7.0} px", "unaccounted"));
+            // What the march actually stored, against what it was handed. The
+            // two agree or the frame is not being drawn, however plausible it
+            // looks -- nothing clears the G-buffer, so pixels the march skipped
+            // keep whatever last reached them.
+            share("  written", coverage.wrote);
+            // Signed, and against the viewport: short means pixels took no
+            // path at all, over means the tally is counting more than one
+            // frame's worth, which would mean it is not being cleared.
+            let unaccounted = i64::from(self.pixels) - i64::from(coverage.total());
+            text.push_str(&format!("\n{:<LABEL$}{unaccounted:>7} px", "unaccounted"));
+            text.push_str(&format!(
+                "\n{:<LABEL$}{:>7} wg",
+                "dispatch", coverage.groups
+            ));
         }
         // Not a share of anything, so it is written plainly: the eye against
         // the highest resident ground. A climbing ray is settled as sky for
@@ -537,6 +548,8 @@ mod tests {
             sky: 100,
             abandoned: 30,
             spent: 20,
+            wrote: 200,
+            groups: 4,
         });
         smoothed.update(&sample);
         let text = smoothed.text();
@@ -546,6 +559,7 @@ mod tests {
             ("marched", 20.0),
             ("  abandoned", 3.0),
             ("  spent", 2.0),
+            ("  written", 20.0),
         ] {
             let expected = format!("{label:<LABEL$}{percent:>8.1} %");
             assert!(text.contains(&expected), "no {expected:?} in {text}");
@@ -560,7 +574,7 @@ mod tests {
                 .len()
         };
         assert_eq!(width("reprojected"), width("cpu"));
-        for label in ["unaccounted", "eye", "ceiling"] {
+        for label in ["unaccounted", "dispatch", "eye", "ceiling"] {
             assert_eq!(width(label), width("cpu"), "{label} line is a ragged width");
         }
 
@@ -575,7 +589,7 @@ mod tests {
             "{short}"
         );
         assert!(
-            short.contains(&format!("{:<LABEL$}{:>7.0} px", "unaccounted", 1000.0)),
+            short.contains(&format!("{:<LABEL$}{:>7} px", "unaccounted", 1000)),
             "{short}"
         );
     }

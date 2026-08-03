@@ -207,11 +207,25 @@ pub struct Coverage {
     /// showing ground the march never actually established -- the one failure
     /// that puts terrain colour where sky belongs.
     pub spent: u32,
+    /// Pixels `cs_march` actually stored.
+    ///
+    /// Should equal [`Self::marched`]. Anything less is a march that did not
+    /// cover the list the compaction handed it, which nothing else would catch:
+    /// the G-buffer is never cleared, so the pixels it skipped keep whatever
+    /// last reached them and go on looking like a picture.
+    pub wrote: u32,
+    /// Workgroups the march was dispatched with, which is
+    /// `ceil(marched / 64)`.
+    ///
+    /// Beside [`Self::wrote`] because an adapter caps how large one dimension
+    /// of a dispatch may be -- 65535 on the baseline this asks for -- and an
+    /// indirect dispatch is not validated against it.
+    pub groups: u32,
 }
 
 impl Coverage {
     /// Size of the buffer this is read out of.
-    pub const BYTES: u64 = 20;
+    pub const BYTES: u64 = 28;
 
     /// Decodes the three counters in the order the `Tally` struct in
     /// `src/terrain.wgsl` declares them.
@@ -229,6 +243,8 @@ impl Coverage {
             sky: at(2),
             abandoned: at(3),
             spent: at(4),
+            wrote: at(5),
+            groups: at(6),
         }
     }
 
@@ -914,14 +930,27 @@ mod tests {
             .split_once('}')
             .expect("the Tally declaration is not closed")
             .0;
+        // Line by line with the comments dropped, because the members are
+        // documented in place and a `:` inside a comment would otherwise be
+        // read as a member of its own.
         let members: Vec<&str> = declared
-            .split(':')
-            .map(|member| member.rsplit(',').next().unwrap_or_default().trim())
-            .filter(|member| !member.is_empty())
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, _)| name.trim())
             .collect();
         assert_eq!(
             members,
-            ["holes", "carried", "sky", "abandoned", "spent"],
+            [
+                "holes",
+                "carried",
+                "sky",
+                "abandoned",
+                "spent",
+                "wrote",
+                "groups"
+            ],
             "in {declared:?}"
         );
 
@@ -932,7 +961,7 @@ mod tests {
 
     #[test]
     fn the_coverage_decodes_the_tally_in_that_order() {
-        let bytes: Vec<u8> = [7u32, 11, 13, 3, 2]
+        let bytes: Vec<u8> = [7u32, 11, 13, 3, 2, 7, 1]
             .iter()
             .flat_map(|n| n.to_le_bytes())
             .collect();
@@ -945,6 +974,8 @@ mod tests {
                 sky: 13,
                 abandoned: 3,
                 spent: 2,
+                wrote: 7,
+                groups: 1,
             }
         );
         // The last two describe marched pixels rather than being paths, so the

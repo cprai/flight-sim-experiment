@@ -44,6 +44,7 @@ const MAX_LEVELS: u32 = 16u;
 // `cs_march` below, which WGSL will not let this constant stand in for.
 const MARCH_GROUP: u32 = 64u;
 
+
 struct Level {
     // The texels resident at this level, as a half-open range measured in this
     // level's own texels from the raster's origin. A point outside it has to be
@@ -547,6 +548,19 @@ struct Tally {
     sky: atomic<u32>,
     abandoned: atomic<u32>,
     spent: atomic<u32>,
+    // Pixels `cs_march` actually stored, and the workgroup count it was
+    // dispatched with.
+    //
+    // `holes` is what the compaction asked for; these two are what the march
+    // was told to do and what it did. They exist because those can disagree
+    // without anything else noticing: nothing clears the G-buffer, so a march
+    // that does not run leaves every pixel holding whatever last reached it,
+    // which on a slow-moving camera looks like a picture rather than like a
+    // failure. `wrote` short of `holes` means the dispatch did not cover the
+    // list; `groups` says how large that dispatch was, which is the number an
+    // adapter limit would cap.
+    wrote: atomic<u32>,
+    groups: atomic<u32>,
 };
 
 // What the march did with this thread's ray, for the two counters above.
@@ -875,9 +889,11 @@ fn cs_compact(@builtin(global_invocation_id) id: vec3<u32>) {
 // workgroup of `cs_compact` has finished and the CPU never sees it at all.
 @compute @workgroup_size(1)
 fn cs_args() {
-    march_args[0] = (atomicLoad(&tally.holes) + MARCH_GROUP - 1u) / MARCH_GROUP;
+    let groups = (atomicLoad(&tally.holes) + MARCH_GROUP - 1u) / MARCH_GROUP;
+    march_args[0] = groups;
     march_args[1] = 1u;
     march_args[2] = 1u;
+    atomicStore(&tally.groups, groups);
 }
 
 // How fast the picture is moving across one dither cell.
@@ -926,11 +942,12 @@ fn cs_risk(
 // One thread per pixel the reprojection could not answer.
 @compute @workgroup_size(64)
 fn cs_march(@builtin(global_invocation_id) id: vec3<u32>) {
+    let at = id.x;
     // The dispatch is whole workgroups, so the last one runs past the list.
-    if (id.x >= atomicLoad(&tally.holes)) {
+    if (at >= atomicLoad(&tally.holes)) {
         return;
     }
-    let packed = holes[id.x];
+    let packed = holes[at];
     let pixel = vec2<u32>(packed & 0xffffu, packed >> 16u);
     store(pixel, ground_at(pixel));
     // Diagnostics, and only paid for by the rays that failed: on a healthy
@@ -941,4 +958,5 @@ fn cs_march(@builtin(global_invocation_id) id: vec3<u32>) {
     if (ray_spent) {
         atomicAdd(&tally.spent, 1u);
     }
+    atomicAdd(&tally.wrote, 1u);
 }

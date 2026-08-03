@@ -475,6 +475,17 @@ pub fn profile(
             coverage.abandoned, coverage.spent,
         );
     }
+    // The march covering the list it was handed is the invariant the whole
+    // uncleared G-buffer rests on, and a frame it skips looks like a frame
+    // rather than like a failure, so say so rather than leave it to be assumed.
+    if coverage.wrote != coverage.marched {
+        log::warn!(
+            "the march wrote {} of the {} pixels it was handed, over {} workgroups",
+            coverage.wrote,
+            coverage.marched,
+            coverage.groups,
+        );
+    }
     Ok(())
 }
 
