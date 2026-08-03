@@ -32,6 +32,11 @@
 //!
 //! Tiles are handed out a few per frame rather than a column at once, so
 //! crossing a boundary costs a bounded amount of work rather than a stall.
+//!
+//! A level that is being filled outright -- its first fill, or a jump too far
+//! to walk to -- is a different case, and reads as resident nowhere until it is
+//! whole. It has no trailing side to give up: the square it is loading into is
+//! the square it is loading over.
 
 use glam::{DVec2, IVec2};
 use terrain_tiles::TILE_SIZE;
@@ -249,11 +254,22 @@ impl LevelResidency {
     ///
     /// One narrower than the square on the trailing side while a step is in
     /// flight, because the new edge is being written over the slots the
-    /// trailing edge is using.
+    /// trailing edge is using -- and empty altogether while a whole square is
+    /// being filled, which has no trailing side to give up because every slot
+    /// it will use is being written at once.
     pub fn valid(&self, tiles_across: u32) -> (IVec2, IVec2) {
         let across = tiles_across as i32;
         let (mut low, mut high) = (self.origin, self.origin + IVec2::splat(across));
         if let Some(step) = &self.step {
+            if step.towards == IVec2::ZERO {
+                // A whole square being filled at once, not an edge sliding by
+                // one: nothing here is loaded, so nothing here may be read.
+                // Every slot the square will use is being written, and until
+                // the tile arrives the slot holds either an untouched texture
+                // or a tile of somewhere else entirely -- the second of which
+                // reads as real ground in the wrong place.
+                return (IVec2::ZERO, IVec2::ZERO);
+            }
             // Moving east writes the column at `origin.x + across`, whose slot
             // is the one `origin.x` is using; moving west writes `origin.x - 1`,
             // which is the slot of the last column.
@@ -499,6 +515,50 @@ mod tests {
             work.iter().all(|w| w.tile.x == work[0].tile.x),
             "the column should share an x: {work:?}"
         );
+    }
+
+    /// A square being filled outright holds nothing yet, and has to say so.
+    ///
+    /// Every slot the square will use is spoken for the moment the fill is
+    /// queued, and until each tile lands its slot holds either a texture
+    /// nothing has written or a tile of somewhere else entirely -- the second
+    /// of which reads as real ground in the wrong place rather than as an
+    /// obvious hole. Advertising the square before it is whole cost the march
+    /// far more than the wrong pixels did: rays descended into a level with no
+    /// data in it and crawled, taking 2746 steps each against the 91 the same
+    /// camera costs once the fill has finished.
+    ///
+    /// The narrowing an edge step does is not enough here, because a fill has
+    /// no direction to narrow along -- see [`LevelResidency::valid`].
+    #[test]
+    fn a_square_being_filled_advertises_nothing() {
+        let residency = Residency {
+            tiles_per_update: 1,
+            ..residency()
+        };
+        let mut tiles = TileResidency::new(residency, 1);
+        let span = f64::from(TILE_SIZE);
+        let camera = DVec2::new(span * 4.5, span * 4.5);
+
+        // Sixteen tiles at one an update, so fifteen updates leave it short.
+        for handed in 1..16 {
+            tiles.advance(camera, 0);
+            let (low, high) = tiles.level(0).valid(4);
+            assert_eq!(
+                low, high,
+                "{handed} of 16 tiles in, the square is still not readable"
+            );
+        }
+        tiles.advance(camera, 0);
+        let (low, high) = tiles.level(0).valid(4);
+        assert_eq!(high - low, IVec2::splat(4), "whole once every tile is in");
+
+        // And the same for a jump, which abandons a square that *was* whole:
+        // its slots are being written over one at a time, so it stops being
+        // readable the moment the refill is queued.
+        tiles.advance(DVec2::new(span * 400.5, span * 400.5), 0);
+        let (low, high) = tiles.level(0).valid(4);
+        assert_eq!(low, high, "a refill is no more readable than a first fill");
     }
 
     /// While a step is in flight the square advertises itself narrower on the
