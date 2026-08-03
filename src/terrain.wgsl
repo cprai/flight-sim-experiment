@@ -44,6 +44,26 @@ const MAX_LEVELS: u32 = 16u;
 // `cs_march` below, which WGSL will not let this constant stand in for.
 const MARCH_GROUP: u32 = 64u;
 
+// Workgroups per row of the march's dispatch.
+//
+// An adapter caps how many workgroups one dimension of a dispatch may hold --
+// 65535 on the baseline this asks for -- and an *indirect* dispatch is not
+// validated against it, so exceeding it does not fail loudly. On this hardware
+// it does not fail at all: the dispatch is dropped, the march writes nothing,
+// and because nothing clears the G-buffer every pixel keeps whatever last
+// reached it. The frame goes on looking like a frame.
+//
+// A screen's worth of rays passes that cap easily. At 3840x2160 a frame with no
+// history is 129600 workgroups, twice over it, and it takes only one such frame
+// to stick: the march writes nothing, so the G-buffer holds nothing to
+// reproject from, so the next frame is another whole screen of rays.
+//
+// So lay the list out in rows instead. A thousand and twenty-four is arbitrary
+// beyond being a power of two well under the cap; two dimensions of it reach
+// four billion pixels, and one row is not dispatched until it is needed.
+//
+// Must match `MARCH_ROW` in `src/reproject.rs`.
+const MARCH_ROW: u32 = 1024u;
 
 struct Level {
     // The texels resident at this level, as a half-open range measured in this
@@ -890,8 +910,12 @@ fn cs_compact(@builtin(global_invocation_id) id: vec3<u32>) {
 @compute @workgroup_size(1)
 fn cs_args() {
     let groups = (atomicLoad(&tally.holes) + MARCH_GROUP - 1u) / MARCH_GROUP;
-    march_args[0] = groups;
-    march_args[1] = 1u;
+    // One row while the work fits in one, so a short list still dispatches
+    // exactly what it needs; full rows after that, which is what lets
+    // `cs_march` recover the index from the two dimensions without being told
+    // how wide the grid is.
+    march_args[0] = min(groups, MARCH_ROW);
+    march_args[1] = (groups + MARCH_ROW - 1u) / MARCH_ROW;
     march_args[2] = 1u;
     atomicStore(&tally.groups, groups);
 }
@@ -942,8 +966,12 @@ fn cs_risk(
 // One thread per pixel the reprojection could not answer.
 @compute @workgroup_size(64)
 fn cs_march(@builtin(global_invocation_id) id: vec3<u32>) {
-    let at = id.x;
-    // The dispatch is whole workgroups, so the last one runs past the list.
+    // The list is laid out in rows of `MARCH_ROW` workgroups; see the constant
+    // for why it is not one long line. A grid one row deep has `y` of zero
+    // throughout and this is `id.x`, so the short case costs nothing.
+    let at = id.y * MARCH_ROW * MARCH_GROUP + id.x;
+    // The dispatch is whole workgroups and whole rows, so the end runs past the
+    // list.
     if (at >= atomicLoad(&tally.holes)) {
         return;
     }

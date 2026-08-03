@@ -127,6 +127,18 @@ pub const RISK_GAIN: f32 = 0.6;
 )]
 pub const MARCH_GROUP: u32 = 64;
 
+/// Workgroups per row of the march's dispatch.
+///
+/// The march is dispatched over a grid rather than a line because one dimension
+/// of a dispatch is capped -- 65535 on the limits this asks for -- and an
+/// indirect dispatch is not validated against it. See `MARCH_ROW` in
+/// `src/terrain.wgsl`, where the whole of the reasoning lives.
+#[allow(
+    dead_code,
+    reason = "the shader is what uses these; Rust mirrors them so the tests can check what it was compiled with"
+)]
+pub const MARCH_ROW: u32 = 1024;
+
 /// The ordered 8x8 Bayer rank of a cell, 0 to 63.
 ///
 /// The Rust mirror of `bayer8` in `src/reproject.wgsl`, kept so the pattern and
@@ -914,6 +926,71 @@ mod tests {
             march.contains(&format!("@workgroup_size({MARCH_GROUP})")),
             "cs_march is not {MARCH_GROUP} threads wide"
         );
+        assert!(
+            march.contains(&format!("const MARCH_ROW: u32 = {MARCH_ROW}u;")),
+            "terrain.wgsl does not declare MARCH_ROW as {MARCH_ROW}"
+        );
+    }
+
+    /// The grid `cs_args` sizes covers the hole list exactly, and never asks
+    /// one dimension for more workgroups than the device is guaranteed to
+    /// allow.
+    ///
+    /// The second half is the whole reason the grid exists, and it is not
+    /// something a frame can be trusted to reveal: an indirect dispatch is not
+    /// validated against the cap, and the hardware this was found on answered
+    /// an oversized one by doing nothing at all -- no error, no warning, and a
+    /// G-buffer that nothing clears, so the frame carried on looking like a
+    /// frame. Screen sizes reach it easily: a frame with no history at 3840 by
+    /// 2160 is 129600 workgroups against a cap of 65535.
+    ///
+    /// The first half matters just as much in the other direction: rows that
+    /// overlapped would march a pixel twice, and rows that left a gap would
+    /// leave it holding the frame before.
+    #[test]
+    fn the_march_grid_covers_the_list_and_fits_the_device() {
+        let cap = crate::deferred::limits().max_compute_workgroups_per_dimension;
+        let sizes = [
+            0,
+            1,
+            MARCH_GROUP - 1,
+            MARCH_GROUP,
+            MARCH_GROUP + 1,
+            MARCH_ROW * MARCH_GROUP - 1,
+            MARCH_ROW * MARCH_GROUP,
+            MARCH_ROW * MARCH_GROUP + 1,
+            1280 * 720,
+            2732 * 1536,
+            3840 * 2160,
+            7680 * 4320,
+        ];
+        for holes in sizes {
+            // Exactly what `cs_args` writes.
+            let groups = holes.div_ceil(MARCH_GROUP);
+            let x = groups.min(MARCH_ROW);
+            let y = groups.div_ceil(MARCH_ROW);
+            assert!(x <= cap && y <= cap, "{holes} holes asks for {x} by {y}");
+
+            // Exactly what `cs_march` derives from `id`, over every thread the
+            // grid runs, checked for one hit per entry and nothing past the end
+            // that the bounds test does not catch.
+            let mut reached = vec![0u32; holes as usize];
+            for gy in 0..y {
+                for thread in 0..x * MARCH_GROUP {
+                    let at = gy * MARCH_ROW * MARCH_GROUP + thread;
+                    if at < holes {
+                        reached[at as usize] += 1;
+                    }
+                }
+            }
+            assert!(
+                reached.iter().all(|hits| *hits == 1),
+                "{holes} holes: {} reached once, {} missed, {} twice",
+                reached.iter().filter(|n| **n == 1).count(),
+                reached.iter().filter(|n| **n == 0).count(),
+                reached.iter().filter(|n| **n > 1).count(),
+            );
+        }
     }
 
     /// [`Coverage`] reads three integers by position, so a pair swapped in the
