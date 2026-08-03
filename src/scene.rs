@@ -2426,10 +2426,16 @@ mod tests {
         let mut reader = crate::reproject::CoverageReader::new(&device);
         let profiler = crate::profile::profiler(&device, false);
         let mut arrived = None;
-        // Generous: one read is in flight at a time, so an answer takes a few
-        // frames. Bounded so a reader that never delivers fails rather than
-        // hanging.
-        for _ in 0..16 {
+        // Not a latency estimate, and deliberately not tuned to one. Nothing
+        // here blocks, so how many frames an answer takes is however deep the
+        // queue happens to run before a poll observes the copy finishing --
+        // measured between 23 and 33 on the machine this was written on, where
+        // an earlier bound of 16 passed for a while and then stopped. What the
+        // test is actually for is a reader that never delivers at all, which
+        // would leave the overlay blank for a whole run; ten seconds of a
+        // sixty-a-second one is past any argument about queue depth, and still
+        // fails rather than hangs.
+        for _ in 0..600 {
             let mut encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             {
