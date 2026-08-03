@@ -277,6 +277,15 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     // Whether the ray has advanced at all. Being under the ground before it has
     // means something quite different from being under it after.
     var moved = false;
+    // The finest level still worth trying where the ray is standing *now*.
+    //
+    // Climbing without advancing `t` -- because nothing is loaded here, or
+    // because the ray is over the whole level -- rules out everything below as
+    // well, a finer level's square being contained in a coarser one's. Without
+    // that recorded, the descent below would take the ray straight back to the
+    // level it just left and the two would trade places at one `t` until the
+    // step budget ran out.
+    var finest = terrain.base_level;
     // Whether the last thing the ray crossed was ground nothing is known about.
     // A ray that drops through a hole comes up against the underside of the
     // ground beside it, and has to be told apart from one that merely grazed a
@@ -298,6 +307,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
                 return out;
             }
             level += 1u;
+            finest = level;
             continue;
         }
 
@@ -310,6 +320,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
                 return out;
             }
             level += 1u;
+            finest = level;
             continue;
         }
 
@@ -330,12 +341,13 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
             t = exit + nudge;
             moved = true;
             level = min(level + 1u, coarsest);
+            finest = terrain.base_level;
             continue;
         }
 
         // Something could be here. Look closer, if anything finer is loaded --
         // which is to say, if this ground is near enough the camera to have it.
-        if (level > terrain.base_level) {
+        if (level > finest) {
             let finer = level - 1u;
             if (resident(finer, vec2<i32>(floor(p / (size * 0.5))))) {
                 level = finer;
@@ -355,6 +367,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
             t = exit + nudge;
             moved = true;
             level = min(level + 1u, coarsest);
+            finest = terrain.base_level;
             continue;
         }
 
@@ -386,6 +399,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
             t = exit + nudge;
             moved = true;
             level = min(level + 1u, coarsest);
+            finest = terrain.base_level;
             continue;
         }
 
