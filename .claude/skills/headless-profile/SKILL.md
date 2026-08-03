@@ -19,21 +19,26 @@ renderer.
 
 ```
 step               min    median      mean
-frame          5.04 ms   5.25 ms   5.32 ms  (190.6 fps median)
-gpu            4.93 ms   5.10 ms   5.10 ms
-  geometry     4.90 ms   5.06 ms   5.06 ms
+frame          1.90 ms   2.41 ms   4.00 ms  (414.8 fps median)
+gpu            1.74 ms   1.84 ms   1.84 ms
+  reproject    0.23 ms   0.23 ms   0.23 ms
+  compact      0.04 ms   0.04 ms   0.04 ms
+  args         0.00 ms   0.00 ms   0.00 ms
+  march        1.41 ms   1.49 ms   1.51 ms
+  risk         0.01 ms   0.01 ms   0.01 ms
   shading      0.02 ms   0.02 ms   0.02 ms
-cpu            0.05 ms   0.06 ms   0.07 ms
+cpu            0.08 ms   0.11 ms   0.11 ms
   camera       0.00 ms   0.00 ms   0.00 ms
   terrain      0.00 ms   0.00 ms   0.00 ms
     advance    0.00 ms   0.00 ms   0.00 ms
     read       0.00 ms   0.00 ms   0.00 ms
     convert    0.00 ms   0.00 ms   0.00 ms
     write      0.00 ms   0.00 ms   0.00 ms
-  encode       0.00 ms   0.01 ms   0.01 ms
-  submit       0.04 ms   0.05 ms   0.06 ms
+  encode       0.01 ms   0.01 ms   0.01 ms
+  submit       0.07 ms   0.10 ms   0.09 ms
 
 60 frames, 0 tile uploads
+160000 of 921600 pixels marched (17.4%); 82.6% carried over or sky
 ```
 
 ## Reading it
@@ -47,16 +52,32 @@ and submits. A frame is roughly `max` of the two, not the sum.
   GPU time plus the blocking poll. Nothing presents, so there is no vsync and
   this is not capped at a refresh rate. The fps beside it is the median
   converted, not an average of rates.
-- **`gpu`** wraps both render passes. Its children are where a shader change
-  shows up:
-  - **`geometry`** is the raymarch into the G-buffer. It is essentially the
-    whole frame -- 5.06 of 5.10 ms above -- because it is one fullscreen
-    triangle whose fragment shader walks the clipmap. Any terrain shader change
-    lands here.
-  - **`shading`** is the deferred resolve: one more fullscreen triangle reading
-    the G-buffer back. Two hundredths of a millisecond. If a change makes this
-    row grow noticeably, that is the finding.
+- **`gpu`** wraps every pass of the frame. Its children are where a shader
+  change shows up:
+  - **`reproject`** scatters the previous frame's ground into this camera, one
+    point per pixel. Roughly fixed at a given resolution -- it does the same
+    work whatever the scene is -- so a change here means the splat itself
+    changed.
+  - **`compact`** settles every pixel that scatter answered and lists the rest.
+    Cheap, and reads as noise unless the list-building changed.
+  - **`args`** turns that list's length into a dispatch size. Three integers;
+    it rounds to zero and is only in the table so nothing is unaccounted for.
+  - **`march`** is the raymarch itself, and still the bulk of the frame -- 1.49
+    of 1.84 ms above. It runs only over the pixels the reprojection left, so it
+    moves both when the shader changes *and* when the share of carried pixels
+    does. Read it beside the coverage line before concluding a shader edit
+    caused it.
+  - **`risk`** reduces the motion field to one number per dither cell. A
+    hundredth of a millisecond.
+  - **`shading`** is the deferred resolve: one fullscreen triangle reading the
+    G-buffer back. Two hundredths of a millisecond. If a change makes this row
+    grow noticeably, that is the finding.
   - **`hud`** appears only in the windowed overlay, never here.
+- **The coverage line** under the table is how much of the frame the march
+  actually did. It is read back from the GPU on one extra frame after the
+  measured run, so it costs the timings nothing. A `march` row that moved
+  without this number moving is a real shader change; both moving together
+  usually means the reprojection's share changed instead.
 - **`cpu`** is the recording side, and on a settled scene it is noise.
   - **`terrain`** and its four children are the tile streaming: `advance`
     decides what is wanted, `read` pulls tiles off disk, `convert` narrows the
@@ -84,17 +105,20 @@ streaming hitch makes and the shape an average erases. Quote the median for
   wgpu's staging belt, not through the command encoder the scopes wrap, so no
   timestamp can reach them. They are inside `submit` on the CPU side and
   unattributed on the GPU side.
-- **Anything inside a pass.** There is one draw call per pass, and the near
-  field and far field are branches of one fragment shader rather than separate
-  pipelines, so `geometry` cannot be split further without splitting the shader.
+- **Anything inside a pass.** There is one dispatch or draw per pass, so
+  `march` cannot be split further without splitting the shader.
+- **What the reprojection got wrong.** The coverage line says how much of the
+  frame was carried rather than marched; it says nothing about whether the
+  carried pixels were *right*. Only a picture shows that -- use
+  `headless-render` with `--frames` and `--motion`.
 
 ## Trusting the numbers
 
 - **`device_type` in the adapter line decides whether any of it is worth
   quoting.** If it says `Cpu`, llvmpipe took the job and you are timing LLVM.
-  The default view at 1280x720 costs about 189 ms there against 5 ms on the
-  discrete GPU -- a factor of 36, so a run that landed on the wrong adapter is
-  obvious from the magnitude alone.
+  The default view at 1280x720 costs on the order of a hundred milliseconds
+  there against under two on the discrete GPU, so a run that landed on the
+  wrong adapter is obvious from the magnitude alone.
   `WGPU_POWER_PREF` (already `high` in the devcontainer) chooses.
 - **An adapter without timestamp support simply omits the GPU rows** rather than
   reporting zeros, so a missing measurement never reads as a fast one. The
@@ -105,6 +129,13 @@ streaming hitch makes and the shape an average erases. Quote the median for
 - **`--frames N`** for a longer or shorter run; 60 is the default and a few more
   are drawn and discarded first, because the first use of a pipeline compiles
   it.
+- **`--motion M/S` decides what is being measured, and the default flatters
+  it.** With the camera still -- the default, and what every run before this
+  option existed did -- every pixel of ground lands back on the pixel it came
+  from, so the reprojection carries all it possibly can and the march does only
+  the share the dither drops. That is a best case that never happens in flight.
+  Flying uncovers ground the previous frame never saw, which has to be marched.
+  Quote both, and never compare a still run against a moving one.
 
 ## A before/after comparison
 
@@ -116,11 +147,24 @@ streaming hitch makes and the shape an average erases. Quote the median for
 diff -u /tmp/before.txt /tmp/after.txt
 ```
 
-Same camera and same size both times, or the comparison means nothing.
-`--camera` takes the same `x,y,z,yaw,pitch` as `render`, and a leading minus
-needs the `=` form -- see the `headless-render` skill for the coordinate frame
-and for how to pick a view that actually contains what you changed.
+Same camera, same size and same `--motion` both times, or the comparison means
+nothing. `--camera` takes the same `x,y,z,yaw,pitch` as `render`, and a leading
+minus needs the `=` form -- see the `headless-render` skill for the coordinate
+frame and for how to pick a view that actually contains what you changed.
 
-Confirm the change reached the pixels too: a shader edit that speeds `geometry`
-up and also changes the image is a different finding from one that does not.
+Run it twice, once still and once flying:
+
+```
+./target/release/flight-sim profile --terrain assets/terrain   --camera=-40000,3000,50000,0,-15 --motion 50 > /tmp/after-moving.txt
+```
+
+Confirm the change reached the pixels too: a shader edit that speeds `march` up
+and also changes the image is a different finding from one that does not.
 `headless-render` and its `cmp` test are how you tell.
+
+**Take one number from a view, not from the view.** How much the reprojection
+can carry depends heavily on what is on screen, so the same build measures very
+differently from different cameras -- a view filled with ground carries far
+more than one with a lot of sky, because sky that the ceiling test cannot settle
+is marched whenever the dither drops it. Two cameras is a much better report
+than one.

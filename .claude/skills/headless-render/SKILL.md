@@ -92,10 +92,36 @@ Nothing goes to stdout. A `render` run whose stdout is empty is working.
 - **`camera at ...`** echoes where the view actually ended up, which is how you
   confirm `--camera` parsed the way you meant.
 
+## Drawing more than one frame
+
+```
+./target/release/flight-sim render --terrain assets/terrain \
+  --camera=0,1500,0,0,-15 --frames 30 --motion 100 -o /tmp/frame.png
+```
+
+`--frames N` draws N frames and writes the last; `--motion M/S` flies the camera
+forward between them, at a nominal sixtieth of a second each so the path is the
+same on any machine. Both default to the old behaviour -- one frame, standing
+still -- so a plain `render` is unchanged.
+
+This is the only way to see anything the reprojection does, and the only way to
+see it go wrong. What to look for, none of which a single frame can show:
+ground that has gone stale in blocks, since whole 8x8 cells are refreshed
+together; terrain smeared or lagging at a silhouette, where near ground slides
+over far; and holes at the edges of the view, where ground the previous frame
+never saw has to be marched from nothing.
+
+A still camera is the case to check first, and it has an exact answer: with the
+camera unmoved, every carried point projects back to the pixel it came from, so
+`--frames 200` must be **byte-identical** to `--frames 1`. If it is not,
+something in the carry is wrong, and that test localises it far better than
+looking at a moving frame does.
+
 ## Comparing two frames
 
 Output is deterministic: the same arguments over the same pyramid produce
-byte-identical PNGs across runs. So `cmp` is a real test.
+byte-identical PNGs across runs, `--frames` and `--motion` included. So `cmp` is
+a real test.
 
 ```
 ./target/release/flight-sim render ... -o /tmp/before.png   # stash, then edit
@@ -107,15 +133,25 @@ cmp -s /tmp/before.png /tmp/after.png && echo "no visible change"
 view. That is a genuine finding -- but read the next section before concluding
 the code is dead.
 
+Comparing a flight against the truth needs a little arithmetic: render
+`--frames N --motion M` and then render *one* frame from the position that
+flight ends at, which is `(N-1) * M / 60` metres along the camera's forward
+vector. The first is what the reprojection produced, the second what marching
+every pixel would have. They will not be identical -- carried material and
+normals are a few frames old -- but the size of the difference is the measure of
+how much staleness the drop rate is letting through.
+
 ## Traps that make a change look like nothing happened
 
 - **The default view frames the whole extent.** It looks at whatever is most of
   the box, so a change confined to one region, one level, or near ground renders
   byte-identical and looks inert. Aim the camera at the thing you changed.
-- **Only one frame is drawn, after a single clipmap update.** Anything that
-  settles over several frames -- streaming that catches up, hysteresis, an
-  incremental update path -- will not appear. Use the `FLIGHT_SIM_WALK` harness
-  below for those.
+- **One frame is drawn unless `--frames` says otherwise, and one frame carries
+  nothing from a frame before it.** The renderer reuses most of the previous
+  frame's ground rather than marching it again, so a single frame shows the
+  march alone and none of the reuse -- and anything that settles over several
+  frames, such as streaming catching up or an incremental update, will not
+  appear either. `--frames N` draws N and writes the last.
 - **`--size` is not a crop.** The viewport's pixel angle decides the *finest*
   level worth filling at a given altitude -- `detail_base` in
   `src/terrain/residency.rs` -- so a small render can be reading coarser ground
