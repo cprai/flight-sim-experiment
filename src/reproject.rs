@@ -173,6 +173,54 @@ struct SplattingUniform {
     was_ray_forward: [f32; 4],
 }
 
+/// How a frame's pixels were settled, read back from [`Carried::tally`].
+///
+/// One number per path through `cs_compact`, and every pixel of the viewport
+/// takes exactly one of them, so they sum to the pixel count. `reprojected` is
+/// the one the reprojection is judged on -- what the previous frame answered
+/// for this one. Sky is kept apart from it rather than counted with it because
+/// the ceiling test settles sky for nothing whether there is a history or not,
+/// so folding the two together would credit the reprojection with pixels it
+/// never had to carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Coverage {
+    /// Pixels no carried point reached that the ceiling test could not settle,
+    /// so a ray was cast for them.
+    pub marched: u32,
+    /// Pixels a splat landed on, carried over from the previous frame.
+    pub reprojected: u32,
+    /// Pixels the ceiling test called sky without casting a ray or consulting
+    /// any history.
+    pub sky: u32,
+}
+
+impl Coverage {
+    /// Size of the buffer this is read out of.
+    pub const BYTES: u64 = 12;
+
+    /// Decodes the three counters in the order the `Tally` struct in
+    /// `src/terrain.wgsl` declares them.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let at = |index: usize| {
+            u32::from_le_bytes(
+                bytes[index * 4..index * 4 + 4]
+                    .try_into()
+                    .expect("four bytes"),
+            )
+        };
+        Self {
+            marched: at(0),
+            reprojected: at(1),
+            sky: at(2),
+        }
+    }
+
+    /// The pixels accounted for, which should be all of them.
+    pub fn total(self) -> u32 {
+        self.marched + self.reprojected + self.sky
+    }
+}
+
 /// Where the reprojection puts what it carried, and the work list it leaves.
 ///
 /// Screen-sized, so it is rebuilt with the G-buffer whenever the target
@@ -192,11 +240,13 @@ pub struct Carried {
     /// because a frame with no history at all -- the first one, and the first
     /// after a resize -- leaves every pixel of ground in it.
     pub holes: wgpu::Buffer,
-    /// How many entries of `holes` are live this frame.
+    /// How many pixels `cs_compact` sent down each of its three paths.
     ///
-    /// Cleared per frame and counted up with an atomic. Also the whole of the
-    /// coverage measurement: pixels marched against pixels there were.
-    pub hole_count: wgpu::Buffer,
+    /// Cleared per frame and counted up with atomics. The first member is how
+    /// many entries of `holes` are live, which the march is sized from; the
+    /// other two are the coverage measurement. See [`Coverage`], which decodes
+    /// it, and the `Tally` struct in `src/terrain.wgsl`, which writes it.
+    pub tally: wgpu::Buffer,
     /// `[workgroups, 1, 1]` for the march's indirect dispatch.
     pub march_args: wgpu::Buffer,
     /// One number per dither cell: the fastest screen-space motion in it, which
@@ -243,9 +293,9 @@ impl Carried {
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             }),
-            hole_count: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("hole count"),
-                size: 4,
+            tally: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("compaction tally"),
+                size: Coverage::BYTES,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
@@ -408,7 +458,7 @@ pub fn bind_args(
         label: Some("reprojection args bind group"),
         layout,
         entries: &[
-            entry(5, carried.hole_count.as_entire_binding()),
+            entry(5, carried.tally.as_entire_binding()),
             entry(6, carried.march_args.as_entire_binding()),
         ],
     })
@@ -429,7 +479,7 @@ pub fn bind_work(
             entry(2, wgpu::BindingResource::TextureView(&carried.normal)),
             entry(3, wgpu::BindingResource::TextureView(&carried.depth)),
             entry(4, carried.holes.as_entire_binding()),
-            entry(5, carried.hole_count.as_entire_binding()),
+            entry(5, carried.tally.as_entire_binding()),
         ],
     })
 }
@@ -713,5 +763,49 @@ mod tests {
             march.contains(&format!("@workgroup_size({MARCH_GROUP})")),
             "cs_march is not {MARCH_GROUP} threads wide"
         );
+    }
+
+    /// [`Coverage`] reads three integers by position, so a pair swapped in the
+    /// shader would report one path's pixels as another's and nothing else
+    /// would notice: the counts would still sum to the pixel count, and the
+    /// march would still be sized from offset zero.
+    #[test]
+    fn the_tally_is_laid_out_the_way_the_coverage_reads_it() {
+        let march = include_str!("terrain.wgsl");
+        let declared = march
+            .split_once("struct Tally {")
+            .expect("terrain.wgsl declares no Tally")
+            .1
+            .split_once('}')
+            .expect("the Tally declaration is not closed")
+            .0;
+        let members: Vec<&str> = declared
+            .split(':')
+            .map(|member| member.rsplit(',').next().unwrap_or_default().trim())
+            .filter(|member| !member.is_empty())
+            .collect();
+        assert_eq!(members, ["holes", "carried", "sky"], "in {declared:?}");
+
+        // And that the three of them are the whole of the buffer, so a member
+        // added without widening it would truncate rather than go unreported.
+        assert_eq!(Coverage::BYTES, members.len() as u64 * 4);
+    }
+
+    #[test]
+    fn the_coverage_decodes_the_tally_in_that_order() {
+        let bytes: Vec<u8> = [7u32, 11, 13]
+            .iter()
+            .flat_map(|n| n.to_le_bytes())
+            .collect();
+        let coverage = Coverage::from_bytes(&bytes);
+        assert_eq!(
+            coverage,
+            Coverage {
+                marched: 7,
+                reprojected: 11,
+                sky: 13,
+            }
+        );
+        assert_eq!(coverage.total(), 31);
     }
 }

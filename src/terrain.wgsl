@@ -457,8 +457,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
 @group(3) @binding(2) var carried_normal: texture_2d<f32>;
 @group(3) @binding(3) var carried_depth: texture_depth_2d;
 
-// The pixels the reprojection did not reach, packed as `x | y << 16`, and how
-// many of them there are.
+// The pixels the reprojection did not reach, packed as `x | y << 16`.
 //
 // This is the point of the whole arrangement. A wave costs as much as the
 // longest ray in it, so a march that runs a thread per pixel and lets most of
@@ -471,7 +470,30 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
 // reprojection failed, so the rays in a wave no longer walk neighbouring cells
 // of the quadtree the way a rectangle of pixels did.
 @group(3) @binding(4) var<storage, read_write> holes: array<u32>;
-@group(3) @binding(5) var<storage, read_write> hole_count: atomic<u32>;
+
+// How many pixels `cs_compact` sent down each of its three paths.
+//
+// `holes` is load bearing -- `cs_args` sizes the march from it and `cs_march`
+// bounds itself by it -- and the other two exist only to be read back and
+// reported. Together they say what the reprojection is actually buying, which
+// the hole count alone cannot: a pixel that was not marched was either carried
+// over from the last frame or settled as sky for free, and those are not the
+// same achievement.
+//
+// Every pixel of the viewport takes exactly one of the three, so they sum to
+// the pixel count. That is worth asserting, and it is what makes the two
+// diagnostic counters worth the atomics rather than deriving one from the
+// others.
+//
+// `holes` stays first so its offset is unchanged; the members after it are
+// mirrored by `Coverage` in `src/reproject.rs`.
+struct Tally {
+    holes: atomic<u32>,
+    carried: atomic<u32>,
+    sky: atomic<u32>,
+};
+
+@group(3) @binding(5) var<storage, read_write> tally: Tally;
 // `[workgroups, 1, 1]`, written by `cs_args` for the march to be dispatched by.
 @group(3) @binding(6) var<storage, read_write> march_args: array<u32, 3>;
 
@@ -741,6 +763,7 @@ fn cs_compact(@builtin(global_invocation_id) id: vec3<u32>) {
     let depth = textureLoad(carried_depth, at, 0);
     if (depth != 0.0) {
         store(pixel, carried_at(pixel, depth));
+        atomicAdd(&tally.carried, 1u);
         return;
     }
 
@@ -751,10 +774,11 @@ fn cs_compact(@builtin(global_invocation_id) id: vec3<u32>) {
     let eye = camera.position.xyz;
     if (ray_through(pixel).y >= 0.0 && eye.y >= terrain.ceiling) {
         store(pixel, nothing());
+        atomicAdd(&tally.sky, 1u);
         return;
     }
 
-    holes[atomicAdd(&hole_count, 1u)] = pixel.x | (pixel.y << 16u);
+    holes[atomicAdd(&tally.holes, 1u)] = pixel.x | (pixel.y << 16u);
 }
 
 // Turns the hole count into a dispatch size for the march.
@@ -763,7 +787,7 @@ fn cs_compact(@builtin(global_invocation_id) id: vec3<u32>) {
 // workgroup of `cs_compact` has finished and the CPU never sees it at all.
 @compute @workgroup_size(1)
 fn cs_args() {
-    march_args[0] = (atomicLoad(&hole_count) + MARCH_GROUP - 1u) / MARCH_GROUP;
+    march_args[0] = (atomicLoad(&tally.holes) + MARCH_GROUP - 1u) / MARCH_GROUP;
     march_args[1] = 1u;
     march_args[2] = 1u;
 }
@@ -815,7 +839,7 @@ fn cs_risk(
 @compute @workgroup_size(64)
 fn cs_march(@builtin(global_invocation_id) id: vec3<u32>) {
     // The dispatch is whole workgroups, so the last one runs past the list.
-    if (id.x >= atomicLoad(&hole_count)) {
+    if (id.x >= atomicLoad(&tally.holes)) {
         return;
     }
     let packed = holes[id.x];

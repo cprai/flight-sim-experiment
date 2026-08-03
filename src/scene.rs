@@ -307,14 +307,14 @@ impl Scene {
         self.terrain.update(queue, self.camera.position);
     }
 
-    /// How many pixels the last frame handed to the march.
+    /// How the last frame's pixels were settled: carried over, sky, or marched.
     ///
-    /// The whole of the coverage measurement: every pixel not on this list was
-    /// either carried over from an earlier frame or settled as sky without a
-    /// ray being cast. Lives on the GPU and is only worth reading back outside
-    /// a measured frame -- see [`crate::headless::profile`].
-    pub fn hole_count(&self) -> &wgpu::Buffer {
-        &self.carried.hole_count
+    /// The whole of the coverage measurement, three `u32`s laid out for
+    /// [`crate::reproject::Coverage`] to decode. Lives on the GPU and is only
+    /// worth reading back outside a measured frame -- see
+    /// [`crate::headless::profile`].
+    pub fn tally(&self) -> &wgpu::Buffer {
+        &self.carried.tally
     }
 
     /// Starts or stops accounting for where an update's time goes.
@@ -381,7 +381,7 @@ impl Scene {
         };
 
         // Counted up from nothing every frame by `cs_compact`.
-        gpu.clear_buffer(&self.carried.hole_count, 0, None);
+        gpu.clear_buffer(&self.carried.tally, 0, None);
 
         {
             // Reads the G-buffer -- still holding last frame, because nothing
@@ -2150,5 +2150,116 @@ mod tests {
         assert!(spans.tiles > 0, "{spans:?}");
         let total = spans.advance + spans.read + spans.convert + spans.write;
         assert!(total > Duration::ZERO, "{spans:?}");
+    }
+
+    /// Draws one frame of `scene` and reads back how its pixels were settled.
+    ///
+    /// Its own submit per call, not several passes on one encoder:
+    /// `queue.write_buffer` is ordered at submit, so consecutive frames batched
+    /// into one would both run against the *later* uniforms -- the same dither
+    /// phase and the same previous-camera basis -- and stop being consecutive
+    /// frames. The same reason `crate::headless::capture` loops this way.
+    fn settled_pixels(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        view: &wgpu::TextureView,
+    ) -> crate::reproject::Coverage {
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coverage readback"),
+            size: crate::reproject::Coverage::BYTES,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let profiler = crate::profile::profiler(device, false);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut gpu = profiler.scope("gpu", &mut encoder);
+            scene.draw(&mut gpu, view);
+        }
+        encoder.copy_buffer_to_buffer(
+            scene.tally(),
+            0,
+            &readback,
+            0,
+            crate::reproject::Coverage::BYTES,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll failed");
+        let coverage = crate::reproject::Coverage::from_bytes(
+            &readback.get_mapped_range(..).expect("buffer not mapped"),
+        );
+        readback.unmap();
+        coverage
+    }
+
+    /// The invariant that replaced clearing the G-buffer: between them
+    /// `cs_compact` and `cs_march` write every pixel exactly once.
+    ///
+    /// Nothing clears the G-buffer any more, so a pixel that fell down no path
+    /// would not be blank -- it would hold whatever the frame before left
+    /// there, which on a slow-moving camera looks entirely plausible. The three
+    /// counters are what make that checkable at all.
+    #[test]
+    fn every_pixel_is_settled_by_exactly_one_path() {
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut scene = test_scene(
+            &device,
+            format,
+            test_residency(),
+            vec![0.0; (RASTER * RASTER) as usize],
+            flat_ground(),
+        );
+
+        // Well above the ground, so the ceiling test can settle a ray that
+        // heads upwards, and tilted by less than half the field of view, so
+        // some rays do and the rest are left with ground to find. All three
+        // paths then have pixels to count, which is what makes the sum worth
+        // asserting: a counter that was never incremented would otherwise hide
+        // behind a path this view happened not to take.
+        scene.camera.position = Vec3::new(0.0, 3000.0, 0.0);
+        scene.camera.orientation = Camera::from_yaw_pitch_roll(0.0, -20f32.to_radians(), 0.0);
+        scene.settle(&queue);
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("coverage target"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let pixels = SIZE * SIZE;
+
+        // The first frame has no history at all -- the G-buffer it reprojects
+        // from has never been written -- so every point is dropped and nothing
+        // is carried.
+        let first = settled_pixels(&device, &queue, &scene, &view);
+        assert_eq!(first.total(), pixels, "{first:?}");
+        assert_eq!(first.reprojected, 0, "{first:?}");
+
+        scene.update(&queue);
+
+        // The second is the first that can take all three paths.
+        let second = settled_pixels(&device, &queue, &scene, &view);
+        assert_eq!(second.total(), pixels, "{second:?}");
+        assert!(second.reprojected > 0, "{second:?}");
+        assert!(second.sky > 0, "{second:?}");
+        // The dither hands a share of the screen back however still the camera
+        // is, so there is always something left to march.
+        assert!(second.marched > 0, "{second:?}");
     }
 }

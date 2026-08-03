@@ -38,7 +38,7 @@ cpu            0.08 ms   0.11 ms   0.11 ms
   submit       0.07 ms   0.10 ms   0.09 ms
 
 60 frames, 0 tile uploads
-160000 of 921600 pixels marched (17.4%); 82.6% carried over or sky
+921600 pixels: 70.1% reprojected from the last frame, 12.5% sky, 17.4% marched
 ```
 
 ## Reading it
@@ -73,11 +73,27 @@ and submits. A frame is roughly `max` of the two, not the sum.
     G-buffer back. Two hundredths of a millisecond. If a change makes this row
     grow noticeably, that is the finding.
   - **`hud`** appears only in the windowed overlay, never here.
-- **The coverage line** under the table is how much of the frame the march
-  actually did. It is read back from the GPU on one extra frame after the
-  measured run, so it costs the timings nothing. A `march` row that moved
-  without this number moving is a real shader change; both moving together
-  usually means the reprojection's share changed instead.
+- **The coverage line** under the table is how every pixel of the frame was
+  settled. The three shares are the three paths through the compaction and add
+  up to 100%:
+  - **reprojected** -- a splat from the previous frame landed here, so this
+    frame answered it for nothing. This is what the reprojection is judged on.
+  - **sky** -- the ceiling test called it sky without casting a ray or
+    consulting any history. Free either way, which is why it is kept apart from
+    the reprojected share rather than counted with it. Zero whenever the camera
+    is below the highest resident peak, because then a ray heading for the
+    horizon has to be walked to the end of its budget before it can be called
+    sky.
+  - **marched** -- what was left, and what the `march` row is the cost of.
+
+  It is read back from the GPU on one extra frame after the measured run, so it
+  costs the timings nothing. That frame is one more step along the same flight,
+  not a redraw of the last measured one -- a still camera is the reprojection's
+  best case and would report the same share whatever `--motion` was asked for.
+
+  A `march` row that moved without the marched share moving is a real shader
+  change; both moving together usually means the reprojection's share changed
+  instead.
 - **`cpu`** is the recording side, and on a settled scene it is noise.
   - **`terrain`** and its four children are the tile streaming: `advance`
     decides what is wanted, `read` pulls tiles off disk, `convert` narrows the
@@ -111,6 +127,9 @@ streaming hitch makes and the shape an average erases. Quote the median for
   frame was carried rather than marched; it says nothing about whether the
   carried pixels were *right*. Only a picture shows that -- use
   `headless-render` with `--frames` and `--motion`.
+- **How coverage varied over the run.** The line is one frame, not an average
+  of the sixty. Reading it back per frame would mean waiting on a map inside
+  the loop, which would measure the readback rather than the frame.
 
 ## Trusting the numbers
 

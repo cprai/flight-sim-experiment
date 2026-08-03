@@ -447,36 +447,55 @@ pub fn profile(
 
     print!("{}", crate::profile::table(&measured));
 
-    let holes = count_holes(&device, &queue, &mut scene, &view)?;
+    let coverage = coverage(&device, &queue, &mut scene, &view, flight)?;
     let pixels = size.x * size.y;
+    // Every pixel takes exactly one path through the compaction, so anything
+    // else means one of them stopped counting -- which would otherwise show up
+    // only as three percentages that quietly fail to add up.
+    if coverage.total() != pixels {
+        log::warn!(
+            "the compaction accounted for {} pixels of {pixels}",
+            coverage.total()
+        );
+    }
+    let share = |count: u32| 100.0 * f64::from(count) / f64::from(pixels);
     println!(
-        "{} of {pixels} pixels marched ({:.1}%); {:.1}% carried over or sky",
-        holes,
-        100.0 * f64::from(holes) / f64::from(pixels),
-        100.0 * f64::from(pixels - holes) / f64::from(pixels),
+        "{pixels} pixels: {:.1}% reprojected from the last frame, {:.1}% sky, \
+         {:.1}% marched",
+        share(coverage.reprojected),
+        share(coverage.sky),
+        share(coverage.marched),
     );
     Ok(())
 }
 
-/// Draws one more frame and reads back how much of it the march did.
+/// Draws one more frame and reads back how each of its pixels was settled.
 ///
 /// After the measured run rather than during it: the copy and the buffer map
 /// cost more than the frame does, and a measurement that waits on a readback is
 /// measuring the readback. The extra frame is drawn on the settled, already
 /// warm scene, so it is representative of the ones just timed.
-fn count_holes(
+///
+/// One more step along the same flight, not a redraw of the last measured
+/// frame. Standing still is the reprojection's best case -- every surviving
+/// point lands back on the pixel it came from -- so a coverage frame that did
+/// not move would report roughly the same share however fast the run it follows
+/// was flying, which is the one thing this number must not do.
+fn coverage(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     scene: &mut Scene,
     view: &wgpu::TextureView,
-) -> Result<u32> {
+    flight: Flight,
+) -> Result<crate::reproject::Coverage> {
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("hole count readback"),
-        size: 4,
+        label: Some("coverage readback"),
+        size: crate::reproject::Coverage::BYTES,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
 
+    flight.advance(scene);
     scene.update(queue);
     let profiler = crate::profile::profiler(device, false);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -486,7 +505,13 @@ fn count_holes(
         let mut gpu = profiler.scope("gpu", &mut encoder);
         scene.draw(&mut gpu, view);
     }
-    encoder.copy_buffer_to_buffer(scene.hole_count(), 0, &readback, 0, 4);
+    encoder.copy_buffer_to_buffer(
+        scene.tally(),
+        0,
+        &readback,
+        0,
+        crate::reproject::Coverage::BYTES,
+    );
     queue.submit(std::iter::once(encoder.finish()));
 
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -497,12 +522,12 @@ fn count_holes(
     receiver
         .recv()
         .context("the buffer was never mapped")?
-        .context("failed to map the hole count")?;
+        .context("failed to map the coverage tally")?;
     let mapped = readback.get_mapped_range(..).context("not mapped")?;
-    let holes = u32::from_le_bytes(mapped[..4].try_into().expect("four bytes"));
+    let coverage = crate::reproject::Coverage::from_bytes(&mapped);
     drop(mapped);
     readback.unmap();
-    Ok(holes)
+    Ok(coverage)
 }
 
 #[cfg(test)]
