@@ -35,15 +35,24 @@ struct Camera {
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 
+// The material id of the ground and where inside its pixel it sits, in one
+// word. The offset is half of what replaced the stored world position: see
+// `rebuilt`.
 @group(1) @binding(0) var history_material: texture_2d<u32>;
-@group(1) @binding(1) var history_position: texture_2d<f32>;
+// The unit normal of that ground, and in `w` -- where the depth is zero --
+// which of the two reasons there is no ground. See `SKY_HERE` in
+// `src/terrain.wgsl`.
 @group(1) @binding(2) var history_normal: texture_2d<f32>;
-// The history depth, read only to compare one point's distance against
-// another's -- never to place a point. The depth a carried point takes is the
-// one *this* camera sees it at, which the rasterizer derives from the
-// projection below; carrying the old depth across would put the point at the
-// distance the old camera was from it. See `swept`, which asks whether what
-// swept across a pixel was nearer than what was standing there.
+// How far the history's own camera found the ground down each of its rays, as
+// reversed-Z depth. Two things want it, and neither of them is the depth this
+// frame's points are placed at: that one is derived by the rasterizer from the
+// projection below, and carrying the old one across would put every point at
+// the distance the *old* camera was from it.
+//
+// `rebuilt` wants it as a distance, to recover the world position the G-buffer
+// no longer stores, against the camera that measured it. `swept` wants it as a
+// comparison, to ask whether what has swept across a pixel is nearer than what
+// was standing there.
 @group(1) @binding(3) var history_depth: texture_2d<f32>;
 
 struct Splatting {
@@ -58,13 +67,17 @@ struct Splatting {
     // this struct up and leave the Rust mirror the wrong size.
     padding_a: u32,
     padding_b: u32,
-    // The ray basis of the camera that drew the history, which is what turns a
-    // sky pixel of it back into the direction it was looking along. Ground does
-    // not need this -- its world position is absolute -- but sky has no
-    // position, only a direction.
+    // The ray basis of the camera that drew the history, and in `was_eye` the
+    // point it was drawn from with its near plane in `w`.
+    //
+    // Sky needs the basis, having only a direction and no position of its own.
+    // Ground needs all of it too, now that its position is not stored: a depth
+    // is a distance along a ray, and this is what says which ray, from where,
+    // and at what scale. See `rebuilt`.
     was_ray_right: vec4<f32>,
     was_ray_up: vec4<f32>,
     was_ray_forward: vec4<f32>,
+    was_eye: vec4<f32>,
 };
 
 @group(1) @binding(4) var<uniform> splatting: Splatting;
@@ -213,11 +226,48 @@ struct Splat {
 // vertex invocation itself.
 const CULLED = vec4<f32>(0.0, 0.0, -1.0, 1.0);
 
-// What `position.w` of the history says was found there. Must match
-// `GROUND_HERE` and `SKY_HERE` in `src/terrain.wgsl`; zero is a buffer nothing
-// has been written to yet, which is the first frame and the first after a
-// resize.
-const GROUND_HERE: f32 = 1.0;
+// The material word's mask, so an id can be told from the sub-pixel offset
+// riding in the same word. Must match `MATERIAL_MASK` in `src/terrain.wgsl`.
+const MATERIAL_MASK: u32 = 0xffffu;
+const OFFSET_SCALE: f32 = 256.0;
+
+// The direction the history's camera looked through a point of its screen,
+// before it is normalised. The same arithmetic as `ray_raw_at` in
+// `src/terrain.wgsl`, against the basis of the camera that drew the history
+// rather than the one drawing now.
+fn was_ray_raw(screen: vec2<f32>, size: vec2<f32>) -> vec3<f32> {
+    let ndc = vec2<f32>(
+        screen.x / size.x * 2.0 - 1.0,
+        1.0 - screen.y / size.y * 2.0,
+    );
+    return splatting.was_ray_right.xyz * ndc.x
+        + splatting.was_ray_up.xyz * ndc.y
+        + splatting.was_ray_forward.xyz;
+}
+
+// Where a pixel of the history put its ground, in world space.
+//
+// The G-buffer does not store it. It stores a reversed-Z depth and, in the spare
+// half of the material word, where inside the pixel the point sits -- and those
+// two with the camera that wrote them are the same information in twelve fewer
+// bytes a pixel. The projection writes `z_near / d` for a distance `d` along the
+// view axis, and the unnormalised ray advances exactly one unit along that axis,
+// so the multiplication below lands on the point with no normalise and no
+// length.
+//
+// Exact, not an approximation of what used to be stored. A marched pixel's ray
+// was cast through the centre of the pixel and its offset says so; a carried
+// one was rebuilt from its own depth and offset by `carried_at` in
+// `src/terrain.wgsl`, by this same arithmetic against what was then the current
+// camera. Either way this recovers the position that was written, bit for bit.
+fn rebuilt(pixel: vec2<u32>, packed: u32, depth: f32, size: vec2<f32>) -> vec3<f32> {
+    let offset = vec2<f32>(
+        f32((packed >> 16u) & 0xffu),
+        f32((packed >> 24u) & 0xffu),
+    ) / OFFSET_SCALE;
+    let at = vec2<f32>(pixel) + offset;
+    return splatting.was_eye.xyz + was_ray_raw(at, size) * (splatting.was_eye.w / depth);
+}
 
 // How far away a carried sky pixel is placed.
 //
@@ -259,7 +309,7 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
     out.normal = vec4<f32>(0.0);
 
     // One point per pixel of the history, in row-major order.
-    let size = textureDimensions(history_position);
+    let size = textureDimensions(history_depth);
     let pixel = vec2<u32>(index % size.x, index / size.x);
 
     // Tested before anything is read, so a dropped point pays for no memory it
@@ -268,17 +318,20 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
         return out;
     }
 
-    let stored = textureLoad(history_position, vec2<i32>(pixel), 0);
+    let normal = textureLoad(history_normal, vec2<i32>(pixel), 0);
+    let depth = textureLoad(history_depth, vec2<i32>(pixel), 0).r;
 
-    // Zero is a buffer nothing has been written to: the first frame, and the
-    // first after a resize. There is no history to carry, so every point is
-    // dropped and the march does the whole frame, exactly as it did before any
-    // of this existed.
-    if (stored.w == 0.0) {
-        return out;
-    }
-
-    if (stored.w != GROUND_HERE) {
+    if (depth == 0.0) {
+        // No ground down this pixel's ray -- or nothing known about it at all.
+        // The two are told apart by the normal's fourth channel, which is where
+        // a marched sky pixel leaves a mark and an abandoned ray, like a buffer
+        // nobody has written, leaves zeroes. There is no history to carry in the
+        // second case, so the point is dropped and the march does the pixel over
+        // -- which on the first frame, and the first after a resize, is the
+        // whole screen, exactly as it was before any of this existed.
+        if (normal.w == 0.0) {
+            return out;
+        }
         // Sky the eye may since have moved behind something is not sky any
         // more, so hand the pixel back rather than answer it from a ray that
         // was cast from somewhere else.
@@ -290,15 +343,7 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
         // basis and placed far enough away that where the eye has moved to
         // stops mattering, which is right: sky turns with the camera and
         // ignores its translation.
-        let ndc = vec2<f32>(
-            (f32(pixel.x) + 0.5) / f32(size.x) * 2.0 - 1.0,
-            1.0 - (f32(pixel.y) + 0.5) / f32(size.y) * 2.0,
-        );
-        let was = normalize(
-            splatting.was_ray_right.xyz * ndc.x
-                + splatting.was_ray_up.xyz * ndc.y
-                + splatting.was_ray_forward.xyz,
-        );
+        let was = normalize(was_ray_raw(vec2<f32>(pixel) + 0.5, vec2<f32>(size)));
         out.clip = camera.view_proj
             * vec4<f32>(camera.position.xyz + was * SKY_DISTANCE, 1.0);
         // Normal left at zero, which is what tells the compaction this is sky
@@ -308,12 +353,15 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
 
     // Ground the carry is still entitled to place, but not necessarily still
     // entitled to show: something nearer may have swept in front of it.
-    if (swept(pixel, textureLoad(history_depth, vec2<i32>(pixel), 0).r)) {
+    if (swept(pixel, depth)) {
         return out;
     }
 
+    let id = textureLoad(history_material, vec2<i32>(pixel), 0).r;
+    let stored = rebuilt(pixel, id, depth, vec2<f32>(size));
+
     // Points behind the eye come out with a negative `w` and are clipped.
-    out.clip = camera.view_proj * vec4<f32>(stored.xyz, 1.0);
+    out.clip = camera.view_proj * vec4<f32>(stored, 1.0);
     // Exactly where inside its pixel this point is about to land. The
     // rasterizer will round it to a pixel and the fragment stage will only ever
     // see that pixel's centre, so if it is not recorded here it is gone -- and
@@ -324,9 +372,8 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
         (ndc.x * 0.5 + 0.5) * f32(size.x),
         (0.5 - ndc.y * 0.5) * f32(size.y),
     );
-    let id = textureLoad(history_material, vec2<i32>(pixel), 0).r;
     out.material = pack_offset(id, landed);
-    out.normal = textureLoad(history_normal, vec2<i32>(pixel), 0);
+    out.normal = normal;
     return out;
 }
 
@@ -334,8 +381,8 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
 // one word. See `MATERIAL_MASK` in `src/terrain.wgsl` for why they share.
 fn pack_offset(id: u32, screen: vec2<f32>) -> u32 {
     let frac = clamp(fract(screen), vec2<f32>(0.0), vec2<f32>(0.99609375));
-    let axis = vec2<u32>(frac * 256.0);
-    return (id & 0xffffu) | (axis.x << 16u) | (axis.y << 24u);
+    let axis = vec2<u32>(frac * OFFSET_SCALE);
+    return (id & MATERIAL_MASK) | (axis.x << 16u) | (axis.y << 24u);
 }
 
 struct Carried {

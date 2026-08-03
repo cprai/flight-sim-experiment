@@ -545,10 +545,16 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
 // has to be written by the dispatch below -- a pixel that found no ground
 // writes zeroes explicitly, and depth zero is how the shading pass knows a
 // pixel is sky.
+//
+// No world position among them. A depth and the sub-pixel offset riding in the
+// spare half of the material word say the same thing in four bytes rather than
+// sixteen; see `MATERIAL_MASK` for the encoding and `rebuilt` in
+// `src/reproject.wgsl` for the one reader that wants a position back.
+
+// A material id and where inside its pixel the ground sits, in one word.
 @group(2) @binding(0) var out_material: texture_storage_2d<r32uint, write>;
-// Where the ray met the ground, in world space; `w` is 1 to say so.
-@group(2) @binding(1) var out_position: texture_storage_2d<rgba32float, write>;
-// The unit normal of that ground, in world space.
+// The unit normal of that ground, in world space, and in `w` which of the two
+// reasons a pixel with no depth has none. See `SKY_HERE`.
 @group(2) @binding(2) var out_normal: texture_storage_2d<rgba16float, write>;
 // The distance the ground was actually found at, as reversed-Z depth.
 @group(2) @binding(3) var out_depth: texture_storage_2d<r32float, write>;
@@ -704,24 +710,34 @@ fn normal_bilinear(level: u32, w: vec2<f32>) -> vec3<f32> {
     return vec3<f32>(mean.r, sqrt(max(1.0 - dot(mean, mean), 0.0)), mean.g);
 }
 
-// What `position.w` says about a pixel of the G-buffer.
+// What the normal's fourth channel says about a pixel whose depth is zero.
 //
 // Three states rather than two, because the reprojection has to tell a pixel
 // whose ray found nothing from a pixel nothing has ever been written to. Sky is
 // worth carrying between frames -- it is most of a horizon view and none of it
-// can be carried by world position, because it has none -- but a buffer that
-// has only just been allocated must carry nothing at all. Zero is what wgpu
-// leaves a fresh texture as, so zero is the one that means "not yet".
-const GROUND_HERE: f32 = 1.0;
-const SKY_HERE: f32 = -1.0;
+// can be carried the way ground is, having no position to carry -- but a buffer
+// that has only just been allocated must carry nothing at all. Zero is what
+// wgpu leaves a fresh texture as, so zero is the one that means "not yet", and
+// this marks the pixels that really did establish there is nothing there.
+//
+// It rides in the normal because a normal is what a pixel with no ground has
+// none of: ground writes a unit vector and leaves `w` alone, and a zero depth
+// is what says to look at `w` at all.
+const SKY_HERE: f32 = 1.0;
 
-// The carried material word is a material id and the sub-pixel position the
-// point landed at, packed together.
+// The material word is a material id and the sub-pixel position the point sits
+// at inside its pixel, packed together.
 //
 // Ids reach 0x080c and so need sixteen bits of the thirty-two; the rest were
 // spare, and the offset rides in them for nothing -- no extra target, no extra
 // export bandwidth. Eight bits an axis puts the point within a 256th of a pixel
 // of where it really is. Must match `pack_offset` in `src/reproject.wgsl`.
+//
+// The offset is what lets the world position go unstored: a pixel's depth says
+// how far along a ray its ground is, and this says which ray. A marched pixel
+// sits at the centre, because the ray was cast through the centre; a carried one
+// sits wherever its point landed. Everything that wants the position rebuilds it
+// from the two, which is what `carried_at` already did for the carried half.
 const MATERIAL_MASK: u32 = 0xffffu;
 const OFFSET_SCALE: f32 = 256.0;
 
@@ -732,29 +748,39 @@ fn unpack_offset(packed: u32) -> vec2<f32> {
     ) / OFFSET_SCALE;
 }
 
+fn pack_offset(id: u32, offset: vec2<f32>) -> u32 {
+    let axis = vec2<u32>(clamp(offset, vec2<f32>(0.0), vec2<f32>(0.99609375)) * OFFSET_SCALE);
+    return (id & MATERIAL_MASK) | (axis.x << 16u) | (axis.y << 24u);
+}
+
 // What one ray found, in the form the G-buffer stores it.
 //
 // Material zero is `Null` and depth zero is the reversed-Z far plane, which no
 // finite hit can produce, so those two are what the shading pass reads as sky.
 struct Ground {
     material: u32,
-    position: vec4<f32>,
+    // Where the point sits inside its pixel, in pixels. Stored in the spare
+    // half of the material word rather than beside the position, because the
+    // position is not stored at all -- see `MATERIAL_MASK`.
+    offset: vec2<f32>,
+    // Where the ground is, which nothing writes: it is here so the motion field
+    // can be worked out from it before it is thrown away.
+    position: vec3<f32>,
     normal: vec4<f32>,
     depth: f32,
 };
 
 fn nothing() -> Ground {
-    return Ground(0u, vec4<f32>(0.0, 0.0, 0.0, SKY_HERE), vec4<f32>(0.0), 0.0);
+    return Ground(0u, vec2<f32>(0.5), vec3<f32>(0.0), vec4<f32>(0.0, 0.0, 0.0, SKY_HERE), 0.0);
 }
 
 // A pixel whose ray was abandoned rather than answered. See `Hit::abandoned`.
 //
 // Draws as sky, because zero depth is what the shading pass reads as sky and
 // there is nothing better to show. What makes it different from `nothing` is
-// the `position.w` of zero, which is the same "nothing is known here" the
-// splat already reads off a G-buffer that has never been written: it drops the
-// point, so the pixel is marched again next frame instead of being answered
-// from a frame that did not know either.
+// leaving the normal at all zeroes, which is what a G-buffer nobody has written
+// reads as: the splat drops the point, so the pixel is marched again next frame
+// instead of being answered from a frame that did not know either.
 //
 // Without this a camera that dips below the surface fills the G-buffer with
 // sky, and because carried sky is placed far enough away to ignore where the
@@ -763,7 +789,7 @@ fn nothing() -> Ground {
 // over it, so the frame stays holed until the dither happens to drop each
 // cell, which takes up to sixteen frames.
 fn unknown() -> Ground {
-    return Ground(0u, vec4<f32>(0.0), vec4<f32>(0.0), 0.0);
+    return Ground(0u, vec2<f32>(0.5), vec3<f32>(0.0), vec4<f32>(0.0), 0.0);
 }
 
 // Where a world point sat on the previous frame's screen, in pixels.
@@ -787,11 +813,11 @@ fn was_at(position: vec3<f32>) -> vec2<f32> {
 // as sky being still -- it turns with the camera like everything else -- but
 // sky is not what the drop pattern is trying to find.
 fn motion_of(pixel: vec2<u32>, ground: Ground) -> vec2<f32> {
-    if (ground.position.w != GROUND_HERE) {
+    if (ground.depth == 0.0) {
         return vec2<f32>(0.0);
     }
     let now = vec2<f32>(pixel) + 0.5;
-    let was = was_at(ground.position.xyz);
+    let was = was_at(ground.position);
     if (all(was == vec2<f32>(0.0))) {
         return vec2<f32>(0.0);
     }
@@ -839,7 +865,10 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // closest is the rounded index.
     let cell = vec2<i32>(floor(hit.w + 0.5));
     out.material = textureLoad(materials, slot(cell), i32(hit.level), 0).r;
-    out.position = vec4<f32>(hit.position, GROUND_HERE);
+    out.position = hit.position;
+    // The ray was cast through the centre of the pixel, so that is where the
+    // hit sits inside it, exactly.
+    out.offset = vec2<f32>(0.5);
     // Read the normals where they are still distinct rather than at the hit's
     // own level: they are stored no finer than level 3 and the store serves
     // finer requests by repeating texels, so interpolating below it would ramp
@@ -892,11 +921,9 @@ fn carried_at(pixel: vec2<u32>, depth: f32) -> Ground {
     // different each time the camera moves, so it would be re-snapped in a
     // different direction every frame and the ground would visibly crawl. This
     // is what keeps a carried point standing still.
-    let landed = vec2<f32>(pixel) + unpack_offset(packed);
-    out.position = vec4<f32>(
-        camera.position.xyz + ray_raw_at(landed) * distance_at(depth),
-        GROUND_HERE,
-    );
+    out.offset = unpack_offset(packed);
+    let landed = vec2<f32>(pixel) + out.offset;
+    out.position = camera.position.xyz + ray_raw_at(landed) * distance_at(depth);
     out.normal = normal;
     out.depth = depth;
     return out;
@@ -905,8 +932,11 @@ fn carried_at(pixel: vec2<u32>, depth: f32) -> Ground {
 // Writes one pixel's worth of ground into the G-buffer.
 fn store(pixel: vec2<u32>, ground: Ground) {
     let at = vec2<i32>(pixel);
-    textureStore(out_material, at, vec4<u32>(ground.material, 0u, 0u, 0u));
-    textureStore(out_position, at, ground.position);
+    textureStore(
+        out_material,
+        at,
+        vec4<u32>(pack_offset(ground.material, ground.offset), 0u, 0u, 0u),
+    );
     textureStore(out_normal, at, ground.normal);
     textureStore(out_depth, at, vec4<f32>(ground.depth, 0.0, 0.0, 0.0));
     let motion = motion_of(pixel, ground);

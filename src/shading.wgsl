@@ -44,15 +44,18 @@ const SUN: vec3<f32> = vec3<f32>(0.5, 0.70710678, 0.5);
 const AMBIENT: f32 = 0.35;
 const SUNLIGHT: f32 = 0.65;
 
+// Must match `MATERIAL_MASK` in `src/terrain.wgsl`.
+const MATERIAL_MASK: u32 = 0xffffu;
+
 struct Palette {
     colours: array<vec4<f32>, 2304>,
 };
 
 @group(0) @binding(0) var<uniform> palette: Palette;
+// A material id in the low sixteen bits and where inside its pixel the ground
+// sits in the rest; only the id is wanted here. See `MATERIAL_MASK` in
+// `src/terrain.wgsl` for what the other half is for.
 @group(0) @binding(1) var material: texture_2d<u32>;
-// Bound but not yet read: the world-space position is the input the distance
-// hazes and anything else that cares where a pixel is will start from.
-@group(0) @binding(2) var position: texture_2d<f32>;
 @group(0) @binding(3) var depth: texture_2d<f32>;
 @group(0) @binding(4) var normal: texture_2d<f32>;
 
@@ -75,7 +78,7 @@ fn fs_shade(@builtin(position) clip: vec4<f32>) -> @location(0) vec4<f32> {
         return SKY;
     }
 
-    let id = textureLoad(material, pixel, 0).r;
+    let id = textureLoad(material, pixel, 0).r & MATERIAL_MASK;
     if (id >= PALETTE_SIZE) {
         return MAGENTA;
     }

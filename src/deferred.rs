@@ -10,18 +10,22 @@
 //!
 //! For now the shading is one flat colour per material from
 //! [`crate::palette`], scaled by how squarely the surface normal faces a fixed
-//! sun. The world-space position is written and bound but not yet read; it is
-//! the input every shading feature that cares where a pixel is will start
-//! from, so the plumbing is laid now while the pipeline is being shaped.
+//! sun.
 //!
 //! The march writes these as storage textures rather than drawing into them as
 //! colour attachments, because it is a compute dispatch: see [`DEPTH_FORMAT`]
 //! for what that costs the depth channel, and `src/terrain.wgsl` for why a
 //! dispatch rather than a fullscreen triangle. Storage carries no
-//! bytes-per-sample budget with it, so the four targets are free to cost the 32
-//! bytes a pixel they cost. The one still worth reclaiming is the position, at
-//! 16 of those bytes, which depth and the camera's inverse projection can
-//! reconstruct.
+//! bytes-per-sample budget with it, so the targets are free to cost the twenty
+//! bytes a pixel they cost.
+//!
+//! There is no world position among them, though everything downstream wants
+//! one. A depth and the sub-pixel offset riding in the spare half of the
+//! material word say the same thing in four bytes rather than sixteen, and the
+//! reprojection -- the only reader there has ever been -- rebuilds it exactly.
+//! See `MATERIAL_MASK` in `src/terrain.wgsl` and `rebuilt` in
+//! `src/reproject.wgsl`. Anything that comes to want a position, a distance
+//! haze first among them, rebuilds it the same way.
 //!
 //! Sky is a pixel whose ray found no ground: the march writes zero depth there,
 //! which a real hit can never produce -- the camera projects with reversed
@@ -36,9 +40,6 @@ use wgpu::util::DeviceExt;
 
 /// One material id per pixel, straight from the march.
 pub const MATERIAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
-
-/// World-space hit position per pixel; `w` is 1 where a hit was written.
-pub const POSITION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 /// Unit surface normal per pixel, in world space.
 ///
@@ -78,7 +79,6 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 /// [`Shading::rebind`].
 pub struct GBuffer {
     pub material: wgpu::TextureView,
-    pub position: wgpu::TextureView,
     pub normal: wgpu::TextureView,
     pub depth: wgpu::TextureView,
     /// How far this pixel's ground moved across the screen since last frame.
@@ -110,7 +110,6 @@ pub struct GBuffer {
 #[allow(dead_code, reason = "read only by the G-buffer readback tests")]
 pub struct Targets {
     pub material: wgpu::Texture,
-    pub position: wgpu::Texture,
     pub normal: wgpu::Texture,
     pub depth: wgpu::Texture,
     pub motion: wgpu::Texture,
@@ -143,14 +142,12 @@ impl GBuffer {
         let view = |texture: &wgpu::Texture| texture.create_view(&Default::default());
         let targets = Targets {
             material: target("gbuffer material", MATERIAL_FORMAT),
-            position: target("gbuffer position", POSITION_FORMAT),
             normal: target("gbuffer normal", NORMAL_FORMAT),
             depth: target("gbuffer depth", DEPTH_FORMAT),
             motion: target("gbuffer motion", MOTION_FORMAT),
         };
         Self {
             material: view(&targets.material),
-            position: view(&targets.position),
             normal: view(&targets.normal),
             depth: view(&targets.depth),
             motion: view(&targets.motion),
@@ -199,7 +196,6 @@ pub fn storage_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         label: Some("gbuffer storage layout"),
         entries: &[
             entry(0, MATERIAL_FORMAT),
-            entry(1, POSITION_FORMAT),
             entry(2, NORMAL_FORMAT),
             entry(3, DEPTH_FORMAT),
             entry(4, MOTION_FORMAT),
@@ -222,7 +218,6 @@ pub fn bind_storage(
         layout,
         entries: &[
             entry(0, &gbuffer.material),
-            entry(1, &gbuffer.position),
             entry(2, &gbuffer.normal),
             entry(3, &gbuffer.depth),
             entry(4, &gbuffer.motion),
@@ -273,10 +268,6 @@ impl Shading {
                     },
                 ),
                 entry(1, texture(wgpu::TextureSampleType::Uint)),
-                entry(
-                    2,
-                    texture(wgpu::TextureSampleType::Float { filterable: false }),
-                ),
                 // A plain float channel, not a depth texture: see
                 // [`DEPTH_FORMAT`].
                 entry(
@@ -354,7 +345,6 @@ impl Shading {
             entries: &[
                 entry(0, palette.as_entire_binding()),
                 entry(1, wgpu::BindingResource::TextureView(&gbuffer.material)),
-                entry(2, wgpu::BindingResource::TextureView(&gbuffer.position)),
                 entry(3, wgpu::BindingResource::TextureView(&gbuffer.depth)),
                 entry(4, wgpu::BindingResource::TextureView(&gbuffer.normal)),
             ],

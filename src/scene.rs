@@ -324,6 +324,8 @@ impl Scene {
             queue,
             self.frame,
             self.was_basis,
+            self.was_eye,
+            self.camera.z_near,
             self.camera.position.distance(self.was_eye),
         );
         // What this frame draws becomes the next one's history, so the basis it
@@ -385,6 +387,8 @@ impl Scene {
             queue,
             self.frame,
             self.was_basis,
+            self.was_eye,
+            self.camera.z_near,
             self.camera.position.distance(self.was_eye),
         );
     }

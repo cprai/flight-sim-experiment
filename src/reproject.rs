@@ -197,6 +197,9 @@ struct SplattingUniform {
     was_ray_right: [f32; 4],
     was_ray_up: [f32; 4],
     was_ray_forward: [f32; 4],
+    /// Where that camera stood, with its near plane in `w`. Ground's world
+    /// position is not stored any more; this is what rebuilds it from a depth.
+    was_eye: [f32; 4],
 }
 
 /// How a frame's pixels were settled, read back from [`Carried::tally`].
@@ -788,7 +791,6 @@ impl Reprojection {
             label: Some("reprojection history layout"),
             entries: &[
                 texture(0, wgpu::TextureSampleType::Uint),
-                texture(1, wgpu::TextureSampleType::Float { filterable: false }),
                 texture(2, wgpu::TextureSampleType::Float { filterable: false }),
                 texture(3, wgpu::TextureSampleType::Float { filterable: false }),
                 texture(5, wgpu::TextureSampleType::Float { filterable: false }),
@@ -889,10 +891,18 @@ impl Reprojection {
     /// The frame number moves the dither's pattern on, so a different share of
     /// the screen is dropped each time. The ray basis is the previous camera's,
     /// which is what a carried sky pixel is rebuilt from -- ground needs no such
-    /// thing, its world position being absolute. `moved` is what says whether
-    /// that sky is still true: a rotation cannot bring ground into a ray, and a
-    /// translation can.
-    pub fn set_frame(&self, queue: &wgpu::Queue, frame: u32, was: [glam::Vec3; 3], moved: f32) {
+    /// thing, being rebuilt from `eye` and the same basis. `moved` is what says
+    /// whether that sky is still true: a rotation cannot bring ground into a
+    /// ray, and a translation can.
+    pub fn set_frame(
+        &self,
+        queue: &wgpu::Queue,
+        frame: u32,
+        was: [glam::Vec3; 3],
+        eye: glam::Vec3,
+        z_near: f32,
+        moved: f32,
+    ) {
         queue.write_buffer(
             &self.dither,
             0,
@@ -903,6 +913,7 @@ impl Reprojection {
                 was_ray_right: was[0].extend(0.0).to_array(),
                 was_ray_up: was[1].extend(0.0).to_array(),
                 was_ray_forward: was[2].extend(0.0).to_array(),
+                was_eye: eye.extend(z_near).to_array(),
             }),
         );
     }
@@ -920,7 +931,6 @@ impl Reprojection {
             layout,
             entries: &[
                 entry(0, wgpu::BindingResource::TextureView(&history.material)),
-                entry(1, wgpu::BindingResource::TextureView(&history.position)),
                 entry(2, wgpu::BindingResource::TextureView(&history.normal)),
                 entry(3, wgpu::BindingResource::TextureView(&history.depth)),
                 entry(4, dither.as_entire_binding()),
