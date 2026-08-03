@@ -609,7 +609,6 @@ fn to_pixels(view_proj: glam::Mat4, point: glam::Vec3, width: u32, height: u32) 
 mod tests {
     use glam::{IVec2, UVec2, Vec2, Vec3};
     use terrain_materials::Material;
-    use terrain_tiles::{Normal, Texel};
 
     use super::*;
     use crate::terrain::geotiff::Georeferencing;
@@ -710,46 +709,6 @@ mod tests {
         vec![GRASS; (RASTER * RASTER) as usize]
     }
 
-    /// The normals `terrain-process` would derive from a height raster.
-    ///
-    /// The same central difference the tool takes, one-sided at the raster's
-    /// edge, so a fixture's normals and its ground are the same surface. The
-    /// tool then averages these down to a coarser base level, which is its own
-    /// business; here they stay at the raster's own resolution.
-    fn normals_of(heights: &[f32]) -> Vec<Normal> {
-        let side = RASTER as usize;
-        let metres = METRES_PER_TEXEL as f32;
-        (0..side * side)
-            .map(|index| {
-                let (x, y) = (index % side, index / side);
-                let at = |x: usize, y: usize| heights[y * side + x];
-                let here = at(x, y);
-                if here < terrain_tiles::NODATA_BELOW {
-                    return Normal::NODATA;
-                }
-                let (west, east) = (x.saturating_sub(1), (x + 1).min(side - 1));
-                let (north, south) = (y.saturating_sub(1), (y + 1).min(side - 1));
-                // Whichever neighbours are ground, over however far apart the
-                // two of them are; a texel between two holes is flat.
-                let axis = |low: f32, high: f32, from: usize, to: usize| {
-                    let ground =
-                        |value: f32| (value >= terrain_tiles::NODATA_BELOW).then_some(value);
-                    match (ground(low), ground(high)) {
-                        (Some(low), Some(high)) => (high - low) / ((to - from) as f32 * metres),
-                        (Some(low), None) => (here - low) / metres,
-                        (None, Some(high)) => (high - here) / metres,
-                        (None, None) => 0.0,
-                    }
-                };
-                Normal::from_unit(
-                    -axis(at(west, y), at(east, y), west, east),
-                    1.0,
-                    -axis(at(x, north), at(x, south), north, south),
-                )
-            })
-            .collect()
-    }
-
     /// Builds terrain from raw texels and renders one frame of it.
     fn render(
         heights: Vec<f32>,
@@ -834,11 +793,6 @@ mod tests {
                             RASTER,
                             heights.clone(),
                         )))),
-                        normals: Box::new(Pyramid::build(Level::new(
-                            RASTER,
-                            RASTER,
-                            normals_of(&heights),
-                        ))),
                     },
                 )
             },
@@ -1716,16 +1670,76 @@ mod tests {
             }
             written += 1;
             let (x, y) = (index as u32 % SIZE, index as u32 / SIZE);
-            // Two bytes an axis on disk and half floats here, so a fortieth is
-            // comfortably outside the rounding and well inside a wrong sign.
+            // Nothing quantises this any more -- the march differences the
+            // height texture itself -- so all that is left is the half floats
+            // of the G-buffer and the rounding of the difference.
             assert!(
-                (got - expected).length() < 0.025,
+                (got - expected).length() < 0.005,
                 "pixel ({x}, {y}) holds {got:?}, not {expected:?}"
             );
         }
         assert!(
             written > 1000,
             "only {written} pixels of the frame hit the ground"
+        );
+    }
+
+    /// Ground beside a hole is shaded by the ground that was measured.
+    ///
+    /// A nodata texel is not a height, so a difference across one has to fall
+    /// back to the samples that are real rather than average the sentinel in --
+    /// which would tilt the ground beside every hole by thousands of metres per
+    /// texel -- or give up and call it flat, which would flatten the shoreline
+    /// of every lake in the survey. On a plane both fallbacks are exact, so
+    /// punching a hole must not move a single normal that is still drawn.
+    ///
+    /// The pass that used to bake these normals owned this rule and tested it;
+    /// the march owns it now.
+    #[test]
+    fn a_hole_leaves_the_normals_of_the_ground_beside_it_alone() {
+        const NODATA: f32 = -32767.0;
+        let (east, south) = (0.2f32, -0.35f32);
+        let metres = METRES_PER_TEXEL as f32;
+        let plane = |hole: bool| -> Vec<f32> {
+            (0..RASTER * RASTER)
+                .map(|index| {
+                    let (col, row) = (index % RASTER, index / RASTER);
+                    if hole && (48..80).contains(&col) && (48..80).contains(&row) {
+                        return NODATA;
+                    }
+                    (east * col as f32 + south * row as f32) * metres
+                })
+                .collect()
+        };
+
+        let expected = Vec3::new(-east, 1.0, -south).normalize();
+        let count = |heights: Vec<f32>| {
+            let mut written = 0;
+            for (index, normal) in render_normals(heights, straight_down).iter().enumerate() {
+                let got = Vec3::new(normal[0], normal[1], normal[2]);
+                // The buffer clears to zero, so a pixel the march discarded is
+                // a vector of no length rather than a direction.
+                if got.length() < 0.5 {
+                    continue;
+                }
+                written += 1;
+                let (x, y) = (index as u32 % SIZE, index as u32 / SIZE);
+                assert!(
+                    (got - expected).length() < 0.005,
+                    "pixel ({x}, {y}) holds {got:?}, not {expected:?}"
+                );
+            }
+            written
+        };
+
+        let solid = count(plane(false));
+        let punched = count(plane(true));
+        // The hole has to actually reach the frame, or every assertion above
+        // passed on ground that never knew there was one.
+        assert!(
+            solid - punched > 1000,
+            "only {} pixels of the frame fell in the hole",
+            solid - punched
         );
     }
 
@@ -1811,9 +1825,9 @@ mod tests {
     #[test]
     fn a_slope_facing_the_sun_takes_it_all_and_one_facing_away_keeps_the_ambient() {
         // A plane through the middle of the raster, so it stays under the
-        // camera whichever way it tilts. `normals_of` takes the same central
-        // difference `terrain-process` does, so the normal the shading dots
-        // against the sun is the gradient written here.
+        // camera whichever way it tilts. The march differences these very
+        // heights, so the normal the shading dots against the sun is the
+        // gradient of the ground written here.
         let plane = |fall: f32| -> Vec<f32> {
             let metres = METRES_PER_TEXEL as f32;
             (0..RASTER * RASTER)
@@ -2212,11 +2226,6 @@ mod tests {
                             RASTER,
                             heights.clone(),
                         )))),
-                        normals: Box::new(Pyramid::build(Level::new(
-                            RASTER,
-                            RASTER,
-                            normals_of(&heights),
-                        ))),
                     },
                 )
             },

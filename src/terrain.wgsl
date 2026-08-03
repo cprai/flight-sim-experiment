@@ -126,10 +126,6 @@ struct Terrain {
 @group(1) @binding(1) var heights: texture_2d_array<f32>;
 @group(1) @binding(2) var materials: texture_2d_array<u32>;
 @group(1) @binding(3) var maxima: texture_2d_array<f32>;
-// The east and south components of the ground's unit normal, signed and
-// normalised by the texture format. See `Normal` in
-// `crates/terrain-tiles/src/texel.rs` for why the third one is not stored.
-@group(1) @binding(4) var normals: texture_2d_array<f32>;
 
 // Elevations below this are the raster's nodata rather than ground.
 //
@@ -139,14 +135,6 @@ struct Terrain {
 // `crates/terrain-tiles/src/texel.rs`, which is where the filter that drops
 // these texels when it builds a coarse level reads the same threshold.
 const NODATA_BELOW: f32 = -30000.0;
-
-// The finest level the normals are stored at.
-//
-// Requests for anything finer are served by repeating texels, so this is where
-// they stop being distinct and interpolating below it would only ramp between
-// copies of one value. Kept in step with `NORMAL_BASE_LEVEL` in
-// `crates/terrain-tiles/src/manifest.rs`.
-const NORMAL_BASE_LEVEL: u32 = 3u;
 
 // Halvings used to place the intercept once the texel holding it is known.
 // Eight takes a texel to a two-hundred-and-fiftieth of its width, far finer
@@ -658,56 +646,120 @@ var<private> ray_spent: bool = false;
 @group(3) @binding(9) var risk: texture_2d<f32>;
 @group(3) @binding(10) var out_reach: texture_storage_2d<r32float, write>;
 
-// Whether a stored pair is a direction at all.
+// One height, paired with whether a difference may use it.
 //
-// Both components of a unit normal fit inside the unit disc, so the sentinel
-// the tools write for unmeasured ground -- the most negative pair the format
-// holds -- is the one value that cannot be mistaken for one.
-fn measured(stored: vec2<f32>) -> f32 {
-    return select(0.0, 1.0, dot(stored, stored) <= 1.0);
+// Three ways it may not. It can be the raster's nodata, which is a hole in the
+// survey rather than a measurement of flat ground. It can lie outside this
+// level's resident square, where `slot` would wrap the read onto whatever tile
+// of somewhere else happens to share that slot -- an arbitrary height, and one
+// that changes as the square moves. The march itself never had to ask that at
+// the leaf: it reads the four corners of the texel it is standing in, and the
+// far one carries no weight where it is not loaded, whereas a central
+// difference reaches two texels past the hit, which the square's edge does not
+// promise. Or it can lie past `last`, outside the survey altogether, where the
+// store answers by repeating its border texel -- ground of no slope, which is
+// the one wrong answer that looks like a right one.
+fn sample_height(level: u32, cell: vec2<i32>, last: vec2<i32>) -> vec2<f32> {
+    if (any(cell < vec2<i32>(0)) || any(cell > last) || !resident(level, cell)) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let height = height_at(level, cell);
+    return select(vec2<f32>(0.0, 0.0), vec2<f32>(height, 1.0), height >= NODATA_BELOW);
+}
+
+// The slope across one axis at a texel, from the samples either side of it.
+//
+// Central where both neighbours are ground, one-sided where only one is, and
+// flat where the texel stands alone -- so the last row of a survey slopes the
+// way its two real samples do rather than the way a repeated edge would.
+fn axis_slope(here: f32, low: vec2<f32>, high: vec2<f32>, metres: f32) -> f32 {
+    if (low.y > 0.0 && high.y > 0.0) {
+        return (high.x - low.x) / (2.0 * metres);
+    }
+    if (low.y > 0.0) {
+        return (here - low.x) / metres;
+    }
+    if (high.y > 0.0) {
+        return (high.x - here) / metres;
+    }
+    return 0.0;
 }
 
 // The ground's unit normal at a fractional position, in world space.
 //
-// Bilinear over the four surrounding texels rather than the nearest of them.
-// Nearest is flat shading: every texel is one constant normal, so the ground
-// breaks into facets that the eye reads as blocks however smooth the surface
-// under them is. Interpolating turns the same data into a normal that varies
-// continuously across a texel, which is the smooth-shading half of what a
-// stored normal is for.
+// A normal is a derivative, and this takes it from the same heights the march
+// traced, at the level the ray stopped at, so shading and silhouette describe
+// one surface rather than two. What that costs is the far field: a coarse texel
+// is already a smoothed surface and its slopes are the slopes of that
+// smoothing, so relief flattens with distance in a way a normal averaged down
+// from level 0 would not. Nothing finer is available to flatten less -- past
+// the finest level's reach the fine heights are not resident and cannot be.
 //
-// The two stored components are what gets mixed, and the third is rebuilt from
-// them afterwards. A height field's normal always points upwards, so the
-// vertical component is whatever is left of unit length -- and a mean of pairs
-// inside the unit disc is inside it too, so the result comes out unit without
-// a normalize. Mixing three components and renormalising would be the same
-// thing with a step added.
+// Bilinear over the four surrounding texels rather than the nearest of them.
+// Nearest is flat shading: one constant direction a texel, so the ground breaks
+// into facets that the eye reads as blocks however smooth the surface under
+// them is. The gradient of the ray's own bilinear patch would be worse again --
+// continuous inside a texel and discontinuous at every wall between them.
+// Blending four central differences is what keeps the normal continuous.
 //
 // Nodata is not a direction and must not be averaged into one: those corners
 // are dropped and the weight redistributed over the rest, so ground beside a
 // hole takes the normal of the ground that was measured. Flat is the answer
-// where nothing was.
-fn normal_bilinear(level: u32, w: vec2<f32>) -> vec3<f32> {
+// where nothing was. Dropping a corner cannot break the continuity above,
+// because a corner that is about to be left behind already carries no weight.
+fn normal_at(level: u32, w: vec2<f32>) -> vec3<f32> {
     let base = vec2<i32>(floor(w));
     let f = fract(w);
-    let a = textureLoad(normals, slot(base), i32(level), 0).rg;
-    let b = textureLoad(normals, slot(base + vec2<i32>(1, 0)), i32(level), 0).rg;
-    let c = textureLoad(normals, slot(base + vec2<i32>(0, 1)), i32(level), 0).rg;
-    let d = textureLoad(normals, slot(base + vec2<i32>(1, 1)), i32(level), 0).rg;
+    // A texel of this level, on the ground, in each of the raster's two
+    // directions. The two need not be the same number, so neither difference
+    // may borrow the other's.
+    let metres = terrain.metres_per_texel * f32(1u << level);
+    // The outermost sample the survey holds, in this level's texels. `origin`
+    // is the position of texel (0, 0) and `data_max` that of the last one, so
+    // the near bound is zero at every level and only the far one is worked out.
+    // A coarse texel sits on the level-0 lattice, so its last index is the
+    // level-0 one shifted down.
+    let last = vec2<i32>(round((terrain.data_max - terrain.origin) / terrain.metres_per_texel))
+        >> vec2<u32>(level);
 
-    let corner = vec4<f32>(
-        (1.0 - f.x) * (1.0 - f.y) * measured(a),
-        f.x * (1.0 - f.y) * measured(b),
-        (1.0 - f.x) * f.y * measured(c),
-        f.x * f.y * measured(d),
-    );
-    let total = corner.x + corner.y + corner.z + corner.w;
+    // Every height the four corner normals are built from: the four-by-four
+    // block around them, less its own corners, which no central difference
+    // reaches. Twelve reads, against the four a baked normal took -- the whole
+    // price of deriving these here, paid once per marched pixel rather than
+    // once per step.
+    var nearby: array<vec2<f32>, 16>;
+    for (var j = -1; j <= 2; j += 1) {
+        for (var i = -1; i <= 2; i += 1) {
+            let outside = (i < 0 || i > 1) && (j < 0 || j > 1);
+            if (!outside) {
+                nearby[(j + 1) * 4 + i + 1] = sample_height(level, base + vec2<i32>(i, j), last);
+            }
+        }
+    }
+
+    var sum = vec3<f32>(0.0);
+    var total = 0.0;
+    for (var j = 0; j <= 1; j += 1) {
+        for (var i = 0; i <= 1; i += 1) {
+            let at = (j + 1) * 4 + i + 1;
+            let here = nearby[at];
+            if (here.y <= 0.0) {
+                continue;
+            }
+            let weight = select(1.0 - f.x, f.x, i == 1) * select(1.0 - f.y, f.y, j == 1);
+            let east = axis_slope(here.x, nearby[at - 1], nearby[at + 1], metres.x);
+            let south = axis_slope(here.x, nearby[at - 4], nearby[at + 4], metres.y);
+            sum += weight * normalize(vec3<f32>(-east, 1.0, -south));
+            total += weight;
+        }
+    }
     if (total <= 0.0) {
         return vec3<f32>(0.0, 1.0, 0.0);
     }
-
-    let mean = (a * corner.x + b * corner.y + c * corner.z + d * corner.w) / total;
-    return vec3<f32>(mean.r, sqrt(max(1.0 - dot(mean, mean), 0.0)), mean.g);
+    // A mean of directions, which is not itself one. Renormalising is what
+    // makes it a direction again, and unlike the packed pair this replaces
+    // there is a third component here to renormalise with.
+    return normalize(sum);
 }
 
 // What the normal's fourth channel says about a pixel whose depth is zero.
@@ -869,23 +921,11 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // The ray was cast through the centre of the pixel, so that is where the
     // hit sits inside it, exactly.
     out.offset = vec2<f32>(0.5);
-    // Read the normals where they are still distinct rather than at the hit's
-    // own level: they are stored no finer than level 3 and the store serves
-    // finer requests by repeating texels, so interpolating below it would ramp
-    // between copies of one value and leave the eight-metre grid on show.
-    //
-    // Never a square the clipmap does not hold. The level asked for is at least
-    // the hit's, which was resident, and a coarser level's window covers twice
-    // the ground of the next finer one from the same camera. The min is for a
-    // raster with no level 3 at all, which only a test builds.
-    let normal_level = min(max(hit.level, NORMAL_BASE_LEVEL), terrain.level_count - 1u);
-    let normal_w = hit.w * exp2(f32(hit.level) - f32(normal_level));
-    // Still not the gradient of the bilinear patch the ray actually
-    // intersected: that patch is a smoothing of the ground, and it flattens as
-    // the level coarsens, where this carries the mean of the finest normals
-    // there are. The far field keeps its relief at the cost of shading and
-    // silhouette parting company a little.
-    out.normal = vec4<f32>(normal_bilinear(normal_level, normal_w), 0.0);
+    // Differenced out of the same heights the ray was traced through, at the
+    // level it stopped at, so the surface that is shaded is the surface that
+    // was drawn. Near ground gets the finest level the clipmap is holding;
+    // far ground gets whatever coarse level answered, and flattens with it.
+    out.normal = vec4<f32>(normal_at(hit.level, hit.w), 0.0);
     return out;
 }
 

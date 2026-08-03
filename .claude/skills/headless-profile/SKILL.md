@@ -138,9 +138,9 @@ and submits. A frame is roughly `max` of the two, not the sum.
     above anything on screen.
 - **`cpu`** is the recording side, and on a settled scene it is noise.
   - **`terrain`** and its four children are the tile streaming: `advance`
-    decides what is wanted, `read` pulls tiles off disk, `convert` narrows the
-    maxima to half floats and rescales the normals, `write` hands the bytes to
-    `queue.write_texture`.
+    decides what is wanted, `read` pulls tiles off disk, `convert` exaggerates
+    the heights and narrows the maxima to half floats, `write` hands the bytes
+    to `queue.write_texture`.
   - **`submit`** is usually the largest CPU row because the staging belt's
     copies are flushed there.
 - **`tile uploads`** at the bottom is the count across the whole run, and it is

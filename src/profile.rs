@@ -12,7 +12,7 @@
 //! **CPU**, through plain [`Instant`] spans: the streaming work that the GPU
 //! clock is blind to, which is where a frame that stutters usually lost its
 //! time -- a tile read is a per-row deflate decode of a whole TIFF, and the
-//! maxima and normals are then rewritten texel by texel.
+//! heights and maxima are then rewritten texel by texel.
 //!
 //! Both are off unless a run asked for them. The scopes below are no-ops when
 //! [`profiler`] was built disabled, and the CPU spans are an [`Option`] that
@@ -98,7 +98,7 @@ pub struct Terrain {
     pub advance: Duration,
     /// Pulling tiles off disk, which is a deflate decode per row.
     pub read: Duration,
-    /// Exaggerating heights, narrowing maxima to half, rescaling normals.
+    /// Exaggerating heights and narrowing maxima to half floats.
     pub convert: Duration,
     /// Handing the bytes to `queue.write_texture`.
     pub write: Duration,

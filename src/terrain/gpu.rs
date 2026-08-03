@@ -23,7 +23,6 @@ use crate::terrain::tiles::{MaterialId, TileStore};
 use anyhow::{Context, Result};
 use glam::{DVec2, IVec2, UVec2, Vec2, Vec3};
 use terrain_tiles::maxima::highest;
-use terrain_tiles::{Normal, Texel};
 
 /// Must match `MAX_LEVELS` in the shader.
 const MAX_LEVELS: usize = 16;
@@ -107,7 +106,6 @@ pub struct Sources {
     pub heights: Box<dyn RasterSource>,
     pub materials: Box<dyn RasterSource>,
     pub maxima: Box<dyn RasterSource>,
-    pub normals: Box<dyn RasterSource>,
 }
 
 /// A height raster and a matching material raster, raymarched through a max
@@ -124,14 +122,6 @@ pub struct Terrain {
     /// level array is the quadtree, so nothing here carries a mip chain of its
     /// own and climbing means reading the next level out.
     maxima: Box<dyn RasterSource>,
-    /// The surface normal of the ground, stored coarser than everything else.
-    ///
-    /// Written by `terrain-process` from the finest elevation there is, so a
-    /// texel carries the mean direction of the ground under it rather than the
-    /// slope of a smoothed height field. Its base level is coarser than the
-    /// march's finest, and the store magnifies it by repeating texels, so the
-    /// closest ground shades in facets the size of that level's texels.
-    normals: Box<dyn RasterSource>,
     height_range: (f32, f32),
 
     /// Which tiles each level holds, and what to load next.
@@ -175,7 +165,6 @@ pub struct Terrain {
     height_texture: wgpu::Texture,
     material_texture: wgpu::Texture,
     maxima_texture: wgpu::Texture,
-    normal_texture: wgpu::Texture,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     /// Settles every pixel it can from the reprojection and lists the rest.
@@ -229,7 +218,6 @@ impl Terrain {
         // Named after the elevation it was reduced from, because `dtm` and `dsm`
         // are different surfaces and a bound over one does not cover the other.
         let ceilings = root.join(terrain_tiles::maxima_product(product));
-        let slopes = root.join(terrain_tiles::normal_product(product));
 
         let heights = TileStore::<f32>::open(&elevation)?;
         let materials = TileStore::<MaterialId>::open(&material).with_context(|| {
@@ -245,20 +233,12 @@ impl Terrain {
                 root.display()
             )
         })?;
-        let normals = TileStore::<Normal>::open(&slopes).with_context(|| {
-            format!(
-                "{} holds no surface normals for {product}; run terrain-process over the download",
-                root.display()
-            )
-        })?;
-
         // Structural rather than approximate: every manifest here descends from
         // one download over one snapped extent, so they either describe the same
         // ground exactly or one of them is from a different run.
         for (directory, manifest) in [
             (&material, materials.manifest()),
             (&ceilings, maxima.manifest()),
-            (&slopes, normals.manifest()),
         ] {
             anyhow::ensure!(
                 heights.manifest().covers_same_ground_as(manifest),
@@ -303,7 +283,6 @@ impl Terrain {
                     raster,
                     terrain_tiles::maxima::highest,
                 )),
-                normals: Box::new(Resident::<Normal>::over(Box::new(normals), raster)),
             },
         ))
     }
@@ -325,7 +304,6 @@ impl Terrain {
             heights,
             materials,
             maxima,
-            normals,
         } = sources;
         let raster = UVec2::new(placement.width, placement.height);
         // Only the sources whose levels *are* terrain levels. The max pyramid's
@@ -361,15 +339,6 @@ impl Terrain {
             "the max pyramid reaches level {} but {level_count} levels are being drawn",
             maxima.level_count().saturating_sub(1)
         );
-        // The normals answer at whichever level the march stopped at, so they
-        // have to reach as far as the heights do. Their *base* is coarser, which
-        // is a different thing: the store magnifies that by repeating texels.
-        assert!(
-            normals.level_count() >= level_count,
-            "the normals reach level {} but {level_count} levels are being drawn",
-            normals.level_count().saturating_sub(1)
-        );
-
         let layers = wgpu::Extent3d {
             width: across,
             height: across,
@@ -404,14 +373,6 @@ impl Terrain {
             // the ground under it; see the reasoning there.
             wgpu::TextureFormat::R16Float,
             usage | wgpu::TextureUsages::COPY_SRC,
-        );
-        let normal_texture = layer_texture(
-            "terrain normals",
-            // The two bytes the tiles already hold, reinterpreted: the stored
-            // pair of signed bytes is exactly an `Rg8Snorm` texel, so the upload
-            // is a copy and the shader reconstructs the third component.
-            wgpu::TextureFormat::Rg8Snorm,
-            usage,
         );
 
         let array_view = |texture: &wgpu::Texture| {
@@ -473,18 +434,6 @@ impl Terrain {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    // Snorm decodes to floats, but like everything else here it
-                    // is only ever loaded at the texel the ray landed on.
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -506,10 +455,6 @@ impl Terrain {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&array_view(&maxima_texture)),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&array_view(&normal_texture)),
                 },
             ],
         });
@@ -589,7 +534,6 @@ impl Terrain {
             heights,
             materials,
             maxima,
-            normals,
             height_range,
             tiles: TileResidency::new(residency, level_count),
             base: 0,
@@ -602,7 +546,6 @@ impl Terrain {
             height_texture,
             material_texture,
             maxima_texture,
-            normal_texture,
             uniform,
             bind_group,
             compact,
@@ -927,28 +870,6 @@ impl Terrain {
         convert += clock.elapsed();
         copy(&self.maxima_texture, 2, &self.staging[..count * 2]);
 
-        let bytes = count * size_of::<Normal>();
-        let clock = crate::profile::Clock::start(timed);
-        self.normals
-            .read_rect(wanted.level, texels, size, &mut self.staging[..bytes]);
-        read += clock.elapsed();
-        let clock = crate::profile::Clock::start(timed);
-        if VERTICAL_EXAGGERATION != 1.0 {
-            // Heights are stretched on the way in, so a normal baked at true
-            // scale would describe a surface the march no longer draws.
-            // Shortening the vertical component by the same factor is the
-            // normal of the stretched ground.
-            for texel in bytemuck::cast_slice_mut::<u8, Normal>(&mut self.staging[..bytes]) {
-                if texel.is_nodata() {
-                    continue;
-                }
-                let [east, up, south] = texel.to_unit();
-                *texel = Normal::from_unit(east, up / VERTICAL_EXAGGERATION, south);
-            }
-        }
-        convert += clock.elapsed();
-        copy(&self.normal_texture, 2, &self.staging[..bytes]);
-
         if let Some(spans) = self.spans.as_mut() {
             spans.read += read;
             spans.convert += convert;
@@ -1233,13 +1154,6 @@ mod tests {
                     vec![MaterialId(0); (RASTER * RASTER) as usize],
                 ))),
                 maxima: Box::new(max_pyramid(&raster)),
-                // The march is not run here, only the pyramid it walks, so
-                // flat ground everywhere is all this needs to be.
-                normals: Box::new(Pyramid::build(Level::new(
-                    RASTER,
-                    RASTER,
-                    vec![Normal::UP; (RASTER * RASTER) as usize],
-                ))),
             },
         );
         let raster: &dyn RasterSource = &raster;
