@@ -105,7 +105,7 @@ pub fn device() -> Result<(wgpu::Device, wgpu::Queue)> {
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("headless device"),
         required_features: crate::profile::timer_features(&adapter),
-        required_limits: wgpu::Limits::default(),
+        required_limits: crate::deferred::limits(),
         ..Default::default()
     }))
     .context("failed to create device")?;

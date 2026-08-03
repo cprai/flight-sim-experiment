@@ -47,6 +47,16 @@ pub const POSITION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Floa
 /// and this buffer holds a decoded direction rather than the packed one.
 pub const NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// Screen-space motion per pixel, in pixels.
+///
+/// Two half floats packed into one integer channel, rather than the `Rg16Float`
+/// this obviously wants to be: the two-channel formats are not storage-writable
+/// without a feature, where `R32Uint` is guaranteed everywhere. `pack2x16float`
+/// makes the packing free and the precision identical -- half floats are ample
+/// for a screen-space offset of at most a screenful, read to steer a heuristic
+/// rather than to address anything.
+pub const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
+
 /// Format of the depth buffer the geometry pass writes.
 ///
 /// A plain float channel rather than a depth format, because the march is a
@@ -71,6 +81,13 @@ pub struct GBuffer {
     pub position: wgpu::TextureView,
     pub normal: wgpu::TextureView,
     pub depth: wgpu::TextureView,
+    /// How far this pixel's ground moved across the screen since last frame.
+    ///
+    /// Not read by the shading. It exists so the drop pattern can tell where
+    /// the picture is changing fastest and spend rays there -- see
+    /// [`crate::reproject`] -- and it is the input any future motion blur or
+    /// temporal filter would start from.
+    pub motion: wgpu::TextureView,
     /// The targets themselves, rather than views of them.
     ///
     /// A frame says little about what the march actually wrote -- the shading
@@ -96,6 +113,7 @@ pub struct Targets {
     pub position: wgpu::Texture,
     pub normal: wgpu::Texture,
     pub depth: wgpu::Texture,
+    pub motion: wgpu::Texture,
 }
 
 impl GBuffer {
@@ -128,15 +146,35 @@ impl GBuffer {
             position: target("gbuffer position", POSITION_FORMAT),
             normal: target("gbuffer normal", NORMAL_FORMAT),
             depth: target("gbuffer depth", DEPTH_FORMAT),
+            motion: target("gbuffer motion", MOTION_FORMAT),
         };
         Self {
             material: view(&targets.material),
             position: view(&targets.position),
             normal: view(&targets.normal),
             depth: view(&targets.depth),
+            motion: view(&targets.motion),
             targets,
             size,
         }
+    }
+}
+
+/// The device limits the G-buffer's shape asks for.
+///
+/// `Limits::default()` but for one raise: the march writes five storage
+/// textures where the portable floor guarantees four. Every desktop GPU allows
+/// far more -- the floor is set by what the web has to promise, and this does
+/// not target the web -- but it has to be asked for explicitly.
+///
+/// Both device sites call this rather than each spelling out their own, for the
+/// reason `crate::profile::timer_features` is shared: a frame measured on the
+/// headless device is only evidence about the windowed one if the two asked for
+/// the same device.
+pub fn limits() -> wgpu::Limits {
+    wgpu::Limits {
+        max_storage_textures_per_shader_stage: 5,
+        ..wgpu::Limits::default()
     }
 }
 
@@ -164,6 +202,7 @@ pub fn storage_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             entry(1, POSITION_FORMAT),
             entry(2, NORMAL_FORMAT),
             entry(3, DEPTH_FORMAT),
+            entry(4, MOTION_FORMAT),
         ],
     })
 }
@@ -186,6 +225,7 @@ pub fn bind_storage(
             entry(1, &gbuffer.position),
             entry(2, &gbuffer.normal),
             entry(3, &gbuffer.depth),
+            entry(4, &gbuffer.motion),
         ],
     })
 }

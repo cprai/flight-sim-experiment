@@ -31,6 +31,15 @@ use glam::UVec2;
 /// the fixed-function depth test can resolve overlapping points for free.
 pub const CARRIED_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// How fast the picture is moving across one dither cell.
+///
+/// One texel per cell, so a sixty-fourth of the pixels -- a hundred and sixty
+/// by ninety at 720p, which is why the width of the channel is not worth
+/// economising on. Full floats because the half-float formats are not
+/// storage-writable without a feature and `R32Float` is guaranteed, the same
+/// reason [`crate::deferred::MOTION_FORMAT`] is packed into an integer.
+pub const RISK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+
 /// Depth cleared into the carried buffer, and the value that means "nothing
 /// landed here".
 ///
@@ -85,6 +94,25 @@ pub const DROP_FRACTION: f32 = 0.30;
     reason = "the shader is what uses these; Rust mirrors them so the tests can check what it was compiled with"
 )]
 pub const DITHER_BLOCK: u32 = 8;
+
+/// The screen-space motion, in pixels a frame, at which a cell counts as moving
+/// as fast as the drop pattern knows how to respond to.
+///
+/// Must match `RISK_FULL` in `src/reproject.wgsl`.
+#[allow(
+    dead_code,
+    reason = "the shader is what uses these; Rust mirrors them so the tests can check what it was compiled with"
+)]
+pub const RISK_FULL: f32 = 8.0;
+
+/// How far towards dropping everything a fully risky cell is taken.
+///
+/// Must match `RISK_GAIN` in `src/reproject.wgsl`.
+#[allow(
+    dead_code,
+    reason = "the shader is what uses these; Rust mirrors them so the tests can check what it was compiled with"
+)]
+pub const RISK_GAIN: f32 = 0.6;
 
 /// Threads per workgroup of the compacted march.
 ///
@@ -171,6 +199,9 @@ pub struct Carried {
     pub hole_count: wgpu::Buffer,
     /// `[workgroups, 1, 1]` for the march's indirect dispatch.
     pub march_args: wgpu::Buffer,
+    /// One number per dither cell: the fastest screen-space motion in it, which
+    /// is what the drop pattern spends its extra rays on.
+    pub risk: wgpu::TextureView,
 }
 
 impl Carried {
@@ -226,6 +257,23 @@ impl Carried {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
                 mapped_at_creation: false,
             }),
+            risk: device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("cell risk"),
+                    size: wgpu::Extent3d {
+                        width: size.x.div_ceil(DITHER_BLOCK),
+                        height: size.y.div_ceil(DITHER_BLOCK),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: RISK_FORMAT,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default()),
         }
     }
 }
@@ -293,6 +341,62 @@ pub fn args_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+/// The layout `cs_risk` reduces the motion field through.
+///
+/// Its own, like [`args_layout`], and for a related reason: it reads the motion
+/// target that the march *writes*, and a pipeline may not have one texture
+/// bound both ways at once.
+pub fn risk_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("reprojection risk layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: RISK_FORMAT,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// Points `cs_risk` at the motion field and the risk it reduces it to.
+pub fn bind_risk(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    gbuffer: &crate::deferred::GBuffer,
+    carried: &Carried,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("reprojection risk bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(&gbuffer.motion),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(&carried.risk),
+            },
+        ],
+    })
+}
+
 /// Points `cs_args` at the count it reads and the dispatch size it writes.
 pub fn bind_args(
     device: &wgpu::Device,
@@ -343,6 +447,7 @@ impl Reprojection {
         device: &wgpu::Device,
         camera_layout: &wgpu::BindGroupLayout,
         history: &crate::deferred::GBuffer,
+        carried: &Carried,
     ) -> Self {
         let dither = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("splatting uniform"),
@@ -371,6 +476,7 @@ impl Reprojection {
                 texture(1, wgpu::TextureSampleType::Float { filterable: false }),
                 texture(2, wgpu::TextureSampleType::Float { filterable: false }),
                 texture(3, wgpu::TextureSampleType::Float { filterable: false }),
+                texture(5, wgpu::TextureSampleType::Float { filterable: false }),
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::VERTEX,
@@ -383,7 +489,7 @@ impl Reprojection {
                 },
             ],
         });
-        let bind_group = Self::bind(device, &layout, &dither, history);
+        let bind_group = Self::bind(device, &layout, &dither, history, carried);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("reprojection shader"),
@@ -452,8 +558,13 @@ impl Reprojection {
     }
 
     /// Points the splat at a rebuilt G-buffer, after a resize.
-    pub fn rebind(&mut self, device: &wgpu::Device, history: &crate::deferred::GBuffer) {
-        self.bind_group = Self::bind(device, &self.layout, &self.dither, history);
+    pub fn rebind(
+        &mut self,
+        device: &wgpu::Device,
+        history: &crate::deferred::GBuffer,
+        carried: &Carried,
+    ) {
+        self.bind_group = Self::bind(device, &self.layout, &self.dither, history, carried);
     }
 
     /// Tells the splat which frame this is and where the history was looking.
@@ -481,6 +592,7 @@ impl Reprojection {
         layout: &wgpu::BindGroupLayout,
         dither: &wgpu::Buffer,
         history: &crate::deferred::GBuffer,
+        carried: &Carried,
     ) -> wgpu::BindGroup {
         let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -492,6 +604,7 @@ impl Reprojection {
                 entry(2, wgpu::BindingResource::TextureView(&history.normal)),
                 entry(3, wgpu::BindingResource::TextureView(&history.depth)),
                 entry(4, dither.as_entire_binding()),
+                entry(5, wgpu::BindingResource::TextureView(&carried.risk)),
             ],
         })
     }

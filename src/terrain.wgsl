@@ -21,6 +21,9 @@
 
 struct Camera {
     view_proj: mat4x4<f32>,
+    // The projection that drew the previous frame, which is what a point's
+    // motion is measured against.
+    was_view_proj: mat4x4<f32>,
     position: vec4<f32>,
     // The ray basis: forward plus the screen axes, already scaled for the field
     // of view, so a pixel's direction is one mad each.
@@ -434,6 +437,9 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
 @group(2) @binding(2) var out_normal: texture_storage_2d<rgba16float, write>;
 // The distance the ground was actually found at, as reversed-Z depth.
 @group(2) @binding(3) var out_depth: texture_storage_2d<r32float, write>;
+// How far this pixel's ground has moved across the screen since last frame,
+// as two half floats in one integer channel. See `MOTION_FORMAT`.
+@group(2) @binding(4) var out_motion: texture_storage_2d<r32uint, write>;
 
 // What the reprojection carried over from the last frame, already placed where
 // this camera sees it. See `src/reproject.wgsl` for how it got here.
@@ -464,6 +470,12 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
 @group(3) @binding(5) var<storage, read_write> hole_count: atomic<u32>;
 // `[workgroups, 1, 1]`, written by `cs_args` for the march to be dispatched by.
 @group(3) @binding(6) var<storage, read_write> march_args: array<u32, 3>;
+
+// The finished motion field, and the one number per dither cell that `cs_risk`
+// reduces it to. Bound only for that pass, which writes neither of the two
+// above and so cannot be given the same layout as the march.
+@group(3) @binding(7) var motion: texture_2d<u32>;
+@group(3) @binding(8) var out_risk: texture_storage_2d<r32float, write>;
 
 // Whether a stored pair is a direction at all.
 //
@@ -541,6 +553,38 @@ struct Ground {
 
 fn nothing() -> Ground {
     return Ground(0u, vec4<f32>(0.0, 0.0, 0.0, SKY_HERE), vec4<f32>(0.0), 0.0);
+}
+
+// Where a world point sat on the previous frame's screen, in pixels.
+//
+// Undefined behind the old camera, where the perspective divide flips; those
+// come back as a zero motion rather than a wild one, which reads as "nothing
+// worth spending rays on" and is the safe way to be wrong.
+fn was_at(position: vec3<f32>) -> vec2<f32> {
+    let clip = camera.was_view_proj * vec4<f32>(position, 1.0);
+    if (clip.w <= 0.0) {
+        return vec2<f32>(0.0);
+    }
+    let ndc = clip.xy / clip.w;
+    let size = vec2<f32>(terrain.viewport);
+    return vec2<f32>((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y);
+}
+
+// How far a pixel's ground has moved across the screen since the last frame.
+//
+// Zero for sky, which has no world position to have moved. That is not the same
+// as sky being still -- it turns with the camera like everything else -- but
+// sky is not what the drop pattern is trying to find.
+fn motion_of(pixel: vec2<u32>, ground: Ground) -> vec2<f32> {
+    if (ground.position.w != GROUND_HERE) {
+        return vec2<f32>(0.0);
+    }
+    let now = vec2<f32>(pixel) + 0.5;
+    let was = was_at(ground.position.xyz);
+    if (all(was == vec2<f32>(0.0))) {
+        return vec2<f32>(0.0);
+    }
+    return now - was;
 }
 
 // The ground down the ray through one pixel, or `nothing()` for sky.
@@ -640,6 +684,8 @@ fn store(pixel: vec2<u32>, ground: Ground) {
     textureStore(out_position, at, ground.position);
     textureStore(out_normal, at, ground.normal);
     textureStore(out_depth, at, vec4<f32>(ground.depth, 0.0, 0.0, 0.0));
+    let motion = motion_of(pixel, ground);
+    textureStore(out_motion, at, vec4<u32>(pack2x16float(motion), 0u, 0u, 0u));
 }
 
 // One thread per pixel: settle what can be settled, and list the rest.
@@ -690,6 +736,49 @@ fn cs_args() {
     march_args[0] = (atomicLoad(&hole_count) + MARCH_GROUP - 1u) / MARCH_GROUP;
     march_args[1] = 1u;
     march_args[2] = 1u;
+}
+
+// How fast the picture is moving across one dither cell.
+//
+// The largest screen-space motion any pixel of the cell has, which is the
+// signal the drop pattern spends its extra rays on: ground that is sweeping
+// across the view is ground whose carried material and normal go stale
+// soonest, and under forward flight it is also the near ground that magnifies
+// fastest and so leaves the most gaps between splats.
+//
+// The maximum rather than the mean, because a cell is dropped or kept whole and
+// the worst pixel in it is what decides whether keeping it shows.
+//
+// One workgroup per cell, which is why the workgroup *is* the cell: the
+// reduction is over exactly the pixels whose fate the answer decides.
+var<workgroup> worst: array<f32, 64>;
+
+@compute @workgroup_size(8, 8)
+fn cs_risk(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(workgroup_id) cell: vec3<u32>,
+    @builtin(local_invocation_index) slot: u32,
+) {
+    // Pixels past the edge take the identity of the reduction rather than
+    // dropping out, so every lane has something defined to contribute.
+    var here = 0.0;
+    if (all(id.xy < terrain.viewport)) {
+        let motion = unpack2x16float(textureLoad(motion, vec2<i32>(id.xy), 0).r);
+        here = max(abs(motion.x), abs(motion.y));
+    }
+    worst[slot] = here;
+    workgroupBarrier();
+
+    for (var stride = 32u; stride > 0u; stride >>= 1u) {
+        if (slot < stride) {
+            worst[slot] = max(worst[slot], worst[slot + stride]);
+        }
+        workgroupBarrier();
+    }
+
+    if (slot == 0u) {
+        textureStore(out_risk, vec2<i32>(cell.xy), vec4<f32>(worst[0], 0.0, 0.0, 0.0));
+    }
 }
 
 // One thread per pixel the reprojection could not answer.

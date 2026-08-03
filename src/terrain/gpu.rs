@@ -184,6 +184,8 @@ pub struct Terrain {
     args: wgpu::ComputePipeline,
     /// Casts a ray for each pixel on the list, and nothing for any other.
     march: wgpu::ComputePipeline,
+    /// Reduces the finished motion field to one number per dither cell.
+    risk: wgpu::ComputePipeline,
 }
 
 /// Side of the square of pixels one workgroup of the compaction covers.
@@ -204,6 +206,7 @@ impl Terrain {
         storage_layout: &wgpu::BindGroupLayout,
         work_layout: &wgpu::BindGroupLayout,
         args_layout: &wgpu::BindGroupLayout,
+        risk_layout: &wgpu::BindGroupLayout,
         residency: Residency,
         viewport: UVec2,
         root: &Path,
@@ -284,6 +287,7 @@ impl Terrain {
             storage_layout,
             work_layout,
             args_layout,
+            risk_layout,
             residency,
             viewport,
             placement,
@@ -306,6 +310,7 @@ impl Terrain {
         storage_layout: &wgpu::BindGroupLayout,
         work_layout: &wgpu::BindGroupLayout,
         args_layout: &wgpu::BindGroupLayout,
+        risk_layout: &wgpu::BindGroupLayout,
         residency: Residency,
         viewport: UVec2,
         placement: Georeferencing,
@@ -527,6 +532,14 @@ impl Terrain {
             bind_group_layouts: &[None, None, None, Some(args_layout)],
             immediate_size: 0,
         });
+        // Likewise its own, and for a related reason: it reads the motion
+        // target the march writes, which cannot be bound both ways at once. It
+        // does need the terrain, for the viewport.
+        let risk_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("terrain risk pipeline layout"),
+            bind_group_layouts: &[None, Some(&layout), None, Some(risk_layout)],
+            immediate_size: 0,
+        });
         // Compute rather than a fullscreen triangle. The march never needed
         // anything the raster pipeline provides -- no interpolation, no
         // blending, and a depth test that could reject nothing because each
@@ -550,6 +563,7 @@ impl Terrain {
         let compact = stage("terrain compact pipeline", "cs_compact", &pipeline_layout);
         let args = stage("terrain args pipeline", "cs_args", &args_pipeline_layout);
         let march = stage("terrain march pipeline", "cs_march", &pipeline_layout);
+        let risk = stage("terrain risk pipeline", "cs_risk", &risk_pipeline_layout);
 
         let height_range = Self::coarsest_height_range(heights.as_ref(), &placement);
         let slots = (residency.tiles_across * residency.tiles_across) as usize;
@@ -579,6 +593,7 @@ impl Terrain {
             compact,
             args,
             march,
+            risk,
         }
     }
 
@@ -998,6 +1013,21 @@ impl Terrain {
         pass.dispatch_workgroups(1, 1, 1);
     }
 
+    /// Reduces the motion field to one risk value per dither cell.
+    ///
+    /// After the march, so the field it reads is the finished one. What it
+    /// writes is read by the *next* frame's splat, which is a frame late and no
+    /// worse for it: how fast the picture is changing does not change fast.
+    pub fn risk(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.risk);
+        pass.set_bind_group(1, &self.bind_group, &[]);
+        pass.dispatch_workgroups(
+            self.viewport.x.div_ceil(COMPACT_TILE),
+            self.viewport.y.div_ceil(COMPACT_TILE),
+            1,
+        );
+    }
+
     /// Casts a ray for each pixel on that list.
     ///
     /// Indirect, because how many there are is decided on the GPU and never
@@ -1124,6 +1154,7 @@ mod tests {
         let storage_layout = crate::deferred::storage_layout(&device);
         let work_layout = crate::reproject::work_layout(&device);
         let args_layout = crate::reproject::args_layout(&device);
+        let risk_layout = crate::reproject::risk_layout(&device);
         let residency = test_residency();
         let across = residency.texels_across();
 
@@ -1137,6 +1168,7 @@ mod tests {
             &storage_layout,
             &work_layout,
             &args_layout,
+            &risk_layout,
             residency,
             UVec2::splat(RASTER),
             Georeferencing::square(RASTER, RASTER, 30.0),

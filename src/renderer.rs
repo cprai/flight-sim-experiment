@@ -63,8 +63,10 @@ impl Renderer {
                 // headless device asks for the same, so a frame measured there
                 // is evidence about the frame this draws.
                 required_features: profile::timer_features(&adapter),
-                // The WebGPU baseline, which every GPU on the target platforms clears.
-                required_limits: wgpu::Limits::default(),
+                // The WebGPU baseline but for one raise the G-buffer needs;
+                // see `deferred::limits`. Shared with the headless device for
+                // the same reason the features are.
+                required_limits: crate::deferred::limits(),
                 ..Default::default()
             })
             .await?;

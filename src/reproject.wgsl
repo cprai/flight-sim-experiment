@@ -26,6 +26,7 @@
 // `src/scene.rs`. WGSL has no includes, so the block is spelled out again.
 struct Camera {
     view_proj: mat4x4<f32>,
+    was_view_proj: mat4x4<f32>,
     position: vec4<f32>,
     ray_right: vec4<f32>,
     ray_up: vec4<f32>,
@@ -63,6 +64,9 @@ struct Splatting {
 };
 
 @group(1) @binding(4) var<uniform> splatting: Splatting;
+// How fast the picture was moving across each dither cell on the last frame,
+// in pixels. One texel per cell. See `cs_risk` in `src/terrain.wgsl`.
+@group(1) @binding(5) var risk: texture_2d<f32>;
 
 // How many of the sixty-four ranks of the dither are dropped, which is how many
 // pixels are handed back to the march however well the reprojection did.
@@ -76,6 +80,21 @@ const DROP_RANKS: u32 = 19u;
 //
 // Must match `DITHER_BLOCK` in `src/reproject.rs`.
 const DITHER_BLOCK: u32 = 8u;
+
+// The screen-space motion, in pixels per frame, at which a cell is treated as
+// moving as fast as this knows how to describe. Anything faster is the same as
+// this.
+//
+// Must match `RISK_FULL` in `src/reproject.rs`.
+const RISK_FULL: f32 = 8.0;
+
+// How much of the way to dropping everything a fully risky cell is taken.
+//
+// One would re-march such a cell entirely, every frame, which is what the
+// reprojection exists to avoid; the point is to spend more rays where the
+// picture is coming apart, not to give up on it. Must match `RISK_GAIN` in
+// `src/reproject.rs`.
+const RISK_GAIN: f32 = 0.6;
 
 // The ordered 8x8 Bayer matrix, in closed form.
 //
@@ -106,10 +125,23 @@ fn bayer8(cell: vec2<u32>) -> u32 {
 // which is the set Bayer is built to spread evenly. Rotating the rank instead
 // would make each frame's dropped set a contiguous *window* of ranks, which is
 // a difference of two prefixes and clumps visibly more.
+// How many of the sixty-four ranks this cell drops.
+//
+// `DROP_RANKS` is the floor, so every cell keeps the refresh guarantee that
+// constant describes however still it stands, and a cell the picture is
+// sweeping across is given more on top. Adding rather than redistributing: a
+// fixed budget would have had to take rays away from somewhere, and this costs
+// march time only while the camera is moving.
+fn ranks_for(cell: vec2<u32>) -> u32 {
+    let speed = textureLoad(risk, vec2<i32>(cell), 0).r;
+    let extra = RISK_GAIN * clamp(speed / RISK_FULL, 0.0, 1.0) * f32(64u - DROP_RANKS);
+    return DROP_RANKS + u32(extra);
+}
+
 fn dropped(pixel: vec2<u32>) -> bool {
-    let cell = pixel / DITHER_BLOCK
-        + vec2<u32>(splatting.frame & 7u, (splatting.frame >> 3u) & 7u);
-    return bayer8(cell) < DROP_RANKS;
+    let cell = pixel / DITHER_BLOCK;
+    let turned = cell + vec2<u32>(splatting.frame & 7u, (splatting.frame >> 3u) & 7u);
+    return bayer8(turned) < ranks_for(cell);
 }
 
 struct Splat {

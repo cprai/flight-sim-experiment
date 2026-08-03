@@ -24,6 +24,12 @@ pub const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+    /// The same, for the camera that drew the previous frame.
+    ///
+    /// What a motion vector is measured against: a point's screen position now,
+    /// less where this matrix says it was. The march knows a point's world
+    /// position, so one matrix is the whole of what motion needs.
+    was_view_proj: [[f32; 4]; 4],
     /// `w` is unused padding; uniform members are aligned to 16 bytes anyway.
     position: [f32; 4],
     /// [`Camera::ray_basis`], one vector per row.
@@ -41,10 +47,11 @@ struct CameraUniform {
 }
 
 impl CameraUniform {
-    fn new(camera: &Camera) -> Self {
+    fn new(camera: &Camera, was_view_proj: glam::Mat4) -> Self {
         let [right, up, forward] = camera.ray_basis();
         Self {
             view_proj: camera.view_projection().to_cols_array_2d(),
+            was_view_proj: was_view_proj.to_cols_array_2d(),
             position: camera.position.extend(1.0).to_array(),
             ray_right: right.extend(0.0).to_array(),
             ray_up: up.extend(0.0).to_array(),
@@ -74,6 +81,8 @@ pub struct Scene {
     work_bind_group: wgpu::BindGroup,
     args_layout: wgpu::BindGroupLayout,
     args_bind_group: wgpu::BindGroup,
+    risk_layout: wgpu::BindGroupLayout,
+    risk_bind_group: wgpu::BindGroup,
     reproject: crate::reproject::Reprojection,
     /// Which frame this is, which is all the dither needs to move its pattern
     /// on. Wraps freely: only the low six bits are ever read.
@@ -85,6 +94,8 @@ pub struct Scene {
     /// only a direction, and the direction it had is the one the previous
     /// camera gave it.
     was_basis: [glam::Vec3; 3],
+    /// The projection that drew what is now the history, for motion vectors.
+    was_view_proj: glam::Mat4,
     shading: Shading,
     /// What the last camera upload cost, zero unless a run asked to be timed.
     camera_span: std::time::Duration,
@@ -128,12 +139,14 @@ impl Scene {
         let storage_layout = crate::deferred::storage_layout(device);
         let work_layout = crate::reproject::work_layout(device);
         let args_layout = crate::reproject::args_layout(device);
+        let risk_layout = crate::reproject::risk_layout(device);
         let terrain = Terrain::from_tiles(
             device,
             &camera_layout,
             &storage_layout,
             &work_layout,
             &args_layout,
+            &risk_layout,
             residency,
             viewport,
             terrain_root,
@@ -147,6 +160,7 @@ impl Scene {
             storage_layout,
             work_layout,
             args_layout,
+            risk_layout,
             &camera_layout,
             terrain,
         ))
@@ -166,13 +180,21 @@ impl Scene {
             &wgpu::BindGroupLayout,
             &wgpu::BindGroupLayout,
             &wgpu::BindGroupLayout,
+            &wgpu::BindGroupLayout,
         ) -> Terrain,
     ) -> Self {
         let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
         let storage_layout = crate::deferred::storage_layout(device);
         let work_layout = crate::reproject::work_layout(device);
         let args_layout = crate::reproject::args_layout(device);
-        let terrain = terrain(&camera_layout, &storage_layout, &work_layout, &args_layout);
+        let risk_layout = crate::reproject::risk_layout(device);
+        let terrain = terrain(
+            &camera_layout,
+            &storage_layout,
+            &work_layout,
+            &args_layout,
+            &risk_layout,
+        );
         Self::assemble(
             device,
             format,
@@ -182,6 +204,7 @@ impl Scene {
             storage_layout,
             work_layout,
             args_layout,
+            risk_layout,
             &camera_layout,
             terrain,
         )
@@ -196,6 +219,7 @@ impl Scene {
         storage_layout: wgpu::BindGroupLayout,
         work_layout: wgpu::BindGroupLayout,
         args_layout: wgpu::BindGroupLayout,
+        risk_layout: wgpu::BindGroupLayout,
         camera_layout: &wgpu::BindGroupLayout,
         terrain: Terrain,
     ) -> Self {
@@ -206,7 +230,9 @@ impl Scene {
         let carried = crate::reproject::Carried::new(device, viewport);
         let work_bind_group = crate::reproject::bind_work(device, &work_layout, &carried);
         let args_bind_group = crate::reproject::bind_args(device, &args_layout, &carried);
-        let reproject = crate::reproject::Reprojection::new(device, camera_layout, &gbuffer);
+        let risk_bind_group = crate::reproject::bind_risk(device, &risk_layout, &gbuffer, &carried);
+        let reproject =
+            crate::reproject::Reprojection::new(device, camera_layout, &gbuffer, &carried);
         let shading = Shading::new(device, format, &gbuffer);
         Self {
             camera,
@@ -221,9 +247,12 @@ impl Scene {
             work_bind_group,
             args_layout,
             args_bind_group,
+            risk_layout,
+            risk_bind_group,
             reproject,
             frame: 0,
             was_basis: camera.ray_basis(),
+            was_view_proj: camera.view_projection(),
             shading,
             camera_span: std::time::Duration::ZERO,
         }
@@ -244,7 +273,9 @@ impl Scene {
             crate::reproject::bind_work(device, &self.work_layout, &self.carried);
         self.args_bind_group =
             crate::reproject::bind_args(device, &self.args_layout, &self.carried);
-        self.reproject.rebind(device, &self.gbuffer);
+        self.risk_bind_group =
+            crate::reproject::bind_risk(device, &self.risk_layout, &self.gbuffer, &self.carried);
+        self.reproject.rebind(device, &self.gbuffer, &self.carried);
         self.shading.rebind(device, &self.gbuffer);
         self.terrain.resize(viewport);
         self.camera.aspect = viewport.x as f32 / viewport.y.max(1) as f32;
@@ -261,7 +292,7 @@ impl Scene {
         queue.write_buffer(
             &self.camera_buffer,
             0,
-            bytemuck::bytes_of(&CameraUniform::new(&self.camera)),
+            bytemuck::bytes_of(&CameraUniform::new(&self.camera, self.was_view_proj)),
         );
         self.camera_span = clock.elapsed();
         // Wrapping is fine and deliberate: the dither reads the low six bits,
@@ -272,6 +303,7 @@ impl Scene {
         // is drawn with is the basis that history will have to be read back
         // through.
         self.was_basis = self.camera.ray_basis();
+        self.was_view_proj = self.camera.view_projection();
         self.terrain.update(queue, self.camera.position);
     }
 
@@ -416,6 +448,15 @@ impl Scene {
             self.terrain.march(&mut pass, &self.carried.march_args);
         }
 
+        {
+            // Last, because the motion field is only whole once both the
+            // compaction and the march have written their share of it. What it
+            // leaves is read by the next frame's splat.
+            let mut pass = gpu.scoped_compute_pass("risk");
+            pass.set_bind_group(3, &self.risk_bind_group, &[]);
+            self.terrain.risk(&mut pass);
+        }
+
         // The clear never survives -- the shading pass writes every pixel --
         // but an interrupted frame showing sky beats one showing garbage.
         let mut pass = gpu.scoped_render_pass(
@@ -442,6 +483,7 @@ fn camera_binding(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::BindGroupLayout
         label: Some("camera uniform"),
         contents: bytemuck::bytes_of(&CameraUniform {
             view_proj: [[0.0; 4]; 4],
+            was_view_proj: [[0.0; 4]; 4],
             position: [0.0; 4],
             ray_right: [0.0; 4],
             ray_up: [0.0; 4],
@@ -715,13 +757,14 @@ mod tests {
             device,
             format,
             UVec2::splat(SIZE),
-            |camera_layout, storage_layout, work_layout, args_layout| {
+            |camera_layout, storage_layout, work_layout, args_layout, risk_layout| {
                 Terrain::new(
                     device,
                     camera_layout,
                     storage_layout,
                     work_layout,
                     args_layout,
+                    risk_layout,
                     residency,
                     UVec2::splat(SIZE),
                     placement(),
@@ -1965,13 +2008,14 @@ mod tests {
             &device,
             wgpu::TextureFormat::Rgba8UnormSrgb,
             UVec2::splat(SIZE),
-            |camera_layout, storage_layout, work_layout, args_layout| {
+            |camera_layout, storage_layout, work_layout, args_layout, risk_layout| {
                 Terrain::new(
                     &device,
                     camera_layout,
                     storage_layout,
                     work_layout,
                     args_layout,
+                    risk_layout,
                     test_residency(),
                     UVec2::splat(SIZE),
                     placement(),
