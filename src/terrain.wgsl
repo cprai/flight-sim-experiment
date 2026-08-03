@@ -944,8 +944,14 @@ fn cs_compact(@builtin(global_invocation_id) id: vec3<u32>) {
     // the camera above every resident peak; below them a ray heading for the
     // horizon has to be walked to the end of its budget before it can be called
     // sky, which is why carrying sky across frames is worth as much as it is.
+    //
+    // The height comparison first, and not for tidiness: `&&` short-circuits,
+    // and the comparison is against a uniform every pixel answers the same way.
+    // Below the peaks -- which is most cameras, and every one that reports no
+    // sky at all -- it rejects the whole test before the normalize behind
+    // `ray_through` is ever run.
     let eye = camera.position.xyz;
-    if (ray_through(pixel).y >= 0.0 && eye.y >= terrain.ceiling) {
+    if (eye.y >= terrain.ceiling && ray_through(pixel).y >= 0.0) {
         store(pixel, nothing());
         atomicAdd(&tally.sky, 1u);
         return;
