@@ -238,6 +238,16 @@ fn distance_at(depth: f32) -> f32 {
 
 struct Hit {
     found: bool,
+    // Whether the ray was abandoned rather than answered.
+    //
+    // A ray can fail to find ground for two quite different reasons. It can
+    // establish that there is none -- it climbed over everything, or it left
+    // the raster -- which is a fact about the world and stays true next frame.
+    // Or it can give up: the eye was under the surface, or the ground it wanted
+    // was not resident. That is a fact about this frame's residency and this
+    // ray's budget, and it must not be carried into the next frame as though it
+    // were sky. See `unknown`.
+    abandoned: bool,
     // Where the ray met the ground, in world space.
     position: vec3<f32>,
     // And which level it was found at, and where in that level's texels, so the
@@ -255,6 +265,7 @@ struct Hit {
 fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     var out: Hit;
     out.found = false;
+    out.abandoned = false;
 
     let coarsest = terrain.level_count - 1u;
     let p0 = (eye.xz - terrain.origin) / terrain.metres_per_texel;
@@ -304,6 +315,9 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         // hand it out to the level beyond, which covers twice the ground.
         if (!resident(level, cell)) {
             if (level >= coarsest) {
+                // Off the end of everything loaded. Whether that is the edge of
+                // the world or a square still filling, this ray does not know.
+                out.abandoned = true;
                 return out;
             }
             level += 1u;
@@ -377,6 +391,12 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
                 // behind the eye and cannot be found from here -- or it has just
                 // dropped through a hole and this is the underside of the ground
                 // beside it. Neither is a hit.
+                //
+                // The first of those is the eye being inside the terrain, which
+                // is a fact about where the camera is and stops being true the
+                // moment it climbs out; the second is a hole in the survey,
+                // which is a fact about the data. Only the first is abandoned.
+                out.abandoned = !moved;
                 return out;
             }
             // Otherwise the ray has grazed the surface within a hair of a texel
@@ -437,6 +457,10 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         out.position = eye + dir * t;
         out.level = level;
         out.w = (p0 + d0 * t) / f32(1u << level);
+    } else {
+        // Never advanced at all, so the eye is inside the terrain. Same case as
+        // the leaf above, reached the long way round.
+        out.abandoned = !moved;
     }
     return out;
 }
@@ -612,6 +636,25 @@ fn nothing() -> Ground {
     return Ground(0u, vec4<f32>(0.0, 0.0, 0.0, SKY_HERE), vec4<f32>(0.0), 0.0);
 }
 
+// A pixel whose ray was abandoned rather than answered. See `Hit::abandoned`.
+//
+// Draws as sky, because zero depth is what the shading pass reads as sky and
+// there is nothing better to show. What makes it different from `nothing` is
+// the `position.w` of zero, which is the same "nothing is known here" the
+// splat already reads off a G-buffer that has never been written: it drops the
+// point, so the pixel is marched again next frame instead of being answered
+// from a frame that did not know either.
+//
+// Without this a camera that dips below the surface fills the G-buffer with
+// sky, and because carried sky is placed far enough away to ignore where the
+// eye has moved to, that sky lands back on the same pixel frame after frame.
+// Climbing out does not clear it: there is no ground in the history to splat
+// over it, so the frame stays holed until the dither happens to drop each
+// cell, which takes up to sixteen frames.
+fn unknown() -> Ground {
+    return Ground(0u, vec4<f32>(0.0), vec4<f32>(0.0), 0.0);
+}
+
 // Where a world point sat on the previous frame's screen, in pixels.
 //
 // Undefined behind the old camera, where the perspective divide flips; those
@@ -661,6 +704,9 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
 
     let hit = march(eye, dir);
     if (!hit.found) {
+        if (hit.abandoned) {
+            return unknown();
+        }
         return nothing();
     }
 

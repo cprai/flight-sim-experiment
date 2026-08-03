@@ -2263,6 +2263,122 @@ mod tests {
         assert!(second.marched > 0, "{second:?}");
     }
 
+    /// Sky the march never established is not carried into the next frame.
+    ///
+    /// A camera inside the terrain finds no ground down any ray: where each one
+    /// entered the surface is behind the eye, so the march gives up rather than
+    /// reporting a hit, and the frame comes out sky throughout. That is an
+    /// answer about where the camera is standing, not about the world, and it
+    /// stops being true the moment the camera climbs out.
+    ///
+    /// Carrying it across holds the frame open long after. A carried sky point
+    /// is placed far enough away to ignore where the eye has moved to -- right
+    /// for sky, exactly wrong for this -- so it lands back on the pixel it came
+    /// from; and with no ground anywhere in the history to splat over it, the
+    /// hole survives until the dither happens to drop each cell, which takes up
+    /// to sixteen frames. Flying a real raster, dipping under the surface and
+    /// climbing straight back out left 13% of the frame reading sky over ground
+    /// plainly in view, and it took eight frames to close.
+    ///
+    /// Looking straight down at flat ground, every pixel is ground, so any sky
+    /// in the second frame is the defect and nothing else.
+    #[test]
+    fn climbing_out_of_the_ground_does_not_carry_its_sky() {
+        const GROUND: f32 = 500.0;
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut scene = test_scene(
+            &device,
+            format,
+            test_residency(),
+            vec![GROUND; (RASTER * RASTER) as usize],
+            flat_ground(),
+        );
+        straight_down(&mut scene.camera);
+        scene.settle(&queue);
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen target"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let bytes_per_row = SIZE * 4;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(bytes_per_row * SIZE),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let profiler = crate::profile::profiler(&device, false);
+
+        // Buried, a hundred metres under the surface. Its own submit, because
+        // `queue.write_buffer` is ordered at submit and the two frames have to
+        // run against their own cameras -- the same reason
+        // `crate::headless::capture` loops that way.
+        scene.camera.position.y = GROUND - 100.0;
+        scene.update(&queue);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut gpu = profiler.scope("gpu", &mut encoder);
+            scene.draw(&mut gpu, &view);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+
+        // Back out above it, where every ray meets the ground again.
+        scene.camera.position.y = 3000.0;
+        scene.update(&queue);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut gpu = profiler.scope("gpu", &mut encoder);
+            scene.draw(&mut gpu, &view);
+        }
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(SIZE),
+                },
+            },
+            wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll failed");
+        let pixels = readback
+            .get_mapped_range(..)
+            .expect("buffer not mapped")
+            .to_vec();
+
+        let sky = count_sky(&pixels);
+        assert_eq!(
+            sky,
+            0,
+            "climbing out of the ground left {sky} of {} pixels showing the sky \
+             it saw from under the surface",
+            SIZE * SIZE
+        );
+    }
+
     /// The overlay's reader, driven exactly the way `Renderer::render` drives
     /// it: record on the frame's encoder, submit, collect. **No poll**, on
     /// purpose -- the windowed loop has none either, and relies on the one
