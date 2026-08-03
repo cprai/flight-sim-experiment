@@ -266,6 +266,8 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     var out: Hit;
     out.found = false;
     out.abandoned = false;
+    ray_abandoned = false;
+    ray_spent = false;
 
     let coarsest = terrain.level_count - 1u;
     let p0 = (eye.xz - terrain.origin) / terrain.metres_per_texel;
@@ -318,6 +320,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
                 // Off the end of everything loaded. Whether that is the edge of
                 // the world or a square still filling, this ray does not know.
                 out.abandoned = true;
+                ray_abandoned = true;
                 return out;
             }
             level += 1u;
@@ -397,6 +400,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
                 // moment it climbs out; the second is a hole in the survey,
                 // which is a fact about the data. Only the first is abandoned.
                 out.abandoned = !moved;
+                ray_abandoned = !moved;
                 return out;
             }
             // Otherwise the ray has grazed the surface within a hair of a texel
@@ -452,6 +456,10 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     //
     // Only for a ray that has moved and is not standing over a hole, which are
     // the same two conditions the leaf applies for the same reasons.
+    //
+    // However it ends, getting here at all means the budget ran out rather than
+    // the ray settling anything, which is what `ray_spent` records.
+    ray_spent = true;
     if (moved && !hole) {
         out.found = true;
         out.position = eye + dir * t;
@@ -461,6 +469,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         // Never advanced at all, so the eye is inside the terrain. Same case as
         // the leaf above, reached the long way round.
         out.abandoned = !moved;
+        ray_abandoned = !moved;
     }
     return out;
 }
@@ -523,13 +532,30 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
 // diagnostic counters worth the atomics rather than deriving one from the
 // others.
 //
+// The last two are not paths. They are subsets of the marched pixels, counted
+// so the overlay can say *why* a march came back empty-handed: `abandoned` is
+// rays that gave up (see `Hit::abandoned`), `spent` is rays that ran out of
+// step budget and were painted as ground where they stopped. Both read zero on
+// a healthy frame, so the atomics cost nothing there, and either one running
+// away is the signature of a march that is failing rather than working.
+//
 // `holes` stays first so its offset is unchanged; the members after it are
 // mirrored by `Coverage` in `src/reproject.rs`.
 struct Tally {
     holes: atomic<u32>,
     carried: atomic<u32>,
     sky: atomic<u32>,
+    abandoned: atomic<u32>,
+    spent: atomic<u32>,
 };
+
+// What the march did with this thread's ray, for the two counters above.
+//
+// Private rather than returned, because `ground_at` reduces a `Hit` to a
+// `Ground` and neither of these belongs in what the G-buffer stores. One
+// `ground_at` per invocation, so there is nothing to reset between rays.
+var<private> ray_abandoned: bool = false;
+var<private> ray_spent: bool = false;
 
 @group(3) @binding(5) var<storage, read_write> tally: Tally;
 // `[workgroups, 1, 1]`, written by `cs_args` for the march to be dispatched by.
@@ -699,6 +725,8 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // climbing, is never coming back down. Worth one comparison: at any horizon
     // view most of the frame is sky.
     if (dir.y >= 0.0 && eye.y >= terrain.ceiling) {
+        ray_abandoned = false;
+        ray_spent = false;
         return nothing();
     }
 
@@ -905,4 +933,12 @@ fn cs_march(@builtin(global_invocation_id) id: vec3<u32>) {
     let packed = holes[id.x];
     let pixel = vec2<u32>(packed & 0xffffu, packed >> 16u);
     store(pixel, ground_at(pixel));
+    // Diagnostics, and only paid for by the rays that failed: on a healthy
+    // frame almost nothing reaches either of these.
+    if (ray_abandoned) {
+        atomicAdd(&tally.abandoned, 1u);
+    }
+    if (ray_spent) {
+        atomicAdd(&tally.spent, 1u);
+    }
 }

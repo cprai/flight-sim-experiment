@@ -317,6 +317,13 @@ impl Scene {
         &self.carried.tally
     }
 
+    /// The highest ground anywhere resident; see [`Terrain::ceiling`].
+    ///
+    /// [`Terrain::ceiling`]: crate::terrain::gpu::Terrain::ceiling
+    pub fn ceiling(&self) -> f32 {
+        self.terrain.ceiling()
+    }
+
     /// Starts or stops accounting for where an update's time goes.
     ///
     /// Off by default, and off costs nothing: see [`crate::profile`].

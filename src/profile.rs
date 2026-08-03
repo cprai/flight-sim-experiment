@@ -162,6 +162,22 @@ pub struct Frame {
     /// further than the GPU rows do -- see [`crate::reproject::CoverageReader`]
     /// -- and is [`None`] until the first read lands.
     pub coverage: Option<crate::reproject::Coverage>,
+    /// Pixels of the target, which is what the coverage is a share *of*.
+    ///
+    /// Carried rather than derived from the coverage's own sum, so that a sum
+    /// which falls short of the screen shows up as shares that do not reach a
+    /// hundred instead of being normalised away. Zero where the caller does not
+    /// know, which is every headless path.
+    pub pixels: u32,
+    /// The highest ground anywhere resident, and the camera's own height, both
+    /// in metres.
+    ///
+    /// Together they say whether the one comparison that settles a climbing ray
+    /// for free can fire at all: it needs the eye above the ceiling, and the
+    /// ceiling is taken across every tile slot rather than across the square
+    /// actually in use, so it can sit far above anything on screen.
+    pub ceiling: f32,
+    pub eye: f32,
 }
 
 /// Flattens the profiler's tree into rows, keeping the nesting as `depth`.
@@ -248,6 +264,9 @@ pub struct Smoothed {
     rows: Vec<Row>,
     tiles: u32,
     coverage: Option<crate::reproject::Coverage>,
+    pixels: u32,
+    ceiling: f32,
+    eye: f32,
 }
 
 impl Smoothed {
@@ -260,6 +279,9 @@ impl Smoothed {
         // the flight does. What makes a timing row unreadable raw is that it
         // jitters every frame around a level that is not moving at all.
         self.coverage = frame.coverage;
+        self.pixels = frame.pixels;
+        self.ceiling = frame.ceiling;
+        self.eye = frame.eye;
         // The GPU rows appear a frame or two late and the hud scope comes and
         // goes, so the row set is not fixed. Smoothing across a changed shape
         // would pair a value with the wrong label.
@@ -291,12 +313,20 @@ impl Smoothed {
         // frame handed to it changes, and these are how the two are told apart
         // while flying.
         //
-        // Against the pixels the compaction accounted for rather than the
-        // pixels on screen. The read lags by a frame or two, so just after a
-        // resize the two disagree, and shares that fail to add up to a hundred
-        // would be the more alarming of the two ways to be briefly wrong.
+        // Against the pixels on screen, not against the compaction's own sum.
+        // Every pixel takes exactly one of the three paths, so the shares reach
+        // a hundred when the compaction covered the frame -- and fall short,
+        // visibly, when it did not. Normalising by the sum instead would report
+        // a healthy-looking hundred percent while most of the screen sat
+        // untouched, holding whatever the last pass to reach it left there.
+        // The read lags by a frame or two, so the shortfall is expected for a
+        // frame or two after a resize; `unaccounted` says how large it is.
         if let Some(coverage) = self.coverage {
-            let pixels = f64::from(coverage.total().max(1));
+            let pixels = f64::from(if self.pixels > 0 {
+                self.pixels
+            } else {
+                coverage.total().max(1)
+            });
             let mut share = |label: &str, count: u32| {
                 let percent = 100.0 * f64::from(count) / pixels;
                 text.push_str(&format!("\n{label:<LABEL$}{percent:>8.1} %"));
@@ -304,7 +334,20 @@ impl Smoothed {
             share("reprojected", coverage.reprojected);
             share("sky", coverage.sky);
             share("marched", coverage.marched);
+            // Of the marched share, how much of it failed rather than worked.
+            // Both are subsets of `marched`, so they do not join the sum.
+            share("  abandoned", coverage.abandoned);
+            share("  spent", coverage.spent);
+            let unaccounted =
+                f64::from(self.pixels.max(coverage.total())) - f64::from(coverage.total());
+            text.push_str(&format!("\n{:<LABEL$}{unaccounted:>7.0} px", "unaccounted"));
         }
+        // Not a share of anything, so it is written plainly: the eye against
+        // the highest resident ground. A climbing ray is settled as sky for
+        // free only above the second, and only then does a sky-filled view stop
+        // being marched.
+        text.push_str(&format!("\n{:<LABEL$}{:>8.0} m", "eye", self.eye));
+        text.push_str(&format!("\n{:<LABEL$}{:>8.0} m", "ceiling", self.ceiling));
         text
     }
 }
@@ -438,6 +481,9 @@ mod tests {
             },
             gpu: Vec::new(),
             coverage: None,
+            pixels: 0,
+            ceiling: 0.0,
+            eye: 0.0,
         }
     }
 
@@ -484,14 +530,23 @@ mod tests {
             smoothed.text()
         );
 
+        sample.pixels = 1000;
         sample.coverage = Some(crate::reproject::Coverage {
             marched: 200,
             reprojected: 700,
             sky: 100,
+            abandoned: 30,
+            spent: 20,
         });
         smoothed.update(&sample);
         let text = smoothed.text();
-        for (label, percent) in [("reprojected", 70.0), ("sky", 10.0), ("marched", 20.0)] {
+        for (label, percent) in [
+            ("reprojected", 70.0),
+            ("sky", 10.0),
+            ("marched", 20.0),
+            ("  abandoned", 3.0),
+            ("  spent", 2.0),
+        ] {
             let expected = format!("{label:<LABEL$}{percent:>8.1} %");
             assert!(text.contains(&expected), "no {expected:?} in {text}");
         }
@@ -505,6 +560,24 @@ mod tests {
                 .len()
         };
         assert_eq!(width("reprojected"), width("cpu"));
+        for label in ["unaccounted", "eye", "ceiling"] {
+            assert_eq!(width(label), width("cpu"), "{label} line is a ragged width");
+        }
+
+        // The three paths are shares of the screen, not of each other, so a
+        // compaction that covered only part of it must show as shares that fall
+        // short rather than as a tidy hundred percent.
+        sample.pixels = 2000;
+        smoothed.update(&sample);
+        let short = smoothed.text();
+        assert!(
+            short.contains(&format!("{:<LABEL$}{:>8.1} %", "marched", 10.0)),
+            "{short}"
+        );
+        assert!(
+            short.contains(&format!("{:<LABEL$}{:>7.0} px", "unaccounted", 1000.0)),
+            "{short}"
+        );
     }
 
     #[test]

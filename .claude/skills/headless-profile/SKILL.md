@@ -39,6 +39,7 @@ cpu            0.08 ms   0.11 ms   0.11 ms
 
 60 frames, 0 tile uploads
 921600 pixels: 70.1% reprojected from the last frame, 12.5% sky, 17.4% marched
+of which 3546 pixels were abandoned and 0 ran out of steps
 ```
 
 ## Reading it
@@ -86,6 +87,20 @@ and submits. A frame is roughly `max` of the two, not the sum.
     sky.
   - **marched** -- what was left, and what the `march` row is the cost of.
 
+  **The second line only appears when there is something wrong to report**, and
+  it describes the marched share rather than adding to it:
+  - **abandoned** -- rays that gave up instead of answering: the eye inside the
+    terrain, or ground that was not resident. They draw as sky, which is not
+    what they mean, and they are marched again every frame because a frame that
+    did not know is not worth carrying. A few thousand at the edge of the
+    raster is ordinary -- the corners of a wide view reach past the loaded
+    square. A large share that will not come down means the march cannot see
+    ground it is standing over.
+  - **ran out of steps** -- rays that exhausted `march_steps` and were painted
+    as ground wherever they had got to. This is the one failure that puts
+    terrain colour where sky belongs, so a number climbing here is worth
+    chasing even while the frame still looks plausible.
+
   It is read back from the GPU on one extra frame after the measured run, so it
   costs the timings nothing. That frame is one more step along the same flight,
   not a redraw of the last measured one -- a still camera is the reprojection's
@@ -95,11 +110,26 @@ and submits. A frame is roughly `max` of the two, not the sum.
   change; both moving together usually means the reprojection's share changed
   instead.
 
-  `fly-profile` draws the same three as rows under `tiles`, so the share can be
-  watched changing as the camera moves. There they lag further than the timing
-  rows -- one read is in flight at a time, so a fresh number lands every few
+  `fly-profile` draws all of it as rows under `tiles`, so it can be watched
+  changing as the camera moves. There the numbers lag further than the timing
+  rows -- one read is in flight at a time, so a fresh one lands every few
   frames -- and they are not smoothed, because they are shares of the screen
-  rather than times and only move when the flight does.
+  rather than times and only move when the flight does. Two rows exist only
+  there:
+  - **`unaccounted`** -- pixels that took no path at all through the
+    compaction, in pixels rather than percent. The three shares are taken
+    against the *viewport*, so they reach a hundred only when the compaction
+    covered the frame; anything else is a region nothing wrote this frame,
+    still holding whatever the last pass to reach it left there. Non-zero for a
+    frame or two after a resize, because the read lags the size. Non-zero for
+    longer is a bug.
+  - **`eye` and `ceiling`** -- the camera's height and the highest ground
+    anywhere resident, in metres. The one comparison that settles a climbing
+    ray for free needs the first above the second, which is why `sky` reads
+    0.0% from any camera below the peaks. The ceiling is taken across every
+    tile *slot* rather than across the square in use, so a tile of somewhere
+    else that has not been written over yet still counts and it can sit well
+    above anything on screen.
 - **`cpu`** is the recording side, and on a settled scene it is noise.
   - **`terrain`** and its four children are the tile streaming: `advance`
     decides what is wanted, `read` pulls tiles off disk, `convert` narrows the

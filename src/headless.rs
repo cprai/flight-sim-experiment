@@ -466,6 +466,15 @@ pub fn profile(
         share(coverage.sky),
         share(coverage.marched),
     );
+    // Subsets of the marched share rather than paths of their own, and both
+    // near zero unless the march is failing, so they are only worth a line when
+    // there is something to say.
+    if coverage.abandoned > 0 || coverage.spent > 0 {
+        println!(
+            "of which {} pixels were abandoned and {} ran out of steps",
+            coverage.abandoned, coverage.spent,
+        );
+    }
     Ok(())
 }
 

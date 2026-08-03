@@ -634,6 +634,20 @@ impl Terrain {
         self.tile_ceilings.len() as u32
     }
 
+    /// The highest ground anywhere resident, across every level being marched.
+    ///
+    /// What `ground_at` and `cs_compact` test a climbing ray against to settle
+    /// it as sky without walking anything. Taken across every *slot* of each
+    /// level rather than across the square in use, so a tile of somewhere else
+    /// that has not yet been written over still counts -- which makes this a
+    /// bound rather than the highest ground on screen, and worth being able to
+    /// read while flying.
+    pub fn ceiling(&self) -> f32 {
+        (self.base..self.level_count())
+            .map(|level| highest(&self.tile_ceilings[level as usize]))
+            .fold(f32::NEG_INFINITY, f32::max)
+    }
+
     /// Whether any level is still short of the tiles it wants.
     pub fn pending(&self) -> bool {
         self.tiles.pending()
@@ -769,8 +783,8 @@ impl Terrain {
                 padding: 0.0,
                 more_padding: [0.0; 2],
             };
-            uniform.ceiling = uniform.ceiling.max(ceiling);
         }
+        uniform.ceiling = self.ceiling();
 
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
     }

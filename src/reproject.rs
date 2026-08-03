@@ -192,11 +192,26 @@ pub struct Coverage {
     /// Pixels the ceiling test called sky without casting a ray or consulting
     /// any history.
     pub sky: u32,
+    /// Of the marched pixels, how many the march gave up on rather than
+    /// answered: the eye inside the terrain, or ground that was not resident.
+    ///
+    /// A subset of [`Self::marched`], so it is not part of [`Self::total`].
+    /// Near zero on a healthy frame. A large figure that will not come down is
+    /// the signature of a march that cannot see the ground it is over, which
+    /// looks the same on screen as sky and is not.
+    pub abandoned: u32,
+    /// Of the marched pixels, how many ran out of step budget.
+    ///
+    /// Also a subset of [`Self::marched`]. A ray that gets here is painted as
+    /// ground wherever it happened to stop, so this is the count of pixels
+    /// showing ground the march never actually established -- the one failure
+    /// that puts terrain colour where sky belongs.
+    pub spent: u32,
 }
 
 impl Coverage {
     /// Size of the buffer this is read out of.
-    pub const BYTES: u64 = 12;
+    pub const BYTES: u64 = 20;
 
     /// Decodes the three counters in the order the `Tally` struct in
     /// `src/terrain.wgsl` declares them.
@@ -212,10 +227,16 @@ impl Coverage {
             marched: at(0),
             reprojected: at(1),
             sky: at(2),
+            abandoned: at(3),
+            spent: at(4),
         }
     }
 
     /// The pixels accounted for, which should be all of them.
+    ///
+    /// The three paths only. [`Self::abandoned`] and [`Self::spent`] describe
+    /// marched pixels rather than being paths of their own, so adding them
+    /// would double-count.
     pub fn total(self) -> u32 {
         self.marched + self.reprojected + self.sky
     }
@@ -898,7 +919,11 @@ mod tests {
             .map(|member| member.rsplit(',').next().unwrap_or_default().trim())
             .filter(|member| !member.is_empty())
             .collect();
-        assert_eq!(members, ["holes", "carried", "sky"], "in {declared:?}");
+        assert_eq!(
+            members,
+            ["holes", "carried", "sky", "abandoned", "spent"],
+            "in {declared:?}"
+        );
 
         // And that the three of them are the whole of the buffer, so a member
         // added without widening it would truncate rather than go unreported.
@@ -907,7 +932,7 @@ mod tests {
 
     #[test]
     fn the_coverage_decodes_the_tally_in_that_order() {
-        let bytes: Vec<u8> = [7u32, 11, 13]
+        let bytes: Vec<u8> = [7u32, 11, 13, 3, 2]
             .iter()
             .flat_map(|n| n.to_le_bytes())
             .collect();
@@ -918,8 +943,12 @@ mod tests {
                 marched: 7,
                 reprojected: 11,
                 sky: 13,
+                abandoned: 3,
+                spent: 2,
             }
         );
+        // The last two describe marched pixels rather than being paths, so the
+        // total is still the three that partition the frame.
         assert_eq!(coverage.total(), 31);
     }
 }
