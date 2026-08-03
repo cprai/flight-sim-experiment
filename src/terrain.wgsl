@@ -601,6 +601,12 @@ var<private> ray_spent: bool = false;
 @group(3) @binding(7) var motion: texture_2d<u32>;
 @group(3) @binding(8) var out_risk: texture_storage_2d<r32float, write>;
 
+// That same risk field read back, and the reach `cs_reach` spreads it into.
+// Its own layout again, and for the same reason: one pass cannot bind the risk
+// texture as writable storage and read it as a texture at the same time.
+@group(3) @binding(9) var risk: texture_2d<f32>;
+@group(3) @binding(10) var out_reach: texture_storage_2d<r32float, write>;
+
 // Whether a stored pair is a direction at all.
 //
 // Both components of a unit normal fit inside the unit disc, so the sentinel
@@ -961,6 +967,60 @@ fn cs_risk(
     if (slot == 0u) {
         textureStore(out_risk, vec2<i32>(cell.xy), vec4<f32>(worst[0], 0.0, 0.0, 0.0));
     }
+}
+
+// Side of one cell of the drop pattern, in pixels. Must match `DITHER_BLOCK` in
+// `src/reproject.rs` and the workgroup size of `cs_risk` above.
+const RISK_CELL: f32 = 8.0;
+
+// How far, in cells, ground is looked for around a cell of sky.
+//
+// A clamp on the search, not on the answer: ground moving further than this
+// reaches further than this says, and the sky beyond is carried on when it
+// should not be. Eight was measured rather than picked. Flying a low camera at
+// a hillside at 200 m/s -- the worst case the installed raster offers, the eye
+// a few metres over the slope -- carrying sky wrongly settles 18,365 pixels of
+// a 1280x720 frame; a reach of two cells leaves 5,766 of them, five leaves
+// 1,584, and eight leaves none. The cost is the search, which is quadratic in
+// this and paid once per cell rather than once per pixel.
+const REACH_CELLS: i32 = 8;
+
+// How far the ground around each cell can have swept across it.
+//
+// The risk field says how fast the ground *in* a cell was moving, which is
+// nothing at all for a cell holding only sky -- and a cell holding only sky is
+// exactly the one whose carried answer is about to be overrun by a ridge
+// coming up from below it. So this spreads each cell's motion outwards over
+// the distance it covers: a cell reads positive when ground somewhere near it
+// moved further than the gap between them, and zero or less when nothing
+// within reach was moving fast enough to arrive.
+//
+// One thread per cell rather than one per pixel, and a pass of its own because
+// a cell needs its neighbours' finished risk. See `swept` in
+// `src/reproject.wgsl` for what reads it.
+@compute @workgroup_size(8, 8)
+fn cs_reach(@builtin(global_invocation_id) id: vec3<u32>) {
+    let cells = vec2<i32>((terrain.viewport + u32(RISK_CELL) - 1u) / u32(RISK_CELL));
+    let cell = vec2<i32>(id.xy);
+    if (any(cell >= cells)) {
+        return;
+    }
+    var reach = 0.0;
+    for (var dy = -REACH_CELLS; dy <= REACH_CELLS; dy++) {
+        for (var dx = -REACH_CELLS; dx <= REACH_CELLS; dx++) {
+            let at = cell + vec2<i32>(dx, dy);
+            // Out of bounds reads zero, which reaches nothing, so the edges of
+            // the screen need no special case.
+            let speed = textureLoad(risk, at, 0).r;
+            // The narrowest gap between the two cells, in pixels, which is zero
+            // for a cell against itself: ground moving at all in a cell puts
+            // its own sky in doubt, and a neighbour's has to cross the space
+            // between before it counts.
+            let gap = RISK_CELL * f32(max(abs(dx), abs(dy)) - 1);
+            reach = max(reach, speed - max(gap, 0.0));
+        }
+    }
+    textureStore(out_reach, cell, vec4<f32>(reach, 0.0, 0.0, 0.0));
 }
 
 // One thread per pixel the reprojection could not answer.

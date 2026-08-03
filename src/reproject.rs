@@ -177,7 +177,10 @@ pub fn dropped(x: u32, y: u32, frame: u32) -> bool {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SplattingUniform {
     frame: u32,
-    padding: [u32; 3],
+    /// How far the eye has moved since the frame that drew the history, in
+    /// metres. Only its being zero or not is read; see `swept` in the shader.
+    moved: f32,
+    padding: [u32; 2],
     /// [`crate::camera::Camera::ray_basis`] of the camera that drew the
     /// history, one vector per row, `w` unused on each.
     was_ray_right: [f32; 4],
@@ -415,6 +418,14 @@ pub struct Carried {
     /// One number per dither cell: the fastest screen-space motion in it, which
     /// is what the drop pattern spends its extra rays on.
     pub risk: wgpu::TextureView,
+    /// The same field spread outwards over the distance it covers: how far the
+    /// ground near each cell had reached across it, in pixels.
+    ///
+    /// Same shape as [`Carried::risk`] and derived from it by `cs_reach`, which
+    /// needs the whole of it finished and so cannot share that pass. What reads
+    /// it is `swept` in `src/reproject.wgsl`, to decide whether a cell's carried
+    /// sky is still worth believing.
+    pub reach: wgpu::TextureView,
 }
 
 impl Carried {
@@ -470,25 +481,31 @@ impl Carried {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
                 mapped_at_creation: false,
             }),
-            risk: device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some("cell risk"),
-                    size: wgpu::Extent3d {
-                        width: size.x.div_ceil(DITHER_BLOCK),
-                        height: size.y.div_ceil(DITHER_BLOCK),
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: RISK_FORMAT,
-                    usage: wgpu::TextureUsages::STORAGE_BINDING
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default()),
+            risk: cells(device, "cell risk", size),
+            reach: cells(device, "cell reach", size),
         }
     }
+}
+
+/// One `RISK_FORMAT` texel per dither cell, written by compute and read as a
+/// texture.
+fn cells(device: &wgpu::Device, label: &str, size: UVec2) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: size.x.div_ceil(DITHER_BLOCK),
+                height: size.y.div_ceil(DITHER_BLOCK),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: RISK_FORMAT,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
 }
 
 /// The layout `cs_compact` and `cs_march` reach the carried buffers and the
@@ -610,6 +627,61 @@ pub fn bind_risk(
     })
 }
 
+/// The layout `cs_reach` spreads the risk field through.
+///
+/// Its own again, for the same reason [`risk_layout`] is: this reads the risk
+/// texture that `cs_risk` writes, and no pipeline may have one texture bound
+/// both ways at once.
+pub fn reach_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("reprojection reach layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: RISK_FORMAT,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// Points `cs_reach` at the risk field and the reach it spreads it into.
+pub fn bind_reach(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    carried: &Carried,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("reprojection reach bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(&carried.risk),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(&carried.reach),
+            },
+        ],
+    })
+}
+
 /// Points `cs_args` at the count it reads and the dispatch size it writes.
 pub fn bind_args(
     device: &wgpu::Device,
@@ -690,6 +762,7 @@ impl Reprojection {
                 texture(2, wgpu::TextureSampleType::Float { filterable: false }),
                 texture(3, wgpu::TextureSampleType::Float { filterable: false }),
                 texture(5, wgpu::TextureSampleType::Float { filterable: false }),
+                texture(6, wgpu::TextureSampleType::Float { filterable: false }),
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::VERTEX,
@@ -780,19 +853,23 @@ impl Reprojection {
         self.bind_group = Self::bind(device, &self.layout, &self.dither, history, carried);
     }
 
-    /// Tells the splat which frame this is and where the history was looking.
+    /// Tells the splat which frame this is, where the history was looking, and
+    /// how far the eye has moved since it was drawn.
     ///
     /// The frame number moves the dither's pattern on, so a different share of
     /// the screen is dropped each time. The ray basis is the previous camera's,
     /// which is what a carried sky pixel is rebuilt from -- ground needs no such
-    /// thing, its world position being absolute.
-    pub fn set_frame(&self, queue: &wgpu::Queue, frame: u32, was: [glam::Vec3; 3]) {
+    /// thing, its world position being absolute. `moved` is what says whether
+    /// that sky is still true: a rotation cannot bring ground into a ray, and a
+    /// translation can.
+    pub fn set_frame(&self, queue: &wgpu::Queue, frame: u32, was: [glam::Vec3; 3], moved: f32) {
         queue.write_buffer(
             &self.dither,
             0,
             bytemuck::bytes_of(&SplattingUniform {
                 frame,
-                padding: [0; 3],
+                moved,
+                padding: [0; 2],
                 was_ray_right: was[0].extend(0.0).to_array(),
                 was_ray_up: was[1].extend(0.0).to_array(),
                 was_ray_forward: was[2].extend(0.0).to_array(),
@@ -818,6 +895,7 @@ impl Reprojection {
                 entry(3, wgpu::BindingResource::TextureView(&history.depth)),
                 entry(4, dither.as_entire_binding()),
                 entry(5, wgpu::BindingResource::TextureView(&carried.risk)),
+                entry(6, wgpu::BindingResource::TextureView(&carried.reach)),
             ],
         })
     }
@@ -929,6 +1007,13 @@ mod tests {
         assert!(
             march.contains(&format!("const MARCH_ROW: u32 = {MARCH_ROW}u;")),
             "terrain.wgsl does not declare MARCH_ROW as {MARCH_ROW}"
+        );
+        // `cs_reach` measures the gap between two cells in pixels, so it has to
+        // spell the cell's side the same way the drop pattern does. Written as
+        // a float there because everything it is combined with is one.
+        assert!(
+            march.contains(&format!("const RISK_CELL: f32 = {DITHER_BLOCK}.0;")),
+            "terrain.wgsl does not declare RISK_CELL as {DITHER_BLOCK}"
         );
     }
 

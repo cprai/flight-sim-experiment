@@ -83,6 +83,8 @@ pub struct Scene {
     args_bind_group: wgpu::BindGroup,
     risk_layout: wgpu::BindGroupLayout,
     risk_bind_group: wgpu::BindGroup,
+    reach_layout: wgpu::BindGroupLayout,
+    reach_bind_group: wgpu::BindGroup,
     reproject: crate::reproject::Reprojection,
     /// Which frame this is, which is all the dither needs to move its pattern
     /// on. Wraps freely: only the low six bits are ever read.
@@ -94,6 +96,12 @@ pub struct Scene {
     /// only a direction, and the direction it had is the one the previous
     /// camera gave it.
     was_basis: [glam::Vec3; 3],
+    /// Where the eye stood when it drew what is now the history.
+    ///
+    /// Only carried sky needs it, and only to know whether the eye has moved at
+    /// all: sky is carried as a fact about a direction, which a rotation leaves
+    /// true and a translation does not. See `swept` in `src/reproject.wgsl`.
+    was_eye: glam::Vec3,
     /// The projection that drew what is now the history, for motion vectors.
     was_view_proj: glam::Mat4,
     shading: Shading,
@@ -140,6 +148,7 @@ impl Scene {
         let work_layout = crate::reproject::work_layout(device);
         let args_layout = crate::reproject::args_layout(device);
         let risk_layout = crate::reproject::risk_layout(device);
+        let reach_layout = crate::reproject::reach_layout(device);
         let terrain = Terrain::from_tiles(
             device,
             &camera_layout,
@@ -147,6 +156,7 @@ impl Scene {
             &work_layout,
             &args_layout,
             &risk_layout,
+            &reach_layout,
             residency,
             viewport,
             terrain_root,
@@ -161,6 +171,7 @@ impl Scene {
             work_layout,
             args_layout,
             risk_layout,
+            reach_layout,
             &camera_layout,
             terrain,
         ))
@@ -181,6 +192,7 @@ impl Scene {
             &wgpu::BindGroupLayout,
             &wgpu::BindGroupLayout,
             &wgpu::BindGroupLayout,
+            &wgpu::BindGroupLayout,
         ) -> Terrain,
     ) -> Self {
         let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
@@ -188,12 +200,14 @@ impl Scene {
         let work_layout = crate::reproject::work_layout(device);
         let args_layout = crate::reproject::args_layout(device);
         let risk_layout = crate::reproject::risk_layout(device);
+        let reach_layout = crate::reproject::reach_layout(device);
         let terrain = terrain(
             &camera_layout,
             &storage_layout,
             &work_layout,
             &args_layout,
             &risk_layout,
+            &reach_layout,
         );
         Self::assemble(
             device,
@@ -205,6 +219,7 @@ impl Scene {
             work_layout,
             args_layout,
             risk_layout,
+            reach_layout,
             &camera_layout,
             terrain,
         )
@@ -220,6 +235,7 @@ impl Scene {
         work_layout: wgpu::BindGroupLayout,
         args_layout: wgpu::BindGroupLayout,
         risk_layout: wgpu::BindGroupLayout,
+        reach_layout: wgpu::BindGroupLayout,
         camera_layout: &wgpu::BindGroupLayout,
         terrain: Terrain,
     ) -> Self {
@@ -231,6 +247,7 @@ impl Scene {
         let work_bind_group = crate::reproject::bind_work(device, &work_layout, &carried);
         let args_bind_group = crate::reproject::bind_args(device, &args_layout, &carried);
         let risk_bind_group = crate::reproject::bind_risk(device, &risk_layout, &gbuffer, &carried);
+        let reach_bind_group = crate::reproject::bind_reach(device, &reach_layout, &carried);
         let reproject =
             crate::reproject::Reprojection::new(device, camera_layout, &gbuffer, &carried);
         let shading = Shading::new(device, format, &gbuffer);
@@ -249,9 +266,12 @@ impl Scene {
             args_bind_group,
             risk_layout,
             risk_bind_group,
+            reach_layout,
+            reach_bind_group,
             reproject,
             frame: 0,
             was_basis: camera.ray_basis(),
+            was_eye: camera.position,
             was_view_proj: camera.view_projection(),
             shading,
             camera_span: std::time::Duration::ZERO,
@@ -275,6 +295,8 @@ impl Scene {
             crate::reproject::bind_args(device, &self.args_layout, &self.carried);
         self.risk_bind_group =
             crate::reproject::bind_risk(device, &self.risk_layout, &self.gbuffer, &self.carried);
+        self.reach_bind_group =
+            crate::reproject::bind_reach(device, &self.reach_layout, &self.carried);
         self.reproject.rebind(device, &self.gbuffer, &self.carried);
         self.shading.rebind(device, &self.gbuffer);
         self.terrain.resize(viewport);
@@ -298,11 +320,17 @@ impl Scene {
         // Wrapping is fine and deliberate: the dither reads the low six bits,
         // and its pattern is periodic in sixty-four frames anyway.
         self.frame = self.frame.wrapping_add(1);
-        self.reproject.set_frame(queue, self.frame, self.was_basis);
+        self.reproject.set_frame(
+            queue,
+            self.frame,
+            self.was_basis,
+            self.camera.position.distance(self.was_eye),
+        );
         // What this frame draws becomes the next one's history, so the basis it
         // is drawn with is the basis that history will have to be read back
         // through.
         self.was_basis = self.camera.ray_basis();
+        self.was_eye = self.camera.position;
         self.was_view_proj = self.camera.view_projection();
         self.terrain.update(queue, self.camera.position);
     }
@@ -353,7 +381,12 @@ impl Scene {
             self.update(queue);
         }
         self.frame = frame;
-        self.reproject.set_frame(queue, self.frame, self.was_basis);
+        self.reproject.set_frame(
+            queue,
+            self.frame,
+            self.was_basis,
+            self.camera.position.distance(self.was_eye),
+        );
     }
 
     /// Records the two passes that make a frame into `view`.
@@ -462,6 +495,15 @@ impl Scene {
             let mut pass = gpu.scoped_compute_pass("risk");
             pass.set_bind_group(3, &self.risk_bind_group, &[]);
             self.terrain.risk(&mut pass);
+        }
+
+        {
+            // Its own pass again, and for the reason `args` has one: a cell
+            // needs its neighbours' finished risk, and a pass boundary is what
+            // says every workgroup above has run.
+            let mut pass = gpu.scoped_compute_pass("reach");
+            pass.set_bind_group(3, &self.reach_bind_group, &[]);
+            self.terrain.reach(&mut pass);
         }
 
         // The clear never survives -- the shading pass writes every pixel --
@@ -764,7 +806,7 @@ mod tests {
             device,
             format,
             UVec2::splat(SIZE),
-            |camera_layout, storage_layout, work_layout, args_layout, risk_layout| {
+            |camera_layout, storage_layout, work_layout, args_layout, risk_layout, reach_layout| {
                 Terrain::new(
                     device,
                     camera_layout,
@@ -772,6 +814,7 @@ mod tests {
                     work_layout,
                     args_layout,
                     risk_layout,
+                    reach_layout,
                     residency,
                     UVec2::splat(SIZE),
                     placement(),
@@ -2015,7 +2058,7 @@ mod tests {
             &device,
             wgpu::TextureFormat::Rgba8UnormSrgb,
             UVec2::splat(SIZE),
-            |camera_layout, storage_layout, work_layout, args_layout, risk_layout| {
+            |camera_layout, storage_layout, work_layout, args_layout, risk_layout, reach_layout| {
                 Terrain::new(
                     &device,
                     camera_layout,
@@ -2023,6 +2066,7 @@ mod tests {
                     work_layout,
                     args_layout,
                     risk_layout,
+                    reach_layout,
                     test_residency(),
                     UVec2::splat(SIZE),
                     placement(),
@@ -2383,6 +2427,172 @@ mod tests {
             "climbing out of the ground left {sky} of {} pixels showing the sky \
              it saw from under the surface",
             SIZE * SIZE
+        );
+    }
+
+    /// A cone of ground rising out of a flat raster, north of the middle.
+    ///
+    /// Something with a silhouette against the sky, and one that climbs the
+    /// screen as the camera flies at it, which is what
+    /// [`flying_at_a_hill_does_not_carry_the_sky_it_rises_into`] needs.
+    fn hill() -> Vec<f32> {
+        const PEAK: f32 = 400.0;
+        const RADIUS: f32 = 20.0;
+        (0..RASTER * RASTER)
+            .map(|i| {
+                let (x, y) = ((i % RASTER) as f32, (i / RASTER) as f32);
+                let away = ((x - 64.0).powi(2) + (y - 32.0).powi(2)).sqrt();
+                PEAK * (1.0 - away / RADIUS).max(0.0)
+            })
+            .collect()
+    }
+
+    /// Sky the eye has since moved behind something is handed back to the march.
+    ///
+    /// Carried sky is put at `SKY_DISTANCE`, far enough that where the eye has
+    /// moved to rounds off. That is right for sky, which has only a direction,
+    /// and wrong for the claim: "no ground down this ray" was established from
+    /// where the eye was standing, and the parallel ray through the same pixel
+    /// from where it is standing now is a different one. Flying at a hill, the
+    /// crest climbs the screen, and the pixels it climbs into were sky a frame
+    /// ago. Settled from the carry they stay sky until the dither drops their
+    /// cell -- up to a dozen frames, in eight-by-eight blocks along the
+    /// skyline, which is what makes it look like the ridge is coming apart.
+    ///
+    /// Flown rather than stepped once, because how far ground can reach is
+    /// measured from the motion field, which describes the frame before: a
+    /// standing start has nothing moving in it to measure and the first frame
+    /// after it is carried on the strength of a still camera's history. That is
+    /// the same frame of lag `ranks_for` already reads the field with, and it
+    /// costs a frame of skyline at the start of a movement and nothing after.
+    ///
+    /// A second scene marches the last camera from nothing, which is the answer
+    /// the first has to match: whatever the sky is there, it is not a question
+    /// the reprojection is entitled to answer.
+    #[test]
+    fn flying_at_a_hill_does_not_carry_the_sky_it_rises_into() {
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        // Low, so the crest is well above the eye and sweeps a good way up the
+        // screen for steps the reprojection can otherwise carry most of.
+        let from = Vec3::new(0.0, 30.0, 1500.0);
+        // Metres are the wrong unit to judge this in: what decides whether the
+        // defect shows is how far the crest sweeps across the *screen*, and
+        // this raster is under four kilometres across. Six steps of a hundred
+        // and fifty move the crest about three pixels of two hundred and
+        // fifty-six a frame, which is what flying a real raster at 200 m/s a
+        // few metres over the ground does to a skyline at 1280 by 720.
+        let step_metres = 150.0;
+        let steps = 6;
+        let to = from - Vec3::Z * (step_metres * steps as f32);
+        let aim = |camera: &mut Camera| {
+            camera.orientation = Camera::from_yaw_pitch_roll(0.0, 0.0, 0.0);
+        };
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen target"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let bytes_per_row = SIZE * 4;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(bytes_per_row * SIZE),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let profiler = crate::profile::profiler(&device, false);
+
+        // One frame per submit, because `queue.write_buffer` is ordered at
+        // submit and each has to run against its own camera -- the same reason
+        // `crate::headless::capture` loops that way.
+        let step = |scene: &mut Scene, at: Vec3, read: bool| {
+            scene.camera.position = at;
+            scene.update(&queue);
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut gpu = profiler.scope("gpu", &mut encoder);
+                scene.draw(&mut gpu, &view);
+            }
+            if read {
+                encoder.copy_texture_to_buffer(
+                    target.as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(bytes_per_row),
+                            rows_per_image: Some(SIZE),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: SIZE,
+                        height: SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+            if !read {
+                return Vec::new();
+            }
+            readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll failed");
+            let pixels = readback
+                .get_mapped_range(..)
+                .expect("buffer not mapped")
+                .to_vec();
+            readback.unmap();
+            pixels
+        };
+
+        let mut flown = test_scene(&device, format, test_residency(), hill(), flat_ground());
+        aim(&mut flown.camera);
+        flown.camera.position = from;
+        flown.settle(&queue);
+        let start = step(&mut flown, from, true);
+        for i in 1..steps {
+            step(&mut flown, from - Vec3::Z * (step_metres * i as f32), false);
+        }
+        let carried = step(&mut flown, to, true);
+
+        let mut marched = test_scene(&device, format, test_residency(), hill(), flat_ground());
+        aim(&mut marched.camera);
+        marched.camera.position = to;
+        marched.settle(&queue);
+        let fresh = step(&mut marched, to, true);
+
+        let (start, carried, fresh) = (count_sky(&start), count_sky(&carried), count_sky(&fresh));
+        // The flight has to be one the defect could show up in at all: the
+        // crest must really have climbed, taking sky with it, or there would be
+        // nothing for the carry to get wrong and this would pass on nothing.
+        assert!(
+            start > fresh,
+            "the hill covered {} more pixels by the end of the flight; it has to \
+             rise into the sky for this to be a test of anything",
+            start - fresh
+        );
+        // One-sided on purpose. Sky standing where the march finds ground is
+        // the defect; a pixel of ground over the sky at the silhouette is the
+        // ordinary lag of a carried point and is not what this is about.
+        assert!(
+            carried <= fresh,
+            "flying {} m at the hill left {carried} pixels of sky where marching \
+             the same camera from nothing gives {fresh}",
+            step_metres * steps as f32
         );
     }
 

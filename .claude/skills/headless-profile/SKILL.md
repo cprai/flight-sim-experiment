@@ -26,6 +26,7 @@ gpu            1.74 ms   1.84 ms   1.84 ms
   args         0.00 ms   0.00 ms   0.00 ms
   march        1.41 ms   1.49 ms   1.51 ms
   risk         0.01 ms   0.01 ms   0.01 ms
+  reach        0.01 ms   0.01 ms   0.01 ms
   shading      0.02 ms   0.02 ms   0.02 ms
 cpu            0.08 ms   0.11 ms   0.11 ms
   camera       0.00 ms   0.00 ms   0.00 ms
@@ -70,6 +71,10 @@ and submits. A frame is roughly `max` of the two, not the sum.
     caused it.
   - **`risk`** reduces the motion field to one number per dither cell. A
     hundredth of a millisecond.
+  - **`reach`** spreads that field outwards over the distance each cell's
+    motion covers, which is what decides whether a cell's carried sky is still
+    sky. One thread per cell, so also a hundredth of a millisecond, and flat in
+    the resolution rather than growing with it.
   - **`shading`** is the deferred resolve: one fullscreen triangle reading the
     G-buffer back. Two hundredths of a millisecond. If a change makes this row
     grow noticeably, that is the finding.

@@ -186,6 +186,8 @@ pub struct Terrain {
     march: wgpu::ComputePipeline,
     /// Reduces the finished motion field to one number per dither cell.
     risk: wgpu::ComputePipeline,
+    /// Spreads that field outwards over the distance each cell's motion covers.
+    reach: wgpu::ComputePipeline,
 }
 
 /// Side of the square of pixels one workgroup of the compaction covers.
@@ -207,6 +209,7 @@ impl Terrain {
         work_layout: &wgpu::BindGroupLayout,
         args_layout: &wgpu::BindGroupLayout,
         risk_layout: &wgpu::BindGroupLayout,
+        reach_layout: &wgpu::BindGroupLayout,
         residency: Residency,
         viewport: UVec2,
         root: &Path,
@@ -288,6 +291,7 @@ impl Terrain {
             work_layout,
             args_layout,
             risk_layout,
+            reach_layout,
             residency,
             viewport,
             placement,
@@ -311,6 +315,7 @@ impl Terrain {
         work_layout: &wgpu::BindGroupLayout,
         args_layout: &wgpu::BindGroupLayout,
         risk_layout: &wgpu::BindGroupLayout,
+        reach_layout: &wgpu::BindGroupLayout,
         residency: Residency,
         viewport: UVec2,
         placement: Georeferencing,
@@ -540,6 +545,15 @@ impl Terrain {
             bind_group_layouts: &[None, Some(&layout), None, Some(risk_layout)],
             immediate_size: 0,
         });
+        // And its own, for the same reason once more: it reads the risk texture
+        // `cs_risk` writes. It needs the terrain for the viewport, which is what
+        // tells it how many cells there are.
+        let reach_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("terrain reach pipeline layout"),
+                bind_group_layouts: &[None, Some(&layout), None, Some(reach_layout)],
+                immediate_size: 0,
+            });
         // Compute rather than a fullscreen triangle. The march never needed
         // anything the raster pipeline provides -- no interpolation, no
         // blending, and a depth test that could reject nothing because each
@@ -564,6 +578,7 @@ impl Terrain {
         let args = stage("terrain args pipeline", "cs_args", &args_pipeline_layout);
         let march = stage("terrain march pipeline", "cs_march", &pipeline_layout);
         let risk = stage("terrain risk pipeline", "cs_risk", &risk_pipeline_layout);
+        let reach = stage("terrain reach pipeline", "cs_reach", &reach_pipeline_layout);
 
         let height_range = Self::coarsest_height_range(heights.as_ref(), &placement);
         let slots = (residency.tiles_across * residency.tiles_across) as usize;
@@ -594,6 +609,7 @@ impl Terrain {
             args,
             march,
             risk,
+            reach,
         }
     }
 
@@ -1042,6 +1058,27 @@ impl Terrain {
         );
     }
 
+    /// Spreads the risk field outwards over the distance each cell's motion
+    /// covers, which is what says whether a cell of sky is still sky.
+    ///
+    /// After [`Terrain::risk`], which it reads whole: one thread per cell, so
+    /// the dispatch is over cells of cells.
+    pub fn reach(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.reach);
+        pass.set_bind_group(1, &self.bind_group, &[]);
+        pass.dispatch_workgroups(
+            self.viewport
+                .x
+                .div_ceil(COMPACT_TILE)
+                .div_ceil(COMPACT_TILE),
+            self.viewport
+                .y
+                .div_ceil(COMPACT_TILE)
+                .div_ceil(COMPACT_TILE),
+            1,
+        );
+    }
+
     /// Casts a ray for each pixel on that list.
     ///
     /// Indirect, because how many there are is decided on the GPU and never
@@ -1169,6 +1206,7 @@ mod tests {
         let work_layout = crate::reproject::work_layout(&device);
         let args_layout = crate::reproject::args_layout(&device);
         let risk_layout = crate::reproject::risk_layout(&device);
+        let reach_layout = crate::reproject::reach_layout(&device);
         let residency = test_residency();
         let across = residency.texels_across();
 
@@ -1183,6 +1221,7 @@ mod tests {
             &work_layout,
             &args_layout,
             &risk_layout,
+            &reach_layout,
             residency,
             UVec2::splat(RASTER),
             Georeferencing::square(RASTER, RASTER, 30.0),

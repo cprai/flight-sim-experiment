@@ -48,12 +48,15 @@ struct Camera {
 struct Splatting {
     // Which frame this is. Wraps freely; only the low six bits are read.
     frame: u32,
+    // How far the eye has moved since the frame that drew the history, in
+    // metres. Zero is the whole of what carried sky needs to be exact -- see
+    // `swept` -- so this is tested against zero rather than scaled by.
+    moved: f32,
     // Spelled out as scalars rather than a `vec3<u32>`: a three-component
     // vector is aligned to sixteen bytes in a uniform block, which would round
     // this struct up and leave the Rust mirror the wrong size.
     padding_a: u32,
     padding_b: u32,
-    padding_c: u32,
     // The ray basis of the camera that drew the history, which is what turns a
     // sky pixel of it back into the direction it was looking along. Ground does
     // not need this -- its world position is absolute -- but sky has no
@@ -67,6 +70,9 @@ struct Splatting {
 // How fast the picture was moving across each dither cell on the last frame,
 // in pixels. One texel per cell. See `cs_risk` in `src/terrain.wgsl`.
 @group(1) @binding(5) var risk: texture_2d<f32>;
+// How far the ground near each cell had reached across it, in pixels. One
+// texel per cell again. See `cs_reach` in `src/terrain.wgsl`.
+@group(1) @binding(6) var reach: texture_2d<f32>;
 
 // How many of the sixty-four ranks of the dither are dropped, which is how many
 // pixels are handed back to the march however well the reprojection did.
@@ -144,6 +150,38 @@ fn dropped(pixel: vec2<u32>) -> bool {
     return bayer8(turned) < ranks_for(cell);
 }
 
+// Whether ground moving nearby could have swept across this pixel since the
+// frame that found no ground down it.
+//
+// Sky is carried as a fact about a *direction*, which is what putting it at
+// `SKY_DISTANCE` says. That is exactly right under rotation and wrong under
+// translation: "no ground down this ray" was established from where the eye
+// was standing, and the parallel ray through the same pixel from where it is
+// standing now is a different ray. Near the ground it is the one that has
+// gone behind a crest the old one grazed over. Carried on regardless, the
+// pixel is settled as sky and never handed to the march, so it stays wrong
+// until the dither drops it -- up to a dozen frames, in blocks, along the
+// skyline.
+//
+// How far ground has moved across the screen is what the motion field already
+// measures, and `cs_reach` in `src/terrain.wgsl` has already spread each
+// cell's share of it outwards over the distance it covers. So all that is left
+// here is to read it: positive means ground within reach of this cell moved
+// further than the gap between them, and could be standing in this pixel now.
+// Open sky, far from anything, reads zero and is carried as before.
+//
+// Only whether the eye moved is asked of `moved`, not how far. A rotation
+// cannot bring ground into a ray, so a camera that only turns keeps the carry
+// exactly as it was and pays nothing for this. Any translation at all can, and
+// how much is what the reach already says -- the motion it was reduced from
+// was a translation's parallax and a rotation's sweep together.
+fn swept(pixel: vec2<u32>) -> bool {
+    if (splatting.moved == 0.0) {
+        return false;
+    }
+    return textureLoad(reach, vec2<i32>(pixel / DITHER_BLOCK), 0).r > 0.0;
+}
+
 struct Splat {
     @builtin(position) clip: vec4<f32>,
     // Flat throughout: a point covers one pixel, so there is nothing between
@@ -210,6 +248,12 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
     }
 
     if (stored.w != GROUND_HERE) {
+        // Sky the eye may since have moved behind something is not sky any
+        // more, so hand the pixel back rather than answer it from a ray that
+        // was cast from somewhere else.
+        if (swept(pixel)) {
+            return out;
+        }
         // Sky, which has no world position -- only the direction the old camera
         // was looking along through this pixel. Rebuilt from that camera's ray
         // basis and placed far enough away that where the eye has moved to
