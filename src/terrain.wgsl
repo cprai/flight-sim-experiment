@@ -595,13 +595,15 @@ var<private> ray_spent: bool = false;
 // `[workgroups, 1, 1]`, written by `cs_args` for the march to be dispatched by.
 @group(3) @binding(6) var<storage, read_write> march_args: array<u32, 3>;
 
-// The finished motion field, and the one number per dither cell that `cs_risk`
-// reduces it to. Bound only for that pass, which writes neither of the two
-// above and so cannot be given the same layout as the march.
+// The finished motion field, the depth beside it, and the pair of numbers per
+// dither cell that `cs_risk` reduces them to. Bound only for that pass, which
+// writes neither of the two above and so cannot be given the same layout as
+// the march.
 @group(3) @binding(7) var motion: texture_2d<u32>;
-@group(3) @binding(8) var out_risk: texture_storage_2d<r32float, write>;
+@group(3) @binding(11) var settled_depth: texture_2d<f32>;
+@group(3) @binding(8) var out_risk: texture_storage_2d<rg32float, write>;
 
-// That same risk field read back, and the reach `cs_reach` spreads it into.
+// That same cell summary read back, and the reach `cs_reach` spreads it into.
 // Its own layout again, and for the same reason: one pass cannot bind the risk
 // texture as writable storage and read it as a texture at the same time.
 @group(3) @binding(9) var risk: texture_2d<f32>;
@@ -926,20 +928,26 @@ fn cs_args() {
     atomicStore(&tally.groups, groups);
 }
 
-// How fast the picture is moving across one dither cell.
+// What one dither cell of this frame held, in the two numbers the next frame
+// asks about it.
 //
-// The largest screen-space motion any pixel of the cell has, which is the
-// signal the drop pattern spends its extra rays on: ground that is sweeping
-// across the view is ground whose carried material and normal go stale
-// soonest, and under forward flight it is also the near ground that magnifies
-// fastest and so leaves the most gaps between splats.
+// The first is the largest screen-space motion any pixel of the cell has, which
+// is the signal the drop pattern spends its extra rays on: ground that is
+// sweeping across the view is ground whose carried material and normal go
+// stale soonest, and under forward flight it is also the near ground that
+// magnifies fastest and so leaves the most gaps between splats.
 //
-// The maximum rather than the mean, because a cell is dropped or kept whole and
-// the worst pixel in it is what decides whether keeping it shows.
+// The second is the nearest ground in the cell, as reversed-Z depth, where
+// larger is nearer and zero is sky. Motion alone cannot say whether what swept
+// across a pixel had any business covering what was there: only something
+// *nearer* occludes. See `cs_reach`, which pairs them.
+//
+// The maximum of each rather than the mean, because a cell is dropped or kept
+// whole and the worst pixel in it is what decides whether keeping it shows.
 //
 // One workgroup per cell, which is why the workgroup *is* the cell: the
 // reduction is over exactly the pixels whose fate the answer decides.
-var<workgroup> worst: array<f32, 64>;
+var<workgroup> worst: array<vec2<f32>, 64>;
 
 @compute @workgroup_size(8, 8)
 fn cs_risk(
@@ -949,10 +957,13 @@ fn cs_risk(
 ) {
     // Pixels past the edge take the identity of the reduction rather than
     // dropping out, so every lane has something defined to contribute.
-    var here = 0.0;
+    var here = vec2<f32>(0.0);
     if (all(id.xy < terrain.viewport)) {
         let motion = unpack2x16float(textureLoad(motion, vec2<i32>(id.xy), 0).r);
-        here = max(abs(motion.x), abs(motion.y));
+        here = vec2<f32>(
+            max(abs(motion.x), abs(motion.y)),
+            textureLoad(settled_depth, vec2<i32>(id.xy), 0).r,
+        );
     }
     worst[slot] = here;
     workgroupBarrier();
@@ -965,7 +976,7 @@ fn cs_risk(
     }
 
     if (slot == 0u) {
-        textureStore(out_risk, vec2<i32>(cell.xy), vec4<f32>(worst[0], 0.0, 0.0, 0.0));
+        textureStore(out_risk, vec2<i32>(cell.xy), vec4<f32>(worst[0], 0.0, 0.0));
     }
 }
 
@@ -985,15 +996,21 @@ const RISK_CELL: f32 = 8.0;
 // this and paid once per cell rather than once per pixel.
 const REACH_CELLS: i32 = 8;
 
-// How far the ground around each cell can have swept across it.
+// The nearest ground that can have swept across each cell since the last frame.
 //
-// The risk field says how fast the ground *in* a cell was moving, which is
-// nothing at all for a cell holding only sky -- and a cell holding only sky is
-// exactly the one whose carried answer is about to be overrun by a ridge
-// coming up from below it. So this spreads each cell's motion outwards over
-// the distance it covers: a cell reads positive when ground somewhere near it
-// moved further than the gap between them, and zero or less when nothing
-// within reach was moving fast enough to arrive.
+// The risk field says how fast the ground *in* a cell was moving and how near
+// it was. Neither alone answers what a carried point needs to know. Motion
+// alone is nothing at all for a cell holding only sky -- and a cell of sky is
+// exactly the one about to be overrun by a ridge coming up from below it --
+// while depth alone says nothing about whether the near thing has had time to
+// get here. Paired, they do: a cell's ground reaches this one if it moved
+// further than the gap between them, and what arrives is worth worrying about
+// only if it is nearer than whatever it lands on.
+//
+// So this takes the nearest ground among the cells that can reach, and leaves
+// the comparison against what is already here to `swept`, which is where the
+// depth of the point being judged is known. Zero means nothing within reach
+// moved far enough to arrive.
 //
 // One thread per cell rather than one per pixel, and a pass of its own because
 // a cell needs its neighbours' finished risk. See `swept` in
@@ -1005,22 +1022,24 @@ fn cs_reach(@builtin(global_invocation_id) id: vec3<u32>) {
     if (any(cell >= cells)) {
         return;
     }
-    var reach = 0.0;
+    var nearest = 0.0;
     for (var dy = -REACH_CELLS; dy <= REACH_CELLS; dy++) {
         for (var dx = -REACH_CELLS; dx <= REACH_CELLS; dx++) {
             let at = cell + vec2<i32>(dx, dy);
-            // Out of bounds reads zero, which reaches nothing, so the edges of
-            // the screen need no special case.
-            let speed = textureLoad(risk, at, 0).r;
+            // Out of bounds reads zero, which neither moves nor is near, so the
+            // edges of the screen need no special case.
+            let there = textureLoad(risk, at, 0).rg;
             // The narrowest gap between the two cells, in pixels, which is zero
             // for a cell against itself: ground moving at all in a cell puts
             // its own sky in doubt, and a neighbour's has to cross the space
             // between before it counts.
             let gap = RISK_CELL * f32(max(abs(dx), abs(dy)) - 1);
-            reach = max(reach, speed - max(gap, 0.0));
+            if (there.r > max(gap, 0.0)) {
+                nearest = max(nearest, there.g);
+            }
         }
     }
-    textureStore(out_reach, cell, vec4<f32>(reach, 0.0, 0.0, 0.0));
+    textureStore(out_reach, cell, vec4<f32>(nearest, 0.0, 0.0, 0.0));
 }
 
 // One thread per pixel the reprojection could not answer.

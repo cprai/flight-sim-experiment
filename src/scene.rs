@@ -2430,6 +2430,106 @@ mod tests {
         );
     }
 
+    /// A target to draw single frames into, and the readback behind it.
+    ///
+    /// Shared by the two flights below, which both need to step a camera a
+    /// frame at a time and look at what came out rather than at a coverage
+    /// count.
+    struct Offscreen {
+        target: wgpu::Texture,
+        view: wgpu::TextureView,
+        readback: wgpu::Buffer,
+        profiler: wgpu_profiler::GpuProfiler,
+    }
+
+    impl Offscreen {
+        fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("offscreen target"),
+                size: wgpu::Extent3d {
+                    width: SIZE,
+                    height: SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            Self {
+                readback: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("readback"),
+                    size: u64::from(SIZE * 4 * SIZE),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                profiler: crate::profile::profiler(device, false),
+                target,
+                view,
+            }
+        }
+
+        /// Moves the camera and draws one frame, reading it back if asked.
+        ///
+        /// One frame per submit, because `queue.write_buffer` is ordered at
+        /// submit and each frame has to run against its own camera -- the same
+        /// reason `crate::headless::capture` loops that way.
+        fn step(
+            &self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            scene: &mut Scene,
+            at: Vec3,
+            read: bool,
+        ) -> Vec<u8> {
+            scene.camera.position = at;
+            scene.update(queue);
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut gpu = self.profiler.scope("gpu", &mut encoder);
+                scene.draw(&mut gpu, &self.view);
+            }
+            if read {
+                encoder.copy_texture_to_buffer(
+                    self.target.as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &self.readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(SIZE * 4),
+                            rows_per_image: Some(SIZE),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: SIZE,
+                        height: SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+            if !read {
+                return Vec::new();
+            }
+            self.readback
+                .map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll failed");
+            let pixels = self
+                .readback
+                .get_mapped_range(..)
+                .expect("buffer not mapped")
+                .to_vec();
+            self.readback.unmap();
+            pixels
+        }
+    }
+
     /// A cone of ground rising out of a flat raster, north of the middle.
     ///
     /// Something with a silhouette against the sky, and one that climbs the
@@ -2488,92 +2588,24 @@ mod tests {
         let aim = |camera: &mut Camera| {
             camera.orientation = Camera::from_yaw_pitch_roll(0.0, 0.0, 0.0);
         };
-
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("offscreen target"),
-            size: wgpu::Extent3d {
-                width: SIZE,
-                height: SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        let bytes_per_row = SIZE * 4;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: u64::from(bytes_per_row * SIZE),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let profiler = crate::profile::profiler(&device, false);
-
-        // One frame per submit, because `queue.write_buffer` is ordered at
-        // submit and each has to run against its own camera -- the same reason
-        // `crate::headless::capture` loops that way.
-        let step = |scene: &mut Scene, at: Vec3, read: bool| {
-            scene.camera.position = at;
-            scene.update(&queue);
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            {
-                let mut gpu = profiler.scope("gpu", &mut encoder);
-                scene.draw(&mut gpu, &view);
-            }
-            if read {
-                encoder.copy_texture_to_buffer(
-                    target.as_image_copy(),
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &readback,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(bytes_per_row),
-                            rows_per_image: Some(SIZE),
-                        },
-                    },
-                    wgpu::Extent3d {
-                        width: SIZE,
-                        height: SIZE,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
-            queue.submit(std::iter::once(encoder.finish()));
-            if !read {
-                return Vec::new();
-            }
-            readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
-            device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .expect("poll failed");
-            let pixels = readback
-                .get_mapped_range(..)
-                .expect("buffer not mapped")
-                .to_vec();
-            readback.unmap();
-            pixels
-        };
+        let screen = Offscreen::new(&device, format);
 
         let mut flown = test_scene(&device, format, test_residency(), hill(), flat_ground());
         aim(&mut flown.camera);
         flown.camera.position = from;
         flown.settle(&queue);
-        let start = step(&mut flown, from, true);
+        let start = screen.step(&device, &queue, &mut flown, from, true);
         for i in 1..steps {
-            step(&mut flown, from - Vec3::Z * (step_metres * i as f32), false);
+            let at = from - Vec3::Z * (step_metres * i as f32);
+            screen.step(&device, &queue, &mut flown, at, false);
         }
-        let carried = step(&mut flown, to, true);
+        let carried = screen.step(&device, &queue, &mut flown, to, true);
 
         let mut marched = test_scene(&device, format, test_residency(), hill(), flat_ground());
         aim(&mut marched.camera);
         marched.camera.position = to;
         marched.settle(&queue);
-        let fresh = step(&mut marched, to, true);
+        let fresh = screen.step(&device, &queue, &mut marched, to, true);
 
         let (start, carried, fresh) = (count_sky(&start), count_sky(&carried), count_sky(&fresh));
         // The flight has to be one the defect could show up in at all: the
@@ -2592,6 +2624,122 @@ mod tests {
             carried <= fresh,
             "flying {} m at the hill left {carried} pixels of sky where marching \
              the same camera from nothing gives {fresh}",
+            step_metres * steps as f32
+        );
+    }
+
+    /// A near ridge with a far one showing over the top of it.
+    ///
+    /// The far ridge is four times the distance and painted a different
+    /// material, so which of the two a pixel is showing can be read straight
+    /// off the frame. Flying at them closes the gap: the near crest climbs the
+    /// screen faster than the far one, so it eats into the band of far ridge
+    /// above it, which is the sweep
+    /// [`flying_at_a_ridge_does_not_carry_what_it_hides`] measures.
+    fn two_ridges() -> (Vec<f32>, Vec<MaterialId>) {
+        let ridge = |row: f32, at: f32, half: f32, peak: f32| {
+            peak * (1.0 - (row - at).abs() / half).max(0.0)
+        };
+        let heights = (0..RASTER * RASTER)
+            .map(|i| {
+                let row = (i / RASTER) as f32;
+                ridge(row, 90.0, 6.0, 100.0).max(ridge(row, 16.0, 8.0, 600.0))
+            })
+            .collect();
+        let materials = (0..RASTER * RASTER)
+            .map(|i| if i / RASTER < 32 { SAND } else { GRASS })
+            .collect();
+        (heights, materials)
+    }
+
+    /// Whether a rendered pixel is showing the sandy far ridge.
+    ///
+    /// Sand is warm and grass is green whatever the light does to them, so this
+    /// separates the two ridges without pinning either to a colour.
+    fn is_sandy(pixel: [u8; 4]) -> bool {
+        pixel[0] > pixel[1] && !is_sky(pixel)
+    }
+
+    fn count_sandy(pixels: &[u8]) -> usize {
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| is_sandy(pixel(pixels, x, y)))
+            .count()
+    }
+
+    /// Ground the carry can still place is not ground it may still show.
+    ///
+    /// A carried point keeps its world position, which stays true however the
+    /// camera moves. Whether it is still the nearest thing along its ray does
+    /// not: a ridge sweeping across it should hide it, and will not if the
+    /// ridge's own points were dropped by the dither or spread apart by
+    /// magnification. What comes through is the background, in eight-by-eight
+    /// speckles along the skyline -- the far snow on a peak, on the raster this
+    /// was reported from.
+    ///
+    /// The depth test cannot catch this. It settles which of the points that
+    /// *did* land is nearest, and the whole problem is the ones that did not.
+    ///
+    /// Flown for the same reason as the sky flight above: the reach is measured
+    /// from the frame before, so a standing start has nothing moving in it yet.
+    #[test]
+    fn flying_at_a_ridge_does_not_carry_what_it_hides() {
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let (heights, materials) = two_ridges();
+        // Low enough that the near ridge stands above the eye, and far enough
+        // back that four times its distance is still inside the raster.
+        let from = Vec3::new(0.0, 50.0, 1500.0);
+        let step_metres = 50.0;
+        let steps = 6;
+        let to = from - Vec3::Z * (step_metres * steps as f32);
+        let aim = |camera: &mut Camera| {
+            camera.orientation = Camera::from_yaw_pitch_roll(0.0, 0.0, 0.0);
+        };
+        let screen = Offscreen::new(&device, format);
+
+        let mut flown = test_scene(
+            &device,
+            format,
+            test_residency(),
+            heights.clone(),
+            materials.clone(),
+        );
+        aim(&mut flown.camera);
+        flown.camera.position = from;
+        flown.settle(&queue);
+        let start = screen.step(&device, &queue, &mut flown, from, true);
+        for i in 1..steps {
+            let at = from - Vec3::Z * (step_metres * i as f32);
+            screen.step(&device, &queue, &mut flown, at, false);
+        }
+        let carried = screen.step(&device, &queue, &mut flown, to, true);
+
+        let mut marched = test_scene(&device, format, test_residency(), heights, materials);
+        aim(&mut marched.camera);
+        marched.camera.position = to;
+        marched.settle(&queue);
+        let fresh = screen.step(&device, &queue, &mut marched, to, true);
+
+        let (start, carried, fresh) = (
+            count_sandy(&start),
+            count_sandy(&carried),
+            count_sandy(&fresh),
+        );
+        // Both ridges have to be on screen, and the near one has to be closing
+        // over the far one, or there is nothing here to get wrong.
+        assert!(
+            fresh > 0 && start > fresh,
+            "the near ridge has to eat into the far one: {start} sandy pixels at \
+             the start against {fresh} at the end"
+        );
+        // One-sided: the far ridge showing where the march finds the near one
+        // is the defect. The near ridge a pixel too fat at its own silhouette
+        // is the ordinary lag of a carried point.
+        assert!(
+            carried <= fresh,
+            "flying {} m at the ridges left {carried} pixels of the far ridge \
+             where marching the same camera from nothing gives {fresh}",
             step_metres * steps as f32
         );
     }

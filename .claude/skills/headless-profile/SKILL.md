@@ -71,10 +71,11 @@ and submits. A frame is roughly `max` of the two, not the sum.
     caused it.
   - **`risk`** reduces the motion field to one number per dither cell. A
     hundredth of a millisecond.
-  - **`reach`** spreads that field outwards over the distance each cell's
-    motion covers, which is what decides whether a cell's carried sky is still
-    sky. One thread per cell, so also a hundredth of a millisecond, and flat in
-    the resolution rather than growing with it.
+  - **`reach`** works out, per cell, the nearest ground that can have swept
+    across it since the last frame -- which is what decides whether a carried
+    answer, sky or ground, is still the nearest thing along its ray. One thread
+    per cell, so also a hundredth of a millisecond, and flat in the resolution
+    rather than growing with it.
   - **`shading`** is the deferred resolve: one fullscreen triangle reading the
     G-buffer back. Two hundredths of a millisecond. If a change makes this row
     grow noticeably, that is the finding.

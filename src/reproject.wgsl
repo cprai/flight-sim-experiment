@@ -38,12 +38,13 @@ struct Camera {
 @group(1) @binding(0) var history_material: texture_2d<u32>;
 @group(1) @binding(1) var history_position: texture_2d<f32>;
 @group(1) @binding(2) var history_normal: texture_2d<f32>;
-// Binding 3 is the history depth. It is in the layout so that one description
-// of a G-buffer serves everything that reads one, and it is deliberately not
-// declared here: the depth a carried point takes is the one *this* camera sees
-// it at, which the rasterizer derives from the projection below. Carrying the
-// old depth across would put the point at the distance the old camera was from
-// it.
+// The history depth, read only to compare one point's distance against
+// another's -- never to place a point. The depth a carried point takes is the
+// one *this* camera sees it at, which the rasterizer derives from the
+// projection below; carrying the old depth across would put the point at the
+// distance the old camera was from it. See `swept`, which asks whether what
+// swept across a pixel was nearer than what was standing there.
+@group(1) @binding(3) var history_depth: texture_2d<f32>;
 
 struct Splatting {
     // Which frame this is. Wraps freely; only the low six bits are read.
@@ -67,11 +68,14 @@ struct Splatting {
 };
 
 @group(1) @binding(4) var<uniform> splatting: Splatting;
-// How fast the picture was moving across each dither cell on the last frame,
-// in pixels. One texel per cell. See `cs_risk` in `src/terrain.wgsl`.
+// What each dither cell held on the last frame: how fast the picture was
+// moving across it in pixels, and how near its nearest ground was. One texel
+// per cell. Only the first is wanted here; `cs_reach` in `src/terrain.wgsl`,
+// which writes both, is what the second is for.
 @group(1) @binding(5) var risk: texture_2d<f32>;
-// How far the ground near each cell had reached across it, in pixels. One
-// texel per cell again. See `cs_reach` in `src/terrain.wgsl`.
+// The nearest ground that can have swept across each cell since the last frame,
+// as reversed-Z depth. One texel per cell again, and zero where nothing within
+// reach moved far enough to arrive. See `cs_reach` in `src/terrain.wgsl`.
 @group(1) @binding(6) var reach: texture_2d<f32>;
 
 // How many of the sixty-four ranks of the dither are dropped, which is how many
@@ -150,36 +154,46 @@ fn dropped(pixel: vec2<u32>) -> bool {
     return bayer8(turned) < ranks_for(cell);
 }
 
-// Whether ground moving nearby could have swept across this pixel since the
-// frame that found no ground down it.
+// Whether something nearer could have swept across this pixel since the frame
+// that answered it.
 //
-// Sky is carried as a fact about a *direction*, which is what putting it at
-// `SKY_DISTANCE` says. That is exactly right under rotation and wrong under
-// translation: "no ground down this ray" was established from where the eye
-// was standing, and the parallel ray through the same pixel from where it is
-// standing now is a different ray. Near the ground it is the one that has
-// gone behind a crest the old one grazed over. Carried on regardless, the
-// pixel is settled as sky and never handed to the march, so it stays wrong
-// until the dither drops it -- up to a dozen frames, in blocks, along the
-// skyline.
+// Two ways a carried answer goes stale, and they turn out to be one. Sky is
+// carried as a fact about a *direction*, which is what putting it at
+// `SKY_DISTANCE` says: exactly right under rotation, and wrong under
+// translation, because "no ground down this ray" was established from where
+// the eye was standing and the parallel ray through the same pixel from where
+// it is standing now is a different one. Ground is carried as a fact about a
+// *point*, which stays true -- but whether that point is still the nearest
+// thing along its ray does not. A ridge sweeping across it should hide it, and
+// will not if the ridge's own points were dropped by the dither or spread
+// apart by magnification, so the background shows through the foreground in
+// eight-by-eight speckles along every skyline.
 //
-// How far ground has moved across the screen is what the motion field already
-// measures, and `cs_reach` in `src/terrain.wgsl` has already spread each
-// cell's share of it outwards over the distance it covers. So all that is left
-// here is to read it: positive means ground within reach of this cell moved
-// further than the gap between them, and could be standing in this pixel now.
-// Open sky, far from anything, reads zero and is carried as before.
+// Both are the same question: has something nearer arrived here? `cs_reach`
+// has already worked out what could have arrived -- the nearest ground among
+// the cells whose motion carries them this far -- so this compares it against
+// what is standing here. Sky is the limiting case and needs no case of its
+// own: its depth is zero, the reversed-Z far plane, so anything at all that
+// arrives is nearer.
+//
+// `OCCLUDER_NEARER` is what keeps this from firing on ground that is merely
+// sloping. A surface seen at a grazing angle changes distance quickly across
+// the screen without ever occluding itself, so the nearest thing within reach
+// of a pixel is routinely a little nearer than the pixel; what marks a real
+// occlusion boundary is a jump. Two was measured rather than picked -- see the
+// constant.
 //
 // Only whether the eye moved is asked of `moved`, not how far. A rotation
-// cannot bring ground into a ray, so a camera that only turns keeps the carry
-// exactly as it was and pays nothing for this. Any translation at all can, and
-// how much is what the reach already says -- the motion it was reduced from
-// was a translation's parallax and a rotation's sweep together.
-fn swept(pixel: vec2<u32>) -> bool {
+// cannot bring ground into a ray or one surface in front of another, so a
+// camera that only turns keeps the carry exactly as it was and pays nothing
+// for this. Any translation at all can, and how much is what the reach already
+// says.
+fn swept(pixel: vec2<u32>, mine: f32) -> bool {
     if (splatting.moved == 0.0) {
         return false;
     }
-    return textureLoad(reach, vec2<i32>(pixel / DITHER_BLOCK), 0).r > 0.0;
+    let intruder = textureLoad(reach, vec2<i32>(pixel / DITHER_BLOCK), 0).r;
+    return intruder > mine * OCCLUDER_NEARER;
 }
 
 struct Splat {
@@ -220,6 +234,23 @@ const GROUND_HERE: f32 = 1.0;
 // times nearer than the reversed-Z far plane's resolution runs out.
 const SKY_DISTANCE: f32 = 1.0e9;
 
+// How much nearer than a carried point something has to be before it counts as
+// able to occlude it, as a ratio of reversed-Z depths -- which is a ratio of
+// distances the other way up, so two means half as far.
+//
+// A threshold is needed at all because the reach is taken over a whole dither
+// cell and its neighbours, and ground seen at a grazing angle changes distance
+// fast across eight pixels without any occlusion being involved. Without one,
+// every pixel that is not the nearest in its own cell is handed back and the
+// reprojection stops carrying anything while the camera moves: measured on a
+// horizon view, 66.8% of the frame carried falls to 27.6%.
+//
+// Two, because that is where the two populations separate on the installed
+// raster. What this is meant to catch is a skyline, where the ground behind a
+// ridge is several times further off than the ridge; what it must not catch is
+// a slope. See the commit that added it for the sweep.
+const OCCLUDER_NEARER: f32 = 2.0;
+
 @vertex
 fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
     var out: Splat;
@@ -251,7 +282,7 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
         // Sky the eye may since have moved behind something is not sky any
         // more, so hand the pixel back rather than answer it from a ray that
         // was cast from somewhere else.
-        if (swept(pixel)) {
+        if (swept(pixel, 0.0)) {
             return out;
         }
         // Sky, which has no world position -- only the direction the old camera
@@ -272,6 +303,12 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
             * vec4<f32>(camera.position.xyz + was * SKY_DISTANCE, 1.0);
         // Normal left at zero, which is what tells the compaction this is sky
         // rather than ground once it has landed.
+        return out;
+    }
+
+    // Ground the carry is still entitled to place, but not necessarily still
+    // entitled to show: something nearer may have swept in front of it.
+    if (swept(pixel, textureLoad(history_depth, vec2<i32>(pixel), 0).r)) {
         return out;
     }
 

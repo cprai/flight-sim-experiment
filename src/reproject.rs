@@ -31,14 +31,25 @@ use glam::UVec2;
 /// the fixed-function depth test can resolve overlapping points for free.
 pub const CARRIED_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// How fast the picture is moving across one dither cell.
+/// What one dither cell of the last frame held: how fast it was moving, and
+/// how near its nearest ground was.
 ///
 /// One texel per cell, so a sixty-fourth of the pixels -- a hundred and sixty
 /// by ninety at 720p, which is why the width of the channel is not worth
 /// economising on. Full floats because the half-float formats are not
-/// storage-writable without a feature and `R32Float` is guaranteed, the same
-/// reason [`crate::deferred::MOTION_FORMAT`] is packed into an integer.
-pub const RISK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+/// storage-writable without a feature, the same reason
+/// [`crate::deferred::MOTION_FORMAT`] is packed into an integer.
+///
+/// Two channels because the two questions the reprojection asks about a cell
+/// need both: how far its ground can have swept, and whether what swept is
+/// near enough to stand in front of what it swept over.
+pub const RISK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
+
+/// The nearest ground that can have swept across a cell, as reversed-Z depth.
+///
+/// One channel, because the distance the search covered is spent by the time
+/// this is written; what comes out is only how near the intruder was.
+pub const REACH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
 /// Depth cleared into the carried buffer, and the value that means "nothing
 /// landed here".
@@ -481,15 +492,19 @@ impl Carried {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
                 mapped_at_creation: false,
             }),
-            risk: cells(device, "cell risk", size),
-            reach: cells(device, "cell reach", size),
+            risk: cells(device, "cell risk", size, RISK_FORMAT),
+            reach: cells(device, "cell reach", size, REACH_FORMAT),
         }
     }
 }
 
-/// One `RISK_FORMAT` texel per dither cell, written by compute and read as a
-/// texture.
-fn cells(device: &wgpu::Device, label: &str, size: UVec2) -> wgpu::TextureView {
+/// One texel per dither cell, written by compute and read as a texture.
+fn cells(
+    device: &wgpu::Device,
+    label: &str,
+    size: UVec2,
+    format: wgpu::TextureFormat,
+) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -501,7 +516,7 @@ fn cells(device: &wgpu::Device, label: &str, size: UVec2) -> wgpu::TextureView {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: RISK_FORMAT,
+            format,
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
@@ -600,11 +615,22 @@ pub fn risk_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 11,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
 
-/// Points `cs_risk` at the motion field and the risk it reduces it to.
+/// Points `cs_risk` at the motion field, the depth beside it, and the cell
+/// summary it reduces the pair to.
 pub fn bind_risk(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -622,6 +648,10 @@ pub fn bind_risk(
             wgpu::BindGroupEntry {
                 binding: 8,
                 resource: wgpu::BindingResource::TextureView(&carried.risk),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(&gbuffer.depth),
             },
         ],
     })
@@ -651,7 +681,7 @@ pub fn reach_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::StorageTexture {
                     access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: RISK_FORMAT,
+                    format: REACH_FORMAT,
                     view_dimension: wgpu::TextureViewDimension::D2,
                 },
                 count: None,
@@ -660,7 +690,7 @@ pub fn reach_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-/// Points `cs_reach` at the risk field and the reach it spreads it into.
+/// Points `cs_reach` at the cell summary and the reach it spreads it into.
 pub fn bind_reach(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
