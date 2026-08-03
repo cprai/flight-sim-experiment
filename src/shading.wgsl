@@ -53,7 +53,7 @@ struct Palette {
 // Bound but not yet read: the world-space position is the input the distance
 // hazes and anything else that cares where a pixel is will start from.
 @group(0) @binding(2) var position: texture_2d<f32>;
-@group(0) @binding(3) var depth: texture_depth_2d;
+@group(0) @binding(3) var depth: texture_2d<f32>;
 @group(0) @binding(4) var normal: texture_2d<f32>;
 
 @vertex
@@ -68,10 +68,10 @@ fn fs_shade(@builtin(position) clip: vec4<f32>) -> @location(0) vec4<f32> {
     // The fragment coordinate is the pixel centre, so truncation is the index.
     let pixel = vec2<i32>(clip.xy);
 
-    // Depth clears to zero and the reversed-infinite projection cannot write
-    // zero for any finite hit, so this test is exact: the march left this
-    // pixel alone and it is sky.
-    if (textureLoad(depth, pixel, 0) == 0.0) {
+    // The march writes zero depth where its ray found no ground, and the
+    // reversed-infinite projection cannot write zero for any finite hit, so
+    // this test is exact: nothing is there and it is sky.
+    if (textureLoad(depth, pixel, 0).r == 0.0) {
         return SKY;
     }
 

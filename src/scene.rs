@@ -19,14 +19,6 @@ pub const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
-/// Depth value the G-buffer is cleared to.
-///
-/// Reversed depth puts the far distance at 0, so "nothing drawn yet" is 0,
-/// fragments pass when their depth is [`wgpu::CompareFunction::Greater`], and
-/// a pixel still at 0 is one the march never wrote -- which is how the
-/// shading pass knows it is sky.
-const DEPTH_CLEAR: f32 = 0.0;
-
 /// Mirrors the `Camera` uniform block in `terrain.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -65,6 +57,12 @@ pub struct Scene {
     terrain: Terrain,
     /// Screen-sized; rebuilt by [`Scene::resize`], never mid-frame.
     gbuffer: GBuffer,
+    /// How the march reaches the G-buffer, and the layout it was built against.
+    ///
+    /// The layout outlives any one G-buffer -- it is what the march pipeline was
+    /// compiled with -- so it is kept to rebind against on resize.
+    storage_layout: wgpu::BindGroupLayout,
+    storage_bind_group: wgpu::BindGroup,
     shading: Shading,
     /// What the last camera upload cost, zero unless a run asked to be timed.
     camera_span: std::time::Duration,
@@ -105,13 +103,22 @@ impl Scene {
         residency: Residency,
     ) -> Result<Self> {
         let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
-        let terrain = Terrain::from_tiles(device, &camera_layout, residency, terrain_root)?;
+        let storage_layout = crate::deferred::storage_layout(device);
+        let terrain = Terrain::from_tiles(
+            device,
+            &camera_layout,
+            &storage_layout,
+            residency,
+            viewport,
+            terrain_root,
+        )?;
         Ok(Self::assemble(
             device,
             format,
             viewport,
             camera_buffer,
             camera_bind_group,
+            storage_layout,
             terrain,
         ))
     }
@@ -125,16 +132,18 @@ impl Scene {
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         viewport: UVec2,
-        terrain: impl FnOnce(&wgpu::BindGroupLayout) -> Terrain,
+        terrain: impl FnOnce(&wgpu::BindGroupLayout, &wgpu::BindGroupLayout) -> Terrain,
     ) -> Self {
         let (camera_buffer, camera_layout, camera_bind_group) = camera_binding(device);
-        let terrain = terrain(&camera_layout);
+        let storage_layout = crate::deferred::storage_layout(device);
+        let terrain = terrain(&camera_layout, &storage_layout);
         Self::assemble(
             device,
             format,
             viewport,
             camera_buffer,
             camera_bind_group,
+            storage_layout,
             terrain,
         )
     }
@@ -145,11 +154,13 @@ impl Scene {
         viewport: UVec2,
         camera_buffer: wgpu::Buffer,
         camera_bind_group: wgpu::BindGroup,
+        storage_layout: wgpu::BindGroupLayout,
         terrain: Terrain,
     ) -> Self {
         let aspect = viewport.x as f32 / viewport.y.max(1) as f32;
         let camera = Camera::overlooking(terrain.world_extent(), terrain.height_range().1, aspect);
         let gbuffer = GBuffer::new(device, viewport);
+        let storage_bind_group = crate::deferred::bind_storage(device, &storage_layout, &gbuffer);
         let shading = Shading::new(device, format, &gbuffer);
         Self {
             camera,
@@ -157,6 +168,8 @@ impl Scene {
             camera_bind_group,
             terrain,
             gbuffer,
+            storage_layout,
+            storage_bind_group,
             shading,
             camera_span: std::time::Duration::ZERO,
         }
@@ -170,7 +183,10 @@ impl Scene {
     /// scene to fit rather than widen the view.
     pub fn resize(&mut self, device: &wgpu::Device, viewport: UVec2) {
         self.gbuffer = GBuffer::new(device, viewport);
+        self.storage_bind_group =
+            crate::deferred::bind_storage(device, &self.storage_layout, &self.gbuffer);
         self.shading.rebind(device, &self.gbuffer);
+        self.terrain.resize(viewport);
         self.camera.aspect = viewport.x as f32 / viewport.y.max(1) as f32;
     }
 
@@ -217,10 +233,12 @@ impl Scene {
 
     /// Records the two passes that make a frame into `view`.
     ///
-    /// The geometry pass raymarches every pixel of ground into the G-buffer;
-    /// the shading pass reads it back and writes the image. `view` must match
-    /// the size the scene was built or last [`Scene::resize`]d to, because the
-    /// G-buffer is looked up by pixel coordinate.
+    /// The geometry pass is a compute dispatch that raymarches every pixel of
+    /// ground into the G-buffer; the shading pass draws the image from it.
+    /// `view` must match the size the scene was built or last
+    /// [`Scene::resize`]d to, because the G-buffer is looked up by pixel
+    /// coordinate and the dispatch is sized to the viewport the terrain was
+    /// last told about.
     ///
     /// Both passes are opened through `gpu` so each is timed at its boundaries.
     /// That is the whole of the GPU side of [`crate::profile`], and it costs an
@@ -245,34 +263,15 @@ impl Scene {
         };
 
         {
-            // Cleared to zeroes: material zero is Null and depth zero is the
-            // reversed-Z far plane, so a pixel the march discards reads back
-            // as "nothing here", which the shading pass draws as sky.
-            let mut pass = gpu.scoped_render_pass(
-                "geometry",
-                wgpu::RenderPassDescriptor {
-                    label: Some("geometry pass"),
-                    color_attachments: &[
-                        target(&self.gbuffer.material, wgpu::Color::TRANSPARENT),
-                        target(&self.gbuffer.position, wgpu::Color::TRANSPARENT),
-                        target(&self.gbuffer.normal, wgpu::Color::TRANSPARENT),
-                    ],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.gbuffer.depth,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
-                            // The shading pass reads it to tell ground from sky.
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                },
-            );
+            // Nothing is cleared, because nothing needs to be: the dispatch
+            // covers every pixel exactly once and writes each one, and a pixel
+            // whose ray found no ground writes zeroes itself. Material zero is
+            // Null and depth zero is the reversed-Z far plane, so those zeroes
+            // read back as "nothing here", which the shading pass draws as sky.
+            let mut pass = gpu.scoped_compute_pass("geometry");
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            self.terrain.draw(&mut pass);
+            pass.set_bind_group(2, &self.storage_bind_group, &[]);
+            self.terrain.march(&mut pass);
         }
 
         // The clear never survives -- the shading pass writes every pixel --
@@ -313,7 +312,7 @@ fn camera_binding(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::BindGroupLayout
         label: Some("camera bind group layout"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -567,28 +566,39 @@ mod tests {
         heights: Vec<f32>,
         materials: Vec<MaterialId>,
     ) -> Scene {
-        Scene::from_terrain(device, format, UVec2::splat(SIZE), |camera_layout| {
-            Terrain::new(
-                device,
-                camera_layout,
-                residency,
-                placement(),
-                Sources {
-                    heights: Box::new(Pyramid::build(Level::new(RASTER, RASTER, heights.clone()))),
-                    materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
-                    maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
-                        RASTER,
-                        RASTER,
-                        heights.clone(),
-                    )))),
-                    normals: Box::new(Pyramid::build(Level::new(
-                        RASTER,
-                        RASTER,
-                        normals_of(&heights),
-                    ))),
-                },
-            )
-        })
+        Scene::from_terrain(
+            device,
+            format,
+            UVec2::splat(SIZE),
+            |camera_layout, storage_layout| {
+                Terrain::new(
+                    device,
+                    camera_layout,
+                    storage_layout,
+                    residency,
+                    UVec2::splat(SIZE),
+                    placement(),
+                    Sources {
+                        heights: Box::new(Pyramid::build(Level::new(
+                            RASTER,
+                            RASTER,
+                            heights.clone(),
+                        ))),
+                        materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
+                        maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
+                            RASTER,
+                            RASTER,
+                            heights.clone(),
+                        )))),
+                        normals: Box::new(Pyramid::build(Level::new(
+                            RASTER,
+                            RASTER,
+                            normals_of(&heights),
+                        ))),
+                    },
+                )
+            },
+        )
     }
 
     /// As [`render_probed`], but over a residency configured by the caller.
@@ -1269,7 +1279,7 @@ mod tests {
             );
         }
         encoder.copy_texture_to_buffer(
-            scene.gbuffer.normal_target.as_image_copy(),
+            scene.gbuffer.targets.normal.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
                 layout: wgpu::TexelCopyBufferLayout {
@@ -1799,11 +1809,13 @@ mod tests {
             &device,
             wgpu::TextureFormat::Rgba8UnormSrgb,
             UVec2::splat(SIZE),
-            |camera_layout| {
+            |camera_layout, storage_layout| {
                 Terrain::new(
                     &device,
                     camera_layout,
+                    storage_layout,
                     test_residency(),
+                    UVec2::splat(SIZE),
                     placement(),
                     Sources {
                         heights: Box::new(Counted {

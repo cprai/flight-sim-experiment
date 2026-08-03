@@ -14,18 +14,22 @@
 //! the input every shading feature that cares where a pixel is will start
 //! from, so the plumbing is laid now while the pipeline is being shaped.
 //!
-//! The three colour targets cost 4, 16 and 8 bytes a sample, and the alignment
-//! rule rounds each up to its own component size, so the pass sits at 28 of
-//! the 32 bytes `wgpu::Limits::default` guarantees. A fourth target does not
-//! fit; the thing to reclaim first is the position, which depth and the
-//! camera's inverse projection can reconstruct.
+//! The march writes these as storage textures rather than drawing into them as
+//! colour attachments, because it is a compute dispatch: see [`DEPTH_FORMAT`]
+//! for what that costs the depth channel, and `src/terrain.wgsl` for why a
+//! dispatch rather than a fullscreen triangle. Storage carries no
+//! bytes-per-sample budget with it, so the four targets are free to cost the 32
+//! bytes a pixel they cost. The one still worth reclaiming is the position, at
+//! 16 of those bytes, which depth and the camera's inverse projection can
+//! reconstruct.
 //!
-//! Sky is a pixel the march never wrote: the buffers clear to depth zero,
+//! Sky is a pixel whose ray found no ground: the march writes zero depth there,
 //! which a real hit can never produce -- the camera projects with reversed
 //! infinite depth, where zero is the far plane itself -- so the shading pass
-//! tests exactly that. A hit whose material is `Null` is different: the ray
-//! met real ground that OpenStreetMap says nothing about, and it draws as
-//! magenta, the colour of missing data.
+//! tests exactly that. Nothing clears these buffers; the dispatch covers every
+//! pixel and writes it, so a stale frame cannot show through. A hit whose
+//! material is `Null` is different: the ray met real ground that OpenStreetMap
+//! says nothing about, and it draws as magenta, the colour of missing data.
 
 use glam::UVec2;
 use wgpu::util::DeviceExt;
@@ -45,10 +49,17 @@ pub const NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Format of the depth buffer the geometry pass writes.
 ///
-/// Float depth rather than the more compact `Depth24Plus` because the camera
+/// A plain float channel rather than a depth format, because the march is a
+/// compute pass and writes it with the other three through `textureStore`, and
+/// no depth format can be a storage texture. Nothing is given up: no pass ever
+/// depth-tested against this buffer -- the march covers each pixel exactly
+/// once, so the test the old render pipeline carried could never reject
+/// anything -- and the value stored is the same reversed-Z depth it always was.
+///
+/// Full 32-bit float rather than anything more compact because the camera
 /// projects with reversed depth, which only pays off when the buffer's own
 /// precision is concentrated near zero the way a float exponent is.
-pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
 /// The screen-sized targets the geometry pass writes and the shading reads.
 ///
@@ -60,48 +71,116 @@ pub struct GBuffer {
     pub position: wgpu::TextureView,
     pub normal: wgpu::TextureView,
     pub depth: wgpu::TextureView,
-    /// The normal target itself, rather than a view of it.
+    /// The targets themselves, rather than views of them.
     ///
-    /// The shading only ever reduces a normal to one number, so a frame says
-    /// little about which normal the march wrote; the way to check that is to
-    /// copy the buffer back and read the vectors, and a copy needs the
-    /// texture. The same reasoning as the `COPY_SRC` on the max pyramid's
-    /// texture: cheap enough to pay for always rather than build a
-    /// differently-shaped G-buffer under `cfg(test)`.
-    #[allow(dead_code, reason = "read only by the G-buffer readback test")]
-    pub normal_target: wgpu::Texture,
+    /// A frame says little about what the march actually wrote -- the shading
+    /// reduces a normal to one number and a material to a palette entry -- so
+    /// the way to check any of it is to copy the buffer back and read the
+    /// values, and a copy needs the texture. The same reasoning as the
+    /// `COPY_SRC` on the max pyramid's texture: cheap enough to pay for always
+    /// rather than build a differently-shaped G-buffer under `cfg(test)`.
+    #[allow(dead_code, reason = "read only by the G-buffer readback tests")]
+    pub targets: Targets,
+}
+
+/// The G-buffer's four textures, kept beside their views.
+#[allow(dead_code, reason = "read only by the G-buffer readback tests")]
+pub struct Targets {
+    pub material: wgpu::Texture,
+    pub position: wgpu::Texture,
+    pub normal: wgpu::Texture,
+    pub depth: wgpu::Texture,
 }
 
 impl GBuffer {
     pub fn new(device: &wgpu::Device, size: UVec2) -> Self {
+        let size = size.max(UVec2::ONE);
         let target = |label, format| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d {
-                    width: size.x.max(1),
-                    height: size.y.max(1),
+                    width: size.x,
+                    height: size.y,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                // Written by the march as storage, read by the shading as a
+                // texture. No `RENDER_ATTACHMENT`: nothing draws into the
+                // G-buffer any more.
+                usage: wgpu::TextureUsages::STORAGE_BINDING
                     | wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             })
         };
         let view = |texture: &wgpu::Texture| texture.create_view(&Default::default());
-        let normal_target = target("gbuffer normal", NORMAL_FORMAT);
+        let targets = Targets {
+            material: target("gbuffer material", MATERIAL_FORMAT),
+            position: target("gbuffer position", POSITION_FORMAT),
+            normal: target("gbuffer normal", NORMAL_FORMAT),
+            depth: target("gbuffer depth", DEPTH_FORMAT),
+        };
         Self {
-            material: view(&target("gbuffer material", MATERIAL_FORMAT)),
-            position: view(&target("gbuffer position", POSITION_FORMAT)),
-            normal: view(&normal_target),
-            depth: view(&target("gbuffer depth", DEPTH_FORMAT)),
-            normal_target,
+            material: view(&targets.material),
+            position: view(&targets.position),
+            normal: view(&targets.normal),
+            depth: view(&targets.depth),
+            targets,
         }
     }
+}
+
+/// The layout the march writes the G-buffer through.
+///
+/// Built here rather than in the terrain so that the one description of what a
+/// G-buffer is stays in one place, and handed to the march pipeline the way the
+/// camera layout already is -- neither side can drift from the other if neither
+/// side owns its own copy.
+pub fn storage_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let entry = |binding, format| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("gbuffer storage layout"),
+        entries: &[
+            entry(0, MATERIAL_FORMAT),
+            entry(1, POSITION_FORMAT),
+            entry(2, NORMAL_FORMAT),
+            entry(3, DEPTH_FORMAT),
+        ],
+    })
+}
+
+/// Points the march at the G-buffer it is to write.
+pub fn bind_storage(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    gbuffer: &GBuffer,
+) -> wgpu::BindGroup {
+    let entry = |binding, view| wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::TextureView(view),
+    };
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gbuffer storage bind group"),
+        layout,
+        entries: &[
+            entry(0, &gbuffer.material),
+            entry(1, &gbuffer.position),
+            entry(2, &gbuffer.normal),
+            entry(3, &gbuffer.depth),
+        ],
+    })
 }
 
 /// The pass that turns the G-buffer into the image.
@@ -151,7 +230,12 @@ impl Shading {
                     2,
                     texture(wgpu::TextureSampleType::Float { filterable: false }),
                 ),
-                entry(3, texture(wgpu::TextureSampleType::Depth)),
+                // A plain float channel, not a depth texture: see
+                // [`DEPTH_FORMAT`].
+                entry(
+                    3,
+                    texture(wgpu::TextureSampleType::Float { filterable: false }),
+                ),
                 entry(
                     4,
                     texture(wgpu::TextureSampleType::Float { filterable: false }),

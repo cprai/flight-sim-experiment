@@ -2,14 +2,14 @@
 //! tiles that stream into them.
 //!
 //! Every level holds a square of whole tiles around the camera, and drawing is
-//! one full-screen pass that raymarches them. There is no mesh, no near field
+//! one compute dispatch that raymarches them. There is no mesh, no near field
 //! and no sliding window: the camera moving within a tile costs nothing, and
 //! crossing out of one costs a bounded number of whole-tile reads. See
 //! [`crate::terrain::residency`] for how the squares move and `src/terrain.wgsl`
 //! for what the march does with them.
 //!
-//! The pass draws into the G-buffer rather than the screen: each pixel gets
-//! the material id and world position of the ground its ray met, and
+//! The dispatch writes the G-buffer rather than the screen: each pixel gets the
+//! material id and world position of the ground its ray met, and
 //! [`crate::deferred`]'s shading pass turns those into colour afterwards.
 
 use std::path::Path;
@@ -58,7 +58,11 @@ struct TerrainUniform {
     march_steps: u32,
     ceiling: f32,
     wall_nudge: f32,
-    more_padding: [f32; 2],
+    /// The target's size in pixels, which turns a pixel index into a ray.
+    ///
+    /// Occupies what was tail padding, so the uniform is the same size and
+    /// every other member sits where it did.
+    viewport: [u32; 2],
 }
 
 /// How far past a cell wall the march has to put a ray for the next step to
@@ -164,6 +168,9 @@ pub struct Terrain {
     /// through `queue.write_texture` onto the staging belt rather than through
     /// a command encoder, so no GPU timestamp scope can be put around them.
     spans: Option<crate::profile::Terrain>,
+    /// The target's size in pixels, passed through to the march so it can turn
+    /// a pixel into the ray through it. Followed by [`Terrain::resize`].
+    viewport: UVec2,
 
     height_texture: wgpu::Texture,
     material_texture: wgpu::Texture,
@@ -171,8 +178,13 @@ pub struct Terrain {
     normal_texture: wgpu::Texture,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    pipeline: wgpu::RenderPipeline,
+    pipeline: wgpu::ComputePipeline,
 }
+
+/// Side of the square of pixels one workgroup of the march covers.
+///
+/// Must match `@workgroup_size` on `cs_march` in `src/terrain.wgsl`.
+const MARCH_TILE: u32 = 8;
 
 impl Terrain {
     /// Opens the tile pyramids and builds the terrain around them.
@@ -184,7 +196,9 @@ impl Terrain {
     pub fn from_tiles(
         device: &wgpu::Device,
         camera_layout: &wgpu::BindGroupLayout,
+        storage_layout: &wgpu::BindGroupLayout,
         residency: Residency,
+        viewport: UVec2,
         root: &Path,
     ) -> Result<Self> {
         let product = crate::terrain::ELEVATION_PRODUCTS
@@ -260,7 +274,9 @@ impl Terrain {
         Ok(Self::new(
             device,
             camera_layout,
+            storage_layout,
             residency,
+            viewport,
             placement,
             Sources {
                 heights: Box::new(Resident::<f32>::over(Box::new(heights), raster)),
@@ -278,7 +294,9 @@ impl Terrain {
     pub fn new(
         device: &wgpu::Device,
         camera_layout: &wgpu::BindGroupLayout,
+        storage_layout: &wgpu::BindGroupLayout,
         residency: Residency,
+        viewport: UVec2,
         placement: Georeferencing,
         sources: Sources,
     ) -> Self {
@@ -394,7 +412,7 @@ impl Terrain {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -404,7 +422,7 @@ impl Terrain {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -414,7 +432,7 @@ impl Terrain {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::COMPUTE,
                     // Integer texels: material ids can only be loaded, never
                     // sampled, so there is no sampler anywhere in this layout.
                     ty: wgpu::BindingType::Texture {
@@ -426,7 +444,7 @@ impl Terrain {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -436,7 +454,7 @@ impl Terrain {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::COMPUTE,
                     // Snorm decodes to floats, but like everything else here it
                     // is only ever loaded at the texel the ray landed on.
                     ty: wgpu::BindingType::Texture {
@@ -481,58 +499,20 @@ impl Terrain {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("terrain pipeline layout"),
-            bind_group_layouts: &[Some(camera_layout), Some(&layout)],
+            bind_group_layouts: &[Some(camera_layout), Some(&layout), Some(storage_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        // Compute rather than a fullscreen triangle. The march never needed
+        // anything the raster pipeline provides -- no interpolation, no
+        // blending, and a depth test that could reject nothing because each
+        // pixel was covered exactly once -- and a dispatch is the only shape
+        // that can be given a list of pixels rather than a screen to cover.
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("terrain pipeline"),
             layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain"),
-                compilation_options: Default::default(),
-                // One oversized triangle, generated from the vertex index.
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_terrain"),
-                compilation_options: Default::default(),
-                // The G-buffer, not the screen: what the march found, for the
-                // shading pass to colour. `blend: None` on both -- an integer
-                // target cannot blend at all, and blending `Rgba32Float` is an
-                // optional feature this stays off.
-                targets: &[
-                    Some(wgpu::ColorTargetState {
-                        format: crate::deferred::MATERIAL_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    Some(wgpu::ColorTargetState {
-                        format: crate::deferred::POSITION_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    Some(wgpu::ColorTargetState {
-                        format: crate::deferred::NORMAL_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                ],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: crate::deferred::DEPTH_FORMAT,
-                // The fragment stage writes its own depth, from the distance the
-                // ray actually met the ground, so anything drawn afterwards
-                // sorts against the terrain properly.
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Greater),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
+            module: &shader,
+            entry_point: Some("cs_march"),
+            compilation_options: Default::default(),
             cache: None,
         });
 
@@ -554,6 +534,7 @@ impl Terrain {
             tile_ceilings: vec![vec![f32::NEG_INFINITY; slots]; level_count as usize],
             staging: vec![0; (residency.tile_texels as usize).pow(2) * size_of::<MaterialId>()],
             spans: None,
+            viewport,
             height_texture,
             material_texture,
             maxima_texture,
@@ -562,6 +543,15 @@ impl Terrain {
             bind_group,
             pipeline,
         }
+    }
+
+    /// Follows the render target to a new size.
+    ///
+    /// Only the pixel count the march turns into rays; how much ground is worth
+    /// keeping resident is [`Residency::pixel_angle`]'s business and is decided
+    /// when the scene is built.
+    pub fn resize(&mut self, viewport: UVec2) {
+        self.viewport = viewport;
     }
 
     /// The terrain's ground size in metres.
@@ -711,7 +701,7 @@ impl Terrain {
             march_steps: self.residency.march_steps(levels),
             ceiling: f32::NEG_INFINITY,
             wall_nudge: wall_nudge(UVec2::new(self.placement.width, self.placement.height)),
-            more_padding: [0.0; 2],
+            viewport: self.viewport.to_array(),
         };
 
         for level in self.base..levels {
@@ -948,11 +938,18 @@ impl Terrain {
         }
     }
 
-    /// Records the terrain into an already-started render pass.
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    /// Records the march into an already-started compute pass.
+    ///
+    /// The caller has set group 0 (the camera) and group 2 (the G-buffer being
+    /// written); this adds group 1, which is the terrain itself.
+    pub fn march(&self, pass: &mut wgpu::ComputePass<'_>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(1, &self.bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        pass.dispatch_workgroups(
+            self.viewport.x.div_ceil(MARCH_TILE),
+            self.viewport.y.div_ceil(MARCH_TILE),
+            1,
+        );
     }
 }
 
@@ -1067,6 +1064,7 @@ mod tests {
     fn every_texel_of_the_pyramid_bounds_the_ground_it_covers() {
         let (device, queue) = crate::scene::test_device();
         let camera_layout = crate::scene::test_camera_layout(&device);
+        let storage_layout = crate::deferred::storage_layout(&device);
         let residency = test_residency();
         let across = residency.texels_across();
 
@@ -1077,7 +1075,9 @@ mod tests {
         let mut terrain = Terrain::new(
             &device,
             &camera_layout,
+            &storage_layout,
             residency,
+            UVec2::splat(RASTER),
             Georeferencing::square(RASTER, RASTER, 30.0),
             Sources {
                 heights: Box::new(Pyramid::build(Level::new(RASTER, RASTER, rugged()))),

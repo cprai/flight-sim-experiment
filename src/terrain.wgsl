@@ -80,7 +80,11 @@ struct Terrain {
     // cell, in level-0 texels. Sized to the raster rather than fixed: see
     // `wall_nudge` in `src/terrain/gpu.rs`.
     wall_nudge: f32,
-    more_padding: vec2<f32>,
+    // The target's size in pixels, which is what turns a pixel coordinate into
+    // the ray through it. Carried in the uniform rather than interpolated from
+    // the vertex stage so that every reader of a pixel's ray -- however it came
+    // to be looking at that pixel -- derives it by exactly the same arithmetic.
+    viewport: vec2<u32>,
 };
 
 @group(1) @binding(0) var<uniform> terrain: Terrain;
@@ -169,23 +173,25 @@ fn height_bilinear(level: u32, w: vec2<f32>) -> Sample {
     return sample;
 }
 
-struct ScreenOut {
-    @builtin(position) clip: vec4<f32>,
-    // Normalized device coordinates, which is what the camera's ray basis wants.
-    @location(0) ndc: vec2<f32>,
-};
-
-@vertex
-fn vs_terrain(@builtin(vertex_index) index: u32) -> ScreenOut {
-    // One oversized triangle rather than two: no diagonal seam down the middle
-    // of the screen, and the quads either side of it are not rasterized twice.
-    let corner = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
-    let ndc = corner * 2.0 - 1.0;
-
-    var out: ScreenOut;
-    out.clip = vec4<f32>(ndc, 1.0, 1.0);
-    out.ndc = ndc;
-    return out;
+// Normalized device coordinates of a pixel's centre, which is what the camera's
+// ray basis wants.
+//
+// Derived from the pixel index rather than handed down from a vertex stage, as
+// it was while this was a fullscreen triangle. Interpolating the corners and
+// computing this agree to within rounding, but only to within rounding, and a
+// last-bit difference in a ray direction can send the march down the far side
+// of a cell wall thousands of texels away. Deriving it means anything that
+// wants the ray through a pixel gets the identical ray, whether it is covering
+// the screen or working from a list of pixel indices.
+//
+// `y` flips: the framebuffer counts rows downwards from the top and clip space
+// counts upwards from the middle.
+fn ndc_of(pixel: vec2<f32>) -> vec2<f32> {
+    let size = vec2<f32>(terrain.viewport);
+    return vec2<f32>(
+        pixel.x / size.x * 2.0 - 1.0,
+        1.0 - pixel.y / size.y * 2.0,
+    );
 }
 
 struct Hit {
@@ -379,19 +385,20 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     return out;
 }
 
-// One pixel of the G-buffer the shading pass reads. A pixel this shader
-// discards keeps the cleared values -- material zero, depth zero -- and depth
-// zero is how the shading pass knows a pixel is sky.
-struct GBufferOut {
-    @location(0) material: u32,
-    // Where the ray met the ground, in world space; `w` is 1 to say so.
-    @location(1) position: vec4<f32>,
-    // The unit normal of that ground, in world space.
-    @location(2) normal: vec4<f32>,
-    // Written rather than interpolated, so the ground takes its place in the
-    // depth buffer at the distance it was actually found at.
-    @builtin(frag_depth) depth: f32,
-};
+// The G-buffer the shading pass reads, written a texel at a time.
+//
+// Storage rather than colour attachments because the march is a compute pass
+// and a compute pass has no attachments. Nothing clears these, so every pixel
+// has to be written by the dispatch below -- a pixel that found no ground
+// writes zeroes explicitly, and depth zero is how the shading pass knows a
+// pixel is sky.
+@group(2) @binding(0) var out_material: texture_storage_2d<r32uint, write>;
+// Where the ray met the ground, in world space; `w` is 1 to say so.
+@group(2) @binding(1) var out_position: texture_storage_2d<rgba32float, write>;
+// The unit normal of that ground, in world space.
+@group(2) @binding(2) var out_normal: texture_storage_2d<rgba16float, write>;
+// The distance the ground was actually found at, as reversed-Z depth.
+@group(2) @binding(3) var out_depth: texture_storage_2d<r32float, write>;
 
 // Whether a stored pair is a direction at all.
 //
@@ -445,31 +452,44 @@ fn normal_bilinear(level: u32, w: vec2<f32>) -> vec3<f32> {
     return vec3<f32>(mean.r, sqrt(max(1.0 - dot(mean, mean), 0.0)), mean.g);
 }
 
-@fragment
-fn fs_terrain(in: ScreenOut) -> GBufferOut {
-    var out: GBufferOut;
-    out.material = 0u;
-    out.position = vec4<f32>(0.0);
-    out.normal = vec4<f32>(0.0);
-    out.depth = 0.0;
+// What one ray found, in the form the G-buffer stores it.
+//
+// Zeroes are sky: material zero is `Null`, and depth zero is the reversed-Z far
+// plane, which no finite hit can produce.
+struct Ground {
+    material: u32,
+    position: vec4<f32>,
+    normal: vec4<f32>,
+    depth: f32,
+};
 
+fn nothing() -> Ground {
+    return Ground(0u, vec4<f32>(0.0), vec4<f32>(0.0), 0.0);
+}
+
+// The ground down the ray through one pixel, or `nothing()` for sky.
+//
+// Split out from the dispatch so that the answer for a pixel depends on the
+// pixel alone, however the caller came to be asking about it.
+fn ground_at(pixel: vec2<u32>) -> Ground {
+    // The centre of the pixel, which is where the ray goes through it -- and
+    // what the rasterizer used to hand this shader as the fragment coordinate.
+    let ndc = ndc_of(vec2<f32>(pixel) + 0.5);
     let eye = camera.position.xyz;
     let dir = normalize(
-        camera.ray_right.xyz * in.ndc.x + camera.ray_up.xyz * in.ndc.y + camera.ray_forward.xyz,
+        camera.ray_right.xyz * ndc.x + camera.ray_up.xyz * ndc.y + camera.ray_forward.xyz,
     );
 
     // A ray already above the highest ground anywhere resident, and still
     // climbing, is never coming back down. Worth one comparison: at any horizon
     // view most of the frame is sky.
     if (dir.y >= 0.0 && eye.y >= terrain.ceiling) {
-        discard;
-        return out;
+        return nothing();
     }
 
     let hit = march(eye, dir);
     if (!hit.found) {
-        discard;
-        return out;
+        return nothing();
     }
 
     // Squares reach past the raster and reads out there wrap onto whatever
@@ -477,10 +497,10 @@ fn fs_terrain(in: ScreenOut) -> GBufferOut {
     // ground. A straight ray leaves the data once and never comes back, so
     // there is nothing further along worth carrying on for.
     if (any(hit.position.xz < terrain.data_min) || any(hit.position.xz > terrain.data_max)) {
-        discard;
-        return out;
+        return nothing();
     }
 
+    var out: Ground;
     let clip = camera.view_proj * vec4<f32>(hit.position, 1.0);
     out.depth = clip.z / clip.w;
     // The nearest texel to the hit: sample centres sit at integer `w`, the
@@ -507,4 +527,29 @@ fn fs_terrain(in: ScreenOut) -> GBufferOut {
     // silhouette parting company a little.
     out.normal = vec4<f32>(normal_bilinear(normal_level, normal_w), 0.0);
     return out;
+}
+
+// Writes one pixel's worth of ground into the G-buffer.
+fn store(pixel: vec2<u32>, ground: Ground) {
+    let at = vec2<i32>(pixel);
+    textureStore(out_material, at, vec4<u32>(ground.material, 0u, 0u, 0u));
+    textureStore(out_position, at, ground.position);
+    textureStore(out_normal, at, ground.normal);
+    textureStore(out_depth, at, vec4<f32>(ground.depth, 0.0, 0.0, 0.0));
+}
+
+// One thread per pixel of the target.
+//
+// Eight by eight rather than a flat sixty-four so that the threads of a wave
+// are neighbours on screen: adjacent rays walk almost the same cells of the
+// quadtree, which is what keeps the texture reads in cache and the traversal
+// lengths within a wave close to each other.
+@compute @workgroup_size(8, 8)
+fn cs_march(@builtin(global_invocation_id) id: vec3<u32>) {
+    // The dispatch is rounded up to whole workgroups, so the last row and
+    // column of them run past the target.
+    if (any(id.xy >= terrain.viewport)) {
+        return;
+    }
+    store(id.xy, ground_at(id.xy));
 }
