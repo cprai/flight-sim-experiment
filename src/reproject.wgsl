@@ -233,9 +233,28 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
 
     // Points behind the eye come out with a negative `w` and are clipped.
     out.clip = camera.view_proj * vec4<f32>(stored.xyz, 1.0);
-    out.material = textureLoad(history_material, vec2<i32>(pixel), 0).r;
+    // Exactly where inside its pixel this point is about to land. The
+    // rasterizer will round it to a pixel and the fragment stage will only ever
+    // see that pixel's centre, so if it is not recorded here it is gone -- and
+    // the compaction would have to assume the centre, which is what makes
+    // carried ground crawl once the camera moves.
+    let ndc = out.clip.xy / out.clip.w;
+    let landed = vec2<f32>(
+        (ndc.x * 0.5 + 0.5) * f32(size.x),
+        (0.5 - ndc.y * 0.5) * f32(size.y),
+    );
+    let id = textureLoad(history_material, vec2<i32>(pixel), 0).r;
+    out.material = pack_offset(id, landed);
     out.normal = textureLoad(history_normal, vec2<i32>(pixel), 0);
     return out;
+}
+
+// The material id and the sub-pixel position the point landed at, packed into
+// one word. See `MATERIAL_MASK` in `src/terrain.wgsl` for why they share.
+fn pack_offset(id: u32, screen: vec2<f32>) -> u32 {
+    let frac = clamp(fract(screen), vec2<f32>(0.0), vec2<f32>(0.99609375));
+    let axis = vec2<u32>(frac * 256.0);
+    return (id & 0xffffu) | (axis.x << 16u) | (axis.y << 24u);
 }
 
 struct Carried {

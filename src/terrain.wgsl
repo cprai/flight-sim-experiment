@@ -213,9 +213,13 @@ fn ndc_of(pixel: vec2<f32>) -> vec2<f32> {
 // Unnormalised, its component along the view axis is exactly one, because the
 // basis is the near plane at unit distance. That is what makes [`distance_at`]
 // a multiply rather than a divide by a length.
-fn ray_raw(pixel: vec2<u32>) -> vec3<f32> {
-    let ndc = ndc_of(vec2<f32>(pixel) + 0.5);
+fn ray_raw_at(screen: vec2<f32>) -> vec3<f32> {
+    let ndc = ndc_of(screen);
     return camera.ray_right.xyz * ndc.x + camera.ray_up.xyz * ndc.y + camera.ray_forward.xyz;
+}
+
+fn ray_raw(pixel: vec2<u32>) -> vec3<f32> {
+    return ray_raw_at(vec2<f32>(pixel) + 0.5);
 }
 
 fn ray_through(pixel: vec2<u32>) -> vec3<f32> {
@@ -540,6 +544,23 @@ fn normal_bilinear(level: u32, w: vec2<f32>) -> vec3<f32> {
 const GROUND_HERE: f32 = 1.0;
 const SKY_HERE: f32 = -1.0;
 
+// The carried material word is a material id and the sub-pixel position the
+// point landed at, packed together.
+//
+// Ids reach 0x080c and so need sixteen bits of the thirty-two; the rest were
+// spare, and the offset rides in them for nothing -- no extra target, no extra
+// export bandwidth. Eight bits an axis puts the point within a 256th of a pixel
+// of where it really is. Must match `pack_offset` in `src/reproject.wgsl`.
+const MATERIAL_MASK: u32 = 0xffffu;
+const OFFSET_SCALE: f32 = 256.0;
+
+fn unpack_offset(packed: u32) -> vec2<f32> {
+    return vec2<f32>(
+        f32((packed >> 16u) & 0xffu),
+        f32((packed >> 24u) & 0xffu),
+    ) / OFFSET_SCALE;
+}
+
 // What one ray found, in the form the G-buffer stores it.
 //
 // Material zero is `Null` and depth zero is the reversed-Z far plane, which no
@@ -667,9 +688,18 @@ fn carried_at(pixel: vec2<u32>, depth: f32) -> Ground {
         return nothing();
     }
     var out: Ground;
-    out.material = textureLoad(carried_material, vec2<i32>(pixel), 0).r;
+    let packed = textureLoad(carried_material, vec2<i32>(pixel), 0).r;
+    out.material = packed & MATERIAL_MASK;
+    // Rebuilt where the point actually landed inside the pixel, not at the
+    // pixel's centre. The centre is up to half a pixel from the truth, and half
+    // a pixel at ten kilometres is metres of ground -- which would not matter if
+    // it were the same half pixel every frame, but the point lands somewhere
+    // different each time the camera moves, so it would be re-snapped in a
+    // different direction every frame and the ground would visibly crawl. This
+    // is what keeps a carried point standing still.
+    let landed = vec2<f32>(pixel) + unpack_offset(packed);
     out.position = vec4<f32>(
-        camera.position.xyz + ray_raw(pixel) * distance_at(depth),
+        camera.position.xyz + ray_raw_at(landed) * distance_at(depth),
         GROUND_HERE,
     );
     out.normal = normal;
