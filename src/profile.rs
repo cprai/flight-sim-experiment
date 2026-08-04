@@ -20,7 +20,10 @@
 
 use std::time::{Duration, Instant};
 
+use glam::{Quat, Vec3};
 use wgpu_profiler::{GpuProfiler, GpuProfilerSettings, GpuTimerQueryResult};
+
+use crate::camera::Camera;
 
 /// A duration in milliseconds, and the rate a frame of that length sustains.
 pub fn ms_and_fps(frame: Duration) -> (f64, f64) {
@@ -169,15 +172,24 @@ pub struct Frame {
     /// hundred instead of being normalised away. Zero where the caller does not
     /// know, which is every headless path.
     pub pixels: u32,
-    /// The highest ground anywhere resident, and the camera's own height, both
-    /// in metres.
+    /// The highest ground anywhere resident, in metres.
     ///
-    /// Together they say whether the one comparison that settles a climbing ray
-    /// for free can fire at all: it needs the eye above the ceiling, and the
-    /// ceiling is taken across every tile slot rather than across the square
-    /// actually in use, so it can sit far above anything on screen.
+    /// With the camera's own height it says whether the one comparison that
+    /// settles a climbing ray for free can fire at all: it needs the eye above
+    /// the ceiling, and the ceiling is taken across every tile slot rather than
+    /// across the square actually in use, so it can sit far above anything on
+    /// screen.
     pub ceiling: f32,
-    pub eye: f32,
+    /// Where the camera is and how it is pointed, in world space.
+    ///
+    /// Read off the screen, these are what makes a view seen while flying
+    /// reproducible: `x,y,z` and the first two angles are exactly the
+    /// `--camera` argument the headless renderer places its own camera by, so
+    /// a frame that looked wrong can be captured again and again while it is
+    /// worked on. The height among them is also the eye the `ceiling` above is
+    /// there to be compared against.
+    pub position: Vec3,
+    pub orientation: Quat,
 }
 
 /// Flattens the profiler's tree into rows, keeping the nesting as `depth`.
@@ -266,7 +278,8 @@ pub struct Smoothed {
     coverage: Option<crate::reproject::Coverage>,
     pixels: u32,
     ceiling: f32,
-    eye: f32,
+    position: Vec3,
+    orientation: Quat,
 }
 
 impl Smoothed {
@@ -275,13 +288,18 @@ impl Smoothed {
         let incoming = frame.rows();
         self.tiles = frame.cpu.terrain.tiles;
         // Not smoothed, and not for want of somewhere to keep the state: these
-        // are shares of the screen rather than times, and they move only when
-        // the flight does. What makes a timing row unreadable raw is that it
-        // jitters every frame around a level that is not moving at all.
+        // are shares of the screen and places in the world rather than times,
+        // and they move only when the flight does. What makes a timing row
+        // unreadable raw is that it jitters every frame around a level that is
+        // not moving at all. Averaging the viewpoint would be worse than
+        // useless: it would trail behind wherever the camera actually is, and
+        // the number that gets transcribed to reproduce a shot would be one the
+        // camera never occupied.
         self.coverage = frame.coverage;
         self.pixels = frame.pixels;
         self.ceiling = frame.ceiling;
-        self.eye = frame.eye;
+        self.position = frame.position;
+        self.orientation = frame.orientation;
         // The GPU rows appear a frame or two late and the hud scope comes and
         // goes, so the row set is not fixed. Smoothing across a changed shape
         // would pair a value with the wrong label.
@@ -353,12 +371,25 @@ impl Smoothed {
                 "dispatch", coverage.groups
             ));
         }
-        // Not a share of anything, so it is written plainly: the eye against
-        // the highest resident ground. A climbing ray is settled as sky for
-        // free only above the second, and only then does a sky-filled view stop
-        // being marched.
-        text.push_str(&format!("\n{:<LABEL$}{:>8.0} m", "eye", self.eye));
+        // Not a share of anything, so these are written plainly. The ceiling is
+        // the highest resident ground, which the eye -- the `y` below it -- has
+        // to clear before a climbing ray can be settled as sky for free, and
+        // only then does a sky-filled view stop being marched.
         text.push_str(&format!("\n{:<LABEL$}{:>8.0} m", "ceiling", self.ceiling));
+        // Whole metres and a tenth of a degree: enough to fly back to, and no
+        // more digits than can be read off a moving screen. `x,y,z` then yaw
+        // and pitch is the order `--camera` wants them in.
+        for (label, metres) in [
+            ("x", self.position.x),
+            ("y", self.position.y),
+            ("z", self.position.z),
+        ] {
+            text.push_str(&format!("\n{label:<LABEL$}{metres:>8.0} m"));
+        }
+        let angles = Camera::to_yaw_pitch_roll(self.orientation);
+        for (label, radians) in [("yaw", angles.x), ("pitch", angles.y), ("roll", angles.z)] {
+            text.push_str(&format!("\n{label:<LABEL$}{:>8.1} °", radians.to_degrees()));
+        }
         text
     }
 }
@@ -494,7 +525,8 @@ mod tests {
             coverage: None,
             pixels: 0,
             ceiling: 0.0,
-            eye: 0.0,
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
         }
     }
 
@@ -566,15 +598,27 @@ mod tests {
         }
 
         // Same width as the timing rows, so the right-aligned block does not
-        // grow a third ragged edge.
+        // grow a third ragged edge. Counted in characters rather than bytes:
+        // the degree sign is two of the latter and one column of the former.
         let width = |label: &str| {
             text.lines()
                 .find(|line| line.starts_with(label))
                 .unwrap_or_else(|| panic!("no {label} line in {text}"))
-                .len()
+                .chars()
+                .count()
         };
         assert_eq!(width("reprojected"), width("cpu"));
-        for label in ["unaccounted", "dispatch", "eye", "ceiling"] {
+        for label in [
+            "unaccounted",
+            "dispatch",
+            "ceiling",
+            "x",
+            "y",
+            "z",
+            "yaw",
+            "pitch",
+            "roll",
+        ] {
             assert_eq!(width(label), width("cpu"), "{label} line is a ragged width");
         }
 
@@ -591,6 +635,48 @@ mod tests {
         assert!(
             short.contains(&format!("{:<LABEL$}{:>7} px", "unaccounted", 1000)),
             "{short}"
+        );
+    }
+
+    /// The point of putting the viewpoint on screen is that it can be typed
+    /// back in: these are the numbers `--camera` takes, in its order and its
+    /// units, so a frame worth looking at again can be found again.
+    #[test]
+    fn the_overlay_reports_the_viewpoint_the_headless_camera_takes() {
+        let mut sample = frame(16, 4);
+        sample.position = Vec3::new(-1234.4, 987.6, 4321.0);
+        sample.orientation = Camera::from_yaw_pitch_roll(
+            120f32.to_radians(),
+            (-7.5f32).to_radians(),
+            0f32.to_radians(),
+        );
+        let mut smoothed = Smoothed::default();
+        smoothed.update(&sample);
+        let text = smoothed.text();
+
+        for (label, value, unit) in [
+            ("x", -1234.0, " m"),
+            ("y", 988.0, " m"),
+            ("z", 4321.0, " m"),
+        ] {
+            let expected = format!("{label:<LABEL$}{value:>8.0}{unit}");
+            assert!(text.contains(&expected), "no {expected:?} in {text}");
+        }
+        for (label, value) in [("yaw", 120.0), ("pitch", -7.5), ("roll", 0.0)] {
+            let expected = format!("{label:<LABEL$}{value:>8.1} °");
+            assert!(text.contains(&expected), "no {expected:?} in {text}");
+        }
+
+        // Taken as it is, not averaged: the whole use of the readout is that it
+        // names where the camera is now.
+        sample.position.x = 0.0;
+        smoothed.update(&sample);
+        assert!(
+            smoothed
+                .text()
+                .contains(&format!("{:<LABEL$}{:>8.0} m", "x", 0.0)),
+            "{}",
+            smoothed.text()
         );
     }
 

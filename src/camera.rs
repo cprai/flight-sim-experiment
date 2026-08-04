@@ -80,6 +80,20 @@ impl Camera {
         Quat::from_euler(EulerRot::YXZ, -yaw, pitch, -roll)
     }
 
+    /// The angles [`Camera::from_yaw_pitch_roll`] would have been given, in
+    /// radians, in that order.
+    ///
+    /// The same decomposition run backwards, so the two round-trip; the
+    /// orientation is kept as a quaternion precisely so that nothing but a
+    /// readout has to know these angles exist. Straight up or straight down the
+    /// yaw and roll axes coincide and the split between them is arbitrary, as
+    /// it is for any Euler triple, but the orientation it rebuilds is still the
+    /// one that went in.
+    pub fn to_yaw_pitch_roll(orientation: Quat) -> Vec3 {
+        let (yaw, pitch, roll) = orientation.to_euler(EulerRot::YXZ);
+        Vec3::new(-yaw, pitch, -roll)
+    }
+
     /// World space -> view space.
     pub fn view(&self) -> Mat4 {
         // The camera's model matrix is `translate(position) * rotate(orientation)`;
@@ -173,6 +187,21 @@ mod tests {
         let rolled = Camera::from_yaw_pitch_roll(0.0, 0.0, 90f32.to_radians());
         // Right wing dropped, so the right vector now points at the ground.
         assert!((rolled * Vec3::X).abs_diff_eq(Vec3::NEG_Y, 1e-6));
+    }
+
+    #[test]
+    fn the_angles_come_back_out_of_the_orientation_they_built() {
+        let angles = Vec3::new(
+            (-140f32).to_radians(),
+            22f32.to_radians(),
+            35f32.to_radians(),
+        );
+        let orientation = Camera::from_yaw_pitch_roll(angles.x, angles.y, angles.z);
+        assert!(
+            Camera::to_yaw_pitch_roll(orientation).abs_diff_eq(angles, 1e-5),
+            "{}",
+            Camera::to_yaw_pitch_roll(orientation)
+        );
     }
 
     #[test]

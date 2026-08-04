@@ -197,13 +197,15 @@ impl Renderer {
 
         self.scene.update(&self.queue);
         self.scene.record(&mut self.frame);
-        // What the coverage is a share of, and the two numbers that say whether
-        // a climbing ray can be settled as sky for free. All three are of this
-        // frame; the coverage they sit beside is a few frames older, which
-        // matters only while the camera is moving hard.
+        // What the coverage is a share of, the ceiling a climbing ray has to
+        // clear before it can be settled as sky for free, and the viewpoint the
+        // whole frame was drawn from. All of them are of this frame; the
+        // coverage they sit beside is a few frames older, which matters only
+        // while the camera is moving hard.
         self.frame.pixels = self.config.width * self.config.height;
         self.frame.ceiling = self.scene.ceiling();
-        self.frame.eye = self.scene.camera.position.y;
+        self.frame.position = self.scene.camera.position;
+        self.frame.orientation = self.scene.camera.orientation;
 
         let clock = profile::Clock::start(self.profiling);
         {
