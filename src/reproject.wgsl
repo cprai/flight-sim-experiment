@@ -218,6 +218,11 @@ struct Splat {
     // Zero for sky and a unit vector for ground, which is how the compaction
     // tells the two apart once they have landed.
     @location(1) @interpolate(flat) normal: vec4<f32>,
+    // Where the point landed, in whole screen pixels, so the fragment can
+    // measure the sub-pixel offset against the pixel it is *actually* in. See
+    // `pack_offset`, which is why this is carried across rather than the offset
+    // itself.
+    @location(2) @interpolate(flat) landed: vec2<f32>,
 };
 
 // Where a point goes to not be drawn: `z` outside the zero-to-one range wgpu
@@ -372,15 +377,47 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
         (ndc.x * 0.5 + 0.5) * f32(size.x),
         (0.5 - ndc.y * 0.5) * f32(size.y),
     );
-    out.material = pack_offset(id, landed);
+    // The id alone here; the offset half of the word is packed in the fragment
+    // stage, where the pixel it is measured against is known. See `pack_offset`.
+    out.material = id & MATERIAL_MASK;
+    out.landed = landed;
     out.normal = normal;
     return out;
 }
 
 // The material id and the sub-pixel position the point landed at, packed into
 // one word. See `MATERIAL_MASK` in `src/terrain.wgsl` for why they share.
-fn pack_offset(id: u32, screen: vec2<f32>) -> u32 {
-    let frac = clamp(fract(screen), vec2<f32>(0.0), vec2<f32>(0.99609375));
+//
+// `base` is the top-left corner of the pixel this word is being written into,
+// and the offset is measured from it. It has to be the pixel the *rasterizer*
+// chose -- `floor(@builtin(position).xy)` in the fragment stage -- and not
+// `floor(landed)`, which is only the pixel the vertex stage predicts. The two
+// disagree on a pixel boundary, and the consequence is not a rounding error but
+// a runaway:
+//
+//   * The rasterizer places a point on a fixed-point sub-pixel grid of its own
+//     and resolves one that falls on a pixel boundary by the fill rule, which
+//     can hand it to the pixel above. Its grid is fine but not finer than this
+//     offset's: rebuilding at the middle of the 256th rather than its edge,
+//     which moves the point by half a quantum, did not escape the boundary.
+//   * Quantising the offset truncates, so a point that lands within a 256th of
+//     a pixel of the boundary stores offset zero, which `rebuilt` reads back as
+//     sitting exactly *on* the boundary.
+//   * Measured from `floor(landed)`, that word then describes a point one whole
+//     pixel above the one it is stored in. Next frame `rebuilt` places it
+//     there, it lands on a boundary again, and the same thing happens -- so the
+//     point climbs the screen at exactly one pixel a frame until it runs off
+//     the top, with the camera perfectly still the whole time.
+//
+// That is what this reads back as chunks of ground sliding up through the sky
+// over a few seconds. It needs a carried point to land in the zero bucket, so
+// it never appears from a cold start -- a marched pixel's offset is 0.5, a
+// pixel centre, which is stable -- and it is far more likely on a wide viewport
+// than a narrow one. `a_still_camera_carries_every_point_back_to_itself` in
+// `src/scene.rs` is the regression test; the fix that makes it pass is
+// measuring from `base` here.
+fn pack_offset(id: u32, landed: vec2<f32>, base: vec2<f32>) -> u32 {
+    let frac = clamp(landed - base, vec2<f32>(0.0), vec2<f32>(0.99609375));
     let axis = vec2<u32>(frac * OFFSET_SCALE);
     return (id & MATERIAL_MASK) | (axis.x << 16u) | (axis.y << 24u);
 }
@@ -397,7 +434,12 @@ struct Carried {
 @fragment
 fn fs_reproject(in: Splat) -> Carried {
     var out: Carried;
-    out.material = in.material;
+    // `in.clip.xy` is this fragment's own centre, so flooring it gives the pixel
+    // the rasterizer settled on -- which is the only pixel the sub-pixel offset
+    // may be measured against. Packing it in the vertex stage instead, from
+    // `fract(landed)`, is what made carried ground climb the screen; the whole
+    // of that is written up on `pack_offset`.
+    out.material = pack_offset(in.material, in.landed, floor(in.clip.xy));
     out.normal = in.normal;
     return out;
 }

@@ -2880,6 +2880,85 @@ mod tests {
         );
     }
 
+    /// A camera that has stopped moving must settle, and stay settled.
+    ///
+    /// Standing still is the carry's exact case: every point it holds projects
+    /// back to the pixel it came from, so once the dither has swept the screen
+    /// the frame reaches a fixed point and every frame after it is identical.
+    /// Anything still changing is a point the round trip through the G-buffer
+    /// does not put back where it found it.
+    ///
+    /// The defect this was written for did that in one direction. The sub-pixel
+    /// offset was packed against the pixel the *vertex* stage predicted the
+    /// point would land in rather than the one the rasterizer chose, so a point
+    /// landing on a pixel boundary was stored describing the pixel above.
+    /// Rebuilt from that word next frame it landed on a boundary again, so it
+    /// climbed the screen at exactly one pixel a frame -- chunks of ground
+    /// sliding up through the sky and off the top over a few seconds, with the
+    /// camera untouched throughout. `pack_offset` in `src/reproject.wgsl` is
+    /// where the whole of it is written down.
+    ///
+    /// Flown a few frames first, and that is the point of the flight: from a
+    /// standing start every pixel is marched and a marched pixel's offset is a
+    /// pixel centre, which is stable. Only a carried point can land on a
+    /// boundary, so only a camera that has moved can reach the state that
+    /// fails.
+    ///
+    /// The aim is not arbitrary either. A boundary landing is a coincidence of
+    /// one point in 256, so a small frame holds few candidates and most views
+    /// hold none: at this pitch the unfixed shader leaves exactly one climbing
+    /// pixel, and at six degrees down it leaves none at all. What made the
+    /// defect obvious on a real flight was a 3440x1440 window -- fifty times
+    /// these pixels, and chunks rather than specks.
+    #[test]
+    fn a_still_camera_carries_every_point_back_to_itself() {
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let (heights, materials) = rugged();
+        let mut scene = test_scene(&device, format, test_residency(), heights, materials);
+        // Just below the horizon, so the ground runs from under the camera out
+        // to the skyline and the frame holds every distance at once.
+        scene.camera.orientation = Camera::from_yaw_pitch_roll(0.0, -2f32.to_radians(), 0.0);
+        let start = Vec3::new(0.0, 1200.0, 1700.0);
+        scene.camera.position = start;
+        scene.settle(&queue);
+
+        // A few metres a frame, which is about what a key tapped at the fly
+        // speed covers.
+        const STEP: f32 = 3.5;
+        const MOVING: u32 = 6;
+        let screen = Offscreen::new(&device, format);
+        for frame in 0..MOVING {
+            let at = start - Vec3::Z * (STEP * frame as f32);
+            screen.step(&device, &queue, &mut scene, at, false);
+        }
+
+        // Then held, long enough for what the movement stirred up to settle:
+        // the two frames either side of this are down to single pixels of
+        // difference, which is what makes exact equality the right assertion.
+        let stopped = start - Vec3::Z * (STEP * (MOVING - 1) as f32);
+        for _ in 0..24 {
+            screen.step(&device, &queue, &mut scene, stopped, false);
+        }
+        let settled = screen.step(&device, &queue, &mut scene, stopped, true);
+        let after = screen.step(&device, &queue, &mut scene, stopped, true);
+
+        let moved: Vec<(u32, u32)> = settled
+            .chunks_exact(4)
+            .zip(after.chunks_exact(4))
+            .enumerate()
+            .filter(|(_, (before, now))| before != now)
+            .map(|(i, _)| (i as u32 % SIZE, i as u32 / SIZE))
+            .collect();
+        assert!(
+            moved.is_empty(),
+            "{} pixels changed between two frames of a camera that had not moved \
+             for twenty-five of them, at {:?}",
+            moved.len(),
+            moved,
+        );
+    }
+
     /// The overlay's reader, driven exactly the way `Renderer::render` drives
     /// it: record on the frame's encoder, submit, collect. **No poll**, on
     /// purpose -- the windowed loop has none either, and relies on the one
