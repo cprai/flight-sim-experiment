@@ -40,7 +40,7 @@ pub const MATERIAL_BASE_LEVEL: u32 = 2;
 pub struct Manifest {
     /// Bumped whenever a reader could otherwise misinterpret an older tree.
     pub version: u32,
-    /// `dtm`, `dsm` or `albedo`.
+    /// `dtm`, `albedo`, `materials`, or a pyramid derived from one of those.
     pub product: String,
     /// The projected CRS the grid is anchored to.
     pub epsg: u32,

@@ -203,20 +203,17 @@ impl Terrain {
         viewport: UVec2,
         root: &Path,
     ) -> Result<Self> {
-        let product = crate::terrain::ELEVATION_PRODUCTS
-            .iter()
-            .find(|product| root.join(product).is_dir())
-            .with_context(|| {
-                format!(
-                    "{} holds no {} directory",
-                    root.display(),
-                    crate::terrain::ELEVATION_PRODUCTS.join(" or ")
-                )
-            })?;
+        let product = crate::terrain::ELEVATION_PRODUCT;
         let elevation = root.join(product);
+        anyhow::ensure!(
+            elevation.is_dir(),
+            "{} holds no {product} directory",
+            root.display()
+        );
         let material = root.join(terrain_tiles::MATERIAL_PRODUCT);
-        // Named after the elevation it was reduced from, because `dtm` and `dsm`
-        // are different surfaces and a bound over one does not cover the other.
+        // Still named after the elevation it was reduced from: a bound belongs
+        // to one surface, and reducing a second elevation product some day must
+        // not quietly reuse this one's ceilings.
         let ceilings = root.join(terrain_tiles::maxima_product(product));
 
         let heights = TileStore::<f32>::open(&elevation)?;

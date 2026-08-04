@@ -116,8 +116,7 @@ struct Arguments {
     #[arg(short, long, value_name = "DIR")]
     output: PathBuf,
 
-    /// What to fetch: bare ground, the top of what the sensor saw, colour, or
-    /// raw OpenStreetMap data.
+    /// What to fetch: bare ground, colour, or raw OpenStreetMap data.
     #[arg(long, value_enum, default_value = "dtm")]
     product: Product,
 

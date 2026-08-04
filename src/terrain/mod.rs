@@ -7,8 +7,15 @@ pub mod pyramid;
 pub mod residency;
 pub mod tiles;
 
-/// Bare-ground elevations, in metres, and the directory they are preferred from.
-pub const ELEVATION_PRODUCTS: [&str; 2] = ["dtm", "dsm"];
+/// Bare-ground elevations, in metres, and the directory they are read from.
+///
+/// One product rather than a list to fall back through. A surface model was the
+/// other candidate and it is not one the renderer can use interchangeably: it
+/// stands the sensor's own reading on top of the ground, so trees and roofs
+/// become terrain a ray collides with, and the shading a hillside gets is the
+/// canopy's. Anything wanting both would have to draw them as two surfaces
+/// rather than pick one at startup.
+pub const ELEVATION_PRODUCT: &str = "dtm";
 
 /// Any elevation below this means "no measurement here".
 ///

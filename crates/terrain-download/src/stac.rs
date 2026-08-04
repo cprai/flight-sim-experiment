@@ -24,15 +24,22 @@ use crate::retry;
 /// The projection every HRDEM mosaic item is published in.
 pub const EXPECTED_EPSG: u32 = 3979;
 
-/// What to fetch. The first two are elevation from HRDEM; the others come from
+/// What to fetch. The first is elevation from HRDEM; the others come from
 /// different providers entirely and never touch the STAC catalogue.
+///
+/// The catalogue publishes a surface model beside the terrain model, and this
+/// used to fetch either. Nothing downstream ever read it: the renderer draws
+/// the bare earth, which is the surface an aircraft has to clear, rather than
+/// the top of the canopy the sensor saw. It was not free to keep around --
+/// over the Squamish box the surface model was 33 GB downloaded, another 33 GB
+/// copied into the tree `terrain-process` writes, and 33 GB more of max
+/// pyramid reduced from it, none of which any pass opens. `asset_key` is where
+/// it would come back.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 pub enum Product {
     /// Digital terrain model: the bare ground, with vegetation and buildings
     /// removed.
     Dtm,
-    /// Digital surface model: the top of whatever the sensor saw.
-    Dsm,
     /// Cloud-free Sentinel-2 colour imagery, for the terrain's surface.
     Albedo,
     /// Raw OpenStreetMap data covering the box, from a Geofabrik extract.
@@ -42,23 +49,21 @@ pub enum Product {
 impl Product {
     /// The key an elevation product appears under in an item's asset map.
     ///
-    /// Albedo has none: it does not come from the HRDEM catalogue at all.
+    /// The others have none: they do not come from the HRDEM catalogue at all.
     pub fn asset_key(self) -> Option<&'static str> {
         match self {
             Self::Dtm => Some("dtm"),
-            Self::Dsm => Some("dsm"),
             Self::Albedo | Self::Osm => None,
         }
     }
 
     pub fn is_elevation(self) -> bool {
-        matches!(self, Self::Dtm | Self::Dsm)
+        matches!(self, Self::Dtm)
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Dtm => "dtm",
-            Self::Dsm => "dsm",
             Self::Albedo => "albedo",
             Self::Osm => "osm",
         }
@@ -357,7 +362,9 @@ mod tests {
     use super::*;
 
     /// Trimmed from a real response for `hrdem-mosaic-1m`, keeping the fields
-    /// this module reads.
+    /// this module reads -- and the `dsm` asset beside them, which it does not.
+    /// An item really does publish both, so leaving it here is what makes
+    /// picking the terrain model a choice rather than the only thing on offer.
     const ONE_METRE_PAGE: &str = r#"{
       "type": "FeatureCollection",
       "features": [
@@ -422,25 +429,10 @@ mod tests {
     }
 
     #[test]
-    fn asking_for_the_surface_model_picks_the_other_asset() {
-        let items =
-            read_all(ONE_METRE_PAGE, Resolution::OneMetre, Product::Dsm).expect("failed to read");
-        assert_eq!(
-            items[0].href,
-            "https://example.invalid/2_4-mosaic-1m-dsm.tif"
-        );
-    }
-
-    #[test]
     fn an_item_without_the_requested_product_is_skipped_not_fatal() {
         let items = read_all(SURFACE_ONLY_PAGE, Resolution::TwoMetre, Product::Dtm)
             .expect("a missing asset should not be an error");
         assert!(items.is_empty(), "{items:?}");
-
-        // The same item does contribute when the surface model is what is wanted.
-        let items = read_all(SURFACE_ONLY_PAGE, Resolution::TwoMetre, Product::Dsm)
-            .expect("failed to read");
-        assert_eq!(items.len(), 1);
     }
 
     #[test]

@@ -48,11 +48,13 @@ pub const MAXIMA_SUFFIX: &str = "-max";
 /// What a max pyramid's product directory is called, given the elevation it was
 /// reduced from.
 ///
-/// A suffix rather than one shared name because `dtm` and `dsm` are different
-/// surfaces and each needs its own bound: the renderer picks whichever elevation
-/// product is installed and must get the pyramid built from that one, not from
-/// the other. Derived here so the tool that writes it and the renderer that
-/// opens it cannot spell it differently.
+/// A suffix rather than one shared name because a bound belongs to the surface
+/// it was reduced from, and nothing about a ceiling over the bare earth bounds
+/// a canopy or a rooftop. Only `dtm` is fetched and drawn today, so the tool
+/// writes one of these; naming it after its source is what keeps a second
+/// elevation product from silently inheriting this one's ceilings. Derived here
+/// so the tool that writes it and the renderer that opens it cannot spell it
+/// differently.
 pub fn maxima_product(elevation: &str) -> String {
     format!("{elevation}{MAXIMA_SUFFIX}")
 }
