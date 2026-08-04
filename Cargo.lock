@@ -3255,6 +3255,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "terrain-generate"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "log",
+ "rayon",
+ "terrain-materials",
+ "terrain-tiles",
+]
+
+[[package]]
 name = "terrain-materials"
 version = "0.0.0"
 

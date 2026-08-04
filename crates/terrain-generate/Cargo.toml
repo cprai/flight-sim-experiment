@@ -1,0 +1,17 @@
+[package]
+name = "terrain-generate"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6", features = ["derive"] }
+env_logger = "0.11.11"
+log = "0.4.33"
+# Every stage but the droplets is per-cell or per-tile work over tens of
+# millions of cells, and the machine this was written on has 24 of them.
+rayon = "1.11.0"
+terrain-materials = { path = "../terrain-materials" }
+# Without "project": nothing here converts coordinates. The generator invents
+# ground on the tile grid's own metres rather than reprojecting a source onto
+# them, so proj4rs would be dead weight.
+terrain-tiles = { path = "../terrain-tiles" }
