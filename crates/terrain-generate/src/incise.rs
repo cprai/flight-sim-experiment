@@ -48,7 +48,19 @@
 //! surface and carries the whole basin's drainage, is cut. Round by round the
 //! rim comes down, the lake shrinks, and the ones that survive are the ones
 //! deep enough to deserve to.
+//!
+//! # Cutting alone is not a landscape
+//!
+//! Every round of cutting is followed by a round of [`crate::creep`], and the
+//! pair is the model rather than the cutting on its own. Stream power has a
+//! runaway in it: a hollow one cell deep gathers a little more water than the
+//! ground beside it, so it is cut a little deeper, so it gathers more still.
+//! Nothing here opposes that, so the feedback runs all the way down to whatever
+//! the grid can hold and the landscape arrives corrugated with grooves one cell
+//! wide. Creep is what opposes it, and the wavelength where the two balance is
+//! the spacing the valleys come out at. See that module for the measurements.
 
+use crate::creep;
 use crate::fields::Fields;
 use crate::flow;
 
@@ -83,57 +95,72 @@ const AREA_EXPONENT: f32 = 0.5;
 /// which is the problem this pass exists to solve.
 const HARDNESS_RESISTANCE: f32 = 0.5;
 
-/// Cuts the drainage into the landscape, `rounds` times.
+/// Runs the landscape forward `rounds` times: rivers cutting down, creep
+/// filling in.
 ///
-/// Each round re-routes the water first, because the last round's cutting moved
-/// it: a basin that drained one way before its rim came down may drain another
-/// way after.
+/// Each round re-routes the water first, because the last round moved it: a
+/// basin that drained one way before its rim came down may drain another way
+/// after.
 pub fn rivers(fields: &mut Fields, rounds: u32) {
+    let mut scratch = vec![0.0f32; fields.height.values.len()];
+    for _ in 0..rounds {
+        cut(fields);
+        // The other half of the model, and it belongs inside this loop rather
+        // than after it. Creep is not a tidy-up of what the rivers left: it is
+        // what the rivers are competing against, round by round, and the
+        // balance between the two is what decides how far apart the valleys end
+        // up. Run once at the end instead, it would smooth a landscape whose
+        // channel spacing had already collapsed to the cell size.
+        creep::settle(&mut fields.height, &mut scratch);
+    }
+}
+
+/// One round of stream-power incision, which only ever takes ground away.
+fn cut(fields: &mut Fields) {
     let width = fields.width();
     let cell_area = fields.metres_per_cell * fields.metres_per_cell;
 
-    for _ in 0..rounds {
-        let drainage = flow::drainage(fields);
-        // The surface the rivers would leave if there were no hollows, built
-        // downstream first so that every cell's receiver is already final.
-        let mut cut = drainage.filled.clone();
-        for index in &drainage.order {
-            let index = *index as usize;
-            let into = drainage.drains_to[index];
-            if into == u32::MAX {
-                // Leaves the map. This is the base level everything else is
-                // measured down to, and it does not move.
-                continue;
-            }
-            let into = into as usize;
-            let (column, row) = (index % width, index / width);
-            let (into_column, into_row) = (into % width, into / width);
-            let diagonal = column != into_column && row != into_row;
-            let reach = if diagonal {
-                std::f32::consts::SQRT_2
-            } else {
-                1.0
-            } * fields.metres_per_cell;
-
-            let resistance = 1.0 - HARDNESS_RESISTANCE * fields.hardness.values[index];
-            let power =
-                ERODIBILITY * resistance * (drainage.area[index] * cell_area).powf(AREA_EXPONENT)
-                    / reach;
-            cut[index] = (drainage.filled[index] + power * cut[into]) / (1.0 + power);
+    let drainage = flow::drainage(fields);
+    // The surface the rivers would leave if there were no hollows, built
+    // downstream first so that every cell's receiver is already final.
+    let mut bed = drainage.filled.clone();
+    for index in &drainage.order {
+        let index = *index as usize;
+        let into = drainage.drains_to[index];
+        if into == u32::MAX {
+            // Leaves the map. This is the base level everything else is
+            // measured down to, and it does not move.
+            continue;
         }
+        let into = into as usize;
+        let (column, row) = (index % width, index / width);
+        let (into_column, into_row) = (into % width, into / width);
+        let diagonal = column != into_column && row != into_row;
+        let reach = if diagonal {
+            std::f32::consts::SQRT_2
+        } else {
+            1.0
+        } * fields.metres_per_cell;
 
-        // A ceiling, not an answer: hollows keep their own floor and only the
-        // ground that stands proud of the water is cut.
-        //
-        // The deposit channel is deliberately left alone. It means "loose
-        // material the water dropped here", which is what the classifier reads
-        // to find talus, gravel bars and alluvial floors, and a river cutting
-        // its bed into bedrock leaves no loose material anywhere. Recording the
-        // incision there as well swamped the droplets' signal completely and
-        // stopped any scree at all from being painted.
-        for (height, ceiling) in fields.height.values.iter_mut().zip(&cut) {
-            *height = height.min(*ceiling);
-        }
+        let resistance = 1.0 - HARDNESS_RESISTANCE * fields.hardness.values[index];
+        let power = ERODIBILITY
+            * resistance
+            * (drainage.area[index] * cell_area).powf(AREA_EXPONENT)
+            / reach;
+        bed[index] = (drainage.filled[index] + power * bed[into]) / (1.0 + power);
+    }
+
+    // A ceiling, not an answer: hollows keep their own floor and only the
+    // ground that stands proud of the water is cut.
+    //
+    // The deposit channel is deliberately left alone. It means "loose material
+    // the water dropped here", which is what the classifier reads to find
+    // talus, gravel bars and alluvial floors, and a river cutting its bed into
+    // bedrock leaves no loose material anywhere. Recording the incision there
+    // as well swamped the droplets' signal completely and stopped any scree at
+    // all from being painted.
+    for (height, ceiling) in fields.height.values.iter_mut().zip(&bed) {
+        *height = height.min(*ceiling);
     }
 }
 
@@ -235,11 +262,18 @@ mod tests {
 
     /// Incision only ever takes ground away. A round that raised anything would
     /// mean the implicit sweep had gone the wrong way round the tree.
+    ///
+    /// Asked of the cutting on its own, because [`rivers`] is the cutting *and*
+    /// the creep, and creep raises ground -- filling a groove is the whole
+    /// point of it. Keeping this claim needs the two steps separable, which is
+    /// why they are.
     #[test]
     fn incision_only_lowers_the_ground() {
         let before = basin(101, 200.0, 260.0);
         let mut after = basin(101, 200.0, 260.0);
-        rivers(&mut after, 40);
+        for _ in 0..40 {
+            cut(&mut after);
+        }
         for (index, (was, now)) in before
             .height
             .values
@@ -297,6 +331,82 @@ mod tests {
         assert!(
             channel > flank * 3.0,
             "the channel was cut {channel} m and the ground beside it {flank} m"
+        );
+    }
+
+    /// The regression test for the corduroy, run over a real raised landscape
+    /// because that is the only place the bug lives.
+    ///
+    /// Cutting valleys is not the bug -- it is the pass working. The bug is the
+    /// *scale* it cuts them at: with stream power and nothing opposing it,
+    /// every other column becomes a channel, because the finest hollow the grid
+    /// can hold is the finest hollow the feedback will find. Left in, it laid a
+    /// corduroy over the whole map that was plainly visible from the air.
+    ///
+    /// So the claim is a comparison rather than a threshold, and it is the same
+    /// one that diagnosed the bug: **the cutting must not leave more roughness
+    /// at the scale of a cell than it was handed.** Uplift arrives with grain
+    /// of its own -- it is a fractal down to two cells -- and rivers are
+    /// entitled to rearrange it, but a pass whose features are all a kilometre
+    /// across has no business multiplying what is there at thirty-two metres.
+    /// Handed 1.59 m of grain, the pass without creep left 6.82 m of it.
+    ///
+    /// Measured on the ground no river runs over, which is where the artifact
+    /// was and where it is a contradiction in terms: a cell two dozen others
+    /// drain through has no river on it. The floor of a real valley is a cell
+    /// or two wide and full of legitimate grain, and including it would drown
+    /// the signal.
+    #[test]
+    fn cutting_leaves_no_more_grain_at_the_cell_scale_than_it_was_given() {
+        let (side, cell) = (256, 32.0f32);
+        let extent = [(side - 1) as f32 * cell, (side - 1) as f32 * cell];
+        let mut fields = Fields::new(extent, cell);
+        crate::shape::raise(
+            &mut fields,
+            crate::shape::Relief {
+                valley_metres: 700.0,
+                peak_metres: 2600.0,
+            },
+            7,
+        );
+        let before = fields.height.clone();
+        rivers(&mut fields, 60);
+
+        let hillslope = &flow::drainage(&fields).area;
+        let grain = |grid: &crate::fields::Grid| {
+            let at = |column: usize, row: usize| grid.values[row * side + column];
+            let (mut total, mut cells) = (0.0f64, 0u32);
+            for row in 8..side - 8 {
+                for column in 8..side - 8 {
+                    if hillslope[row * side + column] > 25.0 {
+                        continue;
+                    }
+                    let mut around = 0.0f32;
+                    for dy in 0..3 {
+                        for dx in 0..3 {
+                            around += at(column + dx - 1, row + dy - 1);
+                        }
+                    }
+                    total += f64::from((at(column, row) - around / 9.0).abs());
+                    cells += 1;
+                }
+            }
+            assert!(cells > 1000, "only {cells} cells of hillslope to measure");
+            total / f64::from(cells)
+        };
+
+        // The rivers must have done something, or a pass that returned early
+        // would pass this trivially.
+        let cut = (before.values.iter().zip(&fields.height.values))
+            .map(|(before, after)| f64::from(before - after))
+            .fold(0.0, f64::max);
+        assert!(cut > 50.0, "the rivers only cut {cut} m into the landscape");
+
+        let (was, now) = (grain(&before), grain(&fields.height));
+        assert!(
+            now < was,
+            "the landscape arrived with {was:.3} m of grain between neighbouring \
+             cells and left with {now:.3} m, which is a corduroy"
         );
     }
 

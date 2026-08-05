@@ -21,19 +21,22 @@
 //!
 //! **A coarse simulation.** The whole raster is held in memory at
 //! `--sim-metres` and put through, in order: fractal uplift (`shape`), thermal
-//! relaxation to the angle rock stands at (`thermal`), river cutting driven by
-//! drainage area (`incise`), droplet erosion (`hydraulic`), another round of
-//! each to settle what those left, and finally depression filling and flow
-//! routing (`flow`). Erosion is iterative and global and cannot be anything
-//! else: where a droplet goes depends on what the last one did. At 16 m a
-//! 49 x 57 km raster is 11 million cells, which is affordable; at one metre it
-//! would be 2.8 billion and it would not.
+//! relaxation to the angle rock stands at (`thermal`), river cutting against
+//! hillslope creep (`incise` and `creep`), droplet erosion (`hydraulic`),
+//! another round of each to settle what those left, and finally depression
+//! filling and flow routing (`flow`). Erosion is iterative and global and
+//! cannot be anything else: where a droplet goes depends on what the last one
+//! did. At 16 m a 49 x 57 km raster is 11 million cells, which is affordable;
+//! at one metre it would be 2.8 billion and it would not.
 //!
 //! The two water passes do different jobs and the landscape needs both.
 //! `incise` cuts at the scale of a range -- it is what finds a way out of every
 //! basin, and without it a sixth of the map ends up under standing water.
 //! `hydraulic` cuts at the scale of a gully, and is what puts the fans, the
 //! banks and the fine drainage texture on the valleys the other one found.
+//! `creep` opposes them both, and is what gives the valleys a spacing: cutting
+//! on its own runs away into whatever the grid can hold and lays a corduroy of
+//! one-cell grooves over the map.
 //!
 //! **A per-texel function.** Every texel of every level is then a pure function
 //! of its position, its level, and a bilinear sample of those channels --
@@ -51,6 +54,7 @@
 
 mod build;
 mod classify;
+mod creep;
 mod detail;
 mod emit;
 mod fields;
