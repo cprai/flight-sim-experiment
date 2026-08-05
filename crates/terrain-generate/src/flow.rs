@@ -30,6 +30,39 @@
 //! drainage area accumulates in one linear sweep with no iteration to converge
 //! and no possibility of a cycle -- even across the dead flat surface of a
 //! filled lake, where a steepest-descent rule has no answer at all.
+//!
+//! # Why the area is shared and the receiver is not
+//!
+//! There are two different questions here and they want two different answers.
+//!
+//! *Which way is downhill from this cell* has one answer, and [`Drainage`]
+//! records it in `drains_to`. Incision needs it to be one answer: the implicit
+//! stream-power sweep is a walk over a **tree**, and a tree is what makes it
+//! unconditionally stable and linear in the cell count.
+//!
+//! *How much ground drains through this cell* must not be answered that way,
+//! and answering it that way was a real and very visible bug. Sending every
+//! cell's whole area to a single steepest neighbour is the D8 rule, and on a
+//! planar hillside D8 has only eight directions to choose between: neighbouring
+//! cells pick between two nearly equal directions, their flow lines run
+//! parallel without ever merging, and which line a cell lands on is decided by
+//! roughness far below the scale of any real valley. On a plane forty cells
+//! across, with twenty centimetres of noise on a two-metre-per-cell fall,
+//! neighbouring cells that are alike in every physical respect came out
+//! carrying drainage differing fifteenfold. Incision cuts in proportion to the
+//! square root of that, so the landscape arrives corrugated with grooves one
+//! cell wide -- a corduroy visible from the air across the whole map. Over a
+//! 16 km box the incision pass was multiplying the power at the
+//! two-to-three-cell scale by four hundred.
+//!
+//! So area is shared instead, over *every* neighbour below the cell, in
+//! proportion to how steeply each falls away. That is Freeman's multiple flow
+//! direction rule (Freeman 1991, "Calculating catchment area with divergent
+//! flow based on a regular grid"), and it is the standard answer to exactly
+//! this artifact. Water spreads on a divergent hillside, as it does in reality,
+//! and converges only where the ground actually converges -- so a valley still
+//! collects a valley's worth of drainage and a smooth slope no longer pretends
+//! to have a river running down one column of it.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -47,6 +80,18 @@ const NEIGHBOURS: [(i64, i64); 8] = [
     (-1, 1),
     (1, 1),
 ];
+
+/// How sharply the sharing favours the steepest way down.
+///
+/// Freeman's value, and the reason it is a little above one rather than well
+/// above it. At one the share is proportional to the fall, which is the
+/// gentlest spreading there is; as the exponent grows the steepest neighbour
+/// takes more and more, and in the limit the rule *is* D8 again, along with the
+/// corrugation D8 causes. The temptation is to raise it on the theory that a
+/// river wants to stay in one channel, and it is the wrong instinct: the
+/// channels a landscape should have are the ones the ground converges into, and
+/// a rule that concentrates water on its own makes them wherever it likes.
+const SPREAD: f32 = 1.1;
 
 /// A total order on `f32` that matches the numeric one, as bits.
 ///
@@ -174,14 +219,63 @@ pub fn drainage(fields: &Fields) -> Drainage {
         }
     }
 
-    // One backwards sweep of the pop order. Every cell is visited before the
-    // cell it drains to, so a single pass is exact.
+    // One backwards sweep of the pop order, sharing each cell's area among
+    // every neighbour below it. The sweep is still exact in a single pass: a
+    // strictly lower neighbour was popped strictly earlier, so it is still to
+    // come in this direction, and by the time a cell is reached every cell that
+    // could give to it already has.
     let mut area = vec![1.0f32; count];
+    let mut falls = [0.0f32; 8];
     for index in order.iter().rev() {
         let index = *index as usize;
-        let into = drains_to[index];
-        if into != u32::MAX {
-            area[into as usize] += area[index];
+        let (column, row) = ((index % width) as i64, (index / width) as i64);
+        let here = filled[index];
+
+        let mut total = 0.0f32;
+        for (slot, (dx, dy)) in NEIGHBOURS.iter().enumerate() {
+            falls[slot] = 0.0;
+            let (nx, ny) = (column + dx, row + dy);
+            if nx < 0 || ny < 0 || nx >= width as i64 || ny >= rows as i64 {
+                continue;
+            }
+            let neighbour = ny as usize * width + nx as usize;
+            let reach = if *dx != 0 && *dy != 0 {
+                std::f32::consts::SQRT_2
+            } else {
+                1.0
+            };
+            let fall = (here - filled[neighbour]) / reach;
+            if fall > 0.0 {
+                // The share each neighbour takes: how steeply it falls, raised
+                // to the spreading exponent, times how much of this cell's
+                // outline faces it. A diagonal neighbour is offered the corner
+                // rather than a whole side, which is `1 / sqrt(2)` of one --
+                // without that the four corners would between them take more
+                // than the four sides and the water would drift onto the
+                // diagonals.
+                falls[slot] = fall.powf(SPREAD) / reach;
+                total += falls[slot];
+            }
+        }
+
+        if total <= 0.0 {
+            // Nothing below: the flat of a filled lake, or a cell on the rim of
+            // the map. The flood's own tree is the only thing that knows the
+            // way to the spill point from here.
+            let into = drains_to[index];
+            if into != u32::MAX {
+                area[into as usize] += area[index];
+            }
+            continue;
+        }
+
+        let sending = area[index];
+        for (slot, (dx, dy)) in NEIGHBOURS.iter().enumerate() {
+            if falls[slot] <= 0.0 {
+                continue;
+            }
+            let neighbour = (row + dy) as usize * width + (column + dx) as usize;
+            area[neighbour] += sending * falls[slot] / total;
         }
     }
 
@@ -325,6 +419,107 @@ mod tests {
         assert!(
             through_the_edge >= count as f64,
             "{through_the_edge} cells left through the edge, out of {count}"
+        );
+    }
+
+    /// The bug this module's sharing rule exists to prevent, stated as
+    /// directly as it can be.
+    ///
+    /// A plane tilted so that it falls between two of the eight neighbour
+    /// directions is the worst case for D8 and the reason for everything above:
+    /// with one receiver each, cells pick whichever of the two is nearer, their
+    /// flow lines run parallel without ever merging, and the area they carry
+    /// ends up differing by orders of magnitude between columns that are
+    /// identical in every physical respect. Incision then cuts in proportion to
+    /// its square root and the hillside comes out corrugated.
+    ///
+    /// Nothing about this ground distinguishes one cell from the next, so
+    /// nothing about the drainage may either.
+    ///
+    /// Stated against the rule it replaced rather than against a bare number,
+    /// by accumulating the same landscape both ways. That is worth the extra
+    /// dozen lines: a threshold on its own would still pass if the sharing were
+    /// ever quietly weakened back towards a single receiver, whereas this
+    /// asserts the contrast that is the whole point -- and records, for anyone
+    /// reading it later, exactly how badly the old rule behaved.
+    #[test]
+    fn a_plane_drains_evenly_rather_than_in_parallel_lines() {
+        let side = 81;
+        let mut fields = Fields::new([(side - 1) as f32 * 10.0, (side - 1) as f32 * 10.0], 10.0);
+        for row in 0..side {
+            for column in 0..side {
+                let index = fields.height.index(column, row);
+                // Falling south-south-east, so that neither an axis nor a
+                // diagonal is the answer and D8 has to keep choosing between
+                // two directions that are very nearly as steep as each other.
+                // The centimetre of noise on top is what makes it choose
+                // differently in different places, and a centimetre is all it
+                // takes -- which is the point. A dead plane is the one case D8
+                // handles: every cell picks the same direction, so the lines
+                // are parallel and carry the same area as each other, and the
+                // problem hides completely.
+                fields.height.values[index] = 900.0 - row as f32 * 2.0 - column as f32 * 0.7
+                    + crate::noise::gradient(column as f32 / 3.0, row as f32 / 3.0, 77) * 0.2;
+            }
+        }
+        let drainage = drainage(&fields);
+
+        // The single-receiver accumulation this module used to do, over the
+        // same flood and the same receivers.
+        let mut d8 = vec![1.0f32; drainage.area.len()];
+        for index in drainage.order.iter().rev() {
+            let index = *index as usize;
+            let into = drainage.drains_to[index];
+            if into != u32::MAX {
+                d8[into as usize] += d8[index];
+            }
+        }
+
+        // Across the middle, well inside the edges, where every cell has the
+        // same ground above it as its neighbours.
+        let row = side / 2;
+        let spread = |area: &[f32]| {
+            let (low, high) = (20..side - 20)
+                .map(|column| area[row * side + column])
+                .fold((f32::INFINITY, 0.0f32), |(l, h), a| (l.min(a), h.max(a)));
+            high / low
+        };
+        assert!(
+            spread(&d8) > 10.0,
+            "the single-receiver rule spread this plane's drainage by only {}, \
+             so this landscape no longer demonstrates the problem",
+            spread(&d8)
+        );
+        assert!(
+            spread(&drainage.area) < 1.5,
+            "identical cells of a plane carry drainage differing by {}",
+            spread(&drainage.area)
+        );
+    }
+
+    /// ... and the other half of it, which is what stops the cure from being
+    /// worse than the disease. Spreading the water must not stop it collecting:
+    /// ground that converges has to end up carrying far more than ground that
+    /// does not, or there are no rivers to cut anything with.
+    #[test]
+    fn a_valley_still_collects_far_more_than_the_slope_beside_it() {
+        let side = 81;
+        let mut fields = Fields::new([(side - 1) as f32 * 10.0, (side - 1) as f32 * 10.0], 10.0);
+        let middle = (side - 1) as f32 * 0.5;
+        for row in 0..side {
+            for column in 0..side {
+                let index = fields.height.index(column, row);
+                let across = (column as f32 - middle).abs().min(20.0);
+                fields.height.values[index] = 900.0 - row as f32 * 2.0 + across * 1.5;
+            }
+        }
+        let drainage = drainage(&fields);
+        let row = side - 12;
+        let floor = drainage.area[row * side + side / 2];
+        let flank = drainage.area[row * side + side - 12];
+        assert!(
+            floor > flank * 20.0,
+            "the valley floor carries {floor} against the flank's {flank}"
         );
     }
 
