@@ -20,9 +20,27 @@
 //! northings would otherwise put between this crate and the tile grid.
 //!
 //! Nodes sit *on* the grid lines rather than in the middle of cells, and there
-//! is one more node than there are cells on each axis, so that a bilinear
-//! sample anywhere in the raster -- including at its far edge -- has four real
-//! nodes around it and no clamping is needed inside the data.
+//! is one more node than there are cells on each axis, so that a sample
+//! anywhere in the raster -- including at its far edge -- has real nodes on
+//! both sides of it rather than an extrapolation of the last one.
+
+/// What the four nodes around a position contribute to it, for a fraction of
+/// the way from the second to the third.
+///
+/// The Catmull-Rom cubic: the curve passes through the two middle nodes, and
+/// its slope at each is the central difference of that node's own neighbours,
+/// which is what makes the pieces meet with a matching gradient. The four
+/// weights always add to one, so a flat field stays flat and a lake stays
+/// exactly at its own level.
+fn catmull_rom_weights(t: f32) -> [f32; 4] {
+    let (t2, t3) = (t * t, t * t * t);
+    [
+        -0.5 * t3 + t2 - 0.5 * t,
+        1.5 * t3 - 2.5 * t2 + 1.0,
+        -1.5 * t3 + 2.0 * t2 + 0.5 * t,
+        0.5 * t3 - 0.5 * t2,
+    ]
+}
 
 /// One channel of the coarse grid.
 #[derive(Clone, PartialEq, Debug)]
@@ -58,6 +76,14 @@ impl Grid {
     }
 
     /// Bilinear interpolation at a position given in *nodes*, not metres.
+    ///
+    /// Cheap, and not what the per-texel half of the generator reads -- see
+    /// [`Grid::sample_smooth`] for why. This is for callers that want the plain
+    /// answer, which is the tests and nothing else.
+    #[allow(
+        dead_code,
+        reason = "the plain interpolation the smooth one is measured against"
+    )]
     pub fn sample_nodes(&self, column: f32, row: f32) -> f32 {
         let (c0, r0) = (column.floor(), row.floor());
         let (fc, fr) = (column - c0, row - r0);
@@ -65,6 +91,50 @@ impl Grid {
         let top = self.at(c0, r0) + (self.at(c0 + 1, r0) - self.at(c0, r0)) * fc;
         let bottom = self.at(c0, r0 + 1) + (self.at(c0 + 1, r0 + 1) - self.at(c0, r0 + 1)) * fc;
         top + (bottom - top) * fr
+    }
+
+    /// Catmull-Rom interpolation at a position given in *nodes*, not metres.
+    ///
+    /// This is what the per-texel half reads, and the reason is the renderer's
+    /// normals. A bilinear surface is continuous but its *gradient* is not: the
+    /// slope changes abruptly at every cell line, because the interpolation
+    /// switches to a different pair of nodes there. The height is fine and the
+    /// shading is not -- the renderer derives its normal from the heights, so
+    /// every cell line draws as a crease and a sixteen-metre grid of them
+    /// covers the whole world in axis-aligned facets. Over a kilometre of
+    /// generated ground the curvature landed on the lattice eleven times more
+    /// strongly than off it, which is that grid, measured.
+    ///
+    /// It is the same mistake [`crate::noise::fade`] exists to avoid one level
+    /// down, and it matters far more here: the noise it interpolates carries a
+    /// few metres, and this grid carries the entire relief.
+    ///
+    /// Catmull-Rom rather than a quintic fade on the bilinear weights. The fade
+    /// is cheaper and also smooth, but it forces the gradient to zero at every
+    /// node, so a hillside comes out as a quilt of level patches with steep
+    /// steps between them -- trading one visible grid for another. Catmull-Rom
+    /// passes through the nodes with the slope the data implies, reproduces any
+    /// linear surface exactly, and is sixteen fixed taps with no branch in
+    /// them, which is what a compute-shader port wants.
+    ///
+    /// It can overshoot by design, which is what a cubic through four points
+    /// does; callers that need a bounded channel clamp it.
+    pub fn sample_smooth(&self, column: f32, row: f32) -> f32 {
+        let (c0, r0) = (column.floor(), row.floor());
+        let (fc, fr) = (column - c0, row - r0);
+        let (c0, r0) = (c0 as i64, r0 as i64);
+
+        let across = catmull_rom_weights(fc);
+        let down = catmull_rom_weights(fr);
+        let mut total = 0.0;
+        for (dy, vertical) in down.iter().enumerate() {
+            let mut line = 0.0;
+            for (dx, horizontal) in across.iter().enumerate() {
+                line += horizontal * self.at(c0 + dx as i64 - 1, r0 + dy as i64 - 1);
+            }
+            total += vertical * line;
+        }
+        total
     }
 
     /// The lowest and highest value held.
@@ -177,10 +247,10 @@ impl Fields {
         let column = x / self.metres_per_cell;
         let row = y / self.metres_per_cell;
 
-        let east = self.height.sample_nodes(column + 1.0, row);
-        let west = self.height.sample_nodes(column - 1.0, row);
-        let south = self.height.sample_nodes(column, row + 1.0);
-        let north = self.height.sample_nodes(column, row - 1.0);
+        let east = self.height.sample_smooth(column + 1.0, row);
+        let west = self.height.sample_smooth(column - 1.0, row);
+        let south = self.height.sample_smooth(column, row + 1.0);
+        let north = self.height.sample_smooth(column, row - 1.0);
         let span = 2.0 * self.metres_per_cell;
         // Downhill, so the sign of each difference is the way the ground falls.
         let (fall_east, fall_south) = ((west - east) / span, (north - south) / span);
@@ -192,11 +262,13 @@ impl Fields {
         };
 
         Sample {
-            height: self.height.sample_nodes(column, row),
-            hardness: self.hardness.sample_nodes(column, row),
-            flow: self.flow.sample_nodes(column, row),
-            deposit: self.deposit.sample_nodes(column, row),
-            filled: self.filled.sample_nodes(column, row),
+            height: self.height.sample_smooth(column, row),
+            // Clamped, because the cubic can overshoot and this one's `0..=1`
+            // is a contract the classifier reads straight into its thresholds.
+            hardness: self.hardness.sample_smooth(column, row).clamp(0.0, 1.0),
+            flow: self.flow.sample_smooth(column, row),
+            deposit: self.deposit.sample_smooth(column, row),
+            filled: self.filled.sample_smooth(column, row),
             slope,
             aspect,
         }
@@ -263,6 +335,97 @@ mod tests {
         assert_eq!(grid.sample_nodes(1.5, 2.0), 3.0 + 10.0);
         assert_eq!(grid.sample_nodes(1.0, 2.5), 2.0 + 12.5);
         assert_eq!(grid.sample_nodes(1.25, 1.5), 2.5 + 7.5);
+    }
+
+    /// The smooth interpolation still has to *be* an interpolation: a node's
+    /// own value at the node, or the surface would no longer be the one the
+    /// erosion passes shaped.
+    #[test]
+    fn the_smooth_sample_still_passes_through_every_node() {
+        let grid = ramp(9, 7);
+        for row in 0..7 {
+            for column in 0..9 {
+                let got = grid.sample_smooth(column as f32, row as f32);
+                let want = grid.values[grid.index(column, row)];
+                assert!((got - want).abs() < 1e-3, "at ({column}, {row}): {got}");
+            }
+        }
+    }
+
+    /// Catmull-Rom reproduces any linear surface exactly, which matters twice
+    /// over: a ramp does not gain ripples, and -- because a constant is linear
+    /// -- the flat surface of a lake stays flat to the last bit.
+    #[test]
+    fn the_smooth_sample_leaves_a_ramp_a_ramp_and_a_lake_flat() {
+        let grid = ramp(9, 9);
+        for step in 0..40 {
+            let (column, row) = (2.0 + step as f32 * 0.1, 3.0 + step as f32 * 0.07);
+            let want = column * 2.0 + row * 5.0;
+            let got = grid.sample_smooth(column, row);
+            assert!((got - want).abs() < 1e-2, "at ({column}, {row}): {got}");
+        }
+
+        // To within the rounding of summing four weights that add to one in
+        // exact arithmetic -- which is a tenth of a millimetre at this height,
+        // and a great deal flatter than anything anybody can see.
+        let lake = Grid::filled(9, 9, 1234.5);
+        for step in 0..40 {
+            let at = 2.0 + step as f32 * 0.13;
+            let got = lake.sample_smooth(at, at);
+            assert!((got - 1234.5).abs() < 1e-3, "the lake read {got} at {at}");
+        }
+    }
+
+    /// The whole reason for the cubic. A bilinear surface bends only *at* the
+    /// cell lines and is dead straight between them, so the renderer's normals
+    /// jump there and the lattice draws as a grid of creases over the world.
+    ///
+    /// Measured the way the artifact was found: the second difference along a
+    /// row, sorted by where it falls in the cell. Bilinear puts essentially all
+    /// of it on the lattice; the smooth sample has to spread it over the cell
+    /// instead.
+    #[test]
+    fn the_smooth_sample_does_not_bend_only_on_the_lattice() {
+        // A grid with something to bend around -- a ramp has no curvature
+        // anywhere and would tell us nothing.
+        let mut grid = Grid::filled(24, 8, 0.0);
+        for row in 0..8 {
+            for column in 0..24 {
+                let index = grid.index(column, row);
+                grid.values[index] = (column as f32 * 0.9).sin() * 40.0 + row as f32 * 3.0;
+            }
+        }
+
+        let concentration = |sample: &dyn Fn(f32, f32) -> f32| {
+            let step = 1.0 / 8.0;
+            let curvature = |at: f32| {
+                (sample(at - step, 4.0) - 2.0 * sample(at, 4.0) + sample(at + step, 4.0)).abs()
+            };
+            let (mut on, mut off) = (0.0f64, 0.0f64);
+            for i in 0..8 * 16 {
+                let at = 4.0 + i as f32 * step;
+                // Within half a step of a cell line, or not.
+                if (at - at.round()).abs() < step * 0.5 {
+                    on += f64::from(curvature(at));
+                } else {
+                    off += f64::from(curvature(at)) / 7.0;
+                }
+            }
+            on / off.max(1e-9)
+        };
+
+        let bilinear = concentration(&|column, row| grid.sample_nodes(column, row));
+        let smooth = concentration(&|column, row| grid.sample_smooth(column, row));
+        assert!(
+            bilinear > 50.0,
+            "bilinear bent {bilinear} times as hard on the lattice as off it, \
+             so this grid no longer demonstrates the problem"
+        );
+        assert!(
+            smooth < 3.0,
+            "the smooth sample still bends {smooth} times as hard on the \
+             lattice as off it"
+        );
     }
 
     /// Reads outside the grid clamp rather than wrap or panic. Erosion asks for

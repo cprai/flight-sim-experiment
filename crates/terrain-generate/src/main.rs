@@ -39,7 +39,7 @@
 //! one-cell grooves over the map.
 //!
 //! **A per-texel function.** Every texel of every level is then a pure function
-//! of its position, its level, and a bilinear sample of those channels --
+//! of its position, its level, and a smooth sample of those channels --
 //! `detail` for the height and `classify` for the material. No state, no
 //! neighbours, no ordering, so tiles are seamless without any overlap handling
 //! and levels are band-limited by construction rather than by filtering.
