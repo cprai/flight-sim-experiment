@@ -5,6 +5,21 @@
 //! closure of the raster alone; every other depth is the greater of the two.
 //! See `terrain_tiles::maxima` for why both terms are needed.
 //!
+//! # The canopy never enters here
+//!
+//! It did briefly. The renderer grew crowns while marching, so a cell had to be
+//! raised by the tallest tree that could stand over it or rays would pass
+//! straight through the forest -- and nothing would report it, because a pyramid
+//! that is too low draws as scattered holes in the far field rather than as an
+//! error.
+//!
+//! The renderer grows nothing now: whatever trees it draws are in the heights it
+//! is given, so the surface it meets *is* the surface this closes. A cell of a
+//! measured download bounds bare earth because that is all the download holds --
+//! this tool copies the elevation across rather than writing it, so nothing here
+//! has anywhere to put a crown. See `terrain-generate` for the path that does
+//! bake them in.
+//!
 //! The work is blocked because closing a square reaches a sample past it. A cell
 //! at the east edge of a tile needs a sample from the tile next door, so a tile
 //! cannot be built alone; a block of `n x n` tiles reads `n + 1` tiles of

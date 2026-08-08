@@ -6,6 +6,21 @@
 //! See `terrain_tiles::maxima` for why both terms are needed -- that module is
 //! where the rules live, and this only blocks the work up.
 //!
+//! # The canopy is already in the heights
+//!
+//! It used to enter here. The renderer grew crowns while marching, so a cell had
+//! to be raised by the tallest tree that could stand over it or rays would pass
+//! straight through the forest -- and nothing would report it, because a pyramid
+//! that is too low draws as scattered holes in the far field rather than as an
+//! error.
+//!
+//! `emit::heights` now writes the trees into the elevation itself, so the
+//! surface the renderer draws *is* the surface this closes, and the pyramid needs
+//! no canopy term at all. The bound is tighter for it: every forest cell used to
+//! carry the tallest crown its cover could grow above the ground it bounded,
+//! which is up to twenty-eight metres of empty air for a ray to descend into and
+//! find nothing in.
+//!
 //! The work is blocked because closing a square reaches a sample past it. A cell
 //! at the east edge of a tile needs a sample from the tile next door, so a tile
 //! cannot be built alone; a block of `n x n` tiles reads `n + 1` tiles of

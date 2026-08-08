@@ -204,6 +204,23 @@ fn surface(corner: vec4<f32>, at: vec2<f32>) -> f32 {
     return mix(mix(corner.x, corner.y, f.x), mix(corner.z, corner.w, f.x), f.y);
 }
 
+// This file knows nothing about trees, and that is recent. The march used to
+// grow the crowns itself, carrying a hand transcription of the whole of
+// `crates/terrain-canopy` -- the crown lattice, the hashes, the distance field
+// and a sphere trace per leaf texel -- and painting a pixel that met one with a
+// canopy material id of its own. All of it is gone. `terrain-generate` writes
+// the trees into the elevation and the ground cover instead, so a ray meets a
+// tree by meeting the ground and a pixel is forest because the material under
+// it says so.
+//
+// That was worth about three quarters of the march. The cost was never the walk
+// -- shortening it barely helped -- it was *entering* the wooded path at all, a
+// cover lookup and nine hashes at every leaf texel a ray crossed, which at level
+// 0 is once a metre through a stand. It also took a whole class of failure with
+// it: two spellings of one function, pinned by a GPU test, where a disagreement
+// would put crowns above the ceiling meant to bound them and let rays through
+// the forest with nothing reporting it.
+
 // Normalized device coordinates of a pixel's centre, which is what the camera's
 // ray basis wants.
 //
@@ -415,7 +432,9 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         let enter = surface(corner, w - base);
         let leave = surface(corner, (p0 + d0 * exit) / size - base);
 
-        // Ground nothing is known about is not ground.
+        // Ground nothing is known about is not ground. The sentinel is far below
+        // anything a canopy could add to it, so ground with trees on it is still
+        // ground and a hole is still a hole.
         if (deepest < NODATA_BELOW) {
             hole = true;
             t = exit + nudge;
@@ -916,6 +935,12 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // convention the height bilinear reads by, so the texel whose centre is
     // closest is the rounded index.
     let cell = vec2<i32>(floor(hit.w + 0.5));
+    // One load, and no question about what the ray met -- which there could not
+    // be, because a crown baked into the heights is indistinguishable from a
+    // hillock and the march has nothing left to ask. A treetop is labelled as
+    // one already: `terrain-generate` writes a canopy id into this product
+    // wherever the crowns cover enough of a texel, so the gaps between the
+    // trees keep the floor's own colour and the trees do not.
     out.material = textureLoad(materials, slot(cell), i32(hit.level), 0).r;
     out.position = hit.position;
     // The ray was cast through the centre of the pixel, so that is where the
@@ -925,6 +950,12 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // level it stopped at, so the surface that is shaded is the surface that
     // was drawn. Near ground gets the finest level the clipmap is holding;
     // far ground gets whatever coarse level answered, and flattens with it.
+    //
+    // A crown's own slope comes out of this too, with nothing added: the trees
+    // are in the heights being differenced, so the flank of a treetop is a slope
+    // like any other. It used to need a second gradient of the crown field on
+    // top, because the surface drawn was the ground plus a canopy the heights
+    // knew nothing about.
     out.normal = vec4<f32>(normal_at(hit.level, hit.w), 0.0);
     return out;
 }
