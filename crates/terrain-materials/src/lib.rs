@@ -64,6 +64,25 @@ pub enum Material {
     ForestMixed = 0x0302,
     /// Felled forest, `man_made=clearcut`: stumps and slash, not trees.
     Clearcut = 0x0303,
+    /// The crowns themselves, rather than any ground.
+    ///
+    /// The one id that does not describe a piece of ground. Every other member
+    /// of this enum says what the earth is made of; this one says the earth is
+    /// not what a ray met, and it exists because a treetop wants a different
+    /// colour from the forest floor it stands over. The floor keeps its own id
+    /// beneath -- what changed is that a stand is two surfaces rather than one.
+    ///
+    /// Written by whichever producer also puts the crowns into the elevation, at
+    /// the texels where they cover enough of the ground to hide it. A producer
+    /// that leaves the heights bare must not write this: the colour would be
+    /// crowns on a surface that has none, and the shading would light a canopy
+    /// off the slope of the hill under it.
+    ///
+    /// One id for every tree there is. Leaf type used to pick the colour, back
+    /// when the material id was also what said a tree was there at all, and a
+    /// needleleaf green against a broadleaf green is not a distinction a canopy
+    /// seen from the air actually makes.
+    Canopy = 0x0304,
     ForestUnknown = 0x03ff,
 
     // Scrub and grass, 0x04xx.
@@ -171,6 +190,7 @@ impl Material {
         Material::ForestBroadleaved,
         Material::ForestMixed,
         Material::Clearcut,
+        Material::Canopy,
         Material::ForestUnknown,
         Material::Scrub,
         Material::Shrubbery,
@@ -255,7 +275,7 @@ mod tests {
     /// here and must be bumped together with any addition.
     #[test]
     fn the_list_holds_every_variant_exactly_once() {
-        assert_eq!(Material::ALL.len(), 77);
+        assert_eq!(Material::ALL.len(), 78);
         let ids: HashSet<u32> = Material::ALL.iter().map(|m| m.id()).collect();
         assert_eq!(ids.len(), Material::ALL.len(), "a duplicate id");
     }

@@ -68,6 +68,11 @@ pub(crate) fn flat_colour(material: Material) -> [u8; 3] {
         ForestBroadleaved => [50, 105, 50],
         ForestMixed => [38, 88, 45],
         Clearcut => [115, 95, 65],
+        // The crowns, and the only entry here that is never ground. Darker than
+        // any of the floors above, because a canopy from above is mostly its
+        // own shadow: the light that reaches a treetop is the light that has
+        // not already been caught by the branches beside it.
+        Canopy => [28, 62, 36],
         ForestUnknown => [40, 90, 45],
 
         // Scrub and grass: lighter, yellower greens than any forest.
