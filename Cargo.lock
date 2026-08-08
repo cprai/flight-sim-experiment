@@ -3234,6 +3234,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "terrain-canopy"
+version = "0.0.0"
+
+[[package]]
 name = "terrain-download"
 version = "0.0.0"
 dependencies = [

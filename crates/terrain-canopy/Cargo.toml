@@ -1,0 +1,11 @@
+[package]
+name = "terrain-canopy"
+edition = "2024"
+
+# None, deliberately, and this is the one crate in the workspace that can say
+# so. Everything it answers -- how tall the trees on a patch of ground are, and
+# how much of it they cover -- follows from a density, a health and a hash, so
+# it borrows neither the tile grid nor the material ids. Keeping it that way is
+# what lets a producer call it per texel without dragging the rest of the
+# pipeline in behind it.
+[dependencies]
