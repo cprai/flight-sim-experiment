@@ -10,6 +10,10 @@ log = "0.4.33"
 # Every stage but the droplets is per-cell or per-tile work over tens of
 # millions of cells, and the machine this was written on has 24 of them.
 rayon = "1.11.0"
+# How tall the trees on a texel stand, and how much of it they hide. Both
+# answers come from one call, so the crowns folded into the elevation and the
+# canopy id written into the ground cover cannot disagree about a texel.
+terrain-canopy = { path = "../terrain-canopy" }
 terrain-materials = { path = "../terrain-materials" }
 # Without "project": nothing here converts coordinates. The generator invents
 # ground on the tile grid's own metres rather than reprojecting a source onto

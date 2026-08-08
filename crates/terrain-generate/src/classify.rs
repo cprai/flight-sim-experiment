@@ -227,7 +227,120 @@ pub fn material(
     relief: Relief,
 ) -> Material {
     let lines = lines(sample, ground, x, y, texel_metres, seed, relief);
+    cover(sample, ground, &lines)
+}
 
+/// How much forest stands on one texel, and how tall it is.
+///
+/// A second product off the same decision rather than a second classifier: the
+/// stand is where [`material`] says forest is, so the ground under a canopy is
+/// always its own floor and a stand can never sit on a lake. What this adds is
+/// the two things an id cannot hold -- how closed the stand is and how well it
+/// is growing -- and both are read off the same fields that put it there.
+///
+/// The scrub belt gets trees too, short ones. That belt is krummholz: the same
+/// species as the timber below it, kept to a few metres by wind and snow, and a
+/// treeline that went from full-height forest to nothing across one texel was
+/// the most visible thing left wrong with the old material-driven canopy.
+pub fn trees(
+    sample: &Sample,
+    ground: &Ground,
+    x: f32,
+    y: f32,
+    texel_metres: f32,
+    seed: u32,
+    relief: Relief,
+) -> Trees {
+    let lines = lines(sample, ground, x, y, texel_metres, seed, relief);
+    match cover(sample, ground, &lines) {
+        Material::ForestNeedleleaved
+        | Material::ForestBroadleaved
+        | Material::ForestMixed
+        | Material::ForestUnknown => timber(sample, ground, &lines),
+        Material::Scrub => krummholz(&lines),
+        _ => Trees::NONE,
+    }
+}
+
+/// What stands on a texel, as the `trees` product stores it.
+///
+/// Both are shares of `0` to `1`, and both mean what `terrain_canopy` means by
+/// them: the density is what fraction of the crown lattice holds a tree, and
+/// the health scales the crown heights that lattice grows.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Trees {
+    pub density: f32,
+    pub health: f32,
+}
+
+impl Trees {
+    /// Ground that grows nothing.
+    pub const NONE: Trees = Trees {
+        density: 0.0,
+        health: 0.0,
+    };
+}
+
+/// How far below the treeline a stand reaches its full height, as a share of
+/// the relief.
+///
+/// Timber does not stop at the treeline, it gets shorter and thinner on the way
+/// up to it, and that band is a good deal wider than the krummholz belt above
+/// it. A quarter of the relief is a few hundred metres on this landscape, which
+/// is about what the difference between valley-bottom and subalpine timber is.
+const TIMBER_SHARE: f32 = 0.25;
+
+/// Timber: a closed stand at the bottom, thinning and shrinking towards the
+/// treeline.
+fn timber(sample: &Sample, ground: &Ground, lines: &Lines) -> Trees {
+    // Zero on ground well below the treeline, one at it.
+    let exposure = smoothstep(
+        lines.treeline - lines.span * TIMBER_SHARE,
+        lines.treeline,
+        sample.height,
+    );
+    // Steep ground holds less soil and fewer trees, and what it holds is
+    // smaller. It does not stop the forest -- conifers root on slopes nobody
+    // would walk up, which is why the classifier put timber here at all.
+    let footing = 1.0 - smoothstep(0.30, 0.85, ground.steepness);
+    // Ground the water passes through grows the best timber on the mountain.
+    let damp = smoothstep(CHANNEL_FLOW - 7.0, CHANNEL_FLOW - 2.0, sample.flow);
+
+    let health = crate::noise::lerp(1.0, 0.5, exposure) * crate::noise::lerp(0.78, 1.0, footing)
+        + 0.10 * damp
+        + 0.06 * lines.mottle;
+    // Sheltered timber is a *closed* stand, and the density is what says so: a
+    // one is every cell of the lattice holding a tree, and valley-bottom conifer
+    // forest is exactly that. The earlier ceiling of 0.92, thinned again to 0.62
+    // of itself on any real slope, meant a mountainside never got past two
+    // thirds -- so the whole landscape drew as an open woodland, which is not
+    // what a Rocky Mountain slope looks like. Steepness still thins the stand,
+    // because a slope holds less soil, but by a quarter rather than by a third.
+    let density = crate::noise::lerp(1.0, 0.55, exposure) * crate::noise::lerp(0.78, 1.0, footing)
+        + 0.16 * lines.mottle;
+    Trees {
+        density: density.clamp(0.0, 1.0),
+        health: health.clamp(0.0, 1.0),
+    }
+}
+
+/// Krummholz: the same trees, beaten down to head height and scattered.
+///
+/// Flat numbers with the mottling on top, because nothing else about this belt
+/// varies in a way that reads from the air -- what makes it look right is that
+/// it is sparse and short, not how sparse or how short.
+fn krummholz(lines: &Lines) -> Trees {
+    Trees {
+        density: (0.30 + 0.16 * lines.mottle).clamp(0.0, 1.0),
+        health: (0.17 + 0.05 * lines.mottle).clamp(0.0, 1.0),
+    }
+}
+
+/// The ground cover, once the lines have been worked out.
+///
+/// Split from [`material`] so [`trees`] can ask the same question without
+/// building the lines twice, and so the two cannot answer it differently.
+fn cover(sample: &Sample, ground: &Ground, lines: &Lines) -> Material {
     // Water first: it covers whatever is underneath it.
     if ground.lake > 0.5 {
         return Material::Lake;
@@ -273,13 +386,13 @@ pub fn material(
     }
 
     if sample.height > lines.treeline {
-        return alpine(sample, ground, &lines);
+        return alpine(sample, ground, lines);
     }
     // Flat, worked-over valley bottom, as against a wooded hillside.
     if sample.slope < 0.09 && lines.band < 0.35 {
-        return floor(sample, ground, &lines);
+        return floor(sample, ground, lines);
     }
-    wooded(sample, ground, &lines)
+    wooded(sample, ground, lines)
 }
 
 #[cfg(test)]

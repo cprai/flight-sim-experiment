@@ -124,7 +124,21 @@ fn placement(manifest: &Manifest, level: u32, tile: Tile) -> TilePlacement {
 }
 
 /// Writes the elevation product: every level, generated from the fields.
-pub fn heights(root: &Path, manifest: &Manifest, fields: &Fields, seed: u32) -> Result<u64> {
+///
+/// The trees are in here, at every level. Nothing grows a crown at run time any
+/// more: a ray meets a tree by meeting the ground, which is the whole of why the
+/// canopy stopped costing three quarters of the frame.
+///
+/// Baked at each level's own texel size, which is what `terrain_canopy::baked`
+/// takes it for -- a texel narrower than a crown is asking about one point of one
+/// tree, and a texel many crowns wide has to stand for the lot.
+pub fn heights(
+    root: &Path,
+    manifest: &Manifest,
+    fields: &Fields,
+    seed: u32,
+    relief: Relief,
+) -> Result<u64> {
     let product = root.join(&manifest.product);
     let cell = fields.metres_per_cell;
     let written = over_tiles(manifest, &manifest.product, |level, tile, texel| {
@@ -138,7 +152,10 @@ pub fn heights(root: &Path, manifest: &Manifest, fields: &Fields, seed: u32) -> 
                 };
                 let sample = fields.sample(x, y);
                 let ground = detail::ground(&sample, texel, cell);
-                samples[row * side + column] = detail::height(&sample, &ground, x, y, texel, seed);
+                let bare = detail::height(&sample, &ground, x, y, texel, seed);
+                let grown = crate::classify::trees(&sample, &ground, x, y, texel, seed, relief);
+                samples[row * side + column] =
+                    bare + terrain_canopy::baked(x, y, &standing(&grown, x, y), texel).height;
                 any = true;
             }
         }
@@ -162,7 +179,31 @@ pub fn heights(root: &Path, manifest: &Manifest, fields: &Fields, seed: u32) -> 
     Ok(written)
 }
 
+/// The cover a point stands under, from what the classifier grew there.
+///
+/// One place, because both products ask the same question and an answer that
+/// differed between them would draw a tree and paint a meadow. The clumping is
+/// applied here rather than in the classifier because it is a *look*, not a fact
+/// about the landscape: it thins and thickens a stand inside itself so that a
+/// classifier writing one density per texel does not draw as one flat density.
+fn standing(grown: &crate::classify::Trees, x: f32, y: f32) -> terrain_canopy::Cover {
+    terrain_canopy::Cover {
+        density: grown.density * terrain_canopy::clump(x, y),
+        health: grown.health,
+    }
+}
+
 /// Writes the ground-cover product: every level, classified from the fields.
+///
+/// Including the trees themselves. Where the crowns cover enough of a texel it is
+/// written as `Material::Canopy` rather than as the floor of the stand, which is
+/// the only thing that tells the renderer a pixel is a treetop -- once the crowns
+/// are baked into the heights, a hit on one is indistinguishable from a hit on a
+/// hillock, and the march has nothing left to ask.
+///
+/// The share comes out of the same `terrain_canopy::baked` call the elevation
+/// used, over the same block of ground, so a texel cannot be raised as a tree
+/// here and painted as open ground there.
 pub fn materials(
     root: &Path,
     manifest: &Manifest,
@@ -188,8 +229,19 @@ pub fn materials(
                 };
                 let sample = fields.sample(x, y);
                 let ground = detail::ground(&sample, texel, cell);
-                ids[row * side + column] =
-                    material(&sample, &ground, x, y, texel, seed, relief).id();
+                let floor = material(&sample, &ground, x, y, texel, seed, relief);
+                let grown = crate::classify::trees(&sample, &ground, x, y, texel, seed, relief);
+                let share = terrain_canopy::baked(x, y, &standing(&grown, x, y), texel).share;
+                // One rule at every level, and it means two different things
+                // without needing to be told which: close up the block is inside
+                // a single crown or the gap beside it, so this asks "is this
+                // texel a treetop"; far out it spans a stand, so it asks "is this
+                // mostly wood". Both are the question the pixel wants answered.
+                ids[row * side + column] = if share >= terrain_canopy::PAINTED {
+                    Material::Canopy.id()
+                } else {
+                    floor.id()
+                };
                 any = true;
             }
         }
@@ -263,6 +315,15 @@ mod tests {
         }
     }
 
+    /// The same span the generator defaults to, so a test writes the heights a
+    /// real run would.
+    fn relief() -> Relief {
+        Relief {
+            valley_metres: 700.0,
+            peak_metres: 2600.0,
+        }
+    }
+
     fn fields() -> Fields {
         let mut fields = Fields::new([2048.0, 1024.0], 32.0);
         crate::shape::raise(
@@ -293,7 +354,7 @@ mod tests {
     fn an_elevation_product_round_trips_through_the_readers() {
         let root = temp("heights-round-trip");
         let manifest = manifest("dtm", 0, -32767.0);
-        let written = heights(&root, &manifest, &fields(), 3).expect("failed to write");
+        let written = heights(&root, &manifest, &fields(), 3, relief()).expect("failed to write");
         assert!(written > 0);
 
         let read = Manifest::read(&root.join("dtm")).expect("the manifest must validate");
@@ -321,7 +382,7 @@ mod tests {
     fn every_stored_level_is_written() {
         let root = temp("every-level");
         let manifest = manifest("dtm", 0, -32767.0);
-        heights(&root, &manifest, &fields(), 3).expect("failed to write");
+        heights(&root, &manifest, &fields(), 3, relief()).expect("failed to write");
         for level in manifest.base_level..=manifest.max_level() {
             let directory = root.join("dtm").join(format!("{level:02}"));
             let count = std::fs::read_dir(&directory)

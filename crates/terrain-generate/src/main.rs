@@ -70,7 +70,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use terrain_tiles::{MATERIAL_PRODUCT, Manifest, TILE_SIZE, manifest::MATERIAL_BASE_LEVEL};
+use terrain_tiles::{MATERIAL_PRODUCT, Manifest, TILE_SIZE};
 
 use fields::Fields;
 use shape::Relief;
@@ -231,11 +231,26 @@ impl Arguments {
         }
     }
 
+    /// The ground cover, stored from level 0 rather than from
+    /// `MATERIAL_BASE_LEVEL`.
+    ///
+    /// That constant is the level *vector* data is worth rasterising at, and it
+    /// belongs to `terrain-process`, which draws OSM ways onto a grid and gains
+    /// nothing from a finer one. This product is a per-texel function of the
+    /// fields, so it can be evaluated at whatever resolution is asked for, and
+    /// now it has a reason to be: the crowns are in here. A texel says `Canopy`
+    /// where a tree stands on it, and a four-metre texel would draw the gaps
+    /// between seven-metre trunks in four-metre blocks.
+    ///
+    /// It costs disk and nothing else. The renderer allocates this texture at one
+    /// texel per level-0 texel either way -- storing it coarser only meant every
+    /// fine level was a magnified copy of level 2 -- so a finer product is fewer
+    /// magnified reads, not more memory.
     fn material_manifest(&self) -> Manifest {
         Manifest {
             product: MATERIAL_PRODUCT.into(),
-            base_level: MATERIAL_BASE_LEVEL,
-            level_count: self.max_level + 1 - MATERIAL_BASE_LEVEL,
+            base_level: 0,
+            level_count: self.max_level + 1,
             nodata: 0.0,
             ..self.elevation_manifest(MATERIAL_PRODUCT)
         }
@@ -331,7 +346,13 @@ fn main() -> Result<()> {
 
     let mut written = 0;
     if arguments.wants(&elevation.product) {
-        written += emit::heights(&arguments.output, &elevation, &fields, arguments.seed)?;
+        written += emit::heights(
+            &arguments.output,
+            &elevation,
+            &fields,
+            arguments.seed,
+            arguments.relief(),
+        )?;
     }
     if arguments.wants(&materials.product) {
         written += emit::materials(
@@ -488,7 +509,10 @@ mod tests {
         };
         assert!(elevation.covers_same_ground_as(&materials));
         assert!(elevation.covers_same_ground_as(&maxima));
-        assert_eq!(materials.base_level, MATERIAL_BASE_LEVEL);
+        // Level 0, not `MATERIAL_BASE_LEVEL`: the crowns are written into this
+        // product, and a four-metre texel would draw the gaps between
+        // seven-metre trunks in four-metre blocks. See `material_manifest`.
+        assert_eq!(materials.base_level, 0);
         assert_eq!(materials.max_level(), elevation.max_level());
         assert_eq!(maxima.product, "dtm-max");
     }
