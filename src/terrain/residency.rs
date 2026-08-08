@@ -127,7 +127,12 @@ impl Residency {
     ///
     /// Heights are four bytes a texel, material ids four, and the max pyramid
     /// two -- one cell per texel each, because the level array is the quadtree
-    /// and no level carries a mip chain of its own.
+    /// and no level carries a mip chain of its own. Three arrays, and
+    /// `Terrain::new` creates exactly three: this sum is a *restatement* of what
+    /// that function allocates, and nothing enforces the correspondence. A
+    /// fourth array added there and not here would go unbudgeted and unlogged,
+    /// with every test in this file still passing -- which is a mistake that has
+    /// been made, and is why the two are worth reading together.
     ///
     /// On the raster this flies, eight tiles a side over eight levels comes to
     /// 1280 MiB against a 1600 MiB budget. Fourteen bytes a texel would not
@@ -431,6 +436,11 @@ mod tests {
     /// [`Residency::fit_tiles`] quietly halves the square, and the finest
     /// level's reach falls from 1536 texels to 512 -- so the next byte anyone
     /// adds should fail here instead.
+    ///
+    /// It only catches a byte added to [`Residency::texture_bytes`]. A texture
+    /// added to `Terrain::new` and not counted here is invisible to this test
+    /// and to every other one in this file: the budget would be met on paper and
+    /// overspent in fact, which is a failure this cannot see.
     #[test]
     fn eight_tiles_still_fit_the_budget() {
         let residency = Residency::default();
