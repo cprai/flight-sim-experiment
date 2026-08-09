@@ -94,6 +94,14 @@ pub(crate) fn flat_colour(material: Material) -> [u8; 3] {
         Glacier => [235, 245, 250],
         BareEarth => [140, 115, 85],
         Mud => [130, 105, 80],
+        // The stones, which like the canopy are never ground. Darker than any
+        // of the bare surfaces above, on the same argument that makes the canopy
+        // darker than the forest floor: a stone's top is weathered and lichened,
+        // and it shades its own flanks and the ground beside it.
+        // Boulder is the darker of the two because a block is big enough to
+        // carry that shadow at the distance a texel is seen from.
+        Boulder => [112, 110, 108],
+        Rubble => [138, 133, 126],
 
         // Agriculture: the yellows of worked ground.
         Farmland => [190, 170, 95],

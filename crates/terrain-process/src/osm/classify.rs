@@ -381,13 +381,17 @@ pub fn island(tags: &[(&str, &str)]) -> bool {
 pub fn precedence(material: Material) -> u8 {
     use Material::*;
     match material {
-        // No OSM way paints a crown. `Canopy` says the surface is a treetop
-        // rather than earth, which is only true where the trees are in the
+        // No OSM way paints a crown or a stone. `Canopy`, `Boulder` and
+        // `Rubble` all say the surface is something lying on the earth rather
+        // than the earth, which is only true where that something is in the
         // heights as well -- and this tool copies the elevation across
-        // untouched. It is listed only because the match is exhaustive, which
-        // is what makes a new material a compile error rather than a silent
-        // zero.
-        Null | Ocean | Canopy => 0,
+        // untouched. Somebody has mapped `natural=stone` ways, and they still
+        // must not become `Boulder` here: the colour would be a block on a
+        // surface that has none, and the shading would light it off the slope
+        // of the hill under it. They are listed only because the match is
+        // exhaustive, which is what makes a new material a compile error rather
+        // than a silent zero.
+        Null | Ocean | Canopy | Boulder | Rubble => 0,
         Residential | Commercial | Retail | Industrial | Institutional | Religious | Railway
         | Military | Brownfield | Greenfield | Farmland | Park | RecreationGround => 1,
         ForestNeedleleaved | ForestBroadleaved | ForestMixed | ForestUnknown | Clearcut | Scrub

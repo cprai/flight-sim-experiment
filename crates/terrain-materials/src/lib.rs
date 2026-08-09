@@ -107,6 +107,30 @@ pub enum Material {
     /// Unvegetated soil: `surface=ground|earth|dirt` areas.
     BareEarth = 0x0506,
     Mud = 0x0507,
+    /// A block of stone lying on the ground, rather than the ground.
+    ///
+    /// The second id that does not describe a piece of earth, and it is here for
+    /// the same reason [`Material::Canopy`] is: an erratic standing on a meadow
+    /// is grey, and without an id of its own it would be painted with the grass
+    /// it is sitting on. Where a boulder lies on ground that is already stone --
+    /// a talus slope, a cliff foot -- the id changes little, and that is fine;
+    /// the case it exists for is the one where the ground under it is not stone
+    /// at all.
+    ///
+    /// Written by whichever producer also puts the stones into the elevation, at
+    /// the texels where they cover enough of the ground to hide it. A producer
+    /// that leaves the heights bare must not write this: the colour would be
+    /// boulders on a surface that has none, and the shading would light them off
+    /// the slope of the hill under them.
+    Boulder = 0x0508,
+    /// Broken stone covering the ground, rather than the ground.
+    ///
+    /// [`Material::Boulder`]'s smaller half. Distinct from [`Material::Scree`],
+    /// which is a *kind of slope* -- loose material lying at the angle it stands
+    /// at, whether or not anything on it can be resolved. This is the id for a
+    /// texel whose surface is individual stones, which is a thing the elevation
+    /// now holds and the ground cover therefore has to be able to say.
+    Rubble = 0x0509,
 
     // Agriculture, 0x06xx.
     Farmland = 0x0600,
@@ -208,6 +232,8 @@ impl Material {
         Material::Glacier,
         Material::BareEarth,
         Material::Mud,
+        Material::Boulder,
+        Material::Rubble,
         Material::Farmland,
         Material::Farmyard,
         Material::Orchard,
@@ -275,7 +301,7 @@ mod tests {
     /// here and must be bumped together with any addition.
     #[test]
     fn the_list_holds_every_variant_exactly_once() {
-        assert_eq!(Material::ALL.len(), 78);
+        assert_eq!(Material::ALL.len(), 80);
         let ids: HashSet<u32> = Material::ALL.iter().map(|m| m.id()).collect();
         assert_eq!(ids.len(), Material::ALL.len(), "a duplicate id");
     }
