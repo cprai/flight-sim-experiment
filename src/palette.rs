@@ -94,13 +94,21 @@ pub(crate) fn flat_colour(material: Material) -> [u8; 3] {
         Glacier => [235, 245, 250],
         BareEarth => [140, 115, 85],
         Mud => [130, 105, 80],
-        // The stones, which like the canopy are never ground. Darker than any
-        // of the bare surfaces above, on the same argument that makes the canopy
-        // darker than the forest floor: a stone's top is weathered and lichened,
-        // and it shades its own flanks and the ground beside it.
-        // Boulder is the darker of the two because a block is big enough to
-        // carry that shadow at the distance a texel is seen from.
-        Boulder => [112, 110, 108],
+        // The stones, which like the canopy are never ground. Unlike the canopy
+        // they are *lighter* than the surface they lie on, and the first attempt
+        // got this backwards by borrowing the canopy's argument wholesale: a
+        // crown is dark because the light that reaches it is what the branches
+        // beside it have not already caught, and a boulder has no equivalent.
+        // It is a convex solid, so its top catches more light than the flat
+        // ground around it, not less.
+        //
+        // Darkening it as well cost twice over, because the shape is already
+        // doing the darkening. A dome's far flank turns away from the sun and
+        // falls to the ambient term whatever its colour is, so a low albedo
+        // drew erratics on a meadow as black holes rather than as stone. These
+        // are the greys of clean broken rock, near `Scree` and a shade above
+        // `BareRock`, and it is the silhouette that says which is which.
+        Boulder => [148, 144, 138],
         Rubble => [138, 133, 126],
 
         // Agriculture: the yellows of worked ground.
