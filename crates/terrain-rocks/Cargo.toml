@@ -1,0 +1,10 @@
+[package]
+name = "terrain-rocks"
+edition = "2024"
+
+# None, for the same reason `terrain-canopy` has none. Everything this answers
+# -- how high the stones on a patch of ground stand, and how much of it they
+# hide -- follows from two densities, a size and a hash, so it borrows neither
+# the tile grid nor the material ids. A producer can call it per texel without
+# dragging the rest of the pipeline in behind it.
+[dependencies]

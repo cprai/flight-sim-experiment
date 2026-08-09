@@ -3293,6 +3293,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "terrain-rocks"
+version = "0.0.0"
+
+[[package]]
 name = "terrain-tiles"
 version = "0.0.0"
 dependencies = [
