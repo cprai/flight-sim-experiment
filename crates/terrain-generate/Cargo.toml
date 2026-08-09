@@ -15,6 +15,11 @@ rayon = "1.11.0"
 # canopy id written into the ground cover cannot disagree about a texel.
 terrain-canopy = { path = "../terrain-canopy" }
 terrain-materials = { path = "../terrain-materials" }
+# The same bargain as the canopy, for stone: how high the boulders and rubble on
+# a texel stand, and how much of it they hide. One call answers both, so the
+# stones folded into the elevation and the ids written into the ground cover
+# cannot disagree about a texel.
+terrain-rocks = { path = "../terrain-rocks" }
 # Without "project": nothing here converts coordinates. The generator invents
 # ground on the tile grid's own metres rather than reprojecting a source onto
 # them, so proj4rs would be dead weight.

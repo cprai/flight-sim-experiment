@@ -336,10 +336,151 @@ fn krummholz(lines: &Lines) -> Trees {
     }
 }
 
+/// What stone is scattered on one texel, and how big it is.
+///
+/// A third product off the same decision, for the reason [`trees`] is a second:
+/// the stones are where [`material`] says stone can lie, so the ground under a
+/// boulder is always its own floor and a boulder can never sit in a lake.
+///
+/// Nothing in the forest or scrub blocks scatters anything, which is a decision
+/// rather than an omission. Rock under a closed stand is hidden from every angle
+/// this landscape is seen from, and growing it would cost a second pair of hash
+/// lattices per texel to draw what the crowns are already covering. What it buys
+/// besides the time is an invariant worth having: no texel carries both trees
+/// and stones, so the two fake surfaces can never argue about which one a ray
+/// met. See `a_texel_never_carries_both_trees_and_stones`.
+pub fn rocks(
+    sample: &Sample,
+    ground: &Ground,
+    x: f32,
+    y: f32,
+    texel_metres: f32,
+    seed: u32,
+    relief: Relief,
+) -> Rocks {
+    let lines = lines(sample, ground, x, y, texel_metres, seed, relief);
+    match cover(sample, ground, &lines) {
+        Material::Scree => talus(ground, &lines),
+        Material::BareRock => shed(ground, &lines),
+        Material::Fell | Material::Heath => frost(sample, ground, &lines),
+        Material::Shingle => bars(&lines),
+        // `Grassland` comes out of both `alpine` and `floor`, and which one it
+        // was decides what is lying on it: frost-shattered plateau above the
+        // treeline, ground the ice left below it. The other three can only come
+        // from `floor`, and asking the same question of them costs nothing.
+        Material::Grassland | Material::Meadow | Material::Sand | Material::BareEarth => {
+            if sample.height > lines.treeline {
+                frost(sample, ground, &lines)
+            } else {
+                erratics(ground, &lines)
+            }
+        }
+        _ => Rocks::NONE,
+    }
+}
+
+/// What is lying on a texel, in the terms `terrain_rocks` scatters it by.
+///
+/// Two densities and a stature, meaning exactly what that crate means by them:
+/// the densities are the shares of each lattice holding a stone, and the stature
+/// scales how tall the stones of both classes stand without touching how wide
+/// they are.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Rocks {
+    pub boulders: f32,
+    pub rubble: f32,
+    pub stature: f32,
+}
+
+impl Rocks {
+    /// Ground with nothing lying on it.
+    pub const NONE: Rocks = Rocks {
+        boulders: 0.0,
+        rubble: 0.0,
+        stature: 0.0,
+    };
+}
+
+/// Talus: the rubble a cliff sheds, with the blocks that did not break up lying
+/// in it.
+///
+/// The rubble is the point and it follows the deposit channel, because that is
+/// the pass that recorded where the material actually piled. The blocks follow
+/// the rockiness instead: hard beds shed hard corners, and a soft one crumbles
+/// to gravel on the way down.
+fn talus(ground: &Ground, lines: &Lines) -> Rocks {
+    Rocks {
+        boulders: (0.25 + 0.30 * ground.rockiness + 0.20 * lines.mottle).clamp(0.0, 1.0),
+        rubble: (0.55 + 0.35 * ground.filling + 0.15 * lines.mottle).clamp(0.0, 1.0),
+        stature: 0.7,
+    }
+}
+
+/// A cliff: swept, with what the ledges managed to hold.
+///
+/// The one place where less is more. A face steep enough to read as bare rock is
+/// steep enough that anything loose has already gone to the talus below it, so
+/// the rubble fades out with the steepness rather than following it up. The few
+/// blocks left are big ones, half-detached from the bed.
+fn shed(ground: &Ground, lines: &Lines) -> Rocks {
+    Rocks {
+        boulders: (0.12 + 0.20 * lines.mottle).clamp(0.0, 1.0),
+        rubble: (0.15 * (1.0 - ground.steepness)).clamp(0.0, 1.0),
+        stature: 0.9,
+    }
+}
+
+/// Felsenmeer: the alpine plateau above the treeline, shattered in place.
+///
+/// Frost splits the bed it stands on rather than carrying anything, so this is
+/// the one kind of strewn ground where the hardness of the rock is most of the
+/// answer and the slope is almost none of it. The blocks want flat ground --
+/// anything steep enough to shed them has already done so, which is what the
+/// steepness term takes away.
+fn frost(sample: &Sample, ground: &Ground, lines: &Lines) -> Rocks {
+    Rocks {
+        boulders: (0.18 + 0.25 * sample.hardness * (1.0 - ground.steepness) + 0.15 * lines.mottle)
+            .clamp(0.0, 1.0),
+        rubble: (0.35 + 0.30 * sample.hardness + 0.15 * lines.mottle).clamp(0.0, 1.0),
+        stature: 0.75,
+    }
+}
+
+/// A gravel bar: cobbles, and not much else.
+///
+/// The one case that is nearly all fine material. `stature` is low rather than the
+/// densities being low, because what makes a bar look like a bar is that
+/// everything on it is small -- a river that could roll a five-metre block would
+/// not have left it here.
+fn bars(lines: &Lines) -> Rocks {
+    Rocks {
+        boulders: 0.05,
+        rubble: (0.55 + 0.20 * lines.mottle).clamp(0.0, 1.0),
+        stature: 0.35,
+    }
+}
+
+/// Erratics: single blocks standing on ground that has none of their kind.
+///
+/// The sparsest of the five and the most visible, which is not a contradiction.
+/// A valley floor is flat, open and looked at from low down, so one eight-metre
+/// block standing on it reads from a long way off -- and it is the case that
+/// needs [`Material::Boulder`] most, because the ground it is sitting on is
+/// grass. Keyed on the filling so the blocks land on moraine and outwash, which
+/// is where the ice actually dropped them, rather than on any flat ground at all.
+fn erratics(ground: &Ground, lines: &Lines) -> Rocks {
+    Rocks {
+        boulders: (0.05 + 0.25 * ground.filling + 0.12 * lines.mottle).clamp(0.0, 1.0),
+        rubble: (0.10 * ground.filling).clamp(0.0, 1.0),
+        stature: 1.0,
+    }
+}
+
 /// The ground cover, once the lines have been worked out.
 ///
-/// Split from [`material`] so [`trees`] can ask the same question without
-/// building the lines twice, and so the two cannot answer it differently.
+/// Split from [`material`] so [`trees`] and [`rocks`] can ask the same question
+/// without building the lines twice, and so the three cannot answer it
+/// differently.
 fn cover(sample: &Sample, ground: &Ground, lines: &Lines) -> Material {
     // Water first: it covers whatever is underneath it.
     if ground.lake > 0.5 {
@@ -410,6 +551,16 @@ mod tests {
     fn classify(sample: &Sample) -> Material {
         let ground = ground_of(sample, 4.0, 16.0);
         material(sample, &ground, 1234.0, 5678.0, 4.0, 9, relief())
+    }
+
+    fn strewn(sample: &Sample) -> Rocks {
+        let ground = ground_of(sample, 4.0, 16.0);
+        rocks(sample, &ground, 1234.0, 5678.0, 4.0, 9, relief())
+    }
+
+    fn grown(sample: &Sample) -> Trees {
+        let ground = ground_of(sample, 4.0, 16.0);
+        trees(sample, &ground, 1234.0, 5678.0, 4.0, 9, relief())
     }
 
     /// Dry ground at a height and a slope, and nothing else going on.
@@ -575,6 +726,116 @@ mod tests {
         assert!(
             kinds.len() > 1,
             "the same material all the way along a line at the treeline"
+        );
+    }
+
+    /// The invariant the elevation's `max` rests on: `emit` folds whichever of
+    /// the two fake surfaces is higher into the ground, and it can only be sure
+    /// it is not burying one under the other because no texel carries both.
+    ///
+    /// Swept over the same channel grid the classification test uses, so a
+    /// branch that started scattering stone under timber would be caught here
+    /// rather than by somebody noticing boulders in a rendered forest.
+    #[test]
+    fn a_texel_never_carries_both_trees_and_stones() {
+        for height in [700.0f32, 1100.0, 1500.0, 1900.0, 2300.0, 2600.0] {
+            for slope in [0.0f32, 0.05, 0.2, 0.5, 1.0, 2.0] {
+                for flow in [0.0f32, 6.0, 10.0, 13.0, 17.0] {
+                    for deposit in [-8.0f32, 0.0, 2.0, 10.0] {
+                        for hardness in [0.0f32, 0.5, 1.0] {
+                            for depth in [0.0f32, 0.2, 5.0] {
+                                let sample = Sample {
+                                    height,
+                                    hardness,
+                                    flow,
+                                    deposit,
+                                    filled: height + depth,
+                                    slope,
+                                    aspect: [0.6, -0.8],
+                                };
+                                let (trees, rocks) = (grown(&sample), strewn(&sample));
+                                let wooded = trees.density > 0.0 && trees.health > 0.0;
+                                let stony = (rocks.boulders > 0.0 || rocks.rubble > 0.0)
+                                    && rocks.stature > 0.0;
+                                assert!(
+                                    !(wooded && stony),
+                                    "{sample:?} carries both {trees:?} and {rocks:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Nothing lies on water or on ice. A boulder floating on a lake is the one
+    /// mistake this whole arrangement is built to make impossible -- the stones
+    /// are keyed off the same `cover` verdict the paint is -- so it is worth an
+    /// assertion that would notice if that ever stopped being true.
+    #[test]
+    fn standing_water_and_ice_are_never_strewn_with_stone() {
+        let lake = Sample {
+            filled: 1210.0,
+            ..dry(1200.0, 0.01)
+        };
+        let river = Sample {
+            flow: 18.0,
+            ..dry(1200.0, 0.02)
+        };
+        let ice = dry(2580.0, 0.05);
+        for sample in [lake, river, ice] {
+            assert_eq!(
+                strewn(&sample),
+                Rocks::NONE,
+                "{:?} ground carries {:?}",
+                classify(&sample),
+                strewn(&sample)
+            );
+        }
+    }
+
+    /// Talus is what a mountainside is mostly made of below its cliffs, and the
+    /// whole point of this pass is that it stops being smooth ground with a grey
+    /// colour on it.
+    #[test]
+    fn a_talus_slope_is_strewn_with_rubble() {
+        let sample = Sample {
+            hardness: 0.1,
+            deposit: 4.0,
+            ..dry(2000.0, 0.55)
+        };
+        assert_eq!(classify(&sample), Material::Scree, "the fixture moved");
+        let talus = strewn(&sample);
+        assert!(
+            talus.rubble > 0.5,
+            "a talus slope only carries {:.2} rubble",
+            talus.rubble
+        );
+        assert!(
+            talus.stature > 0.0,
+            "the rubble on a talus slope has no size"
+        );
+    }
+
+    /// A cliff sheds what lands on it, so the one kind of strewn ground that
+    /// must *not* be thickly covered is the steepest.
+    #[test]
+    fn a_cliff_holds_less_loose_stone_than_the_talus_under_it() {
+        let cliff = strewn(&Sample {
+            hardness: 1.0,
+            ..dry(1400.0, 2.0)
+        });
+        let talus = strewn(&Sample {
+            hardness: 0.1,
+            deposit: 4.0,
+            ..dry(2000.0, 0.55)
+        });
+        assert!(
+            cliff.rubble < talus.rubble,
+            "a cliff carries {:.2} rubble against the talus below it at {:.2}",
+            cliff.rubble,
+            talus.rubble
         );
     }
 

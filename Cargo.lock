@@ -3269,6 +3269,7 @@ dependencies = [
  "rayon",
  "terrain-canopy",
  "terrain-materials",
+ "terrain-rocks",
  "terrain-tiles",
 ]
 

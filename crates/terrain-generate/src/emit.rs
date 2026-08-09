@@ -154,8 +154,17 @@ pub fn heights(
                 let ground = detail::ground(&sample, texel, cell);
                 let bare = detail::height(&sample, &ground, x, y, texel, seed);
                 let grown = crate::classify::trees(&sample, &ground, x, y, texel, seed, relief);
-                samples[row * side + column] =
-                    bare + terrain_canopy::baked(x, y, &standing(&grown, x, y), texel).height;
+                let strewn = crate::classify::rocks(&sample, &ground, x, y, texel, seed, relief);
+                let crowns = terrain_canopy::baked(x, y, &standing(&grown, x, y), texel).height;
+                let stones = terrain_rocks::baked(x, y, &scattered(&strewn, x, y), texel).height;
+                // The higher of the two rather than the sum. Both are surfaces
+                // standing on the same ground and a ray meets whichever is
+                // above the other; adding them would raise a boulder by the
+                // height of the trees beside it. The classifier never grows
+                // both on one texel, so today this only ever picks the one that
+                // is not zero -- which is exactly why it is worth writing the
+                // rule down rather than relying on that.
+                samples[row * side + column] = bare + crowns.max(stones);
                 any = true;
             }
         }
@@ -190,6 +199,22 @@ fn standing(grown: &crate::classify::Trees, x: f32, y: f32) -> terrain_canopy::C
     terrain_canopy::Cover {
         density: grown.density * terrain_canopy::clump(x, y),
         health: grown.health,
+    }
+}
+
+/// The stones lying on a point, from what the classifier scattered there.
+///
+/// The same bargain as [`standing`], and the two noise fields are applied here
+/// for the same reason: where the stone *is* comes out of the landscape, but how
+/// it bunches is a look. The boulder field's is a gate rather than a multiplier,
+/// so most of the ground a classifier calls strewn has no blocks on it at all
+/// and the ground inside a patch has them everywhere -- which is the difference
+/// between a boulder field and an even sprinkle of stones over a mountainside.
+fn scattered(strewn: &crate::classify::Rocks, x: f32, y: f32) -> terrain_rocks::Scatter {
+    terrain_rocks::Scatter {
+        boulders: strewn.boulders * terrain_rocks::field(x, y),
+        rubble: strewn.rubble * terrain_rocks::strew(x, y),
+        stature: strewn.stature,
     }
 }
 
@@ -231,14 +256,28 @@ pub fn materials(
                 let ground = detail::ground(&sample, texel, cell);
                 let floor = material(&sample, &ground, x, y, texel, seed, relief);
                 let grown = crate::classify::trees(&sample, &ground, x, y, texel, seed, relief);
+                let strewn = crate::classify::rocks(&sample, &ground, x, y, texel, seed, relief);
                 let share = terrain_canopy::baked(x, y, &standing(&grown, x, y), texel).share;
+                let stone = terrain_rocks::baked(x, y, &scattered(&strewn, x, y), texel);
                 // One rule at every level, and it means two different things
                 // without needing to be told which: close up the block is inside
                 // a single crown or the gap beside it, so this asks "is this
                 // texel a treetop"; far out it spans a stand, so it asks "is this
-                // mostly wood". Both are the question the pixel wants answered.
+                // mostly wood". Both are the question the pixel wants answered,
+                // and the two stone rules under it read the same way at both
+                // ends.
+                //
+                // The order is what a viewer would say. Crowns first, because a
+                // closed stand hides whatever is under it from above. Then
+                // boulders before rubble, so a block lying in talus paints as
+                // the block: it is the coarser of the two answers and the only
+                // one a texel at any distance can actually resolve.
                 ids[row * side + column] = if share >= terrain_canopy::PAINTED {
                     Material::Canopy.id()
+                } else if stone.boulders >= terrain_rocks::BOULDERED {
+                    Material::Boulder.id()
+                } else if stone.covered >= terrain_rocks::STREWN {
+                    Material::Rubble.id()
                 } else {
                     floor.id()
                 };
