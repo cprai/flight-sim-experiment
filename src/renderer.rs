@@ -69,7 +69,7 @@ impl Renderer {
                 // The WebGPU baseline but for one raise the G-buffer needs;
                 // see `deferred::limits`. Shared with the headless device for
                 // the same reason the features are.
-                required_limits: crate::deferred::limits(),
+                required_limits: crate::deferred::limits(&adapter.limits()),
                 ..Default::default()
             })
             .await?;

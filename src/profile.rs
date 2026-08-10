@@ -5,14 +5,16 @@
 //! **GPU**, through [`wgpu_profiler`]: timestamps written at the boundaries of
 //! the render passes, read back a frame or two later. This is the only honest
 //! account of what the hardware did, and it covers the passes and nothing else.
-//! Note in particular that the tile uploads are *not* in it: they go onto wgpu's
-//! staging belt through `queue.write_texture` and are flushed outside the
-//! encoder these scopes wrap.
+//! Note in particular that the load is *not* in it: it goes onto wgpu's staging
+//! belt through `queue.write_texture` and is flushed outside the encoder these
+//! scopes wrap, and the pass that builds the max pyramid over it is submitted
+//! on its own.
 //!
-//! **CPU**, through plain [`Instant`] spans: the streaming work that the GPU
-//! clock is blind to, which is where a frame that stutters usually lost its
-//! time -- a tile read is a per-row deflate decode of a whole TIFF, and the
-//! heights and maxima are then rewritten texel by texel.
+//! **CPU**, through plain [`Instant`] spans: the work the GPU clock is blind
+//! to. That used to be streaming, and a frame that stuttered had usually lost
+//! its time to a tile read. Nothing streams now -- the chain is read whole on
+//! the first update and never again -- so these are all but empty after that
+//! first frame, which is the point.
 //!
 //! Both are off unless a run asked for them. The scopes below are no-ops when
 //! [`profiler`] was built disabled, and the CPU spans are an [`Option`] that
@@ -89,24 +91,24 @@ fn smooth(previous: Option<Duration>, sample: Duration, dt: Duration) -> Duratio
     previous.mul_f64(1.0 - alpha) + sample.mul_f64(alpha)
 }
 
-/// What the terrain spent bringing tiles in, for one frame.
+/// What the terrain spent on itself, for one frame.
 ///
-/// Split the way the work splits: deciding, reading, converting, uploading. The
-/// tile count belongs beside them because it is what explains the other four --
-/// a frame that read four tiles and one that read none differ by a factor no
-/// duration on its own accounts for.
+/// Split the way the work splits: deciding, reading, converting, uploading.
+/// Only the first frame of a run reads anything -- the chain is read in whole
+/// and then never again -- so on every frame after it these are the arithmetic
+/// that picks a descent floor and one small uniform write. A tile count used to
+/// sit beside them and explained most of their variance; there are no tiles to
+/// count now, and a row that is always zero explains nothing.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Terrain {
-    /// Choosing which tiles are wanted. Pure arithmetic, no disk.
+    /// Choosing the finest level worth descending to. Pure arithmetic.
     pub advance: Duration,
-    /// Pulling tiles off disk, which is a deflate decode per row.
+    /// Pulling the chain off disk, which happens once.
     pub read: Duration,
-    /// Exaggerating heights and narrowing maxima to half floats.
+    /// Exaggerating heights and narrowing ground-cover ids to sixteen bits.
     pub convert: Duration,
     /// Handing the bytes to `queue.write_texture`.
     pub write: Duration,
-    /// Tiles brought in, counting each level separately.
-    pub tiles: u32,
 }
 
 /// A stopwatch that only runs when the run asked to be timed.
@@ -274,7 +276,6 @@ fn line(row: &Row) -> String {
 #[derive(Default)]
 pub struct Smoothed {
     rows: Vec<Row>,
-    tiles: u32,
     coverage: Option<crate::reproject::Coverage>,
     pixels: u32,
     ceiling: f32,
@@ -286,7 +287,6 @@ impl Smoothed {
     /// Folds `frame` in, or starts again if its shape changed.
     pub fn update(&mut self, frame: &Frame) {
         let incoming = frame.rows();
-        self.tiles = frame.cpu.terrain.tiles;
         // Not smoothed, and not for want of somewhere to keep the state: these
         // are shares of the screen and places in the world rather than times,
         // and they move only when the flight does. What makes a timing row
@@ -325,7 +325,6 @@ impl Smoothed {
             text.push_str(&line(row));
             text.push('\n');
         }
-        text.push_str(&format!("{:<LABEL$}{:>7}", "tiles", self.tiles));
         // What the reprojection is buying, which no timing row can show: the
         // `march` row moves when the shader changes and when the share of the
         // frame handed to it changes, and these are how the two are told apart
@@ -459,11 +458,7 @@ pub fn table(frames: &[Frame]) -> String {
         text.push('\n');
     }
 
-    let tiles: u32 = frames.iter().map(|frame| frame.cpu.terrain.tiles).sum();
-    text.push_str(&format!(
-        "\n{} frames, {tiles} tile uploads\n",
-        frames.len()
-    ));
+    text.push_str(&format!("\n{} frames\n", frames.len()));
     text
 }
 
@@ -516,7 +511,6 @@ mod tests {
             cpu: Cpu {
                 terrain: Terrain {
                     read: Duration::from_millis(read),
-                    tiles: 1,
                     ..Terrain::default()
                 },
                 ..Cpu::default()
@@ -716,7 +710,7 @@ mod tests {
     #[test]
     fn the_table_counts_every_frame_and_upload() {
         let text = table(&[frame(16, 4), frame(17, 4)]);
-        assert!(text.contains("2 frames, 2 tile uploads"), "{text}");
+        assert!(text.contains("2 frames"), "{text}");
         assert!(text.contains("read"), "{text}");
     }
 }

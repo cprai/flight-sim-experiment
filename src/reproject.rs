@@ -1074,7 +1074,11 @@ mod tests {
     /// leave it holding the frame before.
     #[test]
     fn the_march_grid_covers_the_list_and_fits_the_device() {
-        let cap = crate::deferred::limits().max_compute_workgroups_per_dimension;
+        // Against the baseline rather than this machine's adapter: the cap the
+        // grid has to respect is the one the device request promises, and
+        // `limits` only raises it where a limit is asked for by name.
+        let cap = crate::deferred::limits(&wgpu::Limits::default())
+            .max_compute_workgroups_per_dimension;
         let sizes = [
             0,
             1,

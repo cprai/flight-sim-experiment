@@ -613,7 +613,7 @@ mod tests {
     use super::*;
     use crate::terrain::geotiff::Georeferencing;
     use crate::terrain::gpu::Sources;
-    use crate::terrain::pyramid::{Level, Pyramid, RasterSource, max_pyramid};
+    use crate::terrain::pyramid::{Level, Pyramid, RasterSource};
     use crate::terrain::tiles::MaterialId;
 
     /// Side of the offscreen render target.
@@ -622,18 +622,14 @@ mod tests {
     const RASTER: u32 = 128;
     const METRES_PER_TEXEL: f64 = 30.0;
 
-    /// A deliberately small residency, so a frame stays quick to march.
+    /// A residency holding the whole test raster at full resolution.
     ///
-    /// Tiles of eight texels rather than the store's five hundred and twelve,
-    /// because a raster a test can afford to build is smaller than one real
-    /// tile and none of the squares, slots or wraps would be exercised at all.
+    /// A raster a test can afford to build is smaller than one real tile, so
+    /// there is no coarsening to do: base level zero is the whole 128 texels
+    /// square and the chain over it is eight mips.
     fn test_residency() -> Residency {
         Residency {
-            tiles_across: 8,
-            tile_texels: 8,
-            // Whole squares at once, so no test has to drain a queue to see a
-            // settled frame.
-            tiles_per_update: 4096,
+            resident_base: 0,
             // A far coarser pixel than any real viewport, because the rule for
             // giving up a level compares its texels to one. This raster's are
             // thirty metres, which a 256-pixel frame still resolves from
@@ -744,14 +740,13 @@ mod tests {
         render_config(test_residency(), heights, materials, aim, path)
     }
 
-    /// The same shape with twice the ground resident at every level.
+    /// The same shape holding the raster one level coarser.
     ///
-    /// The only thing that buys the march more detail at a given distance: a
-    /// point is drawn at the finest level still resident for it, and a wider
-    /// square keeps finer levels further out.
-    fn wide_residency() -> Residency {
+    /// The only knob that changes how much ground truth the march has: the
+    /// finest level held is the finest a ray can ever descend to.
+    fn coarse_residency() -> Residency {
         Residency {
-            tiles_across: 16,
+            resident_base: 1,
             ..test_residency()
         }
     }
@@ -788,11 +783,6 @@ mod tests {
                             heights.clone(),
                         ))),
                         materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
-                        maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
-                            RASTER,
-                            RASTER,
-                            heights.clone(),
-                        )))),
                     },
                 )
             },
@@ -1005,7 +995,7 @@ mod tests {
             render_config(
                 Residency {
                     march_texels: texels,
-                    ..wide_residency()
+                    ..test_residency()
                 },
                 heights.clone(),
                 materials.clone(),
@@ -1042,21 +1032,27 @@ mod tests {
         );
     }
 
-    /// A wider window is the only thing that buys the far field more detail.
+    /// The base level is the only thing that decides how much detail there is.
     ///
-    /// The whole arrangement rests on this and nothing else measures it. The
-    /// ground is flat and painted in a one-texel check of two materials, so a
-    /// ray's hit position is identical either way and the only thing that can
+    /// The whole arrangement rests on this and nothing else measures it. It
+    /// used to be the *width* of the resident window, because a level held only
+    /// a square around the camera and detail fell away with distance. Nothing
+    /// falls away now -- every level covers the whole raster -- so what is left
+    /// to trade is the finest level held at all, which is what this change
+    /// exists to trade.
+    ///
+    /// The ground is flat and painted in a one-texel check of two materials, so
+    /// a ray's hit position is identical either way and the only thing that can
     /// differ is which level's ids it reads there. Ids do not blend the way
     /// colours did: the mode fold makes every coarse level of a two-way check
     /// *uniform* -- each two-by-two holds two of each and the tie always goes
-    /// the same way -- so the check is visible exactly where level zero is
-    /// resident and vanishes beyond it.
+    /// the same way -- so the check is visible exactly where level zero is held
+    /// and vanishes when it is not.
     ///
     /// Measured as the number of horizontally adjacent pixel pairs showing
     /// the two different materials, which only level zero can produce.
     #[test]
-    fn a_wider_window_reads_finer_ground_at_the_same_distance() {
+    fn a_finer_base_reads_more_detail_at_the_same_distance() {
         let check: Vec<MaterialId> = (0..RASTER * RASTER)
             .map(|index| {
                 let (x, y) = (index % RASTER, index / RASTER);
@@ -1092,17 +1088,11 @@ mod tests {
             changes
         };
 
-        // Four times the width, so level zero stays resident across the whole
-        // of the ground this camera can see rather than only the near part of
-        // it -- and a point is drawn at the finest level resident for it.
-        let narrow = transitions(Residency {
-            tiles_across: 4,
-            ..test_residency()
-        });
-        let wide = transitions(wide_residency());
+        let coarse = transitions(coarse_residency());
+        let fine = transitions(test_residency());
         assert!(
-            wide > narrow * 2,
-            "widening the window showed {wide} material transitions against {narrow}, \
+            fine > coarse * 2,
+            "holding the finer base showed {fine} material transitions against {coarse}, \
              which is not the detail it was supposed to buy"
         );
     }
@@ -1166,7 +1156,7 @@ mod tests {
     /// same texel-centre convention the heights read by.
     #[test]
     fn materials_land_where_the_georeferencing_puts_them() {
-        for residency in [test_residency(), wide_residency()] {
+        for residency in [test_residency(), coarse_residency()] {
             // A patch of a distinct material, well away from the raster's
             // centre so that getting the axes or the origin wrong would move
             // it visibly.
@@ -1191,7 +1181,7 @@ mod tests {
                 &[],
             );
             let camera = camera.expect("camera captured");
-            let window = residency.texels_across();
+            let base = residency.resident_base;
 
             let centre = world_of(f64::from(patch_col), f64::from(patch_row));
             let (x, y) = to_pixels(camera.view_projection(), centre, SIZE, SIZE);
@@ -1199,7 +1189,7 @@ mod tests {
 
             assert!(
                 shows(Material::Sand, found),
-                "window {window}: expected the sand patch at ({x:.0}, {y:.0}), got {found:?}"
+                "base {base}: expected the sand patch at ({x:.0}, {y:.0}), got {found:?}"
             );
 
             // ... and the rest of the ground is still the background material,
@@ -1209,7 +1199,7 @@ mod tests {
             let found = pixel(&pixels, x.round() as u32, y.round() as u32);
             assert!(
                 shows(Material::Grass, found),
-                "window {window}: expected background at ({x:.0}, {y:.0}), got {found:?}"
+                "base {base}: expected background at ({x:.0}, {y:.0}), got {found:?}"
             );
         }
     }
@@ -1937,9 +1927,9 @@ mod tests {
     /// a change confined to ground the default view does not reach renders
     /// byte-identical frames and looks like it did nothing.
     ///
-    /// `FLIGHT_SIM_TILES` overrides [`Residency::tiles_across`], which is how
-    /// the detail a wider square buys is measured against what it costs. It is
-    /// a knob here and nowhere else.
+    /// `FLIGHT_SIM_BASE` overrides [`Residency::resident_base`], which is how
+    /// the detail a finer base buys is measured against what it costs in
+    /// memory and load time. It is a knob here and nowhere else.
     #[test]
     #[ignore = "requires a tile pyramid, which is not in version control"]
     fn dump_installed_terrain() {
@@ -1969,12 +1959,12 @@ mod tests {
             ),
             ..Residency::default()
         };
-        if let Ok(tiles) = std::env::var("FLIGHT_SIM_TILES") {
-            residency.tiles_across = tiles
+        if let Ok(base) = std::env::var("FLIGHT_SIM_BASE") {
+            residency.resident_base = base
                 .parse()
-                .expect("FLIGHT_SIM_TILES must be a power of two");
+                .expect("FLIGHT_SIM_BASE must be a level of the stored pyramid");
         }
-        eprintln!("squares of {} tiles", residency.tiles_across);
+        eprintln!("resident from level {}", residency.resident_base);
         let mut scene = Scene::with_residency(
             &device,
             crate::headless::CAPTURE_FORMAT,
@@ -2184,13 +2174,14 @@ mod tests {
     }
 
     #[test]
-    fn a_level_too_fine_to_draw_is_not_streamed_either() {
-        // The saving that matters most is not the triangles: it is the tiles.
-        // A window that is not drawn still follows the camera, and at altitude
-        // the camera covers ground fast, so leaving the finest levels streaming
-        // would keep reading detail nobody can see. They stop entirely instead,
-        // and are refilled whole when the camera comes back down to them --
-        // their textures having gone stale in the meantime.
+    fn the_chain_is_read_once_and_the_camera_never_reads_again() {
+        // This is the whole of what holding the raster resident buys, and
+        // nothing else measures it. A window that followed the camera read a
+        // strip of every level for every tile crossed, and at altitude the
+        // camera crosses them fast; the chain is read once and then the camera
+        // is free. What survives of the old rule is that a level too fine to
+        // resolve is still not *descended* to -- it costs march steps rather
+        // than tile reads now, but it still costs.
         let (device, queue) = test_device();
         let (heights, materials) = rugged();
         let reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -2221,11 +2212,6 @@ mod tests {
                             levels: reads.clone(),
                         }),
                         materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
-                        maxima: Box::new(max_pyramid(&Pyramid::build(Level::new(
-                            RASTER,
-                            RASTER,
-                            heights.clone(),
-                        )))),
                     },
                 )
             },
@@ -2239,25 +2225,30 @@ mod tests {
             (seen, scene.terrain.base_level())
         };
 
-        // High enough that the finest level is gone. Note this is the very first
-        // update, so nothing is resident and every level still being drawn has
-        // to be read in full -- what is missing is missing because it was
-        // dropped, not because it happened to have nothing new.
-        let (high, base) = read_levels(Vec3::new(70.0, 4000.0, -110.0));
+        // The first update is the load, and it reads every level exactly once.
+        let (loaded, base) = read_levels(Vec3::new(70.0, 4000.0, -110.0));
         assert!(base > 0, "the sweep needs an altitude that drops a level");
         assert_eq!(
-            high.iter().copied().min(),
-            Some(base),
-            "levels below {base} should not have been streamed: read {high:?}"
+            loaded.iter().copied().min(),
+            Some(0),
+            "the load has to read the finest level whatever the camera is doing"
         );
 
-        // ... and coming back down brings them straight back.
-        let (low, base) = read_levels(Vec3::new(70.0, 900.0, -110.0));
-        assert_eq!(base, 0, "the descent has to reach the finest level again");
-        assert!(
-            low.contains(&0),
-            "the finest level did not come back on descent: read {low:?}"
-        );
+        // Every update after it reads nothing at all, however far the camera
+        // has moved and whichever levels it has given up or taken back.
+        for at in [
+            Vec3::new(70.0, 900.0, -110.0),
+            Vec3::new(-900.0, 900.0, 900.0),
+            Vec3::new(900.0, 4000.0, -900.0),
+        ] {
+            let (read, _) = read_levels(at);
+            assert!(read.is_empty(), "flying to {at} read levels {read:?}");
+        }
+
+        // ... and the descent floor still follows the altitude, which is what
+        // stops a ray walking levels no pixel can resolve.
+        assert_eq!(read_levels(Vec3::new(70.0, 900.0, -110.0)).1, 0);
+        assert!(read_levels(Vec3::new(70.0, 4000.0, -110.0)).1 > 0);
     }
 
     #[test]
@@ -2305,7 +2296,7 @@ mod tests {
     /// no GPU timestamp can reach them -- so a regression that stopped filling
     /// them would leave a profiled run reporting a frame that cost nothing.
     #[test]
-    fn profiling_accounts_for_the_tiles_an_update_brought_in() {
+    fn profiling_accounts_for_the_load_and_for_nothing_after_it() {
         use std::time::Duration;
 
         let (device, queue) = test_device();
@@ -2326,17 +2317,25 @@ mod tests {
         quiet.record(&mut frame);
         assert_eq!(frame.cpu.terrain, crate::profile::Terrain::default());
 
-        // On, and the first update is the one that fills every level, so it has
-        // plenty to report.
+        // On, and the first update is the one that reads the chain in, so it
+        // has plenty to report.
         let mut watched = test_scene(&device, format, test_residency(), heights, flat_ground());
         watched.profile(true);
         watched.update(&device, &queue);
         watched.record(&mut frame);
+        let load = frame.cpu.terrain;
+        assert!(load.read > Duration::ZERO, "{load:?}");
+        assert!(load.write > Duration::ZERO, "{load:?}");
 
-        let spans = frame.cpu.terrain;
-        assert!(spans.tiles > 0, "{spans:?}");
-        let total = spans.advance + spans.read + spans.convert + spans.write;
-        assert!(total > Duration::ZERO, "{spans:?}");
+        // Every frame after it reads nothing, which is the point of holding the
+        // chain rather than streaming it -- and the reason these rows are worth
+        // keeping is that they are how anyone would notice it had come back.
+        watched.camera.position = Vec3::new(400.0, 900.0, -400.0);
+        watched.update(&device, &queue);
+        watched.record(&mut frame);
+        let flying = frame.cpu.terrain;
+        assert_eq!(flying.read, Duration::ZERO, "{flying:?}");
+        assert_eq!(flying.convert, Duration::ZERO, "{flying:?}");
     }
 
     /// Draws one frame of `scene` and reads back how its pixels were settled.
@@ -2857,6 +2856,12 @@ mod tests {
         marched.settle(&device, &queue);
         let fresh = screen.step(&device, &queue, &mut marched, to, true);
 
+        let sandy_rows = |pixels: &[u8]| -> Vec<usize> {
+            (0..SIZE)
+                .map(|y| (0..SIZE).filter(|&x| is_sandy(pixel(pixels, x, y))).count())
+                .collect()
+        };
+        let (carried_rows, fresh_rows) = (sandy_rows(&carried), sandy_rows(&fresh));
         let (start, carried, fresh) = (
             count_sandy(&start),
             count_sandy(&carried),
@@ -2869,13 +2874,34 @@ mod tests {
             "the near ridge has to eat into the far one: {start} sandy pixels at \
              the start against {fresh} at the end"
         );
-        // One-sided: the far ridge showing where the march finds the near one
-        // is the defect. The near ridge a pixel too fat at its own silhouette
-        // is the ordinary lag of a carried point.
+
+        // Where the near ridge cuts the far one off, in the frame that marched
+        // it rather than carried it.
+        let edge = fresh_rows
+            .iter()
+            .rposition(|&count| count > 0)
+            .expect("the far ridge is on screen");
+
+        // The defect is far ridge coming through *inside* the near one, which
+        // is what a carried point the sweeping ridge failed to invalidate looks
+        // like: eight-by-eight speckles well below the skyline, because whole
+        // dither cells refresh together. Counting sandy pixels cannot tell that
+        // from a silhouette one row fat, which is the ordinary lag of a carried
+        // point and is what this actually leaves -- so measure where they are,
+        // not how many there are.
+        let speckles: usize = carried_rows[(edge + 2).min(SIZE as usize)..].iter().sum();
+        assert_eq!(
+            speckles, 0,
+            "flying {} m left {speckles} pixels of far ridge below row {edge}, \
+             where the near ridge is the nearest thing along every ray",
+            step_metres * steps as f32
+        );
+        // ... and the lag at the silhouette itself is one row of it, no more.
         assert!(
-            carried <= fresh,
+            carried <= fresh + SIZE as usize,
             "flying {} m at the ridges left {carried} pixels of the far ridge \
-             where marching the same camera from nothing gives {fresh}",
+             where marching the same camera from nothing gives {fresh}, which is \
+             more than a row of silhouette lag",
             step_metres * steps as f32
         );
     }

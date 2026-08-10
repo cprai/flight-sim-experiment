@@ -168,9 +168,18 @@ impl GBuffer {
 /// reason `crate::profile::timer_features` is shared: a frame measured on the
 /// headless device is only evidence about the windowed one if the two asked for
 /// the same device.
-pub fn limits() -> wgpu::Limits {
+pub fn limits(adapter: &wgpu::Limits) -> wgpu::Limits {
     wgpu::Limits {
         max_storage_textures_per_shader_stage: 5,
+        // The terrain holds the whole raster as one texture, so how wide a
+        // texture may be is what decides the finest resolution it can be held
+        // at: 16384 takes this survey at 8 m, WebGPU's own default of 8192 only
+        // at 16 m. Asked for as much as the adapter has rather than as a fixed
+        // figure, because a device request for a limit the adapter lacks fails
+        // outright -- and `Residency::fit_base` coarsens the base to whatever
+        // comes back, so a smaller one costs resolution rather than a startup
+        // error.
+        max_texture_dimension_2d: adapter.max_texture_dimension_2d,
         ..wgpu::Limits::default()
     }
 }

@@ -1,29 +1,19 @@
-//! Narrowing the max pyramid on its way into the texture.
+//! Rounding a max pyramid cell to half precision, the only way it may be
+//! rounded.
 //!
-//! The quadtree the far field skips empty space with is no longer built here.
-//! `terrain-process` writes it beside the elevation it bounds, as an ordinary
-//! product of tiles, and the clipmap reads it with the same machinery that
-//! carries the heights: [`crate::terrain::tiles::TileStore`] out,
-//! `write_texture` in. See `crates/terrain-tiles/src/maxima.rs` for what the
-//! cells mean and why their squares are closed.
+//! The pyramid itself is neither read from disk nor built here any more:
+//! `cs_maxima` in `src/terrain.wgsl` derives it on the GPU from the heights
+//! once they are resident, which is one spelling of the recurrence rather than
+//! two. See `crates/terrain-tiles/src/maxima.rs` for what the cells mean and
+//! why their squares are closed.
 //!
-//! One thing is worth repeating here, because it is what the shifted indexing in
-//! [`crate::terrain::gpu`] rests on. The product holds
-//!
-//! ```text
-//! M[m][i, j] = max of the raster's level-0 samples over the closed square
-//!              [i * 2^m, (i + 1) * 2^m] x [j * 2^m, (j + 1) * 2^m]
-//! ```
-//!
-//! and clipmap level `l`'s depth-`m` cell covers `[i * 2^m, (i + 1) * 2^m]` in
-//! level `l`'s texels, which is `[i * 2^(l+m), (i + 1) * 2^(l+m)]` in level-0
-//! texels. Same square, same indices. So level `l` depth `m` is **product level
-//! `l + m`**, read at the window origin shifted down by `m`, and one pyramid
-//! serves every level.
-//!
-//! What remains here is the one conversion that has to happen at upload time,
-//! because the product is written at full precision and the texture holds half.
+//! What remains is this rounding, and it remains because the shader carries a
+//! transcription of it. WGSL's `pack2x16float` is round-to-nearest on most
+//! backends and towards zero on some, and neither is towards positive infinity,
+//! so the shader converts and then corrects -- against exactly the rule below.
+//! Keeping the Rust one is what lets a test say the two agree.
 
+#[cfg(test)]
 use half::f16;
 
 /// The smallest half float that is not below `height`.
@@ -39,6 +29,7 @@ use half::f16;
 /// than it holds, so a ray descends into one it could have skipped. Half floats
 /// carry eleven bits of mantissa, so that is a metre or two at the height of a
 /// mountain and a great deal less near sea level.
+#[cfg(test)]
 pub fn ceiling_half(height: f32) -> f16 {
     let rounded = f16::from_f32(height);
     if rounded.to_f32() >= height || rounded.is_infinite() {

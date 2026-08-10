@@ -16,13 +16,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::terrain::geotiff::Georeferencing;
-use crate::terrain::maxima::ceiling_half;
-use crate::terrain::pyramid::{RasterSource, Resident};
-use crate::terrain::residency::{Residency, TileResidency, Wanted, detail_base};
+use crate::terrain::pyramid::RasterSource;
+use crate::terrain::residency::{Residency, detail_base};
 use crate::terrain::tiles::{MaterialId, TileStore};
 use anyhow::{Context, Result};
 use glam::{DVec2, IVec2, UVec2, Vec2, Vec3};
-use terrain_tiles::maxima::highest;
 
 /// Must match `MAX_LEVELS` in the shader.
 const MAX_LEVELS: usize = 16;
@@ -39,8 +37,19 @@ struct LevelUniform {
     valid_high: [i32; 2],
     ceiling: f32,
     padding: f32,
-    more_padding: [f32; 2],
+    /// All ones for a resident level, whose index is its texture coordinate.
+    mask: [i32; 2],
 }
+
+/// Which mip of the heights is mirrored on the CPU, as an offset from the base.
+///
+/// Four, so 128 m texels on an 8 m base: 768 x 896 for this raster, 2.75 MiB
+/// against the 64 MiB the old mirror of a whole clipmap level cost. Coarse
+/// enough to be small and to answer with the ground *averaged* over kilometres,
+/// which is the right shape of answer for choosing a level that covers
+/// kilometres; fine enough that a camera in a valley is not told it is standing
+/// on the ridge beside it.
+const GROUND_MIP: u32 = 4;
 
 /// Mirrors `Terrain` in the shader.
 #[repr(C)]
@@ -53,7 +62,7 @@ struct TerrainUniform {
     data_max: [f32; 2],
     level_count: u32,
     base_level: u32,
-    texel_mask: u32,
+    resident_base: u32,
     march_steps: u32,
     ceiling: f32,
     wall_nudge: f32,
@@ -91,13 +100,6 @@ const DERIVE_CHUNK: u32 = 1024;
 /// Must match `@workgroup_size` on `cs_maxima` in `src/terrain.wgsl`.
 const DERIVE_GROUP: u32 = 8;
 
-/// Tiles reaching one level past which deriving that level whole is cheaper.
-///
-/// A whole square is a couple of dozen jobs however many tiles asked for it, and
-/// a tile is one or a few. The first update loads every level at once, which
-/// without this would be thousands of dispatches for work a single sweep does.
-const DERIVE_WHOLE_ABOVE: usize = 8;
-
 /// Bytes between the slots of the job uniform.
 ///
 /// A dynamic uniform offset must be a multiple of
@@ -114,17 +116,6 @@ const COPY_ALIGN: u32 = 256;
 /// in anything smaller than four, and rounded up to what a copy demands.
 fn derive_row_bytes(cells: u32) -> u32 {
     (cells.div_ceil(2) * 4).div_ceil(COPY_ALIGN) * COPY_ALIGN
-}
-
-/// How much of `[at, end)` one derive job may take along an axis.
-///
-/// As much as the scratch buffer holds, and never past the next wrap: a
-/// rectangle straddling one is two rectangles in the texture, and the copy out
-/// of the buffer would have to start partway along a row at an offset it is not
-/// allowed to start at.
-fn span(at: i32, end: i32, mask: i32) -> u32 {
-    let to_wrap = mask + 1 - (at & mask);
-    (end - at).min(to_wrap).min(DERIVE_CHUNK as i32) as u32
 }
 
 /// How far past a cell wall the march has to put a ray for the next step to
@@ -158,85 +149,71 @@ fn wall_nudge(raster: UVec2) -> f32 {
     8.0 * raster.max_element() as f32 * f32::EPSILON
 }
 
-/// The three rasters the terrain is drawn from, all describing one piece of
+/// The two rasters the terrain is drawn from, both describing one piece of
 /// ground.
 ///
-/// Grouped rather than passed alongside each other because they are only
-/// meaningful together, and because `maxima` is the one whose texels do not
-/// mean what the others' do -- naming it beside them is where that is easiest
-/// to get wrong. See [`Terrain::maxima`].
+/// There is no max pyramid here any more. It was a third product carried
+/// alongside these, and it is now derived on the GPU from the heights once they
+/// are resident -- see [`Terrain::build_pyramid`].
 pub struct Sources {
     pub heights: Box<dyn RasterSource>,
     pub materials: Box<dyn RasterSource>,
-    pub maxima: Box<dyn RasterSource>,
 }
 
 /// A height raster and a matching material raster, raymarched through a max
 /// pyramid.
+///
+/// All three live in GPU memory whole, as mip chains over the raster from
+/// [`Residency::resident_base`] upwards. Nothing streams and nothing moves, so
+/// most of what used to be here -- the square of tiles per level, the queue of
+/// what to load next, the CPU mirrors that had to be kept in step with it -- is
+/// gone.
 pub struct Terrain {
     residency: Residency,
     placement: Georeferencing,
-    heights: Box<dyn RasterSource>,
-    materials: Box<dyn RasterSource>,
-    /// The quadtree the march is walked through, written by `terrain-process`.
-    ///
-    /// Level `l` holds one ceiling per level-`l` texel, bounding every surface
-    /// the renderer might draw across the closed square that texel covers. The
-    /// level array is the quadtree, so nothing here carries a mip chain of its
-    /// own and climbing means reading the next level out.
-    maxima: Box<dyn RasterSource>,
     height_range: (f32, f32),
 
-    /// Which tiles each level holds, and what to load next.
-    tiles: TileResidency,
-    /// The finest level being kept, from [`detail_base`].
+    /// The level mip zero holds, after [`Residency::fit_base`] has had its say.
+    resident_base: u32,
+    /// Size of mip zero, in its own texels.
+    base_size: UVec2,
+    /// Mips in each chain, so levels `resident_base .. resident_base + this`.
+    mips: u32,
+    /// The finest level worth descending to, from [`detail_base`].
     base: u32,
-    /// Whether anything has been loaded yet, which decides whether an update is
-    /// allowed to take as long as it needs.
-    started: bool,
 
-    /// A CPU mirror of the coarsest level's resident square.
+    /// A CPU mirror of one coarse mip of the heights.
     ///
-    /// Height above terrain decides how many of the finer levels are worth
-    /// keeping, so it has to be known before the levels are loaded, and it
-    /// cannot come from the tile store -- that reopens and reparses a GeoTIFF
-    /// per call. Mirroring the coarsest level costs a copy of what the upload
-    /// is passing through anyway, and the coarsest is the one level never
-    /// dropped: the level chosen from this height must not depend on data whose
-    /// residency that choice controls.
+    /// Height above terrain decides the finest level worth descending to, and
+    /// asking the GPU would mean a readback and a stall. This is the same
+    /// answer a level of the chain holds, kept on the way past during the load;
+    /// [`GROUND_MIP`] says why that level and not another.
     ground: Vec<f32>,
-    /// The highest ceiling in each resident tile, by level and slot.
+    /// Size of the mirrored mip, and the level it is.
+    ground_size: UVec2,
+    ground_level: u32,
+    /// The highest ground anywhere, off the top of the max pyramid.
     ///
-    /// A ray clears a whole level with one comparison against the largest of
-    /// these, which is most of what a ray heading for the horizon does. Kept per
-    /// tile so a swap costs one tile's maximum rather than a sweep of the
-    /// square.
-    tile_ceilings: Vec<Vec<f32>>,
-    /// Reused between uploads so a moving camera allocates nothing.
-    staging: Vec<u8>,
+    /// A ray above it and climbing is sky, which is most of a horizon view.
+    /// One figure rather than one per level: every level bounds the same whole
+    /// raster now, so their maxima differ only by how coarsely each closes it.
+    ceiling: f32,
+    /// Where the chain is read from, until it has been.
+    ///
+    /// Taken at the first update and dropped there. Nothing reads a tile after
+    /// that, which is the whole point: a file handle held past the load is a
+    /// file handle something might be tempted to use.
+    sources: Option<Sources>,
+
     /// Where an update's time went, when a run asked to be told.
     ///
-    /// [`None`] on an unprofiled run, so the clock is not read at all. This is
-    /// the only account there is of the streaming cost: the uploads leave
-    /// through `queue.write_texture` onto the staging belt rather than through
-    /// a command encoder, so no GPU timestamp scope can be put around them.
+    /// [`None`] on an unprofiled run, so the clock is not read at all.
     spans: Option<crate::profile::Terrain>,
     /// The target's size in pixels, passed through to the march so it can turn
     /// a pixel into the ray through it. Followed by [`Terrain::resize`].
     viewport: UVec2,
 
-    /// Whether the max pyramid is derived from the resident heights rather than
-    /// read from the product `terrain-process` wrote.
-    ///
-    /// A prototype knob, off unless `FLIGHT_SIM_DERIVE_MAXIMA` is set, because
-    /// the streamed product is still what the picture is checked against. The
-    /// derivation runs *over* the uploaded cells: the disk read and the
-    /// narrowing above it are untouched, so nothing is saved yet and the two
-    /// can be compared texel for texel.
-    derived: bool,
-    /// Tiles uploaded since the last derive, waiting to be turned into jobs.
-    uploaded: Vec<Wanted>,
-    /// This update's rectangles, coarsest level last.
+    /// The chain's rectangles, coarsest last.
     ///
     /// Ordered by level because a cell carries from the level below, which must
     /// therefore be finished across every rectangle before this one starts.
@@ -301,10 +278,6 @@ impl Terrain {
             root.display()
         );
         let material = root.join(terrain_tiles::MATERIAL_PRODUCT);
-        // Still named after the elevation it was reduced from: a bound belongs
-        // to one surface, and reducing a second elevation product some day must
-        // not quietly reuse this one's ceilings.
-        let ceilings = root.join(terrain_tiles::maxima_product(product));
 
         let heights = TileStore::<f32>::open(&elevation)?;
         let materials = TileStore::<MaterialId>::open(&material).with_context(|| {
@@ -314,26 +287,19 @@ impl Terrain {
                 root.display()
             )
         })?;
-        let maxima = TileStore::<f32>::open(&ceilings).with_context(|| {
-            format!(
-                "{} holds no max pyramid for {product}; run terrain-process over the download",
-                root.display()
-            )
-        })?;
-        // Structural rather than approximate: every manifest here descends from
-        // one download over one snapped extent, so they either describe the same
+        // Structural rather than approximate: both manifests descend from one
+        // download over one snapped extent, so they either describe the same
         // ground exactly or one of them is from a different run.
-        for (directory, manifest) in [
-            (&material, materials.manifest()),
-            (&ceilings, maxima.manifest()),
-        ] {
-            anyhow::ensure!(
-                heights.manifest().covers_same_ground_as(manifest),
-                "{} and {} do not cover the same ground",
-                elevation.display(),
-                directory.display()
-            );
-        }
+        anyhow::ensure!(
+            heights.manifest().covers_same_ground_as(materials.manifest()),
+            "{} and {} do not cover the same ground",
+            elevation.display(),
+            material.display()
+        );
+        // `<product>-max` is no longer opened at all. The pyramid is built on
+        // the GPU out of the heights once they are resident, which is one
+        // spelling of the recurrence instead of two and 57 GB of tiles that no
+        // longer have to exist. See `build_pyramid`.
 
         let placement = heights.placement();
         log::info!(
@@ -344,13 +310,6 @@ impl Terrain {
             heights.manifest().max_level()
         );
 
-        // The tools write as many levels as they were asked for, which is rarely
-        // enough to span the whole raster. Continuing the chain in memory is
-        // what lets the outermost square reach the edge of the data rather than
-        // a couple of kilometres of it. The max chain continues with a maximum
-        // rather than a mean, or its coarsest cells would sit below the ground
-        // they are supposed to bound.
-        let raster = UVec2::new(placement.width, placement.height);
         Ok(Self::new(
             device,
             camera_layout,
@@ -363,13 +322,8 @@ impl Terrain {
             viewport,
             placement,
             Sources {
-                heights: Box::new(Resident::<f32>::over(Box::new(heights), raster)),
-                materials: Box::new(Resident::<MaterialId>::over(Box::new(materials), raster)),
-                maxima: Box::new(Resident::<f32>::over_with(
-                    Box::new(maxima),
-                    raster,
-                    terrain_tiles::maxima::highest,
-                )),
+                heights: Box::new(heights),
+                materials: Box::new(materials),
             },
         ))
     }
@@ -387,57 +341,46 @@ impl Terrain {
         placement: Georeferencing,
         sources: Sources,
     ) -> Self {
-        let Sources {
-            heights,
-            materials,
-            maxima,
-        } = sources;
+        let Sources { heights, materials } = sources;
         let raster = UVec2::new(placement.width, placement.height);
-        // Only the sources whose levels *are* terrain levels. The max pyramid's
-        // run further -- it is a quadtree over the same raster -- and folding it
-        // in here would cost real levels of terrain.
         let available = heights.level_count().min(materials.level_count());
-        // The caller asks for the square the screen would like; how much of it
-        // is affordable depends on the raster, which only becomes known here.
+        // The caller asks for the resolution it would like; whether the device
+        // and the budget will take it depends on the raster, which only becomes
+        // known here.
         let residency = Residency {
-            tiles_across: residency.fit_tiles(raster, available),
+            resident_base: residency.fit_base(raster, available, device.limits().max_texture_dimension_2d),
             ..residency
         };
-        let level_count = residency
-            .level_count(raster, available)
-            .min(MAX_LEVELS as u32);
-        let across = residency.texels_across();
+        let resident_base = residency.resident_base;
+        let base_size = residency.base_size(raster);
+        let mips = Residency::mip_count(base_size).min(MAX_LEVELS as u32 - resident_base);
         log::info!(
-            "terrain: {level_count} levels of {} x {} tiles, {} texels each, {:.0} MiB of \
-             texture, reaching {} texels from the camera",
-            residency.tiles_across,
-            residency.tiles_across,
-            across,
-            residency.texture_bytes(level_count) as f64 / (1 << 20) as f64,
-            residency.reach_texels() << (level_count - 1),
+            "terrain: {} x {} texels at level {resident_base}, {mips} mips, {:.0} MiB of \
+             texture, the whole raster resident",
+            base_size.x,
+            base_size.y,
+            Residency::texture_bytes(base_size, mips) as f64 / (1 << 20) as f64,
+        );
+        assert!(
+            available > resident_base,
+            "the products reach level {} but level {resident_base} is being held",
+            available.saturating_sub(1)
         );
 
-        // The max pyramid has to answer for the coarsest level the march can
-        // climb to. A source that stopped short would answer with its own top
-        // level clamped, which bounds a smaller square than the texel covers and
-        // so is not a bound at all.
-        assert!(
-            maxima.level_count() >= level_count,
-            "the max pyramid reaches level {} but {level_count} levels are being drawn",
-            maxima.level_count().saturating_sub(1)
-        );
-        let layers = wgpu::Extent3d {
-            width: across,
-            height: across,
-            depth_or_array_layers: level_count,
-        };
-        let layer_texture = |label, format, usage| {
+        let chain = |label, format, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
-                size: layers,
-                // The array is the quadtree -- layer `l` is level `l` -- so
-                // nothing needs a mip chain of its own.
-                mip_level_count: 1,
+                size: wgpu::Extent3d {
+                    width: base_size.x,
+                    height: base_size.y,
+                    depth_or_array_layers: 1,
+                },
+                // The chain *is* the quadtree now. It could not be while a
+                // level was a window of fixed texel count over doubling ground
+                // -- a mip halves resolution at a fixed extent, which is the
+                // other thing entirely -- and it can be the moment the whole
+                // raster is resident.
+                mip_level_count: mips,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
@@ -445,17 +388,18 @@ impl Terrain {
                 view_formats: &[],
             })
         };
-        // `COPY_SRC` on the maxima is not needed to draw, only so a test can
-        // read the pyramid back and check it against a reference built on the
-        // CPU -- cheap enough to be worth paying for always rather than building
-        // a differently-shaped texture under `cfg(test)`.
+        // `COPY_SRC` on the maxima is not needed to draw, only so the ceilings
+        // can be read back off the top of the chain and so a test can check the
+        // pyramid against a reference built on the CPU.
         let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
-        let height_texture = layer_texture("terrain heights", wgpu::TextureFormat::R32Float, usage);
-        let material_texture =
-            layer_texture("terrain materials", wgpu::TextureFormat::R32Uint, usage);
-        let maxima_texture = layer_texture(
+        let height_texture = chain("terrain heights", wgpu::TextureFormat::R32Float, usage);
+        // Sixteen bits rather than thirty-two. Ids reach 0x080c and the palette
+        // is 2304 entries, so the top half was never carrying anything, and at
+        // this size that half was 470 MB of it.
+        let material_texture = chain("terrain materials", wgpu::TextureFormat::R16Uint, usage);
+        let maxima_texture = chain(
             "terrain maxima",
-            // Half precision, which is worth a third of the memory. `ceiling_half`
+            // Half precision, which is worth half the memory. `ceiling_half`
             // rounds towards positive infinity so a texel stays an upper bound on
             // the ground under it; see the reasoning there.
             wgpu::TextureFormat::R16Float,
@@ -463,10 +407,7 @@ impl Terrain {
         );
 
         let array_view = |texture: &wgpu::Texture| {
-            texture.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                ..Default::default()
-            })
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
         };
 
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -494,7 +435,7 @@ impl Terrain {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
@@ -506,7 +447,7 @@ impl Terrain {
                     // sampled, so there is no sampler anywhere in this layout.
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Uint,
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
@@ -516,7 +457,7 @@ impl Terrain {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
@@ -644,19 +585,22 @@ impl Terrain {
                 },
             ],
         });
-        // A rectangle is cut so that no job crosses a wrap, which bounds a span
-        // by the distance to the next one; that is at worst one chunk more than
-        // the square is wide. Whichever way a level is derived -- a sweep of the
-        // whole square, or a handful of tiles at four pieces each -- it fits.
-        let spans = (across.div_ceil(DERIVE_CHUNK) + 1) as usize;
-        let job_slots = (spans * spans).max(DERIVE_WHOLE_ABOVE * 4) * level_count as usize;
+        // Every mip is swept whole in rectangles no wider than the scratch, and
+        // a chain is four thirds of its base, so this is a little over four
+        // thirds of what mip zero alone takes.
+        let job_slots: usize = (0..mips)
+            .map(|mip| {
+                let level = UVec2::new(base_size.x >> mip, base_size.y >> mip).max(UVec2::ONE);
+                (level.x.div_ceil(DERIVE_CHUNK) * level.y.div_ceil(DERIVE_CHUNK)) as usize
+            })
+            .sum();
         let derive_jobs = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terrain derive jobs"),
             size: JOB_SLOT * job_slots as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let chunk = DERIVE_CHUNK.min(across);
+        let chunk = DERIVE_CHUNK.min(base_size.x.max(base_size.y));
         let derive_scratch = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terrain derive cells"),
             size: u64::from(derive_row_bytes(chunk)) * u64::from(chunk),
@@ -689,33 +633,27 @@ impl Terrain {
             });
         let derive = stage("terrain derive pipeline", "cs_maxima", &derive_pipeline_layout);
 
-        // A prototype knob, and one that costs an unset run nothing: without it
-        // the pipeline above is built and never dispatched. See the field.
-        let derived = std::env::var_os("FLIGHT_SIM_DERIVE_MAXIMA").is_some();
-        if derived {
-            log::info!("terrain: deriving the max pyramid from the resident heights");
-        }
-
         let height_range = Self::coarsest_height_range(heights.as_ref(), &placement);
-        let slots = (residency.tiles_across * residency.tiles_across) as usize;
-        let square = (across as usize).pow(2);
+        let ground_level = (resident_base + GROUND_MIP).min(resident_base + mips - 1);
+        let ground_size = UVec2::new(
+            (base_size.x >> GROUND_MIP).max(1),
+            (base_size.y >> GROUND_MIP).max(1),
+        );
         Self {
             residency,
             placement,
-            heights,
-            materials,
-            maxima,
             height_range,
-            tiles: TileResidency::new(residency, level_count),
-            base: 0,
-            started: false,
-            ground: vec![0.0; square],
-            tile_ceilings: vec![vec![f32::NEG_INFINITY; slots]; level_count as usize],
-            staging: vec![0; (residency.tile_texels as usize).pow(2) * size_of::<MaterialId>()],
+            resident_base,
+            base_size,
+            mips,
+            base: resident_base,
+            ground: Vec::new(),
+            ground_size,
+            ground_level,
+            ceiling: f32::INFINITY,
+            sources: Some(Sources { heights, materials }),
             spans: None,
             viewport,
-            derived,
-            uploaded: Vec::new(),
             jobs: Vec::new(),
             job_slots,
             height_texture,
@@ -733,17 +671,6 @@ impl Terrain {
             risk,
             reach,
         }
-    }
-
-    /// Derives the max pyramid from the resident heights rather than reading
-    /// the product beside them.
-    ///
-    /// Only tests ask: a run takes what `FLIGHT_SIM_DERIVE_MAXIMA` said. Set
-    /// before the first [`Terrain::update`], because what is already resident
-    /// is not derived retrospectively.
-    #[cfg(test)]
-    pub fn derive_from_heights(&mut self, on: bool) {
-        self.derived = on;
     }
 
     /// Follows the render target to a new size.
@@ -778,38 +705,48 @@ impl Terrain {
         self.base
     }
 
-    /// How many levels the terrain is drawn with.
-    fn level_count(&self) -> u32 {
-        self.tile_ceilings.len() as u32
+    /// The levels the terrain is drawn with, finest first.
+    fn levels(&self) -> std::ops::Range<u32> {
+        self.resident_base..self.resident_base + self.mips
     }
 
-    /// The highest ground anywhere resident, across every level being marched.
+    /// The coarsest level, whose single-figure ceiling clears most of the sky.
+    fn coarsest(&self) -> u32 {
+        self.resident_base + self.mips - 1
+    }
+
+    /// The size of one level, in its own texels.
+    fn level_size(&self, level: u32) -> UVec2 {
+        let mip = level - self.resident_base;
+        UVec2::new(
+            (self.base_size.x >> mip).max(1),
+            (self.base_size.y >> mip).max(1),
+        )
+    }
+
+    /// The highest ground anywhere, which a climbing ray above is sky.
     ///
-    /// What `ground_at` and `cs_compact` test a climbing ray against to settle
-    /// it as sky without walking anything. Taken across every *slot* of each
-    /// level rather than across the square in use, so a tile of somewhere else
-    /// that has not yet been written over still counts -- which makes this a
-    /// bound rather than the highest ground on screen, and worth being able to
-    /// read while flying.
+    /// What `ground_at` and `cs_compact` test against to settle a pixel without
+    /// walking anything. Off the coarsest cell of the max pyramid, so it is the
+    /// bound the chain itself carries rather than a second opinion about it.
     pub fn ceiling(&self) -> f32 {
-        (self.base..self.level_count())
-            .map(|level| highest(&self.tile_ceilings[level as usize]))
-            .fold(f32::NEG_INFINITY, f32::max)
+        self.ceiling
     }
 
-    /// Whether any level is still short of the tiles it wants.
-    pub fn pending(&self) -> bool {
-        self.tiles.pending()
-    }
-
-    /// Brings residency up to date with where the camera is, and writes the
-    /// uniform the march reads.
+    /// Whether the chain has still to be read in.
     ///
-    /// Bounded: at most [`Residency::tiles_per_update`] tiles are read, so
-    /// crossing a tile boundary costs a known amount rather than a stall. The
-    /// exception is the first update, which has nothing resident at all and
-    /// takes as long as it needs -- there is no frame to protect yet, and a
-    /// single-frame render would otherwise draw an empty world.
+    /// True exactly once, before the first update. It is not the queue of a
+    /// moving window any more -- there is no window -- but `settle` still wants
+    /// to know whether a frame drawn now would draw anything.
+    pub fn pending(&self) -> bool {
+        self.sources.is_some()
+    }
+
+    /// Reads the chain in on the first call, then follows the camera.
+    ///
+    /// The load is one-off and unbounded: it is the whole raster, and there is
+    /// no frame to protect while it happens. Every update after it is a little
+    /// arithmetic and one small uniform write, because nothing streams.
     pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, camera: Vec3) {
         // Cleared rather than accumulated: a row in the readout is what this
         // frame cost, not what every frame since the run began cost.
@@ -817,74 +754,38 @@ impl Terrain {
             *spans = crate::profile::Terrain::default();
         }
 
+        if let Some(sources) = self.sources.take() {
+            self.load(device, queue, &sources);
+        }
+
         let camera_texels = self
             .placement
             .texel_of_world(f64::from(camera.x), f64::from(camera.z));
-
-        // The coarsest level is brought up first, out of turn, because the
-        // height above terrain that decides how many finer levels are worth
-        // keeping is read back out of its square. Taking it from the one level
-        // that is never dropped keeps the decision independent of what the
-        // decision itself makes resident.
-        // Accumulated into a local and merged once at the end: `advance` is
-        // measured either side of calls that borrow `self` mutably, so holding
-        // a borrow of `self.spans` across them would not compile.
         let timed = self.spans.is_some();
-        let mut advance = Duration::ZERO;
-
-        let coarsest = self.level_count() - 1;
-        loop {
-            let clock = crate::profile::Clock::start(timed);
-            let work = self.tiles.advance(camera_texels, coarsest);
-            advance += clock.elapsed();
-            if work.is_empty() {
-                break;
-            }
-            for wanted in work {
-                self.upload(queue, wanted);
-            }
-        }
-
+        let clock = crate::profile::Clock::start(timed);
         let ground = self.ground_height(camera_texels);
         let metres_per_texel = self
             .placement
             .metres_per_texel_x
             .min(self.placement.metres_per_texel_z);
+        // Never finer than what is held. `detail_base` answers in absolute
+        // levels, so below the base it is answering about ground that is not
+        // there.
         self.base = detail_base(
             &self.residency,
             metres_per_texel,
             f64::from(camera.y - ground),
-            self.level_count(),
-        );
-
-        loop {
-            let clock = crate::profile::Clock::start(timed);
-            let work = self.tiles.advance(camera_texels, self.base);
-            advance += clock.elapsed();
-            let more = !work.is_empty();
-            for wanted in work {
-                self.upload(queue, wanted);
-            }
-            // Every level whole before the first frame; after that, whatever the
-            // budget allowed, with the rest picked up next time.
-            if !more || self.started {
-                break;
-            }
-        }
-        self.started = true;
+            self.resident_base + self.mips,
+        )
+        .max(self.resident_base);
+        let advance = clock.elapsed();
 
         let clock = crate::profile::Clock::start(timed);
         self.write_uniform(queue);
         let uniform = clock.elapsed();
 
-        // After the uniform, because the rectangles are cut against the
-        // residency the march will read, not the one it read last frame.
-        self.derive_pyramid(device, queue);
-
         if let Some(spans) = self.spans.as_mut() {
             spans.advance += advance;
-            // The uniform is one small `write_buffer`, the same kind of work as
-            // the texture uploads and far too small to earn a row of its own.
             spans.write += uniform;
         }
     }
@@ -899,9 +800,8 @@ impl Terrain {
         self.spans
     }
 
-    /// Describes the current residency to the shader.
+    /// Describes the chain to the shader.
     fn write_uniform(&self, queue: &wgpu::Queue) {
-        let levels = self.level_count();
         let (data_min, data_max) = self.placement.data_bounds();
         let (origin_x, origin_z) = self.placement.world_of_texel(0, 0.0, 0.0);
 
@@ -914,50 +814,59 @@ impl Terrain {
             ],
             data_min: [data_min.0 as f32, data_min.1 as f32],
             data_max: [data_max.0 as f32, data_max.1 as f32],
-            level_count: levels,
+            // The coarsest level plus one, because the shader counts levels
+            // from zero even though nothing below the base exists: a level is
+            // an absolute power-of-two texel size, and the march works in
+            // level-0 texels throughout.
+            level_count: self.resident_base + self.mips,
             base_level: self.base,
-            texel_mask: self.residency.texel_mask(),
-            march_steps: self.residency.march_steps(levels),
-            ceiling: f32::NEG_INFINITY,
+            resident_base: self.resident_base,
+            march_steps: self.residency.march_steps(self.mips),
+            ceiling: self.ceiling,
             wall_nudge: wall_nudge(UVec2::new(self.placement.width, self.placement.height)),
             viewport: self.viewport.to_array(),
         };
 
-        for level in self.base..levels {
-            let (low, high) = self.tiles.level(level).valid(self.residency.tiles_across);
-            let ceiling = highest(&self.tile_ceilings[level as usize]);
+        for level in self.base..self.resident_base + self.mips {
+            let size = self.level_size(level);
             uniform.levels[level as usize] = LevelUniform {
-                valid_low: (low * self.residency.tile_texels as i32).to_array(),
-                // One short, because the bilinear patch at the last texel of the
-                // square reads the texel after it, which belongs to whatever
-                // else shares that slot.
-                valid_high: (high * self.residency.tile_texels as i32 - IVec2::ONE).to_array(),
-                ceiling,
+                valid_low: [0, 0],
+                // The whole level. `slot` clamps reads into it, so the last
+                // texel is readable and its patch repeats the border, which is
+                // what the tile store does past the edge of a survey.
+                valid_high: [size.x as i32, size.y as i32],
+                // One figure for every level: they all bound the same whole
+                // raster, so the highest cell of one is the highest cell of any
+                // to within how coarsely it closes its squares.
+                ceiling: self.ceiling,
                 padding: 0.0,
-                more_padding: [0.0; 2],
+                // A texel index is a texture coordinate while the whole raster
+                // is resident, so nothing is wrapped.
+                mask: [-1, -1],
             };
         }
-        uniform.ceiling = self.ceiling();
 
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
     }
 
     /// The elevation of the ground under the camera, in world units.
     ///
-    /// Read from the mirror of the coarsest level, so it is the ground averaged
-    /// over kilometres rather than the peak the camera happens to be over. That
-    /// is the right shape of answer for choosing a level that covers kilometres,
+    /// Read from the mirror of a coarse mip, so it is the ground averaged over
+    /// kilometres rather than the peak the camera happens to be over. That is
+    /// the right shape of answer for choosing a level that covers kilometres,
     /// and where it is least accurate -- close to the ground, where the relief
     /// it smooths away is a large fraction of the distance -- the finest level
     /// is being drawn anyway.
     fn ground_height(&self, camera_texels: DVec2) -> f32 {
-        let level = self.level_count() - 1;
-        let across = self.residency.texels_across() as usize;
-        let texels = camera_texels / f64::from(1u32 << level);
-        let slot = IVec2::new(texels.x.floor() as i32, texels.y.floor() as i32)
-            & IVec2::splat(self.residency.texel_mask() as i32);
-
-        let height = self.ground[slot.y as usize * across + slot.x as usize];
+        if self.ground.is_empty() {
+            return 0.0;
+        }
+        let texels = camera_texels / f64::from(1u32 << self.ground_level);
+        let at = IVec2::new(texels.x.floor() as i32, texels.y.floor() as i32).clamp(
+            IVec2::ZERO,
+            self.ground_size.as_ivec2() - IVec2::ONE,
+        );
+        let height = self.ground[at.y as usize * self.ground_size.x as usize + at.x as usize];
         // The camera can legally be over ground the raster says nothing about:
         // past the edge of the survey, or over a hole in it. Sea level is the
         // same fallback the terrain itself draws there.
@@ -968,186 +877,160 @@ impl Terrain {
         }
     }
 
-    /// Reads one tile of every product and writes it into its slot.
+    /// Reads every mip of the heights and the ground cover in, then builds the
+    /// max pyramid over them.
     ///
-    /// A whole tile, always. That is 512 consecutive rows of one file, which is
-    /// what the one-row-per-strip layout the tiles are written in is fastest at
-    /// -- and it is why nothing here has to care which way the camera moved.
-    fn upload(&mut self, queue: &wgpu::Queue, wanted: Wanted) {
-        let tile = self.residency.tile_texels;
-        let texels = wanted.tile * tile as i32;
-        let slot = texels & IVec2::splat(self.residency.texel_mask() as i32);
-        let extent = wgpu::Extent3d {
-            width: tile,
-            height: tile,
-            depth_or_array_layers: 1,
-        };
-        let origin = wgpu::Origin3d {
-            x: slot.x as u32,
-            y: slot.y as u32,
-            z: wanted.level,
-        };
-        let size = UVec2::splat(tile);
-        let count = (tile as usize).pow(2);
+    /// A block of rows at a time rather than a level at a time: mip zero of
+    /// this raster is 704 MB of heights, and staging it whole would cost more
+    /// resident memory than the texture it is on its way into.
+    fn load(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, sources: &Sources) {
+        /// Rows of one mip staged at once. A hundred and forty megabytes at the
+        /// widest, which is a fifth of what a whole level would be.
+        const LOAD_ROWS: u32 = 512;
 
         let timed = self.spans.is_some();
-        let (mut read, mut convert) = (Duration::ZERO, Duration::ZERO);
-        // A `Cell` because `copy` is a closure called four times and the total
-        // has to outlive each call; it captures nothing of `self`, which is
-        // what lets the reads borrow `self.staging` mutably alongside it.
-        let write = std::cell::Cell::new(Duration::ZERO);
+        let started = std::time::Instant::now();
+        let mut staging: Vec<u8> = Vec::new();
+        let (mut read, mut convert, mut write) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
 
-        let copy = |texture: &wgpu::Texture, bytes: u32, data: &[u8]| {
-            let clock = crate::profile::Clock::start(timed);
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(tile * bytes),
-                    rows_per_image: Some(tile),
-                },
-                extent,
-            );
-            write.set(write.get() + clock.elapsed());
-        };
+        for mip in 0..self.mips {
+            let level = self.resident_base + mip;
+            let size = self.level_size(level);
+            let mirrored = level == self.ground_level;
+            if mirrored {
+                self.ground = vec![0.0; (size.x as usize) * (size.y as usize)];
+            }
 
-        let bytes = count * size_of::<f32>();
-        let clock = crate::profile::Clock::start(timed);
-        self.heights
-            .read_rect(wanted.level, texels, size, &mut self.staging[..bytes]);
-        read += clock.elapsed();
-        let clock = crate::profile::Clock::start(timed);
-        if VERTICAL_EXAGGERATION != 1.0 {
-            for height in bytemuck::cast_slice_mut::<u8, f32>(&mut self.staging[..bytes]) {
-                *height *= VERTICAL_EXAGGERATION;
+            let mut y = 0;
+            while y < size.y {
+                let rows = LOAD_ROWS.min(size.y - y);
+                let count = (size.x as usize) * (rows as usize);
+                let origin = IVec2::new(0, y as i32);
+                let block = UVec2::new(size.x, rows);
+
+                staging.resize(count * size_of::<f32>(), 0);
+                let clock = crate::profile::Clock::start(timed);
+                sources.heights.read_rect(level, origin, block, &mut staging);
+                read += clock.elapsed();
+                let clock = crate::profile::Clock::start(timed);
+                if VERTICAL_EXAGGERATION != 1.0 {
+                    for height in bytemuck::cast_slice_mut::<u8, f32>(&mut staging) {
+                        *height *= VERTICAL_EXAGGERATION;
+                    }
+                }
+                convert += clock.elapsed();
+                if mirrored {
+                    let from: &[f32] = bytemuck::cast_slice(&staging);
+                    let at = (y as usize) * (size.x as usize);
+                    self.ground[at..at + count].copy_from_slice(from);
+                }
+                let clock = crate::profile::Clock::start(timed);
+                Self::write_rows(queue, &self.height_texture, mip, y, block, 4, &staging);
+                write += clock.elapsed();
+
+                staging.resize(count * size_of::<MaterialId>(), 0);
+                let clock = crate::profile::Clock::start(timed);
+                sources
+                    .materials
+                    .read_rect(level, origin, block, &mut staging);
+                read += clock.elapsed();
+                let clock = crate::profile::Clock::start(timed);
+                // Narrowed in place, forwards, so the sixteen bit id is written
+                // over bytes the thirty-two bit one has already been read out
+                // of. Two bytes never overtake four. An id that did not fit
+                // becomes `Null`, which draws as the magenta that means nothing
+                // is known -- visible, rather than silently some other material.
+                for cell in 0..count {
+                    let wide = u32::from_le_bytes(
+                        staging[cell * 4..cell * 4 + 4]
+                            .try_into()
+                            .expect("four bytes"),
+                    );
+                    let narrow = u16::try_from(wide).unwrap_or(0);
+                    staging[cell * 2..cell * 2 + 2].copy_from_slice(&narrow.to_le_bytes());
+                }
+                convert += clock.elapsed();
+                let clock = crate::profile::Clock::start(timed);
+                Self::write_rows(
+                    queue,
+                    &self.material_texture,
+                    mip,
+                    y,
+                    block,
+                    2,
+                    &staging[..count * 2],
+                );
+                write += clock.elapsed();
+
+                y += rows;
             }
         }
-        convert += clock.elapsed();
-        copy(&self.height_texture, 4, &self.staging[..bytes]);
-        if wanted.level == self.level_count() - 1 {
-            self.mirror_ground(slot, bytes);
-        }
 
-        let bytes = count * size_of::<MaterialId>();
-        let clock = crate::profile::Clock::start(timed);
-        self.materials
-            .read_rect(wanted.level, texels, size, &mut self.staging[..bytes]);
-        read += clock.elapsed();
-        copy(&self.material_texture, 4, &self.staging[..bytes]);
-
-        let bytes = count * size_of::<f32>();
-        let clock = crate::profile::Clock::start(timed);
-        self.maxima
-            .read_rect(wanted.level, texels, size, &mut self.staging[..bytes]);
-        read += clock.elapsed();
-        let clock = crate::profile::Clock::start(timed);
-        // Narrowed in place, forwards, so the half float for a cell is written
-        // over bytes the full-precision one has already been read out of. Two
-        // bytes never overtake four.
-        let mut ceiling = f32::NEG_INFINITY;
-        for cell in 0..count {
-            let read = f32::from_le_bytes(
-                self.staging[cell * 4..cell * 4 + 4]
-                    .try_into()
-                    .expect("four bytes"),
-            );
-            let narrowed = ceiling_half(read * VERTICAL_EXAGGERATION);
-            ceiling = ceiling.max(narrowed.to_f32());
-            self.staging[cell * 2..cell * 2 + 2].copy_from_slice(&narrowed.to_bits().to_le_bytes());
-        }
-        convert += clock.elapsed();
-        copy(&self.maxima_texture, 2, &self.staging[..count * 2]);
+        // Before the pyramid, because `cs_maxima` reads the chain through the
+        // same uniform the march does -- the level masks, the base, the sizes.
+        // Deriving against an unwritten uniform reads every cell of every level
+        // at texel zero, which is a pyramid of one number and looks like a
+        // shader bug rather than an ordering one.
+        self.write_uniform(queue);
+        self.build_pyramid(device, queue);
+        self.ceiling = self.read_ceiling(device, queue);
+        log::info!(
+            "terrain: read {} mips and built the pyramid in {:.2?}, highest ground {:.0} m",
+            self.mips,
+            started.elapsed(),
+            self.ceiling
+        );
 
         if let Some(spans) = self.spans.as_mut() {
             spans.read += read;
             spans.convert += convert;
-            spans.write += write.get();
-            spans.tiles += 1;
+            spans.write += write;
         }
-
-        // Read back out of the half floats rather than kept at full precision,
-        // so the figure a ray clears a whole level with is the same bound the
-        // texture holds.
-        let across = self.residency.tiles_across as usize;
-        let slot_index =
-            (slot.y as usize / tile as usize) * across + slot.x as usize / tile as usize;
-        self.tile_ceilings[wanted.level as usize][slot_index] = ceiling;
-
-        // Kept whether or not the pyramid is being derived, because the list is
-        // what says which cells a derivation would have to redo, and a run that
-        // is not deriving throws it away a few lines later at no cost.
-        self.uploaded.push(wanted);
     }
 
-    /// Turns the tiles uploaded since the last one into rectangles to derive.
+    /// Writes a block of rows into one mip.
+    fn write_rows(
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        mip: u32,
+        y: u32,
+        block: UVec2,
+        bytes: u32,
+        data: &[u8],
+    ) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: mip,
+                origin: wgpu::Origin3d { x: 0, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                // Tightly packed. `write_texture` waives the row alignment a
+                // buffer copy demands, which is what lets a six-texel mip go in
+                // without a padded staging copy of its own.
+                bytes_per_row: Some(block.x * bytes),
+                rows_per_image: Some(block.y),
+            },
+            wgpu::Extent3d {
+                width: block.x,
+                height: block.y,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Builds the max pyramid over the whole chain, finest mip first.
     ///
-    /// A tile changes the pyramid at every level from its own upwards: its
-    /// heights feed the cells of its own level directly, and those cells are
-    /// carried up into every coarser cell above them. So one rectangle per
-    /// level, coarsest last, because a cell reads the level below and that
-    /// level has to be finished across the whole update before this one starts.
-    fn plan(&mut self) {
+    /// One sweep, once. There is nothing incremental about it because there is
+    /// nothing incremental left: the heights under it never change.
+    fn build_pyramid(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.jobs.clear();
-        let uploaded = std::mem::take(&mut self.uploaded);
-        if !self.derived || uploaded.is_empty() {
-            return;
-        }
-        let tile = self.residency.tile_texels as i32;
-        let across = self.residency.tiles_across;
-        for level in self.base..self.level_count() {
-            let (low, high) = self.tiles.level(level).valid(across);
-            let (valid_low, valid_high) = (low * tile, high * tile);
-            let reaching = uploaded.iter().filter(|w| w.level <= level).count();
-            if reaching == 0 {
-                continue;
-            }
-            if reaching > DERIVE_WHOLE_ABOVE {
-                // More tiles than sweeping the level whole costs. The first
-                // update is every tile of every level at once, which this turns
-                // from thousands of dispatches into a couple of dozen.
-                self.emit(level, valid_low, valid_high);
-                continue;
-            }
-            for wanted in uploaded.iter().filter(|w| w.level <= level) {
-                let shift = level - wanted.level;
-                let side = (tile >> shift).max(1);
-                let corner = IVec2::new(
-                    (wanted.tile.x * tile) >> shift,
-                    (wanted.tile.y * tile) >> shift,
-                );
-                // A tile's own slots are its own whatever residency says: its
-                // heights went into them a moment ago, and the square only
-                // admits them once the step it is part of finishes. Coarser
-                // cells are not its to write, and one outside the square will
-                // be derived by whichever tile makes it valid.
-                let (mut low, high) = if shift == 0 {
-                    (corner, corner + IVec2::splat(side))
-                } else {
-                    (
-                        corner.max(valid_low),
-                        (corner + IVec2::splat(side)).min(valid_high),
-                    )
-                };
-                // One cell back along each axis, because a cell is closed by a
-                // sample past itself: the last row and column of the ground
-                // before this tile could not be closed until it arrived. Only
-                // where that ground is resident -- outside the square the slot
-                // holds somewhere else entirely.
-                let back = low - IVec2::ONE;
-                if back.x >= valid_low.x && back.x < valid_high.x {
-                    low.x = back.x;
-                }
-                if back.y >= valid_low.y && back.y < valid_high.y {
-                    low.y = back.y;
-                }
-                self.emit(level, low, high);
-            }
+        for level in self.levels() {
+            let size = self.level_size(level).as_ivec2();
+            self.emit(level, IVec2::ZERO, size);
         }
         debug_assert!(
             self.jobs.len() <= self.job_slots,
@@ -1155,41 +1038,34 @@ impl Terrain {
             self.jobs.len(),
             self.job_slots
         );
+        self.run_jobs(device, queue);
     }
 
     /// Cuts one rectangle of one level into jobs and records them.
     ///
-    /// Two things bound a job: the scratch buffer its cells go out through, and
-    /// the wrap. A rectangle straddling a wrap is two rectangles in the texture
-    /// and cannot be copied in one go, so it is cut there rather than copied in
-    /// pieces at offsets a copy would refuse to start at.
+    /// Bounded by the scratch buffer the cells go out through, and by nothing
+    /// else: a resident level's texel index is its texture coordinate, so a
+    /// rectangle cannot straddle a wrap the way a window's could.
     fn emit(&mut self, level: u32, low: IVec2, high: IVec2) {
         if low.x >= high.x || low.y >= high.y {
             return;
         }
-        let mask = self.residency.texel_mask() as i32;
-        // The level below, bounded exactly as the march bounds it -- one texel
-        // short on the high side -- so a child is carried if and only if a ray
-        // could descend into it. Carrying no further than that is what makes a
-        // derived cell no higher than the offline product's.
-        let carry = level > self.base;
+        // The level below, bounded exactly as the march bounds it, so a child
+        // is carried if and only if a ray could descend into it.
+        let carry = level > self.resident_base;
         let (below_low, below_high) = if carry {
-            let tile = self.residency.tile_texels as i32;
-            let (low, high) = self
-                .tiles
-                .level(level - 1)
-                .valid(self.residency.tiles_across);
-            (low * tile, high * tile - IVec2::ONE)
+            (IVec2::ZERO, self.level_size(level - 1).as_ivec2())
         } else {
             (IVec2::ZERO, IVec2::ZERO)
         };
 
+        let chunk = DERIVE_CHUNK as i32;
         let mut y = low.y;
         while y < high.y {
-            let rows = span(y, high.y, mask);
+            let rows = (high.y - y).min(chunk) as u32;
             let mut x = low.x;
             while x < high.x {
-                let columns = span(x, high.x, mask);
+                let columns = (high.x - x).min(chunk) as u32;
                 self.jobs.push(MaximaJob {
                     origin: [x, y],
                     size: [columns, rows],
@@ -1206,15 +1082,8 @@ impl Terrain {
         }
     }
 
-    /// Derives the pyramid cells the tiles just uploaded left stale.
-    ///
-    /// Recorded and submitted here rather than into the frame's encoder because
-    /// this is streaming and not drawing. [`crate::scene::Scene::settle`] runs
-    /// many updates before any frame exists, and the uploads this follows went
-    /// to the queue directly rather than through an encoder at all -- so one
-    /// submission carries both, which is also what puts them in order.
-    fn derive_pyramid(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        self.plan();
+    /// Dispatches every planned rectangle and copies its cells into the chain.
+    fn run_jobs(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         if self.jobs.is_empty() {
             return;
         }
@@ -1226,7 +1095,6 @@ impl Terrain {
             );
         }
 
-        let mask = self.residency.texel_mask();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("terrain derive"),
         });
@@ -1264,13 +1132,11 @@ impl Terrain {
                 },
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.maxima_texture,
-                    mip_level: 0,
-                    // The same wrap the shader took, and for the same reason: a
-                    // cell's slot depends on nothing but its index.
+                    mip_level: job.level - self.resident_base,
                     origin: wgpu::Origin3d {
-                        x: job.origin[0] as u32 & mask,
-                        y: job.origin[1] as u32 & mask,
-                        z: job.level,
+                        x: job.origin[0] as u32,
+                        y: job.origin[1] as u32,
+                        z: 0,
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
@@ -1285,19 +1151,62 @@ impl Terrain {
         self.jobs.clear();
     }
 
-    /// Copies a just-uploaded coarsest-level tile into the CPU mirror.
+    /// The highest cell of the coarsest mip, which bounds every cell under it.
     ///
-    /// Written from the same staging buffer, at the same slot, as the texture
-    /// copy immediately above it, so the mirror wraps exactly as the texture
-    /// does and cannot drift out of step with it.
-    fn mirror_ground(&mut self, slot: IVec2, bytes: usize) {
-        let heights: &[f32] = bytemuck::cast_slice(&self.staging[..bytes]);
-        let across = self.residency.texels_across() as usize;
-        let tile = self.residency.tile_texels as usize;
-        for row in 0..tile {
-            let to = (slot.y as usize + row) * across + slot.x as usize;
-            self.ground[to..to + tile].copy_from_slice(&heights[row * tile..(row + 1) * tile]);
+    /// This is what `tile_ceilings` used to be, and it is now a property of the
+    /// chain rather than a tally the upload path had to keep in step with it:
+    /// `M[d] >= reduce_max(M[d - 1])` at every depth, so the top of the chain
+    /// bounds the whole of it and one readback of a few dozen texels answers.
+    fn read_ceiling(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> f32 {
+        let size = self.level_size(self.coarsest());
+        let stride = (size.x * 2).div_ceil(COPY_ALIGN) * COPY_ALIGN;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain ceiling readback"),
+            size: u64::from(stride * size.y),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("terrain ceiling"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.maxima_texture,
+                mip_level: self.mips - 1,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(size.y),
+                },
+            },
+            wgpu::Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        readback.map_async(wgpu::MapMode::Read, .., |result| {
+            result.expect("ceiling readback failed")
+        });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll failed");
+        let bytes = readback.get_mapped_range(..).expect("buffer not mapped");
+        let mut ceiling = f32::NEG_INFINITY;
+        for row in 0..size.y as usize {
+            let at = row * stride as usize;
+            let cells: &[u16] = bytemuck::cast_slice(&bytes[at..at + size.x as usize * 2]);
+            for cell in cells {
+                ceiling = ceiling.max(half::f16::from_bits(*cell).to_f32());
+            }
         }
+        ceiling
     }
 
     /// The lowest and highest elevation in the raster, from a coarse level.
@@ -1414,19 +1323,13 @@ impl Terrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terrain::pyramid::{Level, Pyramid, max_pyramid};
+    use crate::terrain::maxima::ceiling_half;
+    use crate::terrain::pyramid::{Level, Pyramid};
 
-    /// Tiles small enough that a test raster is several of them across.
-    ///
-    /// The store's tiles are 512 texels, which is bigger than any raster a test
-    /// can afford to build, so residency is told to work at a scale where its
-    /// own arithmetic -- squares, slots, wraps -- is actually exercised.
-    fn test_residency() -> Residency {
+    /// The whole test raster, held at whatever base the test asks for.
+    fn test_residency(resident_base: u32) -> Residency {
         Residency {
-            tiles_across: 4,
-            tile_texels: 8,
-            // Whole squares per update, so a test never has to drain a queue.
-            tiles_per_update: 4096,
+            resident_base,
             ..Default::default()
         }
     }
@@ -1494,7 +1397,7 @@ mod tests {
             UVec2::splat(side),
             bytemuck::cast_slice_mut(&mut samples),
         );
-        highest(&samples)
+        samples.iter().copied().fold(f32::NEG_INFINITY, f32::max)
     }
 
     /// What a level is defined to hold: the greatest of [`cell_ceiling`] over
@@ -1520,21 +1423,16 @@ mod tests {
     /// same recursion the march performs, with the same residency test.
     fn cell_reachable(source: &dyn RasterSource, terrain: &Terrain, level: u32, cell: IVec2) -> f32 {
         let mut top = cell_ceiling(source, level, cell, 1);
-        if level <= terrain.base {
+        if level <= terrain.resident_base {
             return top;
         }
         let finer = level - 1;
-        let tile = terrain.residency.tile_texels as i32;
-        let (low, high) = terrain
-            .tiles
-            .level(finer)
-            .valid(terrain.residency.tiles_across);
-        // The march's own bound: one texel short on the high side.
-        let (low, high) = (low * tile, high * tile - IVec2::ONE);
+        // The march's own bound, which is the whole level.
+        let high = terrain.level_size(finer).as_ivec2();
         for dy in 0..2 {
             for dx in 0..2 {
                 let child = cell * 2 + IVec2::new(dx, dy);
-                if child.cmpge(low).all() && child.cmplt(high).all() {
+                if child.cmpge(IVec2::ZERO).all() && child.cmplt(high).all() {
                     top = top.max(cell_reachable(source, terrain, finer, child));
                 }
             }
@@ -1542,41 +1440,15 @@ mod tests {
         top
     }
 
-    /// A pyramid of nothing, in place of the product the tools write.
-    ///
-    /// The whole difficulty in testing a derived pyramid is that it agrees with
-    /// the offline one almost everywhere -- the recurrences are the same, and
-    /// the terms the derivation drops are the ones no ray reaches -- so a check
-    /// on the values alone passes whether or not the derivation ran at all.
-    ///
-    /// So take the offline product away. Every cell of this reads as the
-    /// raster's nodata, which is far below any ground, and a cell the
-    /// derivation failed to write keeps it. Then the bounds below are a
-    /// statement about the derivation and nothing else.
-    fn hollow() -> Pyramid<f32> {
-        /// The sentinel a survey writes where it measured nothing.
-        const NODATA: f32 = -32767.0;
-        Pyramid::build(Level::new(
-            RASTER,
-            RASTER,
-            vec![NODATA; (RASTER * RASTER) as usize],
-        ))
-    }
-
-    /// A terrain over a rugged raster, reading `maxima` as the product the
-    /// tools wrote beside it.
-    fn terrain_over(
-        device: &wgpu::Device,
-        maxima: Box<dyn RasterSource>,
-        derived: bool,
-    ) -> Terrain {
+    /// A terrain over a rugged raster, held from `resident_base` upwards.
+    fn terrain_over(device: &wgpu::Device, resident_base: u32) -> Terrain {
         let camera_layout = crate::scene::test_camera_layout(device);
         let storage_layout = crate::deferred::storage_layout(device);
         let work_layout = crate::reproject::work_layout(device);
         let args_layout = crate::reproject::args_layout(device);
         let risk_layout = crate::reproject::risk_layout(device);
         let reach_layout = crate::reproject::reach_layout(device);
-        let mut terrain = Terrain::new(
+        Terrain::new(
             device,
             &camera_layout,
             &storage_layout,
@@ -1584,7 +1456,7 @@ mod tests {
             &args_layout,
             &risk_layout,
             &reach_layout,
-            test_residency(),
+            test_residency(resident_base),
             UVec2::splat(RASTER),
             Georeferencing::square(RASTER, RASTER, 30.0),
             Sources {
@@ -1594,24 +1466,28 @@ mod tests {
                     RASTER,
                     vec![MaterialId(0); (RASTER * RASTER) as usize],
                 ))),
-                maxima,
             },
-        );
-        terrain.derive_from_heights(derived);
-        terrain
+        )
     }
 
-    /// Every layer of the max pyramid texture, and the padded row stride it
-    /// came back at.
-    fn read_pyramid(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &Terrain) -> (Vec<u8>, u32) {
-        let across = terrain.residency.texels_across();
-        let levels = terrain.level_count();
+    /// One mip of the max pyramid, with the padded row stride it came back at.
+    ///
+    /// A mip at a time because they are all different sizes now, which is the
+    /// whole difference between a chain and the array of equal layers this
+    /// replaced.
+    fn read_mip(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        terrain: &Terrain,
+        level: u32,
+    ) -> (Vec<u8>, u32) {
+        let size = terrain.level_size(level);
         // Rows in a texture-to-buffer copy are padded to 256 bytes, which a
-        // thirty-two texel square of half floats is well short of.
-        let stride = (across * 2).div_ceil(256) * 256;
+        // sixty-four texel row of half floats is well short of.
+        let stride = (size.x * 2).div_ceil(256) * 256;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pyramid readback"),
-            size: u64::from(stride * across * levels),
+            size: u64::from(stride * size.y),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1619,7 +1495,7 @@ mod tests {
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &terrain.maxima_texture,
-                mip_level: 0,
+                mip_level: level - terrain.resident_base,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
@@ -1628,13 +1504,13 @@ mod tests {
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(stride),
-                    rows_per_image: Some(across),
+                    rows_per_image: Some(size.y),
                 },
             },
             wgpu::Extent3d {
-                width: across,
-                height: across,
-                depth_or_array_layers: levels,
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
             },
         );
         queue.submit(std::iter::once(encoder.finish()));
@@ -1646,55 +1522,59 @@ mod tests {
         (bytes, stride)
     }
 
-    /// One cell out of what [`read_pyramid`] returned.
-    fn pyramid_cell(bytes: &[u8], stride: u32, across: u32, level: u32, slot: IVec2) -> f32 {
-        let at = (level * across + slot.y as u32) as usize * stride as usize + slot.x as usize * 2;
+    /// One cell out of what [`read_mip`] returned.
+    fn mip_cell(bytes: &[u8], stride: u32, cell: IVec2) -> f32 {
+        let at = cell.y as usize * stride as usize + cell.x as usize * 2;
         half::f16::from_bits(u16::from_le_bytes([bytes[at], bytes[at + 1]])).to_f32()
     }
 
-    /// Checks every derived cell against both bounds it sits between, and
-    /// returns how many were asked.
+    /// Checks every cell of every level against both bounds it sits between,
+    /// and returns how many were asked.
     ///
     /// The lower bound is the failure this structure exists to prevent: a cell
     /// below ground a ray could reach is a ridge the ray passes through. The
     /// upper bound is the promise the derivation makes in return -- it carries
-    /// strictly less than the offline chain does, so it can only ever be
-    /// tighter, and a cell above the product's would mean it had invented slack
-    /// the march would have to pay descents for.
-    fn check_derived(terrain: &Terrain, raster: &dyn RasterSource, bytes: &[u8], stride: u32) -> u32 {
-        let residency = terrain.residency;
-        let across = residency.texels_across();
+    /// only from levels that are held, so it can only ever be tighter than the
+    /// chain a tool would have written over the whole raster, and a cell above
+    /// that would be slack the march has to pay descents for.
+    ///
+    /// The two coincide exactly when the base is level zero, because then every
+    /// level a cell is defined over is a level that is held. That is what makes
+    /// the base-zero case an equality rather than a sandwich.
+    fn check_pyramid(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        terrain: &Terrain,
+        raster: &dyn RasterSource,
+    ) -> u32 {
         let mut checked = 0;
-        for level in terrain.base..terrain.level_count() {
-            let (low, high) = terrain.tiles.level(level).valid(residency.tiles_across);
-            let (low, high) = (
-                low * residency.tile_texels as i32,
-                high * residency.tile_texels as i32 - IVec2::ONE,
-            );
-            for cell_y in low.y..high.y {
-                for cell_x in low.x..high.x {
+        for level in terrain.levels() {
+            let (bytes, stride) = read_mip(device, queue, terrain, level);
+            let size = terrain.level_size(level).as_ivec2();
+            for cell_y in 0..size.y {
+                for cell_x in 0..size.x {
                     let cell = IVec2::new(cell_x, cell_y);
-                    // Asked only of texels whose square lands on real ground,
-                    // for the reason `cell_defined`'s caller gives: out past the
-                    // raster the pyramid and the oracle both repeat the border,
-                    // at their own granularities.
+                    // Asked only of texels whose square lands on real ground.
+                    // A closed square reaches one sample past the cell, and out
+                    // there the chain and this oracle both repeat the border,
+                    // at their own granularities -- so they agree on the bound
+                    // without agreeing on the figure.
                     let reach = (cell + IVec2::ONE) << level;
-                    if cell.min_element() < 0 || reach.max_element() >= RASTER as i32 {
+                    if reach.max_element() >= RASTER as i32 {
                         continue;
                     }
-                    let slot = cell & IVec2::splat(residency.texel_mask() as i32);
-                    let got = pyramid_cell(bytes, stride, across, level, slot);
+                    let got = mip_cell(&bytes, stride, cell);
                     let needs = ceiling_half(cell_reachable(raster, terrain, level, cell)).to_f32();
                     let allowed = ceiling_half(cell_defined(raster, level, cell)).to_f32();
                     assert!(
                         got >= needs,
-                        "level {level} texel {cell} in slot {slot} holds {got} where a ray \
-                         reaching through it can meet ground at {needs}"
+                        "level {level} cell {cell} holds {got} where a ray reaching \
+                         through it can meet ground at {needs}"
                     );
                     assert!(
                         got <= allowed,
-                        "level {level} texel {cell} in slot {slot} holds {got}, above the \
-                         {allowed} the tools would have written"
+                        "level {level} cell {cell} holds {got}, above the {allowed} \
+                         a chain over the whole raster would have"
                     );
                     checked += 1;
                 }
@@ -1703,201 +1583,72 @@ mod tests {
         checked
     }
 
-    /// A pyramid derived from the resident heights sits between the bound the
-    /// march needs and the bound the tools write.
+    /// Every cell of the pyramid bounds the ground it claims, at every level.
     ///
-    /// The whole case for deriving it rests on those two inequalities. Below
-    /// the first is a ray passing through a ridge; above the second is slack
-    /// the offline product did not have, which would make the march slower for
-    /// no reason. This is the first update, where every level is filled at once
-    /// and each is therefore swept whole rather than tile by tile.
+    /// With the base at level zero the derivation has every level a cell is
+    /// defined over, so this is an equality against the CPU oracle rather than
+    /// a bound: the GPU chain must be exactly what `terrain-process` used to
+    /// write. That is the strongest statement available about it, and it is
+    /// what says the shader's closed squares, its carry and its rounding all
+    /// agree with the definition in `crates/terrain-tiles/src/maxima.rs`.
+    ///
+    /// Teeth: nothing writes these cells but the derivation, so a chain that
+    /// failed to run reads as zeroes, and this raster is ridged either side of
+    /// zero.
     #[test]
-    fn a_derived_pyramid_bounds_every_level_a_ray_can_reach() {
+    fn every_cell_of_the_pyramid_bounds_the_ground_it_covers() {
         let (device, queue) = crate::scene::test_device();
         let raster = Pyramid::build(Level::new(RASTER, RASTER, rugged()));
-        let mut terrain = terrain_over(&device, Box::new(hollow()), true);
-
-        // Off any round number, so no square starts on a multiple of its own
-        // width and reading the slots the wrong way round would be visible.
+        let mut terrain = terrain_over(&device, 0);
         terrain.update(&device, &queue, Vec3::new(137.0, 100.0, -71.0));
         assert_eq!(terrain.base_level(), 0, "the test wants every level built");
 
-        let (bytes, stride) = read_pyramid(&device, &queue, &terrain);
-        let checked = check_derived(&terrain, &raster, &bytes, stride);
-        assert!(
-            checked > 100,
-            "only {checked} texels sat wholly on the raster, which is too few"
-        );
-    }
-
-    /// ... and goes on doing so as the squares move under it.
-    ///
-    /// This is the test that catches the one thing the shader cannot see for
-    /// itself. A tile arriving at a fine level raises the cells above it at
-    /// every coarser level, and nothing about that fine tile's own dispatch
-    /// says so -- the host has to walk the levels up. Miss it and the first
-    /// update above still passes, because there every level is swept whole;
-    /// only a camera that has moved since tells the difference.
-    ///
-    /// It also exercises the other half of a tile's rectangle: a cell is closed
-    /// by a sample past itself, so the last row and column of the ground before
-    /// an arriving tile could not be closed until it arrived, and are derived
-    /// with it rather than left as they were.
-    #[test]
-    fn a_derived_pyramid_survives_the_squares_moving() {
-        let (device, queue) = crate::scene::test_device();
-        let raster = Pyramid::build(Level::new(RASTER, RASTER, rugged()));
-        let mut terrain = terrain_over(&device, Box::new(hollow()), true);
-
-        terrain.update(&device, &queue, Vec3::new(137.0, 100.0, -71.0));
-        // Each step slides the finest square by tiles -- a tile is eight texels
-        // of thirty metres -- and does it at an angle, so both axes step and the
-        // slots wrap on each.
-        //
-        // The altitudes alternate so the finest level kept moves as well. That
-        // is the other way the levels below a cell change out from under it:
-        // climbing drops them, which leaves a cell carrying ground no ray can
-        // reach any more -- harmless, and still no higher than the offline
-        // product -- while descending brings them back, and a cell that did not
-        // pick them up again would be a hole in a ridge.
-        let mut base_seen = std::collections::BTreeSet::new();
-        for step in 1..7 {
-            let along = 240.0 * step as f32;
-            let up = if step % 2 == 0 { 100.0 } else { 120_000.0 };
-            terrain.update(
-                &device,
-                &queue,
-                Vec3::new(137.0 + along, up, -71.0 - along),
-            );
-            base_seen.insert(terrain.base_level());
-
-            let (bytes, stride) = read_pyramid(&device, &queue, &terrain);
-            let checked = check_derived(&terrain, &raster, &bytes, stride);
-            assert!(checked > 0, "step {step} left nothing on the raster to check");
-        }
-        assert!(
-            base_seen.len() > 1,
-            "the flight never changed the finest level kept, so nothing was \
-             dropped or brought back: {base_seen:?}"
-        );
-    }
-
-    /// Every texel of the pyramid bounds the ground it claims, and sits where
-    /// the march will go looking for it.
-    ///
-    /// Both halves matter and they fail differently. A wrong *value* lets rays
-    /// through ridges; a wrong *position* is worse, because a slot's address is
-    /// a mask of the raster-relative index, so a version that wrapped against
-    /// the square's own origin instead would read a neighbouring tile's ceiling
-    /// and be wrong everywhere except when the square happened to start on a
-    /// multiple of its own width.
-    #[test]
-    fn every_texel_of_the_pyramid_bounds_the_ground_it_covers() {
-        let (device, queue) = crate::scene::test_device();
-        let residency = test_residency();
-        let across = residency.texels_across();
-
-        // The raster the texels are defined over, kept aside so the oracle can
-        // look their squares up directly rather than through anything the
-        // upload path touched.
-        let raster = Pyramid::build(Level::new(RASTER, RASTER, rugged()));
-        // This is a test of the product `terrain-process` writes and of the
-        // path that carries it in, so the derivation is pinned off rather than
-        // left to the environment: derived cells are legitimately tighter than
-        // these, and would fail an equality against them.
-        let mut terrain = terrain_over(&device, Box::new(max_pyramid(&raster)), false);
         let raster: &dyn RasterSource = &raster;
-
-        // Off any round number, so no square starts on a multiple of its own
-        // width and reading the slots the wrong way round would be visible.
-        terrain.update(&device, &queue, Vec3::new(137.0, 100.0, -71.0));
-        assert_eq!(terrain.base_level(), 0, "the test wants every level built");
-        let levels = terrain.level_count();
-
-        // Rows in a texture-to-buffer copy are padded to 256 bytes, which a
-        // thirty-two texel square of half floats is well short of.
-        let stride = (across * 2).div_ceil(256) * 256;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pyramid readback"),
-            size: u64::from(stride * across * levels),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &terrain.maxima_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(stride),
-                    rows_per_image: Some(across),
-                },
-            },
-            wgpu::Extent3d {
-                width: across,
-                height: across,
-                depth_or_array_layers: levels,
-            },
+        let checked = check_pyramid(&device, &queue, &terrain, raster);
+        assert!(
+            checked > 1000,
+            "only {checked} cells sat wholly on the raster, which is too few"
         );
-        queue.submit(std::iter::once(encoder.finish()));
-        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll failed");
-        let bytes = readback.get_mapped_range(..).expect("buffer not mapped");
+    }
 
-        let mut checked = 0;
-        for level in 0..levels {
-            let (low, high) = terrain.tiles.level(level).valid(residency.tiles_across);
-            let (low, high) = (
-                low * residency.tile_texels as i32,
-                high * residency.tile_texels as i32,
-            );
-            let layer = &bytes[level as usize * stride as usize * across as usize..];
+    /// A chain held from a coarser base carries only what a ray can reach.
+    ///
+    /// This is the trade the resident base makes, stated as a test. Level one
+    /// is the finest thing held, so no cell answers for level-zero detail --
+    /// the chain is legitimately *lower* than one built over the whole raster
+    /// would be, and correct anyway, because no ray can descend to ground that
+    /// is not there.
+    #[test]
+    fn a_coarser_base_bounds_only_the_levels_it_holds() {
+        let (device, queue) = crate::scene::test_device();
+        let raster = Pyramid::build(Level::new(RASTER, RASTER, rugged()));
+        let mut terrain = terrain_over(&device, 1);
+        terrain.update(&device, &queue, Vec3::new(137.0, 100.0, -71.0));
 
-            for cell_y in low.y..high.y {
-                for cell_x in low.x..high.x {
-                    let cell = IVec2::new(cell_x, cell_y);
-                    let slot = cell & IVec2::splat(residency.texel_mask() as i32);
-                    let row: &[u16] = bytemuck::cast_slice(
-                        &layer[slot.y as usize * stride as usize
-                            ..slot.y as usize * stride as usize + across as usize * 2],
-                    );
-                    let got = half::f16::from_bits(row[slot.x as usize]).to_f32();
+        let raster: &dyn RasterSource = &raster;
+        let checked = check_pyramid(&device, &queue, &terrain, raster);
+        assert!(checked > 100, "only {checked} cells to check");
 
-                    // Asked only of texels whose square lands on real ground.
-                    // A resident square legitimately hangs off the raster, and
-                    // out there the pyramid and this oracle both repeat the
-                    // border, but at their own granularities -- so they agree
-                    // on the bound without agreeing on the figure.
-                    let reach = (cell + IVec2::ONE) << level;
-                    if cell.min_element() < 0 || reach.max_element() >= RASTER as i32 {
-                        continue;
-                    }
-                    // Half precision, rounded towards positive infinity, so a
-                    // texel is at or a little above the ground it covers and
-                    // never below it. Below would be a ridge a ray can pass
-                    // through; above only costs a descent.
-                    let want = cell_defined(raster, level, cell);
-                    assert_eq!(
-                        got,
-                        ceiling_half(want).to_f32(),
-                        "level {level} texel {cell} in slot {slot} holds {got} \
-                         where the levels reading it want {want}"
-                    );
-                    checked += 1;
+        // ... and it really is lower somewhere, or the test above would have
+        // covered this one and the base would be buying nothing.
+        let level = 1;
+        let (bytes, stride) = read_mip(&device, &queue, &terrain, level);
+        let size = terrain.level_size(level).as_ivec2();
+        let mut tighter = 0;
+        for cell_y in 0..size.y - 1 {
+            for cell_x in 0..size.x - 1 {
+                let cell = IVec2::new(cell_x, cell_y);
+                let whole = ceiling_half(cell_defined(raster, level, cell)).to_f32();
+                if mip_cell(&bytes, stride, cell) < whole {
+                    tighter += 1;
                 }
             }
         }
         assert!(
-            checked > 1000,
-            "only {checked} texels sat wholly on the raster, which is too few"
+            tighter > 0,
+            "no cell of level {level} came out below what a whole-raster chain holds, \
+             so dropping level zero cost nothing and bought nothing"
         );
     }
+
 }

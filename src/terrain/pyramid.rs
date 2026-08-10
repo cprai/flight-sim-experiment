@@ -15,6 +15,7 @@
 
 use glam::{IVec2, UVec2};
 
+#[cfg(test)]
 use terrain_tiles::Texel;
 
 /// A rectangular window of texels, at some level of detail.
@@ -35,6 +36,7 @@ pub trait RasterSource {
 }
 
 /// One level of a [`Pyramid`].
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct Level<T> {
     pub width: u32,
@@ -42,6 +44,7 @@ pub struct Level<T> {
     pub texels: Vec<T>,
 }
 
+#[cfg(test)]
 impl<T: Texel> Level<T> {
     pub fn new(width: u32, height: u32, texels: Vec<T>) -> Self {
         assert_eq!(
@@ -63,21 +66,18 @@ impl<T: Texel> Level<T> {
 
 /// A raster and every power-of-two reduction of it, held in memory.
 ///
-/// The simulator streams the bulk of its mip chain off disk, where the
-/// downloader built it once rather than on every launch. This is what the tests
-/// build synthetic terrain with, and what [`Resident`] continues that chain
-/// with once the stored levels run out.
+/// Only tests build one. The simulator reads a chain the tools wrote and holds
+/// it whole, so nothing at run time reduces a level or continues a chain past
+/// where it stops.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct Pyramid<T> {
     levels: Vec<Level<T>>,
 }
 
+#[cfg(test)]
 impl<T: Texel> Pyramid<T> {
     /// Builds the reduction chain from a full-resolution level, down to 1x1.
-    ///
-    /// Only tests reach for this: the application's chains are built by the
-    /// tools and continued by [`Resident`], both of which name their fold.
-    #[cfg(test)]
     pub fn build(base: Level<T>) -> Self {
         Self::build_with(base, T::box_filter)
     }
@@ -126,48 +126,7 @@ impl Pyramid<f32> {
     }
 }
 
-/// Builds the max pyramid `terrain-process` would have written for a raster.
-///
-/// The same recurrence, applied in memory to the mip chain of `heights`, so a
-/// test can hand [`crate::terrain::gpu::Terrain`] the third source it wants
-/// without a tile tree behind it. Closing a square reaches one sample past it,
-/// and here that reach repeats the border rather than reading nodata, which is
-/// what [`RasterSource::read_rect`] does past an edge anyway.
 #[cfg(test)]
-pub fn max_pyramid(heights: &Pyramid<f32>) -> Pyramid<f32> {
-    /// One level's own samples, closed: the maximum of the four around each
-    /// cell, with the last row and column repeating the border.
-    fn close(fine: &Level<f32>) -> Level<f32> {
-        let (width, height) = (fine.width, fine.height);
-        let wide = width + 1;
-        let mut padded = vec![0f32; (wide as usize) * (height as usize + 1)];
-        for y in 0..=height {
-            for x in 0..=width {
-                padded[(y * wide + x) as usize] = fine.get(x.min(width - 1), y.min(height - 1));
-            }
-        }
-        let mut out = vec![0f32; (width as usize) * (height as usize)];
-        terrain_tiles::maxima::quad_max(&padded, width, height, &mut out);
-        Level::new(width, height, out)
-    }
-
-    let mut levels: Vec<Level<f32>> = Vec::new();
-    for depth in 0..heights.levels.len() {
-        let mut cells = close(&heights.levels[depth]);
-        if let Some(below) = levels.last() {
-            // Every bound the depth below carries, halved, against this level's
-            // own. `reduce` folds with a maximum here, and rounds the size up
-            // the same way the mip chain beside it does.
-            let carried = reduce(below, terrain_tiles::maxima::highest);
-            for (cell, from) in cells.texels.iter_mut().zip(&carried.texels) {
-                *cell = cell.max(*from);
-            }
-        }
-        levels.push(cells);
-    }
-    Pyramid { levels }
-}
-
 /// Halves a level, rounding up so a single odd texel still gets a home.
 fn reduce<T: Texel>(fine: &Level<T>, fold: fn(&[T]) -> T) -> Level<T> {
     let width = (fine.width.div_ceil(2)).max(1);
@@ -205,6 +164,7 @@ fn reduce<T: Texel>(fine: &Level<T>, fold: fn(&[T]) -> T) -> Level<T> {
     Level::new(width, height, texels)
 }
 
+#[cfg(test)]
 impl<T: Texel> RasterSource for Pyramid<T> {
     fn level_count(&self) -> u32 {
         self.levels.len() as u32
@@ -223,83 +183,6 @@ impl<T: Texel> RasterSource for Pyramid<T> {
                 let x = (origin.x + column as i32).clamp(0, max_x) as u32;
                 texels[(row as usize) * (size.x as usize) + (column as usize)] = level.get(x, y);
             }
-        }
-    }
-}
-
-/// A source whose coarse end is held in memory instead of streamed.
-///
-/// The tile pyramid on disk stops wherever the downloader stopped, which is
-/// often well short of a level that spans the whole dataset -- the installed
-/// 8192-texel raster stores five levels where seven are needed. A clipmap can
-/// only build as many levels as it is given, so the outermost ring ends up
-/// reaching a couple of kilometres of ground that goes on for eight, and
-/// everything past it is sky whether it is drawn or marched.
-///
-/// This continues the chain rather than accepting where it stopped: it reads the
-/// coarsest stored level whole, reduces it to a single texel, and answers for
-/// every level from there up. Those levels are small -- the coarsest stored
-/// level of that raster is 512 texels square, so a megabyte, and everything
-/// above it a third as much again -- which is what makes holding them
-/// affordable. Two things fall out of that. The far field can see to the edge of
-/// the data from anywhere in it, and the levels whose windows sweep fastest
-/// across the ground come off the streaming path altogether.
-///
-/// Reducing here rather than in the downloader is deliberate. These levels are
-/// derived, not measured, so there is nothing to gain by writing them down, and
-/// a pyramid already on disk would have to be regenerated to grow them.
-pub struct Resident<T> {
-    /// Levels finer than `first` are still someone else's problem.
-    inner: Box<dyn RasterSource>,
-    /// Which level `coarse`'s own level zero stands for.
-    first: u32,
-    coarse: Pyramid<T>,
-}
-
-impl<T: Texel> Resident<T> {
-    /// Reads the coarsest level `inner` holds and carries on from it.
-    ///
-    /// `raster` is the full-resolution size, which is what says how large that
-    /// level is; a source knows how many levels it has but not how wide.
-    pub fn over(inner: Box<dyn RasterSource>, raster: UVec2) -> Self {
-        Self::over_with(inner, raster, T::box_filter)
-    }
-
-    /// As [`Resident::over`], but continuing the chain however `fold` says.
-    ///
-    /// The max pyramid's tail has to be folded with a maximum rather than a
-    /// mean, for the reason [`Pyramid::build_with`] gives.
-    pub fn over_with(inner: Box<dyn RasterSource>, raster: UVec2, fold: fn(&[T]) -> T) -> Self {
-        let first = inner.level_count().saturating_sub(1);
-        let size = UVec2::new((raster.x >> first).max(1), (raster.y >> first).max(1));
-
-        let mut texels = vec![T::default(); (size.x as usize) * (size.y as usize)];
-        inner.read_rect(
-            first,
-            IVec2::ZERO,
-            size,
-            bytemuck::cast_slice_mut(&mut texels),
-        );
-
-        Self {
-            inner,
-            first,
-            coarse: Pyramid::build_with(Level::new(size.x, size.y, texels), fold),
-        }
-    }
-}
-
-impl<T: Texel> RasterSource for Resident<T> {
-    fn level_count(&self) -> u32 {
-        // The stored levels below the handover, then the whole chain above it.
-        self.first + self.coarse.level_count()
-    }
-
-    fn read_rect(&self, level: u32, origin: IVec2, size: UVec2, out: &mut [u8]) {
-        if level < self.first {
-            self.inner.read_rect(level, origin, size, out);
-        } else {
-            self.coarse.read_rect(level - self.first, origin, size, out);
         }
     }
 }
@@ -351,79 +234,6 @@ mod tests {
         // so it must not be dragged towards zero by a phantom partner.
         let pyramid = Pyramid::build(ramp(3, 2));
         assert_eq!(pyramid.level(1).get(1, 0), (2.0 + 5.0) / 2.0);
-    }
-
-    /// A source that stops partway down, the way a stored tile pyramid does.
-    ///
-    /// Asks are checked rather than clamped: reading a level it does not have is
-    /// the mistake worth catching, because clamping would hide it behind a level
-    /// that quietly answers for every coarser one.
-    struct Shallow {
-        whole: Pyramid<f32>,
-        levels: u32,
-    }
-
-    impl RasterSource for Shallow {
-        fn level_count(&self) -> u32 {
-            self.levels
-        }
-
-        fn read_rect(&self, level: u32, origin: IVec2, size: UVec2, out: &mut [u8]) {
-            assert!(
-                level < self.levels,
-                "asked for level {level} of {}",
-                self.levels
-            );
-            self.whole.read_rect(level, origin, size, out);
-        }
-    }
-
-    /// The point of [`Resident`]: a pyramid that stops short still ends up with
-    /// levels all the way to a single texel, and they are the same levels the
-    /// downloader would have written had it kept going.
-    ///
-    /// Without this the clipmap gets only as many levels as the store happens to
-    /// hold, and its outermost ring reaches a fraction of the ground the data
-    /// covers -- two kilometres of eight, for the installed pyramid.
-    #[test]
-    fn the_resident_tail_carries_the_chain_past_where_the_store_stops() {
-        let base = ramp(64, 64);
-        let stored = 3;
-        let resident = Resident::<f32>::over(
-            Box::new(Shallow {
-                whole: Pyramid::build(base.clone()),
-                levels: stored,
-            }),
-            UVec2::splat(64),
-        );
-
-        // Sixty-four texels reduce to one in seven levels however few were kept.
-        let whole = Pyramid::build(base);
-        assert_eq!(resident.level_count(), 7);
-        assert_eq!(resident.level_count(), whole.level_count());
-
-        // Reducing a reduction is reducing the original, so the levels invented
-        // here are indistinguishable from the ones that were not written down.
-        // The window deliberately overhangs the raster, since that is what a
-        // clipmap window does at the coarse end and it is where clamping to the
-        // border has to agree as well.
-        for level in 0..resident.level_count() {
-            let (mut mine, mut theirs) = ([0f32; 100], [0f32; 100]);
-            let window = (IVec2::splat(-3), UVec2::splat(10));
-            resident.read_rect(
-                level,
-                window.0,
-                window.1,
-                bytemuck::cast_slice_mut(&mut mine),
-            );
-            whole.read_rect(
-                level,
-                window.0,
-                window.1,
-                bytemuck::cast_slice_mut(&mut theirs),
-            );
-            assert_eq!(mine, theirs, "level {level}");
-        }
     }
 
     #[test]

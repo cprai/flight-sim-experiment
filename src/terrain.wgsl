@@ -7,17 +7,22 @@
 // surface itself. Tevs, Ihrke and Seidel, "Maximum Mipmaps for Fast, Accurate,
 // and Scalable Dynamic Height Field Rendering", I3D 2008.
 //
-// The level array *is* the quadtree. Level `l` holds one ceiling per level-`l`
-// texel, bounding every surface the renderer might draw across the closed
-// square that texel covers, so climbing the quadtree is reading the next level
-// out. Nothing carries a mip chain of its own. See
+// The mip chain *is* the quadtree. Level `l` is mip `l - resident_base`, and
+// holds one ceiling per level-`l` texel bounding every surface the renderer
+// might draw across the closed square that texel covers, so climbing the
+// quadtree is reading the next mip out. See
 // `crates/terrain-tiles/src/maxima.rs` for what a cell means and why the bound
 // has to hold for coarse levels as well as fine.
 //
-// Which level a point can be read at is decided by residency alone, and
-// residency is decided by distance from the camera -- a level holds a square of
-// whole tiles around it. That is the level of detail, and it needs no rule of
-// its own: a ray far from the camera simply finds nothing finer resident.
+// The whole raster is resident from `resident_base` upwards and nothing
+// streams, so a texel index *is* a texture coordinate: every level's mask is
+// all ones and `slot` is the identity. The mask stays because it is what a
+// generated level below the base will need, and because paying for it is one
+// AND against a word `resident` has already loaded.
+//
+// Which level a point can be read at is decided by residency, and below the
+// base there is none. That is the level of detail, and it needs no rule of its
+// own: a ray simply finds nothing finer resident.
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -66,20 +71,22 @@ const MARCH_GROUP: u32 = 64u;
 const MARCH_ROW: u32 = 1024u;
 
 struct Level {
-    // The texels resident at this level, as a half-open range measured in this
-    // level's own texels from the raster's origin. A point outside it has to be
-    // read at a coarser level, which covers twice the ground from the same
-    // number of tiles and is therefore resident wherever this one is.
-    //
-    // One texel short of the tiles actually loaded on the high side, because
-    // the bilinear patch at the last texel reads its neighbour.
+    // The texels readable at this level, as a half-open range in this level's
+    // own texels from the raster's origin. The whole level, while the whole
+    // raster is resident: outside it there is no coarser level to fall to, only
+    // the edge of the world. `slot` clamps into this range rather than holding
+    // a texel back from it.
     valid_low: vec2<i32>,
     valid_high: vec2<i32>,
-    // The highest ground anywhere resident at this level, taken across the
-    // tiles themselves. A ray above it and climbing has nothing to find here.
+    // The highest ground anywhere resident at this level. A ray above it and
+    // climbing has nothing to find here.
     ceiling: f32,
     padding: f32,
-    more_padding: vec2<f32>,
+    // What wraps a texel index onto its texture coordinate at this level. All
+    // ones for a resident level, whose index is its coordinate; a power-of-two
+    // square below one is a mask rather than a modulo, and it is per level
+    // because a resident chain and a window under it are different widths.
+    mask: vec2<i32>,
 };
 
 struct Terrain {
@@ -96,12 +103,11 @@ struct Terrain {
     data_min: vec2<f32>,
     data_max: vec2<f32>,
     level_count: u32,
-    // The finest level being kept. Below it nothing is loaded, because its
-    // texels would be smaller than the pixels they land in.
+    // The finest level worth descending to. Below it nothing is resident, or
+    // its texels would be smaller than the pixels they land in.
     base_level: u32,
-    // A level's texture is a power of two square, so wrapping a texel index
-    // onto its slot is an AND with this.
-    texel_mask: u32,
+    // The level mip zero holds. Level `l` is mip `l - resident_base`.
+    resident_base: u32,
     // How many texels a ray may cross before the march gives up on it.
     march_steps: u32,
     // The highest ground anywhere resident, across every level being marched.
@@ -123,9 +129,9 @@ struct Terrain {
 // exact texel centres, never sampled, so no float-filtering support is needed.
 // Materials could not be filtered even in principle: ids are labels, and a
 // blend of two labels is a third, wrong, label.
-@group(1) @binding(1) var heights: texture_2d_array<f32>;
-@group(1) @binding(2) var materials: texture_2d_array<u32>;
-@group(1) @binding(3) var maxima: texture_2d_array<f32>;
+@group(1) @binding(1) var heights: texture_2d<f32>;
+@group(1) @binding(2) var materials: texture_2d<u32>;
+@group(1) @binding(3) var maxima: texture_2d<f32>;
 
 // Elevations below this are the raster's nodata rather than ground.
 //
@@ -159,19 +165,38 @@ fn resident(level: u32, cell: vec2<i32>) -> bool {
     return all(cell >= info.valid_low) && all(cell < info.valid_high);
 }
 
-// The slot a texel index lands in.
+// The texture coordinate a texel index lands at, in this level.
 //
-// A level's square is a power-of-two number of tiles and a tile is a power of
-// two texels, so this is a mask rather than a modulo -- and it depends on
-// nothing but the index, because a tile's slot does not move when the square
-// does. Negative indices wrap correctly: a two's complement AND is exactly the
-// non-negative remainder.
-fn slot(cell: vec2<i32>) -> vec2<i32> {
-    return cell & vec2<i32>(i32(terrain.texel_mask));
+// The identity for a resident level, whose mask is all ones. For a window under
+// one it is a mask rather than a modulo, because such a window is a power-of-two
+// square of tiles -- and it depends on nothing but the index, so a tile's
+// address does not move when the window does. Negative indices wrap correctly:
+// a two's complement AND is exactly the non-negative remainder.
+//
+// Then clamped to the level, which is what lets the last texel of a level be
+// read at all. The bilinear patch there reaches one sample past itself, and
+// past the last one there is nothing: `textureLoad` out of bounds answers zero,
+// which draws as sea level rather than as absent. Clamping repeats the border
+// instead, which is exactly what the tile store does past the edge of a survey
+// -- so the two agree about ground that is off the end of the data.
+//
+// This is what the resident square used to hold back a texel for. It could not
+// clamp, because past its edge sat a real texel of somewhere else entirely; a
+// chain has no somewhere else. Holding a texel back here instead would make the
+// coarsest levels empty -- the top of this chain is one texel across, and one
+// less than that is none.
+fn slot(level: u32, cell: vec2<i32>) -> vec2<i32> {
+    let info = terrain.levels[level];
+    return clamp(cell & info.mask, info.valid_low, info.valid_high - vec2<i32>(1));
+}
+
+// Which mip of the resident chain a level is.
+fn mip(level: u32) -> i32 {
+    return i32(level - terrain.resident_base);
 }
 
 fn height_at(level: u32, cell: vec2<i32>) -> f32 {
-    return textureLoad(heights, slot(cell), i32(level), 0).r;
+    return textureLoad(heights, slot(level, cell), mip(level)).r;
 }
 
 // The four corner heights of one texel, in the order [`surface`] expects: the
@@ -298,8 +323,8 @@ struct Hit {
 //
 // The march works throughout in *level-0 texel* coordinates, so a level is
 // nothing but a cell size: level `l`'s texels are `2^l` of them across. Nothing
-// has to be rebased when a ray changes level, which is the whole reason the
-// resident squares are anchored to the raster rather than to the camera.
+// has to be rebased when a ray changes level, which a chain gives for free --
+// mip `m` of a texture is exactly half mip `m - 1`.
 fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     var out: Hit;
     out.found = false;
@@ -315,9 +340,13 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     // texel rather than back in this one. `wall_nudge` is a distance along the
     // dominant axis; dividing by `speed` turns it into a distance along the ray.
     let nudge = terrain.wall_nudge / speed;
-    // A ray that has crossed the coarsest square twice has left it, or is going
-    // straight up or down and never will.
-    let limit = 2.0 * f32(terrain.texel_mask + 1u) * f32(1u << coarsest) / speed;
+    // A ray that has crossed the raster twice has left it, or is going straight
+    // up or down and never will. Taken from the data bounds rather than from
+    // the texture, which since the whole raster is resident is the same figure
+    // and the more honest of the two: what bounds a ray is the ground, not the
+    // memory holding it.
+    let extent = (terrain.data_max - terrain.data_min) / terrain.metres_per_texel;
+    let limit = 2.0 * max(extent.x, extent.y) / speed;
 
     var t = 0.0;
     // Start at the coarsest level and descend, which is the shape a maximum
@@ -351,14 +380,21 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         let size = f32(1u << level);
         let cell = vec2<i32>(floor(p / size));
 
-        // Nothing loaded here at this level: the ray has left this square, so
-        // hand it out to the level beyond, which covers twice the ground.
+        // Off the end of this level: the ray has left the raster at this
+        // resolution, so hand it out to the level beyond, which covers twice
+        // the ground per texel and so reaches one texel further.
         if (!resident(level, cell)) {
             if (level >= coarsest) {
-                // Off the end of everything loaded. Whether that is the edge of
-                // the world or a square still filling, this ray does not know.
-                out.abandoned = true;
-                ray_abandoned = true;
+                // Past the coarsest level is past the raster, and there is
+                // nothing out there to draw. This used to be reported as a ray
+                // that gave up, because it was genuinely ambiguous: a square
+                // still filling looked exactly like the edge of the world, and
+                // calling either one sky would have drawn a hole while a level
+                // loaded. Nothing fills now -- the whole raster is resident
+                // before the first frame -- so a ray that leaves the chain has
+                // left the world, and sky is the honest answer rather than a
+                // diagnostic. It also lets the reprojection carry the pixel,
+                // where an abandoned one was re-marched every frame forever.
                 return out;
             }
             level += 1u;
@@ -389,7 +425,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         );
         let exit = min(t + max(span, 0.0), limit);
 
-        let ceiling = textureLoad(maxima, slot(cell), i32(level), 0).r;
+        let ceiling = textureLoad(maxima, slot(level, cell), mip(level)).r;
         // The texel bounds its whole closed square, so a ray above that ceiling
         // at both ends of the segment is above it throughout.
         if (min(eye.y + dir.y * t, eye.y + dir.y * exit) > ceiling) {
@@ -667,17 +703,17 @@ var<private> ray_spent: bool = false;
 
 // One height, paired with whether a difference may use it.
 //
-// Three ways it may not. It can be the raster's nodata, which is a hole in the
-// survey rather than a measurement of flat ground. It can lie outside this
-// level's resident square, where `slot` would wrap the read onto whatever tile
-// of somewhere else happens to share that slot -- an arbitrary height, and one
-// that changes as the square moves. The march itself never had to ask that at
-// the leaf: it reads the four corners of the texel it is standing in, and the
-// far one carries no weight where it is not loaded, whereas a central
-// difference reaches two texels past the hit, which the square's edge does not
-// promise. Or it can lie past `last`, outside the survey altogether, where the
-// store answers by repeating its border texel -- ground of no slope, which is
-// the one wrong answer that looks like a right one.
+// Three ways it may not, and two of them are the same mistake at different
+// edges. It can be the raster's nodata, which is a hole in the survey rather
+// than a measurement of flat ground. It can lie outside this level, where
+// `slot` clamps and answers with the border texel repeated. Or it can lie past
+// `last`, outside the survey altogether, where the store did the same thing
+// when the level was read. Both of those are ground of no slope, which is the
+// one wrong answer that looks like a right one.
+//
+// The march itself never had to ask: at the leaf it reads the four corners of
+// the texel it is standing in, and the far one carries no weight at the edge,
+// whereas a central difference reaches two texels past the hit.
 fn sample_height(level: u32, cell: vec2<i32>, last: vec2<i32>) -> vec2<f32> {
     if (any(cell < vec2<i32>(0)) || any(cell > last) || !resident(level, cell)) {
         return vec2<f32>(0.0, 0.0);
@@ -941,7 +977,7 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // one already: `terrain-generate` writes a canopy id into this product
     // wherever the crowns cover enough of a texel, so the gaps between the
     // trees keep the floor's own colour and the trees do not.
-    out.material = textureLoad(materials, slot(cell), i32(hit.level), 0).r;
+    out.material = textureLoad(materials, slot(hit.level, cell), mip(hit.level)).r;
     out.position = hit.position;
     // The ray was cast through the centre of the pixel, so that is where the
     // hit sits inside it, exactly.
@@ -1309,12 +1345,12 @@ fn derived_ceiling(cell: vec2<i32>) -> f32 {
     // Tested per child rather than for the group, because the square's edge can
     // fall between them: a ray may descend into one child of a cell and not its
     // neighbour, and the one it can reach is the one that has to be bounded.
-    let below = i32(level - 1u);
+    let below = mip(level - 1u);
     for (var dy = 0; dy < 2; dy++) {
         for (var dx = 0; dx < 2; dx++) {
             let child = cell * 2 + vec2<i32>(dx, dy);
             if (all(child >= job.below_low) && all(child < job.below_high)) {
-                top = max(top, textureLoad(maxima, slot(child), below, 0).r);
+                top = max(top, textureLoad(maxima, slot(level - 1u, child), below).r);
             }
         }
     }
