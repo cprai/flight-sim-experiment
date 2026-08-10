@@ -1002,11 +1002,12 @@ mod tests {
     ///
     /// `detail_base` starts blending the finest level into the one outside it as
     /// soon as a pixel covers more than one of its texels -- 500 m above the
-    /// ground for this raster and this test's deliberately coarse pixel -- and
-    /// the march does not reproduce that blend. Six hundred metres over ground
-    /// standing at about 180 leaves it at zero, so a comparison from here is
-    /// measuring the traversal rather than measuring a mismatch that is already
-    /// known and accepted.
+    /// ground for this raster and this test's deliberately coarse pixel. That
+    /// blend is a coin thrown per texel now rather than a step, which makes it
+    /// no easier to compare against: a frame drawn half at one level and half at
+    /// the next matches nothing exactly. Six hundred metres over ground standing
+    /// at about 180 leaves the weight at zero, so a comparison from here is
+    /// measuring the traversal rather than measuring the dissolve.
     fn low_and_looking_out(camera: &mut Camera) {
         camera.position = Vec3::new(70.0, 600.0, -110.0);
         camera.orientation = Camera::from_yaw_pitch_roll(0.0, -20f32.to_radians(), 0.0);
@@ -1249,6 +1250,215 @@ mod tests {
                 "base {base}: expected background at ({x:.0}, {y:.0}), got {found:?}"
             );
         }
+    }
+
+    /// A camera high enough over the dissolve to see it, and low enough that
+    /// nothing else is going on.
+    ///
+    /// [`coarse_residency`] generates one level under a base of 60 m texels and
+    /// reaches 24 of the fine ones -- 720 m -- so the band runs from 360 m to
+    /// there. From 450 m up, straight down, the whole frame lies inside it: the
+    /// middle of the picture is 450 m from the eye and the corners about 555,
+    /// so the share falls from three quarters to under a half across the frame.
+    /// Any lower and the band is off the top of the picture; any higher and
+    /// `detail_base` starts blending on its own account, which is a second
+    /// thing to explain in one measurement.
+    const DISSOLVE_ALTITUDE: f32 = 450.0;
+
+    /// Flat ground, no relief, and a cover that changes every other texel.
+    ///
+    /// The plane is what makes the picture a projection with nothing in it but
+    /// the cover: a crown or a stone would stand off it, and the fractal would
+    /// crumple it. Grass and water because nothing grows on either -- see
+    /// `standing_on` in the shader, which walks past both.
+    ///
+    /// The checkerboard is what makes the two levels *disagree*. A generated
+    /// level upscales the survey's cover with a fractal warp and a resident one
+    /// reads it square, so they answer differently only near a boundary; two
+    /// texels to a square puts a boundary within reach of everywhere.
+    fn dissolve_ground() -> (Vec<f32>, Vec<MaterialId>) {
+        let heights = vec![0.0f32; (RASTER * RASTER) as usize];
+        let materials = (0..RASTER * RASTER)
+            .map(|index| {
+                let (col, row) = (index % RASTER, index / RASTER);
+                if (col / 2 + row / 2).is_multiple_of(2) {
+                    GRASS
+                } else {
+                    LAKE
+                }
+            })
+            .collect();
+        (heights, materials)
+    }
+
+    fn looking_down_from(altitude: f32, east: f32) -> impl FnOnce(&mut Camera) {
+        move |camera: &mut Camera| {
+            camera.position = Vec3::new(east, altitude, 0.0);
+            camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+        }
+    }
+
+    /// The dissolve has to be fixed to the ground rather than to the frame, and
+    /// this is the test that says so.
+    ///
+    /// A camera looking straight down at a plane projects it linearly -- every
+    /// point of the plane is the same distance along the view axis -- so sliding
+    /// the camera sideways slides the whole picture by exactly that much and
+    /// changes nothing else. Slide it by a whole number of pixels and the two
+    /// frames must overlap exactly. Whatever the dissolve did to the first, it
+    /// must have done to the same ground in the second.
+    ///
+    /// This is what a coin thrown off the pixel, off the frame counter, or off
+    /// anything screen-space would fail: the pattern would stand still while
+    /// the ground moved under it, which reads as the ground crawling. It is
+    /// also why the coin is thrown off the texel index and not off a world
+    /// position with the height in it.
+    #[test]
+    fn the_dissolve_is_fixed_to_the_ground_and_not_to_the_frame() {
+        let (heights, materials) = dissolve_ground();
+        let residency = Residency {
+            // A plane, exactly: the fractal would put a decimetre of crumple on
+            // it and the projection would stop being a slide.
+            detail_relief: 0.0,
+            ..coarse_residency()
+        };
+        // One pixel, on the ground. The frame is square, so the horizontal
+        // field of view is the vertical one.
+        let half = f64::from(crate::camera::FOV_Y_DEGREES).to_radians() * 0.5;
+        let metres_per_pixel = 2.0 * f64::from(DISSOLVE_ALTITUDE) * half.tan() / f64::from(SIZE);
+        let across = 8u32;
+        let frame = |east: f32| {
+            render_config(
+                residency,
+                heights.clone(),
+                materials.clone(),
+                looking_down_from(DISSOLVE_ALTITUDE, east),
+                &[],
+            )
+            .0
+        };
+        let still = frame(0.0);
+        let slid = frame((f64::from(across) * metres_per_pixel) as f32);
+
+        // Away from an edge, because the last place a boundary falls is decided
+        // by arithmetic the slide does not leave alone: the two eyes are a
+        // hundred metres apart, and the divide that turns a world position into
+        // a texel index rounds where it lands. That moves a boundary by up to a
+        // pixel, which over a checkerboard thirty pixels to a square is a fringe
+        // of a few percent and says nothing about the coin. So a pixel counts
+        // only where both frames are flat around it -- which is most of every
+        // square, and all of what a coin thrown per texel decides.
+        let flat = |frame: &[u8], x: u32, y: u32| {
+            let here = pixel(frame, x, y);
+            (-1..=1).all(|dy: i32| {
+                (-1..=1).all(|dx: i32| {
+                    pixel(frame, x.wrapping_add_signed(dx), y.wrapping_add_signed(dy)) == here
+                })
+            })
+        };
+        // Moving the eye east moves the ground west in the picture, so the
+        // second frame's column `x` is the first's `x + across`.
+        let (mut same, mut differ) = (0u32, 0u32);
+        for y in 1..SIZE - 1 {
+            for x in 1..SIZE - across - 1 {
+                if !flat(&still, x + across, y) || !flat(&slid, x, y) {
+                    continue;
+                }
+                if pixel(&still, x + across, y) == pixel(&slid, x, y) {
+                    same += 1;
+                } else {
+                    differ += 1;
+                }
+            }
+        }
+        assert!(
+            same + differ > 20_000,
+            "only {} pixels sit away from an edge, which is too few to judge",
+            same + differ
+        );
+        let share = f64::from(same) / f64::from(same + differ);
+        println!(
+            "{share:.4} of {} compared pixels slid with the ground",
+            same + differ
+        );
+        // Eight pixels, which is sixteen metres of a three-hundred-and-sixty
+        // metre band. The share itself is measured from the camera and so moves
+        // with it -- that is what makes the seam creep instead of jumping --
+        // and a slide long enough to matter carries a percent or two of texels
+        // across their own coin, which is the dissolve working rather than a
+        // pattern coming loose. A short slide does not, so this can ask for
+        // very nearly all of it: a coin thrown anywhere but the ground would
+        // re-roll every texel in the band and lose a third of them.
+        assert!(
+            share > 0.999,
+            "only {share:.4} of the overlap survived a slide of {across} pixels, \
+             so the dissolve is not fixed to the ground"
+        );
+    }
+
+    /// And it has to be a dissolve: a share that falls off with distance, not
+    /// an edge that has moved inwards.
+    ///
+    /// The same plane, rendered with the band open and with it shut, and the
+    /// texels that changed counted in the middle of the frame against the
+    /// corners. The middle is 450 m from the eye and the corners about 555, so
+    /// with the band running 360 m to 720 the share of ground still drawn at
+    /// the fine level falls from three quarters to under a half between them --
+    /// and what changed is one minus that. An edge would have given the same
+    /// answer everywhere inside it and nothing outside.
+    #[test]
+    fn the_handover_is_a_share_that_falls_with_distance() {
+        let (heights, materials) = dissolve_ground();
+        let shape = |fade: f32| Residency {
+            detail_relief: 0.0,
+            detail_fade: fade,
+            ..coarse_residency()
+        };
+        let frame = |fade: f32| {
+            render_config(
+                shape(fade),
+                heights.clone(),
+                materials.clone(),
+                looking_down_from(DISSOLVE_ALTITUDE, 0.0),
+                &[],
+            )
+            .0
+        };
+        // One is the band shut: the level is used out to its reach and then
+        // stops, which from here means the whole frame.
+        let shut = frame(1.0);
+        let open = frame(Residency::default().detail_fade);
+
+        let middle = SIZE / 2;
+        let (mut near, mut near_seen) = (0u32, 0u32);
+        let (mut far, mut far_seen) = (0u32, 0u32);
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let radius = Vec2::new(x as f32 - middle as f32, y as f32 - middle as f32).length();
+                let changed = u32::from(pixel(&shut, x, y) != pixel(&open, x, y));
+                if radius < 0.25 * SIZE as f32 {
+                    near_seen += 1;
+                    near += changed;
+                } else if radius > 0.45 * SIZE as f32 {
+                    far_seen += 1;
+                    far += changed;
+                }
+            }
+        }
+        let (near, far) = (
+            f64::from(near) / f64::from(near_seen),
+            f64::from(far) / f64::from(far_seen),
+        );
+        println!("changed: {near:.3} in the middle of the frame, {far:.3} at the corners");
+        assert!(
+            near > 0.01,
+            "nothing gave way in the middle of the band, which is {near:.3} changed"
+        );
+        assert!(
+            far > 3.0 * near,
+            "the corners are {far:.3} changed against {near:.3} in the middle, \
+             which is an edge rather than a share falling off with distance"
+        );
     }
 
     /// Tiles with nothing under them are never written, so a survey's ragged
@@ -1596,6 +1806,15 @@ mod tests {
     /// The shading reduces a normal to one number, so this is the only way to
     /// see the vector the march actually wrote.
     fn render_normals(heights: Vec<f32>, aim: impl FnOnce(&mut Camera)) -> Vec<[f32; 4]> {
+        render_normals_config(test_residency(), heights, aim)
+    }
+
+    /// As [`render_normals`], but over a residency configured by the caller.
+    fn render_normals_config(
+        residency: Residency,
+        heights: Vec<f32>,
+        aim: impl FnOnce(&mut Camera),
+    ) -> Vec<[f32; 4]> {
         let (device, queue) = test_device();
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -1613,7 +1832,7 @@ mod tests {
             view_formats: &[],
         });
 
-        let mut scene = test_scene(&device, format, test_residency(), heights, flat_ground());
+        let mut scene = test_scene(&device, format, residency, heights, flat_ground());
         aim(&mut scene.camera);
         scene.update(&device, &queue);
 
@@ -1804,7 +2023,25 @@ mod tests {
             })
             .collect();
 
-        let normals = render_normals(heights, straight_down);
+        // The one test here that has to be told the truth about how big a pixel
+        // is. Every other fixture takes [`test_residency`]'s deliberately
+        // coarse `pixel_angle`, which exists so that a 256-pixel frame of a
+        // 128-texel raster gives up levels at all -- but the march now
+        // dissolves the handover between two levels rather than switching, and
+        // it sizes that dissolve by the same angle. A pixel fifteen times its
+        // true width puts the dissolve's texels twenty-four pixels across
+        // instead of one, which reads as exactly the facet this is looking for.
+        // With the real angle the camera sits on the finest level with nothing
+        // to blend into, which is where a question about interpolation *within*
+        // a level belongs.
+        let honest = Residency {
+            pixel_angle: crate::terrain::residency::pixel_angle(
+                SIZE,
+                f64::from(crate::camera::FOV_Y_DEGREES).to_radians(),
+            ),
+            ..test_residency()
+        };
+        let normals = render_normals_config(honest, heights, straight_down);
         let at = |x: u32, y: u32| {
             let [nx, ny, nz, _] = normals[(y * SIZE + x) as usize];
             Vec3::new(nx, ny, nz)

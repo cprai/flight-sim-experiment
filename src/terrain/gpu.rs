@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::terrain::geotiff::Georeferencing;
 use crate::terrain::pyramid::RasterSource;
-use crate::terrain::residency::{Residency, TileResidency, Wanted, detail_base};
+use crate::terrain::residency::{Residency, TileResidency, Wanted, detail_base, detail_base_fade};
 use crate::terrain::tiles::{MaterialId, TileStore};
 use anyhow::{Context, Result};
 use glam::{DVec2, IVec2, UVec2, Vec2, Vec3};
@@ -71,6 +71,15 @@ struct TerrainUniform {
     /// Occupies what was tail padding, so the uniform is the same size and
     /// every other member sits where it did.
     viewport: [u32; 2],
+    /// How far level zero's window reaches, in metres. Doubled per level.
+    detail_reach: f32,
+    /// Where a level starts giving way, as a fraction of that.
+    detail_fade: f32,
+    /// The chance a texel is drawn one level coarser than `base_level`.
+    base_fade: f32,
+    /// Four rather than three, because `bytemuck::Pod` refuses a struct with
+    /// tail padding and three would leave four bytes of it.
+    padding: f32,
 }
 
 /// Mirrors `DetailJob` in the shader: one rectangle of one level to generate.
@@ -223,6 +232,10 @@ pub struct Terrain {
     mips: u32,
     /// The finest level worth descending to, from [`detail_base`].
     base: u32,
+    /// How far past that the same measure had got, from [`detail_base_fade`].
+    /// The chance a texel is drawn at `base + 1` instead, so that climbing
+    /// dissolves rather than switching the whole frame at one altitude.
+    base_fade: f32,
 
     /// A CPU mirror of one coarse mip of the heights.
     ///
@@ -1101,6 +1114,7 @@ impl Terrain {
             base_size,
             mips,
             base: resident_base,
+            base_fade: 0.0,
             ground: Vec::new(),
             ground_size,
             ground_level,
@@ -1293,12 +1307,14 @@ impl Terrain {
         // there.
         // No longer clamped to the base: the levels under it exist again, and
         // this is what decides how many of them are worth generating.
-        self.base = detail_base(
-            &self.residency,
-            metres_per_texel,
-            f64::from(camera.y - ground),
-            self.resident_base + self.mips,
-        );
+        let above_ground = f64::from(camera.y - ground);
+        let levels = self.resident_base + self.mips;
+        self.base = detail_base(&self.residency, metres_per_texel, above_ground, levels);
+        // And the part of the same measure the floor threw away, which the
+        // march spends as the chance of drawing a texel one level coarser. The
+        // level it blends into is the one above the floor, which is generated
+        // or resident either way, so nothing here is asked for that is missing.
+        self.base_fade = detail_base_fade(&self.residency, metres_per_texel, above_ground, levels);
         // Below the base nothing is generated, and a window that has been given
         // up is refilled whole when the camera comes back down to it.
         let work = self
@@ -1506,6 +1522,19 @@ impl Terrain {
             ceiling: self.ceiling,
             wall_nudge: wall_nudge(UVec2::new(self.placement.width, self.placement.height)),
             viewport: self.viewport.to_array(),
+            // Level zero's band, which the march doubles per level. Zero where
+            // there is nothing under the base to generate: the shader's ramp is
+            // only ever asked about a generated level.
+            detail_reach: if self.resident_base > 0 {
+                self.residency
+                    .fade_band(0, self.placement.metres_per_texel_x)
+                    .1 as f32
+            } else {
+                0.0
+            },
+            detail_fade: self.residency.detail_fade,
+            base_fade: self.base_fade,
+            padding: 0.0,
         };
 
         for level in self.base..self.resident_base + self.mips {

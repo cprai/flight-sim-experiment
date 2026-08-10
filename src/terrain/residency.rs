@@ -108,9 +108,9 @@ pub struct Residency {
     /// Levels below the base are not held: there is no measured ground under
     /// them to hold. They are synthesised into a square of whole tiles around
     /// the camera, which moves as it does, and this is how far that square
-    /// reaches -- sixteen tiles of 512 puts level zero at 3584 texels in every
+    /// reaches -- eight tiles of 512 puts level zero at 1536 texels in every
     /// direction, its parent at twice that, and the coarsest generated level at
-    /// 14336 m.
+    /// 6144 m.
     ///
     /// **This is what decides where the trees stop.** A crown is 7 m across and
     /// the survey's own base is 8 m, so no level at or above the base can hold
@@ -130,19 +130,12 @@ pub struct Residency {
     /// | 4 | 16 m | 55.4 |
     ///
     /// So the handover from the last generated level to the chain is a 26% step
-    /// in how bright a forest is, and the two rings inside it are 9% and 4%. The
-    /// step does not shrink with distance -- it is a change in the *mean*, not
-    /// in detail nobody can resolve -- so the only thing that hides it is
-    /// putting it where little ground is left to show it. Eight tiles put that
-    /// ring at 6144 m, which over a valley is mid-frame and read as a band of
-    /// hillside growing trees a frame at a time; sixteen put it at 14336 m,
-    /// where crossing it moved 10% more of the frame than the frames either
-    /// side of it did, against 27% before -- inside what ordinary flight
-    /// changes anyway.
-    ///
-    /// Sixteen is also the ceiling: 16 x 512 is 8192 texels, which is WebGPU's
-    /// own `max_texture_dimension_2d`, and the next doubling would be four times
-    /// the 1920 MiB this already costs.
+    /// in how bright a forest is, and the two inside it are 9% and 4%. Widening
+    /// this was tried first and only moved that step further out -- it is a
+    /// change in the *mean*, not in detail nobody can resolve, so distance does
+    /// not shrink it. [`Residency::detail_fade`] dissolves it instead, which is
+    /// what lets this stay small: a window at sixteen tiles is 1920 MiB against
+    /// 480 here, for a seam that was still a seam.
     pub detail_tiles: u32,
     /// Side of one generated tile, in texels.
     ///
@@ -164,6 +157,29 @@ pub struct Residency {
     /// The bound on what crossing a tile boundary costs. A level that falls
     /// behind is not wrong, only coarser at its outer edge until it catches up.
     pub detail_per_update: u32,
+    /// Where a level starts giving way to the one outside it, as a fraction of
+    /// how far it reaches.
+    ///
+    /// A level used out to its window's edge and not one texel further is a
+    /// ring, and a ring in a forest is a step in how bright the ground is --
+    /// see [`Residency::detail_tiles`] for the measurement. So a level is given
+    /// up gradually instead: from `detail_fade` of its reach out to the whole
+    /// of it, the share of ground still drawn at that level falls from all to
+    /// none, and which texels keep it is decided by a coin thrown per texel off
+    /// its own world position. The seam becomes a dissolve as wide as the band,
+    /// and the mean over it moves smoothly rather than in one step.
+    ///
+    /// One half, so that the bands *abut*: a level reaches twice as far as the
+    /// one under it, so `far / 2` for one level is `far` for the next, and the
+    /// whole range from half of level zero's reach out to the chain is a single
+    /// continuous handover with no plain stretch anywhere in it.
+    ///
+    /// **One is off**, not zero: at one the band has no width and the share
+    /// falls from all to none at the reach itself, which is the ring this
+    /// replaced. Zero is the other extreme -- every level starts giving way at
+    /// the camera -- and is a dissolve so wide that the near field is already
+    /// half drawn at the level above.
+    pub detail_fade: f32,
     /// How many bytes of texture the generated window may occupy.
     ///
     /// What [`Residency::fit_detail_tiles`] spends. A window is square and every
@@ -194,16 +210,18 @@ impl Default for Residency {
             // 1080p at sixty degrees, replaced wherever a real viewport is known.
             pixel_angle: 2.0 * (30f64.to_radians()).tan() / 1080.0,
             march_texels: 512,
-            // Sixteen tiles of 512 is 8192 texels square, which is where the
-            // trees end; see the field. Nothing above this fits WebGPU's own
-            // texture limit anyway.
-            detail_tiles: 16,
+            // Eight tiles of 512 is 4096 texels square: level zero out to
+            // 1536 m and the last level that draws a tree out to 6144 m, with
+            // the last half of each dissolving into the level outside it.
+            detail_tiles: 8,
             detail_tile_texels: 512,
             detail_relief: 2.0,
             detail_per_update: 4,
-            // Room for exactly that: three levels of 8192 square at ten bytes a
-            // texel is 1920 MiB.
-            window_budget: 2048 << 20,
+            detail_fade: 0.5,
+            // Room for exactly that: three levels of 4096 square at ten bytes a
+            // texel is 480 MiB. Sized for the shape above and not to the card,
+            // so that widening the window is a decision rather than a drift.
+            window_budget: 512 << 20,
         }
     }
 }
@@ -342,6 +360,24 @@ impl Residency {
         (self.detail_tiles / 2 - 1) * self.detail_tile_texels
     }
 
+    /// Where a generated level starts giving way and where it is gone, in
+    /// metres from the camera.
+    ///
+    /// The far end is the reach above, which is what the window *guarantees* in
+    /// every direction rather than where its square happens to have stepped to.
+    /// That is the point of measuring the dissolve against it: the share reaches
+    /// nought exactly where residency runs out, so no ray ever asks for a texel
+    /// past the edge and the edge itself stops being visible. The near end is
+    /// [`Residency::detail_fade`] of it.
+    ///
+    /// The march is handed the level-zero band and doubles it per level, which
+    /// is this same arithmetic: `detail_reach` counts a level's own texels, and
+    /// each of those is `1 << level` of level zero's.
+    pub fn fade_band(&self, level: u32, metres_per_texel: f64) -> (f64, f64) {
+        let far = f64::from(self.detail_reach() << level) * metres_per_texel;
+        (f64::from(self.detail_fade) * far, far)
+    }
+
     /// How many texels a ray may cross in total before the march gives up.
     pub const fn march_steps(&self, levels: u32) -> u32 {
         levels * self.march_texels
@@ -360,8 +396,7 @@ impl Residency {
 ///
 /// This used to decide what was *loaded*, which was the larger saving while
 /// levels came off disk. Nothing is loaded any more, so what it saves now is
-/// march steps -- and it is what will decide how many levels are worth
-/// generating once anything is generated.
+/// march steps -- and it is what decides how many levels are worth generating.
 pub fn detail_base(
     residency: &Residency,
     metres_per_texel: f64,
@@ -369,9 +404,38 @@ pub fn detail_base(
     levels: u32,
 ) -> u32 {
     let coarsest = levels.saturating_sub(1);
+    (detail_level(residency, metres_per_texel, distance, levels).floor() as u32).min(coarsest)
+}
+
+/// How far past [`detail_base`] the same measure had got, in `0..1`.
+///
+/// The floor above throws this away, and throwing it away is a step: the whole
+/// frame changes level at one altitude, all at once, because the measure is a
+/// fact about the camera rather than about any ground in it. It is exactly a
+/// blend weight -- at nought the level below is worth every pixel of it, at one
+/// it is worth none -- so the march spends it as the chance that a texel is
+/// drawn one level coarser than the floor, and climbing dissolves.
+///
+/// Nought at the coarsest level with no case of its own: the measure is clamped
+/// to it, so once it is reached the fraction past it is nought by construction.
+/// The same clamp is what makes this nought close to the ground, where a pixel
+/// covers less than one texel of the finest level there is.
+pub fn detail_base_fade(
+    residency: &Residency,
+    metres_per_texel: f64,
+    distance: f64,
+    levels: u32,
+) -> f32 {
+    let t = detail_level(residency, metres_per_texel, distance, levels);
+    (t - t.floor()) as f32
+}
+
+/// How many halvings of the base level a pixel at `distance` covers, clamped to
+/// the levels that exist. The measure both of the two above are read off.
+fn detail_level(residency: &Residency, metres_per_texel: f64, distance: f64, levels: u32) -> f64 {
+    let coarsest = levels.saturating_sub(1);
     let resolvable = distance * residency.pixel_angle / metres_per_texel;
-    let t = resolvable.max(1.0).log2().clamp(0.0, f64::from(coarsest));
-    (t.floor() as u32).min(coarsest)
+    resolvable.max(1.0).log2().clamp(0.0, f64::from(coarsest))
 }
 
 /// A tile of one generated level, by its index on the raster's tile grid.
@@ -674,40 +738,57 @@ mod tests {
         assert!(whole > base && whole < base * 4 / 3 + base / 100);
     }
 
-    /// The window is where the trees stop, so how far it reaches is a fact
-    /// about the picture rather than about memory, and it is worth writing down.
+    /// Where each level gives way, which is where the picture changes and so
+    /// worth writing down. On the survey this flies a texel is a metre, so
+    /// these are metres.
     ///
-    /// The coarsest generated level is the one that matters: past it the chain
-    /// takes over, and the chain's base is 8 m, which cannot hold a 7 m crown.
+    /// The bands have to *abut*: a level reaches twice as far as the one under
+    /// it, so at a fade of one half each band begins exactly where its parent's
+    /// ended and the whole handover is continuous. Any other fraction leaves a
+    /// stretch drawn at one level alone, which is not wrong but is a stretch
+    /// where nothing is being blended.
     #[test]
-    fn the_window_reaches_past_where_a_forest_would_end() {
+    fn the_fade_bands_abut_so_the_handover_never_stops() {
         let residency = Residency::default();
-        let coarsest = residency.resident_base - 1;
-        assert_eq!(residency.detail_reach(), 3584, "level zero, in its texels");
+        assert_eq!(residency.detail_fade, 0.5);
+        assert_eq!(residency.detail_reach(), 1536, "level zero, in its texels");
+        let band = |level| residency.fade_band(level, 1.0);
+        assert_eq!(band(0), (768.0, 1536.0));
+        assert_eq!(band(1), (1536.0, 3072.0));
         assert_eq!(
-            residency.detail_reach() << coarsest,
-            14336,
-            "the last level that can draw a tree, in level-0 texels -- which on \
-             a one metre survey is 14 km"
+            band(residency.resident_base - 1),
+            (3072.0, 6144.0),
+            "the last level that can draw a tree is gone by 6 km"
         );
+        for level in 1..residency.resident_base {
+            assert_eq!(
+                band(level).0,
+                band(level - 1).1,
+                "level {level} starts giving way somewhere other than where \
+                 level {} finished",
+                level - 1
+            );
+        }
     }
 
-    /// A window is a texture like any other and this one is at the limit: 8192
-    /// square is exactly WebGPU's own `max_texture_dimension_2d`, so a device
-    /// that offers no more than the default still takes the shipped shape whole.
-    ///
-    /// The budget is the other half of the same question. Adding a product to
-    /// the window without adding its bytes to [`WINDOW_BYTES_PER_TEXEL`] does
-    /// not fail -- it silently allocates more than the budget says -- so it
-    /// should fail here instead.
+    /// A window is a texture like any other, and the budget is what says the
+    /// shipped one is the shape it is meant to be rather than whatever it has
+    /// drifted to. Adding a product to the window without adding its bytes to
+    /// [`WINDOW_BYTES_PER_TEXEL`] does not fail -- it silently allocates more
+    /// than the budget says -- so it should fail here instead.
     #[test]
     fn the_default_window_fits_the_default_device_and_budget() {
         let residency = Residency::default();
         let levels = residency.resident_base;
-        assert_eq!(residency.window_across(), 8192);
-        assert_eq!(residency.window_bytes(levels), 1920 << 20);
+        assert_eq!(residency.window_across(), 4096);
+        assert_eq!(residency.window_bytes(levels), 480 << 20);
         assert!(residency.window_bytes(levels) <= residency.window_budget);
-        assert_eq!(residency.fit_detail_tiles(levels, 8192), 16);
+        assert_eq!(
+            residency.fit_detail_tiles(levels, 8192),
+            8,
+            "well inside WebGPU's own texture limit, unlike the 8192 square \
+             this used to be"
+        );
     }
 
     /// A device or a budget that will not take the shipped window costs
@@ -716,24 +797,27 @@ mod tests {
     fn a_window_narrows_until_the_device_and_the_budget_take_it() {
         let residency = Residency::default();
         assert_eq!(
-            residency.fit_detail_tiles(3, 4096),
-            8,
-            "half the width is a quarter of the memory"
+            residency.fit_detail_tiles(3, 2048),
+            4,
+            "half the width is a quarter of the memory, and four is the floor"
         );
-        assert_eq!(residency.fit_detail_tiles(3, 1024), 4, "and stops at four");
         assert_eq!(
             Residency {
-                window_budget: 512 << 20,
+                window_budget: 128 << 20,
+                ..residency
+            }
+            .fit_detail_tiles(3, 16384),
+            4,
+            "120 MiB of window fits where 480 does not"
+        );
+        assert_eq!(
+            Residency {
+                detail_tiles: 16,
                 ..residency
             }
             .fit_detail_tiles(3, 16384),
             8,
-            "480 MiB of window fits where 1920 does not"
-        );
-        assert_eq!(
-            residency.fit_detail_tiles(1, 16384),
-            16,
-            "one level of it costs a third as much and stays whole"
+            "the budget alone narrows a window the device would have taken"
         );
     }
 
@@ -752,5 +836,50 @@ mod tests {
         assert_eq!(at(20_000.0), 1);
         assert_eq!(at(40_000.0), 2);
         assert!(at(1.0e9) <= 11, "clamped to the levels that exist");
+    }
+
+    /// And the part of that the floor threw away, which is what stops a climb
+    /// changing the whole frame at one altitude.
+    ///
+    /// It has to run the whole way from nought to one *within* a level and drop
+    /// back to nought at the next, because it is spent as the chance of drawing
+    /// one level coarser: a fade that never reached one would leave a step at
+    /// the top of every level, and one that did not return to nought would
+    /// leave the frame permanently half coarse.
+    #[test]
+    fn the_blend_weight_runs_out_exactly_as_the_level_changes() {
+        let residency = Residency {
+            pixel_angle: pixel_angle(1080, 60f64.to_radians()),
+            ..Default::default()
+        };
+        let level = |distance| detail_base(&residency, 8.0, distance, 12);
+        let fade = |distance| detail_base_fade(&residency, 8.0, distance, 12);
+        // A pixel covers one eight-metre texel at 7482 m and two at 14964 m,
+        // which is where level zero is finally given up. A hundred metres or so
+        // either side of that is a weight at each end of its range.
+        let (below, above) = (14_800.0, 15_100.0);
+        assert_eq!((level(below), level(above)), (0, 1));
+        assert!(
+            fade(below) > 0.97,
+            "level zero is all but given up at {below} m and the weight is {}",
+            fade(below)
+        );
+        assert!(
+            fade(above) < 0.03,
+            "level one has only just been reached at {above} m and the weight \
+             is already {}",
+            fade(above)
+        );
+        assert_eq!(
+            fade(100.0),
+            0.0,
+            "nothing to blend below the first handover"
+        );
+        assert_eq!(
+            fade(1.0e9),
+            0.0,
+            "and nothing above the last: there is no level over the coarsest \
+             to give way to"
+        );
     }
 }

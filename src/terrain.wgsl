@@ -122,6 +122,17 @@ struct Terrain {
     // the vertex stage so that every reader of a pixel's ray -- however it came
     // to be looking at that pixel -- derives it by exactly the same arithmetic.
     viewport: vec2<u32>,
+    // How far level zero's window reaches from the camera, in metres, and where
+    // in that a level starts giving way to the one outside it. One figure for
+    // level zero because every level's window is the same square of tiles, so a
+    // level reaches exactly twice as far as the one under it. See `level_share`.
+    detail_reach: f32,
+    detail_fade: f32,
+    // The chance a texel is drawn one level coarser than `base_level`: the part
+    // of the height-above-ground measure that `base_level`'s own floor threw
+    // away. See `detail_base_fade` in `src/terrain/residency.rs`.
+    base_fade: f32,
+    padding: f32,
 };
 
 @group(1) @binding(0) var<uniform> terrain: Terrain;
@@ -221,6 +232,93 @@ fn slot(level: u32, cell: vec2<i32>) -> vec2<i32> {
 // Which mip of the resident chain a level is.
 fn mip(level: u32) -> i32 {
     return i32(level - terrain.resident_base);
+}
+
+// Wellons' `lowbias32`, whose avalanche is measured rather than assumed: one
+// input bit flips about half the output bits, which is what stops neighbouring
+// lattice points drawing correlated gradients and putting a grain in the
+// terrain.
+//
+// Up here rather than in the noise block below because the march wants it too,
+// and WGSL will not call a function declared later in the file. Two consumers,
+// one hash: the gradient noise reads it per lattice point, and `level_coin`
+// reads it per texel.
+fn noise_mix(bits: u32) -> u32 {
+    var b = bits;
+    b ^= b >> 16u;
+    b = b * 0x7feb352du;
+    b ^= b >> 15u;
+    b = b * 0x846ca68bu;
+    b ^= b >> 16u;
+    return b;
+}
+
+// The two coordinates are folded in one at a time, each through its own mixer,
+// rather than combined and mixed once. Combining first is cheaper and wrong in
+// a way that shows: they would meet only through a single xor, so whole
+// diagonals of the lattice collide and the noise grows a herringbone.
+fn noise_hash(x: i32, y: i32, seed: u32) -> u32 {
+    var bits = seed * 0x9e3779b1u;
+    bits = noise_mix(bits ^ (u32(x) * 0x3504f333u));
+    bits = noise_mix(bits ^ (u32(y) * 0xf1bbcdcbu));
+    return bits;
+}
+
+// Seeds the coin a texel throws to decide whether it is drawn at its own level
+// or at the one outside it. Its own, so that a run of levels does not hand the
+// same texel the same coin twice.
+const LEVEL_SEED: u32 = 0x4c6f6473u;
+
+// A number in `0..1` for one texel of one level, from where it is in the world
+// and nothing else.
+//
+// The whole design of the dissolve rests on what this does *not* depend on. Not
+// the frame, or a still camera would boil; not the pixel, or the pattern would
+// swim across the ground as the view turned; not the height, so a texel keeps
+// its coin whatever is standing on it and however the ground under it is later
+// raised. A patch of ground therefore keeps its answer for as long as it is on
+// screen, and changes it only when the ramp below sweeps past its own coin --
+// one texel at a time, scattered, rather than a whole ring at once.
+fn level_coin(cell: vec2<i32>, level: u32) -> f32 {
+    let bits = noise_hash(cell.x, cell.y, LEVEL_SEED ^ (level * 0x9e3779b9u));
+    // The top twenty-four bits, which an `f32` holds exactly.
+    return f32(bits >> 8u) * (1.0 / 16777216.0);
+}
+
+// What share of the ground `t` metres from the eye is still drawn at `level`.
+//
+// All of it close in, none of it at the far end, and the ramp between the two
+// is where a seam used to be. Three things narrow it, in the order they bind:
+//
+//   * Nothing below `base_level` is generated at all, so it is worth nothing.
+//   * `base_level` itself is worth `1 - base_fade`, which is the part of the
+//     altitude measure its own floor threw away. Climbing therefore gives up
+//     the finest level a texel at a time instead of a frame at a time.
+//   * A generated level is worth all of itself out to `detail_fade` of its
+//     window's reach and nothing at the reach itself, falling off in between.
+//
+// The far end is what the window *guarantees* in every direction, not where its
+// square has stepped to, which is what makes the ramp a function of distance
+// alone: it reaches nought exactly where residency runs out, so the edge that
+// used to show is never the thing a ray stops at.
+//
+// Resident levels have no band. They cover the whole raster, so there is no
+// edge to dissolve and no ring to hide -- every seam this is for is under the
+// base.
+fn level_share(level: u32, t: f32) -> f32 {
+    if (level < terrain.base_level) {
+        return 0.0;
+    }
+    var share = 1.0;
+    if (level == terrain.base_level) {
+        share = 1.0 - terrain.base_fade;
+    }
+    if (level < terrain.resident_base) {
+        let far = terrain.detail_reach * f32(1u << level);
+        let near = terrain.detail_fade * far;
+        share = min(share, clamp((far - t) / max(far - near, 1e-6), 0.0, 1.0));
+    }
+    return share;
 }
 
 // A height off the resident chain, which is every level from the base up.
@@ -487,10 +585,27 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         }
 
         // Something could be here. Look closer, if anything finer is loaded --
-        // which is to say, if this ground is near enough the camera to have it.
+        // which is to say, if this ground is near enough the camera to have it
+        // -- and if this particular texel is one of the ones still taking it.
+        //
+        // The second half is the dissolve. A level used out to its window's
+        // edge and not a texel further draws a ring, and over a forest that
+        // ring is a step in how bright the ground is, because a crown is wider
+        // than the base's texels and only the generated levels can hold one.
+        // So the share falls off with distance and each texel throws a coin
+        // against it: near the camera every texel descends, at the far end
+        // none does, and in between the two levels are interleaved in a
+        // pattern fixed to the ground rather than to the frame. What was a
+        // ring becomes a band kilometres wide whose mean slides from one
+        // level's answer to the other's.
+        //
+        // Refusing the descent is not a special case. The ray simply treats
+        // this level as the leaf, which is exactly what it does at the edge of
+        // a window today, so nothing below has to know.
         if (level > finest) {
             let finer = level - 1u;
-            if (resident(finer, vec2<i32>(floor(p / (size * 0.5))))) {
+            if (resident(finer, vec2<i32>(floor(p / (size * 0.5))))
+                && level_coin(cell, level) < level_share(finer, t)) {
                 level = finer;
                 continue;
             }
@@ -1459,30 +1574,9 @@ const GRADIENTS = array<vec2<f32>, 16>(
 // What unit gradient noise has to be multiplied by to reach `-1..=1`.
 const GRADIENT_SCALE: f32 = 1.4142136;
 
-// Wellons' `lowbias32`, whose avalanche is measured rather than assumed: one
-// input bit flips about half the output bits, which is what stops neighbouring
-// lattice points drawing correlated gradients and putting a grain in the
-// terrain.
-fn noise_mix(bits: u32) -> u32 {
-    var b = bits;
-    b ^= b >> 16u;
-    b = b * 0x7feb352du;
-    b ^= b >> 15u;
-    b = b * 0x846ca68bu;
-    b ^= b >> 16u;
-    return b;
-}
-
-// The two coordinates are folded in one at a time, each through its own mixer,
-// rather than combined and mixed once. Combining first is cheaper and wrong in
-// a way that shows: they would meet only through a single xor, so whole
-// diagonals of the lattice collide and the noise grows a herringbone.
-fn noise_hash(x: i32, y: i32, seed: u32) -> u32 {
-    var bits = seed * 0x9e3779b1u;
-    bits = noise_mix(bits ^ (u32(x) * 0x3504f333u));
-    bits = noise_mix(bits ^ (u32(y) * 0xf1bbcdcbu));
-    return bits;
-}
+// The lattice hash this noise is built on lives further up the file, beside the
+// march that also throws coins off it; see `noise_hash`. WGSL wants a function
+// declared before it is used and the march comes first.
 
 // Perlin's quintic interpolant, which has zero first *and* second derivative at
 // both ends. The cubic is cheaper and leaves a second-derivative jump at every
