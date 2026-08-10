@@ -441,6 +441,20 @@ impl Terrain {
             ),
             ..residency
         };
+        // And then the window under it, which is a texture too and a large one:
+        // the shipped sixteen tiles of 512 is 8192 texels square, exactly
+        // WebGPU's own limit and 1920 MiB across the three products. A device
+        // that will not take that gets a narrower window rather than an error,
+        // which costs how far the generated levels reach and nothing else. This
+        // runs second because it is asked over the levels the base leaves under
+        // it, and the base has only just been settled.
+        let residency = Residency {
+            detail_tiles: residency.fit_detail_tiles(
+                residency.resident_base.max(1),
+                device.limits().max_texture_dimension_2d,
+            ),
+            ..residency
+        };
         let resident_base = residency.resident_base;
         let base_size = residency.base_size(raster);
         let mips = Residency::mip_count(base_size).min(MAX_LEVELS as u32 - resident_base);
@@ -524,7 +538,7 @@ impl Terrain {
         // degenerates to one texel that nothing ever reads.
         let detail_levels = resident_base.max(1);
         let detail_across = if resident_base > 0 {
-            residency.detail_tiles * residency.detail_tile_texels
+            residency.window_across()
         } else {
             // Nothing under the base to generate, and a texture may not be
             // empty. One texel that nothing ever reads.
@@ -586,7 +600,7 @@ impl Terrain {
                  texels each, {:.0} MiB, reaching {} texels from the camera",
                 residency.detail_tiles,
                 residency.detail_tiles,
-                (detail_across as usize).pow(2) * 10 * resident_base as usize / (1 << 20),
+                residency.window_bytes(resident_base) / (1 << 20),
                 residency.detail_reach() << (resident_base - 1),
             );
         }

@@ -60,6 +60,19 @@ use glam::{DVec2, IVec2, UVec2};
 /// Anything added there must be added here.
 pub const BYTES_PER_TEXEL: usize = 4 + 2 + 2 + 2;
 
+/// Bytes one texel of a *generated* level costs, across its three products.
+///
+/// Heights `R32Float`, the max pyramid over them `R16Float`, and the ids
+/// `R32Uint` -- wider than the chain's `R16Uint` because a generated level is
+/// written by a dispatch and `r16uint` is not a WebGPU storage format. Neither a
+/// lift nor a cover of its own: a generated level grows what stands on it into
+/// its own heights as it fills, so there is nothing left to keep beside them.
+///
+/// The same restatement, and the same hazard, as [`BYTES_PER_TEXEL`]: nothing
+/// ties this to what `Terrain::new` allocates but [`Residency::window_bytes`]
+/// and the line it logs both believe it.
+pub const WINDOW_BYTES_PER_TEXEL: usize = 4 + 2 + 4;
+
 /// How much of the raster is resident, and how the march is bounded.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Residency {
@@ -70,7 +83,13 @@ pub struct Residency {
     /// or the budget will not take it; never made finer, because the detail
     /// below it is meant to be generated rather than stored.
     pub resident_base: u32,
-    /// How many bytes of texture the whole arrangement may occupy.
+    /// How many bytes of texture the *resident chain* may occupy.
+    ///
+    /// The chain alone. The generated window under it is bounded separately by
+    /// [`Residency::window_budget`], because the two answer different questions
+    /// -- the chain how much ground truth is held, the window how far from the
+    /// camera the levels below it reach -- and one figure covering both would
+    /// buy trees further out by coarsening the survey, without saying so.
     pub memory_budget: usize,
     /// The angle one pixel of the target subtends, in radians.
     ///
@@ -89,9 +108,41 @@ pub struct Residency {
     /// Levels below the base are not held: there is no measured ground under
     /// them to hold. They are synthesised into a square of whole tiles around
     /// the camera, which moves as it does, and this is how far that square
-    /// reaches -- eight tiles of 512 puts level zero at 1536 texels in every
-    /// direction, which is what the streamed clipmap reached with the same
-    /// arrangement.
+    /// reaches -- sixteen tiles of 512 puts level zero at 3584 texels in every
+    /// direction, its parent at twice that, and the coarsest generated level at
+    /// 14336 m.
+    ///
+    /// **This is what decides where the trees stop.** A crown is 7 m across and
+    /// the survey's own base is 8 m, so no level at or above the base can hold
+    /// one: the resident chain's canopy is an order statistic of crowns it
+    /// cannot resolve, which is a smooth sheet at treetop height. Only the
+    /// generated levels are fine enough to draw trees at all, and the outermost
+    /// of them ends exactly here. Measured on the installed survey, over one
+    /// view, by forcing the whole frame to one level and taking the mean of the
+    /// forest in it, out of 255:
+    ///
+    /// | finest level | texel | how bright the forest is |
+    /// | --- | --- | --- |
+    /// | 0 | 1 m | 38.8 |
+    /// | 1 | 2 m | 40.3 |
+    /// | 2 | 4 m | 43.8 |
+    /// | 3 | 8 m | 55.2 |
+    /// | 4 | 16 m | 55.4 |
+    ///
+    /// So the handover from the last generated level to the chain is a 26% step
+    /// in how bright a forest is, and the two rings inside it are 9% and 4%. The
+    /// step does not shrink with distance -- it is a change in the *mean*, not
+    /// in detail nobody can resolve -- so the only thing that hides it is
+    /// putting it where little ground is left to show it. Eight tiles put that
+    /// ring at 6144 m, which over a valley is mid-frame and read as a band of
+    /// hillside growing trees a frame at a time; sixteen put it at 14336 m,
+    /// where crossing it moved 10% more of the frame than the frames either
+    /// side of it did, against 27% before -- inside what ordinary flight
+    /// changes anyway.
+    ///
+    /// Sixteen is also the ceiling: 16 x 512 is 8192 texels, which is WebGPU's
+    /// own `max_texture_dimension_2d`, and the next doubling would be four times
+    /// the 1920 MiB this already costs.
     pub detail_tiles: u32,
     /// Side of one generated tile, in texels.
     ///
@@ -113,6 +164,15 @@ pub struct Residency {
     /// The bound on what crossing a tile boundary costs. A level that falls
     /// behind is not wrong, only coarser at its outer edge until it catches up.
     pub detail_per_update: u32,
+    /// How many bytes of texture the generated window may occupy.
+    ///
+    /// What [`Residency::fit_detail_tiles`] spends. A window is square and every
+    /// level of it is the same size, so this is a fourfold step rather than a
+    /// dial: the tiles across halve, and the memory quarters, until it fits.
+    /// Losing that halving costs distance rather than resolution -- the trees
+    /// stop nearer -- which is why it is worth a knob of its own rather than
+    /// being traded against the survey held above it.
+    pub window_budget: usize,
 }
 
 /// The angle one pixel subtends, for a viewport of this height.
@@ -134,10 +194,16 @@ impl Default for Residency {
             // 1080p at sixty degrees, replaced wherever a real viewport is known.
             pixel_angle: 2.0 * (30f64.to_radians()).tan() / 1080.0,
             march_texels: 512,
-            detail_tiles: 8,
+            // Sixteen tiles of 512 is 8192 texels square, which is where the
+            // trees end; see the field. Nothing above this fits WebGPU's own
+            // texture limit anyway.
+            detail_tiles: 16,
             detail_tile_texels: 512,
             detail_relief: 2.0,
             detail_per_update: 4,
+            // Room for exactly that: three levels of 8192 square at ten bytes a
+            // texel is 1920 MiB.
+            window_budget: 2048 << 20,
         }
     }
 }
@@ -217,6 +283,53 @@ impl Residency {
             base += 1;
         }
         base
+    }
+
+    /// Texels across one generated level's window.
+    pub const fn window_across(&self) -> u32 {
+        self.detail_tiles * self.detail_tile_texels
+    }
+
+    /// Bytes the whole generated window occupies, over `levels` of it.
+    ///
+    /// Every level is the same square, so this is simply the square times the
+    /// levels: unlike a chain there is no mip series under it, because a
+    /// generated level is not a reduction of anything -- it is evaluated from
+    /// the base and the fields at whatever size it is asked for.
+    pub const fn window_bytes(&self, levels: u32) -> usize {
+        let across = self.window_across() as usize;
+        across * across * WINDOW_BYTES_PER_TEXEL * levels as usize
+    }
+
+    /// The widest window no wider than this one that the device and the window
+    /// budget will both take.
+    ///
+    /// `levels` is how many levels are generated, which is the resident base
+    /// once [`Residency::fit_base`] has settled it. Halving the tiles across
+    /// quarters the memory and halves the reach, so this converges at once from
+    /// anywhere sensible, and it stops at four: a window of two tiles reaches
+    /// nothing at all, because the camera's own tile and the one behind it are
+    /// the whole of it.
+    ///
+    /// What a device that cannot take the shipped window loses is *distance* --
+    /// the trees stop nearer -- rather than anything about the ground. That is
+    /// the same shape of trade as [`Residency::fit_base`] and the same reason
+    /// for making it rather than failing to start.
+    pub fn fit_detail_tiles(&self, levels: u32, max_dimension: u32) -> u32 {
+        let mut tiles = self.detail_tiles;
+        while tiles > 4 {
+            let shape = Self {
+                detail_tiles: tiles,
+                ..*self
+            };
+            if shape.window_across() <= max_dimension
+                && shape.window_bytes(levels) <= self.window_budget
+            {
+                break;
+            }
+            tiles /= 2;
+        }
+        tiles
     }
 
     /// How far a generated level reaches from the camera, in its own texels.
@@ -559,6 +672,69 @@ mod tests {
         let base = (size.x as usize) * (size.y as usize) * BYTES_PER_TEXEL;
         let whole = Residency::texture_bytes(size, Residency::mip_count(size));
         assert!(whole > base && whole < base * 4 / 3 + base / 100);
+    }
+
+    /// The window is where the trees stop, so how far it reaches is a fact
+    /// about the picture rather than about memory, and it is worth writing down.
+    ///
+    /// The coarsest generated level is the one that matters: past it the chain
+    /// takes over, and the chain's base is 8 m, which cannot hold a 7 m crown.
+    #[test]
+    fn the_window_reaches_past_where_a_forest_would_end() {
+        let residency = Residency::default();
+        let coarsest = residency.resident_base - 1;
+        assert_eq!(residency.detail_reach(), 3584, "level zero, in its texels");
+        assert_eq!(
+            residency.detail_reach() << coarsest,
+            14336,
+            "the last level that can draw a tree, in level-0 texels -- which on \
+             a one metre survey is 14 km"
+        );
+    }
+
+    /// A window is a texture like any other and this one is at the limit: 8192
+    /// square is exactly WebGPU's own `max_texture_dimension_2d`, so a device
+    /// that offers no more than the default still takes the shipped shape whole.
+    ///
+    /// The budget is the other half of the same question. Adding a product to
+    /// the window without adding its bytes to [`WINDOW_BYTES_PER_TEXEL`] does
+    /// not fail -- it silently allocates more than the budget says -- so it
+    /// should fail here instead.
+    #[test]
+    fn the_default_window_fits_the_default_device_and_budget() {
+        let residency = Residency::default();
+        let levels = residency.resident_base;
+        assert_eq!(residency.window_across(), 8192);
+        assert_eq!(residency.window_bytes(levels), 1920 << 20);
+        assert!(residency.window_bytes(levels) <= residency.window_budget);
+        assert_eq!(residency.fit_detail_tiles(levels, 8192), 16);
+    }
+
+    /// A device or a budget that will not take the shipped window costs
+    /// distance, not resolution: the tiles halve and the trees stop nearer.
+    #[test]
+    fn a_window_narrows_until_the_device_and_the_budget_take_it() {
+        let residency = Residency::default();
+        assert_eq!(
+            residency.fit_detail_tiles(3, 4096),
+            8,
+            "half the width is a quarter of the memory"
+        );
+        assert_eq!(residency.fit_detail_tiles(3, 1024), 4, "and stops at four");
+        assert_eq!(
+            Residency {
+                window_budget: 512 << 20,
+                ..residency
+            }
+            .fit_detail_tiles(3, 16384),
+            8,
+            "480 MiB of window fits where 1920 does not"
+        );
+        assert_eq!(
+            residency.fit_detail_tiles(1, 16384),
+            16,
+            "one level of it costs a third as much and stays whole"
+        );
     }
 
     /// Ground a pixel cannot resolve is not worth descending to. The handover
