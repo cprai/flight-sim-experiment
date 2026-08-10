@@ -101,7 +101,7 @@ struct MaximaJob {
     below_low: [i32; 2],
     below_high: [i32; 2],
     stride: u32,
-    padding: u32,
+    wide_stride: u32,
 }
 
 /// Side of the widest rectangle one derive job covers, in cells.
@@ -133,6 +133,15 @@ const COPY_ALIGN: u32 = 256;
 /// in anything smaller than four, and rounded up to what a copy demands.
 fn derive_row_bytes(cells: u32) -> u32 {
     (cells.div_ceil(2) * 4).div_ceil(COPY_ALIGN) * COPY_ALIGN
+}
+
+/// Bytes one row of the full-precision scratch occupies for this many cells.
+///
+/// Four bytes a cell rather than two, and rounded up separately: a row is padded
+/// to what a copy demands *after* it is sized, so the wider cells do not round
+/// to twice the narrow ones.
+fn surface_row_bytes(cells: u32) -> u32 {
+    (cells * 4).div_ceil(COPY_ALIGN) * COPY_ALIGN
 }
 
 /// How much of `[at, end)` one derive job may take along an axis.
@@ -266,6 +275,12 @@ pub struct Terrain {
     height_texture: wgpu::Texture,
     material_texture: wgpu::Texture,
     maxima_texture: wgpu::Texture,
+    /// What stands on the chain, as metres above the survey's own ground.
+    ///
+    /// Kept alive by the views the bind groups hold; owning it here is what says
+    /// the terrain owns the memory.
+    #[allow(dead_code, reason = "read by the test that checks what was raised")]
+    lift_texture: wgpu::Texture,
     /// The generated levels: one array layer per level below the base.
     ///
     /// Kept alive by the views the bind groups hold, so nothing outside a test
@@ -274,6 +289,8 @@ pub struct Terrain {
     #[allow(dead_code, reason = "read by the tests that check what was generated")]
     detail_height_texture: wgpu::Texture,
     detail_maxima_texture: wgpu::Texture,
+    #[allow(dead_code, reason = "read by the test that checks what was painted")]
+    detail_material_texture: wgpu::Texture,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     /// Fills one rectangle of one generated level.
@@ -286,6 +303,14 @@ pub struct Terrain {
     generate_bind_group: wgpu::BindGroup,
     /// One generation job per 256-byte slot, addressed by dynamic offset.
     generate_jobs: wgpu::Buffer,
+    /// Works out what stands on one rectangle of one resident level.
+    cover: wgpu::ComputePipeline,
+    /// Adds that to the survey, once the whole chain knows it.
+    raise: wgpu::ComputePipeline,
+    /// Group 3 for [`Terrain::cover`]: the job, and the two buffers it writes.
+    cover_bind_group: wgpu::BindGroup,
+    /// Where one rectangle's raised heights land on their way to the texture.
+    surface_scratch: wgpu::Buffer,
     /// Derives one rectangle of one level from the heights and the level below.
     derive: wgpu::ComputePipeline,
     /// Group 3 for [`Terrain::derive`]: the job, and the cells it writes.
@@ -470,6 +495,21 @@ impl Terrain {
             wgpu::TextureFormat::R16Float,
             usage | wgpu::TextureUsages::COPY_SRC,
         );
+        // How much of the chain's surface is what stands on it rather than what
+        // the survey measured. A mip per level, because that is how a level's
+        // lift reaches the level above it: only the base walks the crown
+        // lattice, and every coarser level is the mean of its four children.
+        //
+        // Half precision, and rounded *up* by the same `ceiling_half` the
+        // pyramid uses, because the two go out through the same buffer. A lift
+        // rounded up is bare earth rounded down by a centimetre, which is the
+        // harmless direction: the surface itself is stored whole, so nothing a
+        // ray meets moves.
+        let lift_texture = chain(
+            "terrain lift",
+            wgpu::TextureFormat::R16Float,
+            usage | wgpu::TextureUsages::COPY_SRC,
+        );
 
         // The generated levels. One layer per level below the base, all the
         // same width, wrapped onto their slots -- which is the clipmap the
@@ -517,13 +557,25 @@ impl Terrain {
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::COPY_SRC,
         );
+        // Thirty-two bits for an id that fits in twelve. The resident chain
+        // stores ids at sixteen and this cannot: a generated level is written by
+        // a dispatch rather than copied in, and `r16uint` is not a storage
+        // format in WebGPU. Widening costs 96 MiB at the default window and
+        // saves a whole buffer-and-copy path for a product written per tile.
+        let detail_material_texture = window(
+            "terrain detail materials",
+            wgpu::TextureFormat::R32Uint,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        );
         if resident_base > 0 {
             log::info!(
                 "terrain: {resident_base} generated levels of {} x {} tiles, {detail_across} \
                  texels each, {:.0} MiB, reaching {} texels from the camera",
                 residency.detail_tiles,
                 residency.detail_tiles,
-                (detail_across as usize).pow(2) * 6 * resident_base as usize / (1 << 20),
+                (detail_across as usize).pow(2) * 10 * resident_base as usize / (1 << 20),
                 residency.detail_reach() << (resident_base - 1),
             );
         }
@@ -598,6 +650,19 @@ impl Terrain {
                     },
                     count: None,
                 },
+                // The lift, which the generation pass needs and the march never
+                // touches -- so it belongs in the group both share rather than
+                // in either pass's private one.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
         ];
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain layout"),
@@ -606,8 +671,19 @@ impl Terrain {
                 layout_entries[1],
                 layout_entries[2],
                 layout_entries[3],
+                layout_entries[4],
                 generated_entry(4),
                 generated_entry(5),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         // The same terrain without the generated arrays. `cs_detail` writes one
@@ -616,7 +692,7 @@ impl Terrain {
         // level binds only what it reads, which is the base.
         let base_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain base layout"),
-            entries: &layout_entries[..4],
+            entries: &layout_entries,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("terrain bind group"),
@@ -650,6 +726,16 @@ impl Terrain {
                         &detail_maxima_texture,
                     )),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&array_view(&lift_texture)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&layer_view(
+                        &detail_material_texture,
+                    )),
+                },
             ],
         });
         let generate_terrain_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -671,6 +757,10 @@ impl Terrain {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&array_view(&maxima_texture)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&array_view(&lift_texture)),
                 },
             ],
         });
@@ -746,9 +836,7 @@ impl Terrain {
         // reason the three above have theirs: group 3 is where a pass's private
         // bindings go, four groups being all the device promises, and this pass
         // shares none of its with the march.
-        let derive_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("terrain derive layout"),
-            entries: &[
+        let derive_entries = [
                 wgpu::BindGroupLayoutEntry {
                     binding: 12,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -771,7 +859,10 @@ impl Terrain {
                     },
                     count: None,
                 },
-            ],
+        ];
+        let derive_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("terrain derive layout"),
+            entries: &derive_entries,
         });
         // Every mip is swept whole in rectangles no wider than the scratch, and
         // a chain is four thirds of its base, so this is a little over four
@@ -828,6 +919,64 @@ impl Terrain {
             });
         let derive = stage("terrain derive pipeline", "cs_maxima", &derive_pipeline_layout);
 
+        // Raising the chain: the same job, the same rectangles and the same
+        // half-precision scratch the pyramid goes out through, plus a second
+        // buffer for the surface itself. Two outputs off one walk, because the
+        // walk is what costs -- a hundred crown samples of nine hashes each, per
+        // texel of a raster of a hundred and seventy-six million.
+        let cover_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("terrain cover layout"),
+            entries: &[
+                derive_entries[0],
+                derive_entries[1],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let surface_scratch = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain cover surface"),
+            size: u64::from(surface_row_bytes(chunk)) * u64::from(chunk),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let cover_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terrain cover bind group"),
+            layout: &cover_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &derive_jobs,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(size_of::<MaximaJob>() as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: derive_scratch.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: surface_scratch.as_entire_binding(),
+                },
+            ],
+        });
+        let cover_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("terrain cover pipeline layout"),
+            bind_group_layouts: &[None, Some(&layout), None, Some(&cover_layout)],
+            immediate_size: 0,
+        });
+        let cover = stage("terrain cover pipeline", "cs_cover", &cover_pipeline_layout);
+        let raise = stage("terrain raise pipeline", "cs_raise", &cover_pipeline_layout);
+
         // Generating a level: reads the base through group 1, writes one layer
         // of the generated heights through group 3.
         let generate_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -849,6 +998,16 @@ impl Terrain {
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
                         format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 17,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Uint,
                         view_dimension: wgpu::TextureViewDimension::D2Array,
                     },
                     count: None,
@@ -881,6 +1040,12 @@ impl Terrain {
                     binding: 15,
                     resource: wgpu::BindingResource::TextureView(&layer_view(
                         &detail_height_texture,
+                    )),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: wgpu::BindingResource::TextureView(&layer_view(
+                        &detail_material_texture,
                     )),
                 },
             ],
@@ -927,14 +1092,20 @@ impl Terrain {
             height_texture,
             material_texture,
             maxima_texture,
+            lift_texture,
             detail_height_texture,
             detail_maxima_texture,
+            detail_material_texture,
             uniform,
             bind_group,
             generate,
             generate_terrain_group,
             generate_bind_group,
             generate_jobs,
+            cover,
+            raise,
+            cover_bind_group,
+            surface_scratch,
             derive,
             derive_bind_group,
             derive_jobs,
@@ -1421,6 +1592,7 @@ impl Terrain {
         // at texel zero, which is a pyramid of one number and looks like a
         // shader bug rather than an ordering one.
         self.write_uniform(queue);
+        self.raise_surface(device, queue);
         self.build_pyramid(device, queue);
         self.ceiling = self.read_ceiling(device, queue);
         log::info!(
@@ -1468,6 +1640,124 @@ impl Terrain {
                 height: block.y,
                 depth_or_array_layers: 1,
             },
+        );
+    }
+
+    /// Puts the crowns and the stones onto the chain, once, over the whole of
+    /// it.
+    ///
+    /// The survey is bare earth: HRDEM measured the ground and OpenStreetMap
+    /// said what grows on it, and until now a wooded mountainside drew as a flat
+    /// green slab -- correct in colour and wrong in every other way, and worst at
+    /// the middle distances where a canopy's texture is most of what tells the
+    /// eye how far away a hill is.
+    ///
+    /// Finest level first, because every level above the base takes its lift
+    /// from the four children under it rather than walking the crown lattice
+    /// again -- see `level_lift`, which is where that trade is argued. One
+    /// rectangle at a time through one scratch buffer, so a coarse level's reads
+    /// are already ordered after the fine level's copy.
+    ///
+    /// The pyramid is built afterwards and reads the raised heights, so the
+    /// ceilings bound the crowns without knowing anything about them. That is
+    /// the property `a5b0704` gave up a traced canopy to get.
+    ///
+    /// Nothing here is incremental and nothing ever re-runs it. The survey does
+    /// not change, the lattices are pure functions of position, and the levels
+    /// below the base grow their own crowns as they are generated.
+    fn raise_surface(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let started = std::time::Instant::now();
+        self.jobs.clear();
+        for level in self.levels() {
+            self.emit(level, IVec2::ZERO, self.level_size(level).as_ivec2());
+        }
+        let rectangles = self.jobs.len();
+        debug_assert!(
+            rectangles <= self.job_slots,
+            "{rectangles} rectangles to raise against room for {}",
+            self.job_slots
+        );
+        for (index, job) in self.jobs.iter().enumerate() {
+            queue.write_buffer(
+                &self.derive_jobs,
+                index as u64 * JOB_SLOT,
+                bytemuck::bytes_of(job),
+            );
+        }
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("terrain cover"),
+        });
+        // Two sweeps of the same rectangles: the whole lift chain first, then
+        // the heights. The walk asks the survey how steep the ground under a
+        // stand is, so nothing may raise the survey until every level has
+        // finished asking.
+        let sweeps = [
+            (&self.cover, &self.lift_texture),
+            (&self.raise, &self.height_texture),
+        ];
+        for (sweep, (pipeline, texture)) in sweeps.into_iter().enumerate() {
+            for (index, job) in self.jobs.iter().enumerate() {
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("terrain cover"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(1, &self.bind_group, &[]);
+                    pass.set_bind_group(
+                        3,
+                        &self.cover_bind_group,
+                        &[(index as u64 * JOB_SLOT) as u32],
+                    );
+                    pass.dispatch_workgroups(
+                        job.size[0].div_ceil(2).div_ceil(DERIVE_GROUP),
+                        job.size[1].div_ceil(DERIVE_GROUP),
+                        1,
+                    );
+                }
+                let (buffer, row) = if sweep == 0 {
+                    (&self.derive_scratch, job.stride * 4)
+                } else {
+                    (&self.surface_scratch, job.wide_stride * 4)
+                };
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(row),
+                            rows_per_image: Some(job.size[1]),
+                        },
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: job.level - self.resident_base,
+                        origin: wgpu::Origin3d {
+                            x: job.origin[0] as u32,
+                            y: job.origin[1] as u32,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: job.size[0],
+                        height: job.size[1],
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        // Waited on so the log below times the work rather than the
+        // submission, and so the pyramid built next reads a raised chain.
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("raising the chain");
+        self.jobs.clear();
+        log::info!(
+            "terrain: raised {rectangles} rectangles of the chain in {:.2?}",
+            started.elapsed()
         );
     }
 
@@ -1525,7 +1815,7 @@ impl Terrain {
                     below_low: below_low.to_array(),
                     below_high: below_high.to_array(),
                     stride: derive_row_bytes(columns) / 4,
-                    padding: 0,
+                    wide_stride: surface_row_bytes(columns) / 4,
                 });
                 x += columns as i32;
             }
@@ -1913,29 +2203,43 @@ mod tests {
 
     /// A terrain over a rugged raster, held from `resident_base` upwards.
     fn terrain_over(device: &wgpu::Device, resident_base: u32) -> Terrain {
-        let camera_layout = crate::scene::test_camera_layout(device);
-        let storage_layout = crate::deferred::storage_layout(device);
-        let work_layout = crate::reproject::work_layout(device);
-        let args_layout = crate::reproject::args_layout(device);
-        let risk_layout = crate::reproject::risk_layout(device);
-        let reach_layout = crate::reproject::reach_layout(device);
+        terrain_from(device, resident_base, 0.0, 30.0, 0)
+    }
+
+    /// A terrain over a rugged raster with the relief, the texel size and the
+    /// ground cover a test wants.
+    ///
+    /// The cover is one id over the whole raster because what it decides is
+    /// binary at this scale -- whether the pass that raises the base finds
+    /// anything standing there at all -- and a test that has to hunt for a
+    /// wooded texel checks the hunt rather than the trees.
+    fn terrain_from(
+        device: &wgpu::Device,
+        resident_base: u32,
+        relief: f32,
+        metres: f64,
+        cover: u32,
+    ) -> Terrain {
         Terrain::new(
             device,
-            &camera_layout,
-            &storage_layout,
-            &work_layout,
-            &args_layout,
-            &risk_layout,
-            &reach_layout,
-            test_residency(resident_base),
+            &crate::scene::test_camera_layout(device),
+            &crate::deferred::storage_layout(device),
+            &crate::reproject::work_layout(device),
+            &crate::reproject::args_layout(device),
+            &crate::reproject::risk_layout(device),
+            &crate::reproject::reach_layout(device),
+            Residency {
+                detail_relief: relief,
+                ..test_residency(resident_base)
+            },
             UVec2::splat(RASTER),
-            Georeferencing::square(RASTER, RASTER, 30.0),
+            Georeferencing::square(RASTER, RASTER, metres),
             Sources {
                 heights: Box::new(Pyramid::build(Level::new(RASTER, RASTER, rugged()))),
                 materials: Box::new(Pyramid::build(Level::new(
                     RASTER,
                     RASTER,
-                    vec![MaterialId(0); (RASTER * RASTER) as usize],
+                    vec![MaterialId(cover); (RASTER * RASTER) as usize],
                 ))),
             },
         )
@@ -2056,29 +2360,7 @@ mod tests {
 
     /// A terrain over a rugged raster with the relief turned up.
     fn terrain_with_relief(device: &wgpu::Device, resident_base: u32, relief: f32) -> Terrain {
-        Terrain::new(
-            device,
-            &crate::scene::test_camera_layout(device),
-            &crate::deferred::storage_layout(device),
-            &crate::reproject::work_layout(device),
-            &crate::reproject::args_layout(device),
-            &crate::reproject::risk_layout(device),
-            &crate::reproject::reach_layout(device),
-            Residency {
-                detail_relief: relief,
-                ..test_residency(resident_base)
-            },
-            UVec2::splat(RASTER),
-            Georeferencing::square(RASTER, RASTER, 30.0),
-            Sources {
-                heights: Box::new(Pyramid::build(Level::new(RASTER, RASTER, rugged()))),
-                materials: Box::new(Pyramid::build(Level::new(
-                    RASTER,
-                    RASTER,
-                    vec![MaterialId(0); (RASTER * RASTER) as usize],
-                ))),
-            },
-        )
+        terrain_from(device, resident_base, relief, 30.0, 0)
     }
 
     /// The detail is real, it stays inside the relief it was given, and it
@@ -2203,6 +2485,281 @@ mod tests {
         }
     }
 
+    /// The crowns and the stones are put on, at every level, and the same stand
+    /// comes out the same height however finely it is sampled.
+    ///
+    /// Measured against the same terrain with the ground cover set to `Null`,
+    /// so what is left is the surface standing on the survey and nothing else --
+    /// no second spelling of the interpolation, the fractal or the survey
+    /// underneath.
+    ///
+    /// The last assertion is the one worth having. What a texel carries is the
+    /// mean of the tallest fraction of a block, and it is an *average* precisely
+    /// so that it survives a change of texel size: a maximum would climb with
+    /// the block, and `8c928a9` measured that as a closed stand growing eleven
+    /// metres between a one-metre texel and a sixteen-metre one -- a step at
+    /// every ring, and forest that grows as you fly away from it. Here the base
+    /// samples an eight-metre block and the finest generated level samples a
+    /// two-metre one, four rings apart, and the two have to agree or there is a
+    /// visible wall where the window ends.
+    #[test]
+    fn what_stands_on_the_ground_is_raised_and_holds_its_height() {
+        /// `ForestNeedleleaved`; see `crates/terrain-materials`.
+        const WOODED: u32 = 0x0300;
+        /// `Material::Canopy`, which is what a texel mostly under crowns is
+        /// painted with.
+        const CANOPY: u32 = 0x0304;
+        /// The tallest a full-health crown gets, from `terrain-canopy`.
+        const TALLEST: f32 = 28.0;
+        const BASE: u32 = 2;
+
+        /// How much of a pixel a stand may step by where two levels meet.
+        const HANDOVER: f64 = 0.5;
+
+        let (device, queue) = crate::scene::test_device();
+        let mut carried: Vec<f64> = Vec::new();
+        // Two metres a texel, so the base is at eight and the generated levels
+        // at four, two and one -- the shipped arrangement, and the one the
+        // crowns' own sampling was tuned against.
+        let mut bald = terrain_from(&device, BASE, 0.0, 2.0, 0);
+        let mut wooded = terrain_from(&device, BASE, 0.0, 2.0, WOODED);
+        let at = Vec3::new(64.0, 200.0, -64.0);
+        bald.update(&device, &queue, at);
+        wooded.update(&device, &queue, at);
+        assert_eq!(wooded.base_level(), 0, "the test wants every level generated");
+
+        // The base first, where the lift is stored as well as added.
+        let survey = read_level(&device, &queue, &bald, &bald.height_texture, BASE, 4);
+        let surface = read_level(&device, &queue, &wooded, &wooded.height_texture, BASE, 4);
+        let stored = read_level(&device, &queue, &wooded, &wooded.lift_texture, BASE, 2);
+        let size = wooded.level_size(BASE).as_ivec2();
+        let (mut base_lift, mut raised) = (0.0f64, 0u32);
+        for cell_y in 0..size.y {
+            for cell_x in 0..size.x {
+                let cell = IVec2::new(cell_x, cell_y);
+                let lift = surface(cell) - survey(cell);
+                assert!(
+                    (0.0..=TALLEST).contains(&lift),
+                    "base cell {cell} was raised by {lift} m"
+                );
+                // Half precision, so the stored copy is the added one rounded
+                // up by at most one step -- a centimetre at these heights.
+                assert!(
+                    (stored(cell) - lift).abs() < 0.02,
+                    "base cell {cell} stores {} m of lift against the {lift} m it was raised by",
+                    stored(cell)
+                );
+                base_lift += f64::from(lift);
+                raised += u32::from(lift > 1.0);
+            }
+        }
+        let cells = size.x * size.y;
+        base_lift /= f64::from(cells);
+        assert!(
+            raised > (cells as u32) / 2,
+            "only {raised} of {cells} base cells grew anything"
+        );
+
+        // And every level above it, where the lift is the mean of the four
+        // children rather than a walk of its own. That is what carries the
+        // canopy out past the range the base is descended to -- without it a
+        // wooded ridge in the far field is drawn as the bare earth under it and
+        // painted green, which is the slab this exists to remove.
+        for level in BASE + 1..wooded.resident_base + wooded.mips {
+            let survey = read_level(&device, &queue, &bald, &bald.height_texture, level, 4);
+            let surface = read_level(&device, &queue, &wooded, &wooded.height_texture, level, 4);
+            let stored = read_level(&device, &queue, &wooded, &wooded.lift_texture, level, 2);
+            let under = read_level(&device, &queue, &wooded, &wooded.lift_texture, level - 1, 2);
+            let size = wooded.level_size(level).as_ivec2();
+            for cell_y in 0..size.y {
+                for cell_x in 0..size.x {
+                    let cell = IVec2::new(cell_x, cell_y);
+                    let mut mean = 0.0;
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            mean += under(cell * 2 + IVec2::new(dx, dy)) / 4.0;
+                        }
+                    }
+                    assert!(
+                        (stored(cell) - mean).abs() < 0.02,
+                        "level {level} cell {cell} holds {} m of lift where its children \
+                         average {mean} m",
+                        stored(cell)
+                    );
+                    let lift = surface(cell) - survey(cell);
+                    assert!(
+                        (lift - stored(cell)).abs() < 0.02,
+                        "level {level} cell {cell} was raised by {lift} m against the {} m \
+                         it holds",
+                        stored(cell)
+                    );
+                }
+            }
+        }
+
+        // Then every generated level, over the ground the window holds.
+        for level in 0..BASE {
+            let smooth = read_level(&device, &queue, &bald, &bald.detail_height_texture, level, 4);
+            let grown =
+                read_level(&device, &queue, &wooded, &wooded.detail_height_texture, level, 4);
+            // `R32Uint` read through the same closure: the bits come back
+            // unchanged, which is all an id is.
+            let painted = read_level(
+                &device,
+                &queue,
+                &wooded,
+                &wooded.detail_material_texture,
+                level,
+                4,
+            );
+            let (low, high) = wooded.level_valid(level);
+            let (mut lift, mut counted, mut canopy) = (0.0f64, 0u32, 0u32);
+            for cell_y in low.y..high.y {
+                for cell_x in low.x..high.x {
+                    let cell = IVec2::new(cell_x, cell_y);
+                    let here = grown(cell) - smooth(cell);
+                    assert!(
+                        (0.0..=TALLEST).contains(&here),
+                        "level {level} cell {cell} was raised by {here} m"
+                    );
+                    lift += f64::from(here);
+                    counted += 1;
+                    canopy += u32::from(painted(cell).to_bits() == CANOPY);
+                }
+            }
+            lift /= f64::from(counted);
+            assert!(
+                canopy > counted / 4,
+                "level {level} painted only {canopy} of {counted} texels as canopy"
+            );
+            eprintln!("level {level}: {lift:.3} m");
+            carried.push(lift);
+        }
+        carried.push(base_lift);
+        eprintln!("base: {base_lift:.3} m");
+
+        // A step of `d` metres at the ring where a texel of `t` metres hands
+        // over to the next level subtends `d / t` pixels, because that ring is
+        // by definition the distance at which `t` is a pixel wide. So the
+        // measure the crates argue in -- each step against the angular size at
+        // the ring it happens at -- comes out as a plain ratio here, with no
+        // camera in it at all.
+        for (level, pair) in carried.windows(2).enumerate() {
+            let texel = 2.0 * f64::from(1u32 << level);
+            let step = (pair[1] - pair[0]).abs() / texel;
+            assert!(
+                step <= HANDOVER,
+                "the stand steps {:.2} m from level {level} to the one above it, which is \
+                 {step:.2} of a pixel at the ring where a {texel} m texel hands over",
+                pair[1] - pair[0]
+            );
+        }
+    }
+
+    /// Strewn ground gets its stones, and only on the levels fine enough to
+    /// hold them.
+    ///
+    /// The rubble is the class that shows here. Its stones are 2.4 m across, so
+    /// the sampling that finds their tops is fifteen times the walk the boulders
+    /// want, and `RUBBLE_TEXEL` cuts it off above two metres rather than pay
+    /// that over the whole resident base. What this pins is the size of the step
+    /// that buys: rubble stands under two metres tall and its order statistic is
+    /// a fraction of that, so the level where it stops has to hand over to the
+    /// one above it for well under a pixel.
+    ///
+    /// The boulders contribute nothing at all on a raster this small -- their
+    /// field is gated on a two-hundred-metre noise and this whole world is a
+    /// hundred and twenty-eight metres across, so it sits inside a single cell
+    /// of it and that cell is shut. That is the field behaving as designed: a
+    /// boulder field is *there or not there*, which is what separates it from
+    /// the canopy's clumping, and ground between two fields has no stones on it.
+    #[test]
+    fn stones_are_scattered_on_the_levels_fine_enough_to_hold_them() {
+        /// `Scree`, and `Rubble`; see `crates/terrain-materials`.
+        const SCREE: u32 = 0x0501;
+        const RUBBLE: u32 = 0x0509;
+        /// The tallest a full-size piece of rubble stands, from `terrain-rocks`.
+        const TALLEST: f32 = 1.6;
+        const BASE: u32 = 2;
+
+        let (device, queue) = crate::scene::test_device();
+        let mut bald = terrain_from(&device, BASE, 0.0, 2.0, 0);
+        let mut strewn = terrain_from(&device, BASE, 0.0, 2.0, SCREE);
+        let at = Vec3::new(64.0, 200.0, -64.0);
+        bald.update(&device, &queue, at);
+        strewn.update(&device, &queue, at);
+
+        let mut carried = Vec::new();
+        let mut painted_rubble = Vec::new();
+        for level in 0..BASE {
+            let bare = read_level(&device, &queue, &bald, &bald.detail_height_texture, level, 4);
+            let stony =
+                read_level(&device, &queue, &strewn, &strewn.detail_height_texture, level, 4);
+            let painted = read_level(
+                &device,
+                &queue,
+                &strewn,
+                &strewn.detail_material_texture,
+                level,
+                4,
+            );
+            let (low, high) = strewn.level_valid(level);
+            let (mut lift, mut counted, mut rubble) = (0.0f64, 0u32, 0u32);
+            for cell_y in low.y..high.y {
+                for cell_x in low.x..high.x {
+                    let cell = IVec2::new(cell_x, cell_y);
+                    let here = stony(cell) - bare(cell);
+                    assert!(
+                        (0.0..=TALLEST).contains(&here),
+                        "level {level} cell {cell} was raised by {here} m"
+                    );
+                    lift += f64::from(here);
+                    counted += 1;
+                    rubble += u32::from(painted(cell).to_bits() == RUBBLE);
+                }
+            }
+            carried.push(lift / f64::from(counted));
+            painted_rubble.push((rubble, counted));
+        }
+        // The base, where nothing should be lying at all.
+        let survey = read_level(&device, &queue, &bald, &bald.height_texture, BASE, 4);
+        let surface = read_level(&device, &queue, &strewn, &strewn.height_texture, BASE, 4);
+        let size = strewn.level_size(BASE).as_ivec2();
+        for cell_y in 0..size.y {
+            for cell_x in 0..size.x {
+                let cell = IVec2::new(cell_x, cell_y);
+                assert_eq!(
+                    surface(cell),
+                    survey(cell),
+                    "base cell {cell} grew a stone where the boulder field is shut"
+                );
+            }
+        }
+
+        let (rubble, counted) = painted_rubble[0];
+        assert!(
+            rubble > counted / 4,
+            "the finest level painted only {rubble} of {counted} texels as rubble"
+        );
+        assert_eq!(
+            painted_rubble[1].0, 0,
+            "four-metre texels painted rubble they are not carrying"
+        );
+        assert!(
+            carried[0] > 0.1,
+            "the finest level carries {:.3} m of rubble, which is nothing",
+            carried[0]
+        );
+        assert_eq!(carried[1], 0.0, "four-metre texels are meant to hold none");
+        assert!(
+            carried[0] / 2.0 <= 0.5,
+            "the rubble steps {:.2} m where a two-metre texel hands over, which is \
+             {:.2} of a pixel",
+            carried[0],
+            carried[0] / 2.0
+        );
+    }
+
     /// Every cell of the pyramid bounds the ground it claims, at every level.
     ///
     /// With the base at level zero the derivation has every level a cell is
@@ -2320,19 +2877,32 @@ mod tests {
     /// only question that stays meaningful either way -- does the pyramid bound
     /// the surface the march will actually solve against -- and it tests the
     /// closed square, the carry, the residency test and the rounding at once.
+    ///
+    /// Over wooded ground as well as bare, because the surface a ray meets is no
+    /// longer the survey: the crowns go into the heights and the pyramid is
+    /// built from those heights afterwards, so a pyramid raised before the base
+    /// was would bound the earth under a forest rather than the forest. That is
+    /// a ray passing through solid trees and drawing the ridge behind them,
+    /// which is the one failure this whole structure exists to prevent.
     #[test]
     fn the_pyramid_is_the_recurrence_over_the_heights_that_are_there() {
-        let (device, queue) = crate::scene::test_device();
-        let mut terrain = terrain_over(&device, 1);
-        terrain.update(&device, &queue, Vec3::new(137.0, 100.0, -71.0));
+        for cover in [0, 0x0300] {
+            let (device, queue) = crate::scene::test_device();
+            let mut terrain = terrain_from(&device, 1, 0.0, 30.0, cover);
+            terrain.update(&device, &queue, Vec3::new(137.0, 100.0, -71.0));
+            check_recurrence(&device, &queue, &terrain);
+        }
+    }
+
+    fn check_recurrence(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &Terrain) {
         assert_eq!(terrain.base_level(), 0, "the test wants the generated level");
 
         let mut checked = 0;
         for level in terrain.base..terrain.resident_base + terrain.mips {
             let heights = read_level(
-                &device,
-                &queue,
-                &terrain,
+                device,
+                queue,
+                terrain,
                 if level >= terrain.resident_base {
                     &terrain.height_texture
                 } else {
@@ -2342,9 +2912,9 @@ mod tests {
                 4,
             );
             let ceilings = read_level(
-                &device,
-                &queue,
-                &terrain,
+                device,
+                queue,
+                terrain,
                 if level >= terrain.resident_base {
                     &terrain.maxima_texture
                 } else {
@@ -2355,9 +2925,9 @@ mod tests {
             );
             let below = (level > terrain.base).then(|| {
                 read_level(
-                    &device,
-                    &queue,
-                    &terrain,
+                    device,
+                    queue,
+                    terrain,
                     if level > terrain.resident_base {
                         &terrain.maxima_texture
                     } else {
@@ -2463,5 +3033,4 @@ mod tests {
             assert!(shared > 16, "level {level} shared only {shared} nodes");
         }
     }
-
 }

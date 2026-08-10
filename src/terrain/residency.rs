@@ -49,16 +49,16 @@
 
 use glam::{DVec2, IVec2, UVec2};
 
-/// Bytes one texel of the three resident products costs between them.
+/// Bytes one texel of the four resident products costs between them.
 ///
 /// Heights are `R32Float`, ground cover `R16Uint` -- ids reach 0x080c, so 16
-/// bits is ample and the other two were never used -- and the max pyramid
-/// `R16Float`. This is a *restatement* of what `Terrain::new` allocates and
-/// nothing enforces the correspondence, which has already gone wrong once: a
-/// fourth array was added there and not here, so the clipmap really spent
-/// fourteen bytes a texel while this reported ten. Anything added there must be
-/// added here.
-pub const BYTES_PER_TEXEL: usize = 4 + 2 + 2;
+/// bits is ample and the other two were never used -- the max pyramid
+/// `R16Float`, and the lift `R16Float` beside it. This is a *restatement* of
+/// what `Terrain::new` allocates and nothing enforces the correspondence, which
+/// has already gone wrong once: a fourth array was added there and not here, so
+/// the clipmap really spent fourteen bytes a texel while this reported ten.
+/// Anything added there must be added here.
+pub const BYTES_PER_TEXEL: usize = 4 + 2 + 2 + 2;
 
 /// How much of the raster is resident, and how the march is bounded.
 #[derive(Clone, Copy, PartialEq, Debug)]

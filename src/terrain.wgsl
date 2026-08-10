@@ -138,6 +138,17 @@ struct Terrain {
 // whole, so these are the one thing left that moves.
 @group(1) @binding(4) var detail_heights: texture_2d_array<f32>;
 @group(1) @binding(5) var detail_maxima: texture_2d_array<f32>;
+// How much of the chain's surface is what stands on it rather than what the
+// survey measured, in metres. A mip per level, and read by nothing that draws:
+// the coarse mips are how a level's lift reaches the level above it, and mip
+// zero is what `cs_detail` subtracts to recover the bare earth -- a generated
+// level grows its own crowns at its own texel size, and interpolating the base's
+// would have it grow them twice. Half precision, which a lift of tens of metres
+// is far more than served by.
+@group(1) @binding(6) var lift: texture_2d<f32>;
+// What a generated texel is painted as, where what stands on it hides the ground
+// -- a crown or a stone -- and zero everywhere else.
+@group(1) @binding(7) var detail_materials: texture_2d_array<u32>;
 
 // Elevations below this are the raster's nodata rather than ground.
 //
@@ -1008,20 +1019,31 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // convention the height bilinear reads by, so the texel whose centre is
     // closest is the rounded index.
     let cell = vec2<i32>(floor(hit.w + 0.5));
-    // One load, and no question about what the ray met -- which there could not
-    // be, because a crown baked into the heights is indistinguishable from a
-    // hillock and the march has nothing left to ask. A treetop is labelled as
-    // one already: `terrain-generate` writes a canopy id into this product
-    // wherever the crowns cover enough of a texel, so the gaps between the
-    // trees keep the floor's own colour and the trees do not.
-    // Ground cover is held only on the resident chain: nothing finer than the
-    // base has a material anyone measured, and a generated level stands on the
-    // cover of the ground under it. Reading the coarser texel directly rather
-    // than magnifying one into a texture of its own saves a whole array and
-    // says the same thing.
+    // No question about what the ray met -- which there could not be, because a
+    // crown baked into the heights is indistinguishable from a hillock and the
+    // march has nothing left to ask. A treetop is labelled as one already: the
+    // pass that raised it wrote a canopy id at the same time, so the gaps
+    // between the trees keep the floor's own colour and the trees do not.
+    //
+    // Two products, because there are two surfaces. The survey's ground cover is
+    // held only on the resident chain -- nothing finer than the base has a
+    // material anyone measured -- so a generated level falls back to the cover
+    // of the ground under it, and overrides it only where its own walk found
+    // enough crown or stone to hide that ground.
     let cover = max(hit.level, terrain.resident_base);
     let cover_cell = cell >> vec2<u32>(cover - hit.level);
     out.material = textureLoad(materials, slot(cover, cover_cell), mip(cover)).r;
+    if (hit.level < terrain.resident_base) {
+        let standing = textureLoad(
+            detail_materials,
+            slot(hit.level, cell),
+            i32(hit.level),
+            0,
+        ).r;
+        if (standing != 0u) {
+            out.material = standing;
+        }
+    }
     out.position = hit.position;
     // The ray was cast through the centre of the pixel, so that is where the
     // hit sits inside it, exactly.
@@ -1328,10 +1350,13 @@ struct MaximaJob {
     // it. Read only when `carry` is set.
     below_low: vec2<i32>,
     below_high: vec2<i32>,
-    // `u32`s per row of `out_maxima`, which is the byte stride the copy out of
+    // `u32`s per row of `out_halves`, which is the byte stride the copy out of
     // it uses divided by four.
     stride: u32,
-    padding: u32,
+    // `f32`s per row of `out_surface`, likewise. A second stride rather than one
+    // scaled by two: a row is padded up to what a buffer-to-texture copy demands
+    // *after* it is sized, so the wider cells round differently.
+    wide_stride: u32,
 };
 
 @group(3) @binding(12) var<uniform> job: MaximaJob;
@@ -1339,7 +1364,15 @@ struct MaximaJob {
 // is not a storage format in WebGPU. A buffer costs one copy afterwards and
 // needs no format widened, no feature asked for and no render pipeline in a
 // file that has none.
-@group(3) @binding(13) var<storage, read_write> out_maxima: array<u32>;
+//
+// Two passes write through this: the pyramid's ceilings and the cover's lift.
+// Both are half-precision cells of a level being rebuilt, so both want the same
+// buffer, the same packing and the same copy.
+@group(3) @binding(13) var<storage, read_write> out_halves: array<u32>;
+// Full-precision cells, for the pass that also raises the ground. Elevations
+// reach four figures and a half float is two metres coarse up there, so the
+// surface a ray meets cannot go out packed the way the lift above it does.
+@group(3) @binding(16) var<storage, read_write> out_surface: array<f32>;
 
 // Generating the levels below the base, which no survey holds.
 //
@@ -1353,9 +1386,11 @@ struct MaximaJob {
 // crowns per ray-texel cost three quarters of the frame and baking them per
 // texel cost nothing measurable.
 //
-// What it adds so far is nothing at all: a generated level is the base read
-// smoothly and no more, so the picture is the base's picture and what is being
-// tested is the plumbing under it. The fractal detail goes in on top of this.
+// A generated texel is three things added: the base read smoothly, the fractal
+// octaves the base is too coarse to hold, and the crowns and stones standing on
+// it at this level's own texel size. The first two are the survey's own ground
+// put back at a resolution nobody stored; the third is a surface that was never
+// ground at all, and it is why this pass writes an id as well as a height.
 struct DetailJob {
     // North-west cell of the rectangle, in this level's own texels.
     origin: vec2<i32>,
@@ -1376,6 +1411,11 @@ struct DetailJob {
 // Written as storage rather than through a buffer and a copy, which is what the
 // max pyramid has to do: `r32float` is a storage format and `r16float` is not.
 @group(3) @binding(15) var out_detail: texture_storage_2d_array<r32float, write>;
+// Thirty-two bits for an id that fits in twelve, because `r16uint` is not a
+// storage format either and a generated level is written by a dispatch rather
+// than copied in. Three levels of a four-thousand-texel window is 192 MiB, which
+// is the price of a near field that paints what it draws.
+@group(3) @binding(17) var out_detail_ids: texture_storage_2d_array<r32uint, write>;
 
 // The fractal detail the survey does not hold, transcribed from
 // `crates/terrain-generate/src/noise.rs`.
@@ -1564,8 +1604,31 @@ fn catmull_rom(t: f32) -> vec4<f32> {
 // between them. Catmull-Rom passes through the nodes with the slope the data
 // implies and reproduces any linear surface exactly, so a ramp gains no ripples
 // and a lake stays flat.
-fn base_height(at: vec2<f32>) -> f32 {
+// The survey's own ground at one texel of the base, with whatever stands on it
+// taken back off.
+//
+// Only mip zero carries a surface rather than a survey, so this is the only
+// level the question arises at. Subtracting is exact -- the lift went in as the
+// half float that comes back out -- and it is what keeps a generated level from
+// growing the base's crowns a second time on top of its own.
+fn bare_above(level: u32, cell: vec2<i32>) -> f32 {
+    return resident_height_at(level, cell) - lift_at(level, cell);
+}
+
+fn lift_at(level: u32, cell: vec2<i32>) -> f32 {
+    return textureLoad(lift, slot(level, cell), mip(level)).r;
+}
+
+fn bare_height_at(cell: vec2<i32>) -> f32 {
     let base = terrain.resident_base;
+    let height = resident_height_at(base, cell);
+    if (height < NODATA_BELOW) {
+        return height;
+    }
+    return height - lift_at(base, cell);
+}
+
+fn base_height(at: vec2<f32>) -> f32 {
     let node = floor(at);
     let across = catmull_rom(at.x - node.x);
     let down = catmull_rom(at.y - node.y);
@@ -1576,7 +1639,7 @@ fn base_height(at: vec2<f32>) -> f32 {
     for (var row = 0; row < 4; row++) {
         var line = 0.0;
         for (var column = 0; column < 4; column++) {
-            let sample = resident_height_at(base, corner + vec2<i32>(column, row));
+            let sample = bare_height_at(corner + vec2<i32>(column, row));
             line += across[column] * sample;
             deepest = min(deepest, sample);
         }
@@ -1610,6 +1673,7 @@ fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
     let base = terrain.resident_base;
     let at = vec2<f32>(cell) / f32(1u << (base - level));
     var height = base_height(at);
+    var painted = 0u;
 
     // Nothing is added to a hole. The sentinel is what says the survey measured
     // nothing here, and a hole with texture on it is ground.
@@ -1621,10 +1685,8 @@ fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
         let node = vec2<i32>(floor(at));
         let metres = terrain.metres_per_texel * f32(1u << base);
         let fall = vec2<f32>(
-            resident_height_at(base, node + vec2<i32>(1, 0))
-                - resident_height_at(base, node - vec2<i32>(1, 0)),
-            resident_height_at(base, node + vec2<i32>(0, 1))
-                - resident_height_at(base, node - vec2<i32>(0, 1)),
+            bare_height_at(node + vec2<i32>(1, 0)) - bare_height_at(node - vec2<i32>(1, 0)),
+            bare_height_at(node + vec2<i32>(0, 1)) - bare_height_at(node - vec2<i32>(0, 1)),
         );
         let slope = length(fall / (2.0 * metres));
         var relief = detail.relief * smoothstep(RELIEF_FLAT, RELIEF_STEEP, slope);
@@ -1641,6 +1703,14 @@ fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
         // has been away comes back exactly as it was.
         let world = vec2<f32>(cell) * f32(1u << level) * terrain.metres_per_texel;
         height += relief * fractal(world, detail.wavelength, detail.octaves, base);
+
+        // And then what stands on it, at this level's own texel size. The base
+        // carries the same stand sampled over eight metres; here it is sampled
+        // over one, so a crown is a crown rather than the eighth of a hillside
+        // it averages into up there.
+        let grown = standing_at(cell, level);
+        height += grown.lift;
+        painted = grown.id;
     }
 
     textureStore(
@@ -1649,6 +1719,697 @@ fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
         i32(level),
         vec4<f32>(height, 0.0, 0.0, 0.0),
     );
+    // Zero where nothing stands, which is what says "keep the ground's own id".
+    // A crown drawn and a meadow painted is the failure both shares exist to
+    // prevent, and it can only be prevented by writing them off the same walk.
+    textureStore(out_detail_ids, cell & terrain.levels[level].mask, i32(level), vec4<u32>(painted));
+}
+
+// What stands on the ground, rather than what the ground is.
+//
+// `crates/terrain-canopy` and `crates/terrain-rocks` transcribed, and the two
+// crates' own docs carry the arguments this does not repeat: why a stand needs
+// three sources of irregularity to look unplanted, why a crown is nearly a cone
+// and a boulder nearly a dome, why the rubble is a second lattice rather than a
+// wider spread of radii on the first, and why every threshold sits where it
+// does.
+//
+// The whole of that ran offline until now, once per texel of every level of the
+// stored products, and `a5b0704` is why: growing crowns *in the march* cost
+// three quarters of the frame, because entering the wooded path was paid once
+// per ray-texel and a ray crosses a forest a texel at a time. Nothing about that
+// has changed. What has changed is that the products are no longer stored at the
+// resolution a crown lives at, so the same per-texel walk has to happen here --
+// and the pass it happens in writes a texture, so it is still paid once per
+// texel. The inversion `a5b0704` identified is the one this keeps.
+//
+// It is also the second reason that commit gives for baking, turned around. The
+// crown field had to exist twice, once in Rust for the offline pyramid and once
+// in WGSL for the march, and a GPU test existed only to keep the two spellings
+// honest. Here there is one spelling again, because the pyramid is derived from
+// the surface this raises rather than reduced from a product beside it.
+
+// The crown lattice. See `crates/terrain-canopy/src/lib.rs`, whose constants
+// these are; the names carry the crate's prefix so the two scatters can share
+// this file.
+const CANOPY_SPACING: f32 = 7.0;
+const CANOPY_SHORTEST: f32 = 15.0;
+const CANOPY_TALLEST: f32 = 28.0;
+const CANOPY_RADIUS: f32 = 3.5;
+const CANOPY_ROUNDNESS: f32 = 0.15;
+const CANOPY_FLOOR: f32 = 0.35;
+const CANOPY_SEED: u32 = 0x54726565u;
+const CANOPY_WAVELENGTH: f32 = 34.0;
+const CLUMP_THINNEST: f32 = 0.6;
+const CLUMP_THICKEST: f32 = 1.9;
+const CANOPY_SILHOUETTE: f32 = 0.15;
+const PAINTED: f32 = 0.25;
+
+// The two stone lattices. See `crates/terrain-rocks/src/lib.rs`.
+const BOULDER_SPACING: f32 = 24.0;
+const RUBBLE_SPACING: f32 = 3.0;
+const BOULDER_RADIUS: f32 = 5.0;
+const RUBBLE_RADIUS: f32 = 1.2;
+const BOULDER_SHORTEST: f32 = 2.5;
+const BOULDER_TALLEST: f32 = 9.0;
+const RUBBLE_SHORTEST: f32 = 0.4;
+const RUBBLE_TALLEST: f32 = 1.6;
+const STONE_ROUNDNESS: f32 = 0.9;
+const BOULDER_SEED: u32 = 0x526f636bu;
+const RUBBLE_SEED: u32 = 0x53637265u;
+const FIELD_WAVELENGTH: f32 = 200.0;
+const FIELD_EDGE: f32 = 0.42;
+const FIELD_FULL: f32 = 0.78;
+const FIELD_THICKEST: f32 = 2.2;
+const STREW_WAVELENGTH: f32 = 60.0;
+const STREW_THINNEST: f32 = 0.55;
+const STREW_THICKEST: f32 = 1.7;
+const STONE_SILHOUETTE: f32 = 0.08;
+const BOULDERED: f32 = 0.07;
+const STREWN: f32 = 0.30;
+
+// How wide a band of density a crown or a stone grows in over. Both crates set
+// it to the same three tenths and for the same reason: the cover is evaluated
+// once per texel and handed to every sample inside it, so two neighbouring
+// texels disagree slightly about a lattice cell that straddles them. A hard
+// threshold turns that into a tree sliced vertically down the middle; a band
+// turns it into a tree a few centimetres shorter on one side.
+const COVER_EDGE: f32 = 0.30;
+
+// The coarsest texel the rubble is scattered on, in metres.
+//
+// Not in either crate: they scatter both classes at every size. It is here
+// because of what the finer class costs to *find*. `stone_samples` spaces its
+// samples by a quarter of the smaller radius, so a rubble-bearing texel of eight
+// metres wants twenty-seven samples across where a boulder-bearing one wants
+// seven -- fifteen times the walk, over the whole resident base, to resolve a
+// stone 2.4 m wide and at most 1.6 m tall.
+//
+// What that costs is a step at the ring where the last level fine enough to
+// carry rubble hands over to the first that is not. The rubble's own order
+// statistic is a few tenths of a metre, and a two-metre texel is a pixel at
+// 3.7 km, so the step is under a fifth of a pixel: the same slack the crates
+// spend their `SILHOUETTE` on, measured the same way.
+const RUBBLE_TEXEL: f32 = 2.0;
+
+// Hermite ease, flat at both ends -- the crates' `fade`, which is *not*
+// `noise_fade`. The gradient noise above wants a quintic because a
+// second-derivative jump shows through the shading; a density field feeding a
+// threshold does not care, and both crates use the cubic.
+fn cover_fade(t: f32) -> f32 {
+    return t * t * (3.0 - 2.0 * t);
+}
+
+fn cover_ramp(edge0: f32, edge1: f32, t: f32) -> f32 {
+    return cover_fade(clamp((t - edge0) / (edge1 - edge0), 0.0, 1.0));
+}
+
+// One smooth field in `0..=1` off a lattice of the given size.
+//
+// The crates take three fields out of one set of four hashes by splitting each
+// word into three ten-bit slices, because their callers want all three. Every
+// caller here wants exactly one, so the slice is a parameter and the saving is
+// the other two fields rather than the other three hashes. The slice numbers
+// still have to match theirs: `clump` is the third, the boulder field the
+// first, the strewing the second.
+fn cover_field(p: vec2<f32>, wavelength: f32, seed: u32, slice: u32) -> f32 {
+    let u = p / wavelength;
+    let cell = floor(u);
+    let f = vec2<f32>(cover_fade(u.x - cell.x), cover_fade(u.y - cell.y));
+    let at = vec2<i32>(cell);
+    let shift = 10u * slice;
+    let take = 1.0 / 1023.0;
+    let a = f32((noise_hash(at.x, at.y, seed) >> shift) & 0x3ffu) * take;
+    let b = f32((noise_hash(at.x + 1, at.y, seed) >> shift) & 0x3ffu) * take;
+    let c = f32((noise_hash(at.x, at.y + 1, seed) >> shift) & 0x3ffu) * take;
+    let d = f32((noise_hash(at.x + 1, at.y + 1, seed) >> shift) & 0x3ffu) * take;
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// A stand thins and thickens inside itself rather than being uniform to its
+// edge; a boulder field is there or not there at all; rubble covers a slope
+// everywhere and only varies in how thickly. Those three shapes are why the
+// canopy multiplies, the boulders gate, and the rubble multiplies again.
+fn canopy_clump(p: vec2<f32>) -> f32 {
+    return mix(CLUMP_THINNEST, CLUMP_THICKEST, cover_field(p, CANOPY_WAVELENGTH, CANOPY_SEED, 2u));
+}
+
+fn stone_field(p: vec2<f32>) -> f32 {
+    let noise = cover_field(p, FIELD_WAVELENGTH, BOULDER_SEED, 0u);
+    return FIELD_THICKEST * cover_ramp(FIELD_EDGE, FIELD_FULL, noise);
+}
+
+fn stone_strew(p: vec2<f32>) -> f32 {
+    let noise = cover_field(p, STREW_WAVELENGTH, BOULDER_SEED, 1u);
+    return mix(STREW_THINNEST, STREW_THICKEST, noise);
+}
+
+// How high the crowns reach over one point, in metres above the ground.
+//
+// Nine cells rather than one, because a crown wide enough to close a canopy
+// reaches out of its own cell and has to be findable from the cells beside it.
+// Those nine hashes are the whole cost of this file.
+fn crown_at(p: vec2<f32>, density: f32, health: f32) -> f32 {
+    if (health <= 0.0 || density <= 0.0) {
+        return 0.0;
+    }
+    // The understorey: a floor under the crowns for the ground between them,
+    // faded out by density so a clearing does not draw as a raised plate. It is
+    // not canopy, which is what the share below counts.
+    var found = CANOPY_FLOOR * CANOPY_SHORTEST * health * min(density, 1.0);
+    let home = vec2<i32>(floor(p / CANOPY_SPACING));
+
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let cell = home + vec2<i32>(dx, dy);
+            let bits = noise_hash(cell.x, cell.y, CANOPY_SEED);
+            // Four fields out of one word. Splitting a hash beats taking four:
+            // a crown costs two mixers rather than eight, and the fields are
+            // independent because the mixer's avalanche already made every
+            // output bit depend on every input bit.
+            let jitter = vec2<f32>(f32(bits & 0x3ffu), f32((bits >> 10u) & 0x3ffu)) * (1.0 / 1024.0);
+            let size = f32((bits >> 20u) & 0x3fu) * (1.0 / 64.0);
+            let wants = f32((bits >> 26u) & 0x3fu) * (1.0 / 64.0);
+
+            let grow = cover_fade(clamp((density - wants) / COVER_EDGE, 0.0, 1.0));
+            if (grow <= 0.0) {
+                continue;
+            }
+            // Anywhere in its own cell, which is what stops the stand drawing
+            // as a grid, and a short tree is a narrow one.
+            let trunk = (vec2<f32>(cell) + jitter) * CANOPY_SPACING;
+            let scale = grow * (0.72 + 0.28 * size);
+            let radius = max(CANOPY_RADIUS * scale, 1.0 / 1024.0);
+            let height = health * mix(CANOPY_SHORTEST, CANOPY_TALLEST, size) * grow;
+
+            let u = length(p - trunk) / radius;
+            if (u < 1.0) {
+                let cone = 1.0 - u;
+                let dome = sqrt(max(1.0 - u * u, 0.0));
+                found = max(found, height * mix(cone, dome, CANOPY_ROUNDNESS));
+            }
+        }
+    }
+    return found;
+}
+
+// How high the stones of one class stand over one point, in metres.
+//
+// The crown's walk with no understorey under it: a boulder field is stones lying
+// on ground you can see between, so the gaps are the ground at the ground's own
+// height, and a floor here would draw every talus slope as a raised plate with
+// lumps on it.
+fn stone_class(
+    p: vec2<f32>,
+    density: f32,
+    stature: f32,
+    spacing: f32,
+    radius: f32,
+    shortest: f32,
+    tallest: f32,
+    seed: u32,
+) -> f32 {
+    if (density <= 0.0 || stature <= 0.0) {
+        return 0.0;
+    }
+    var found = 0.0;
+    let home = vec2<i32>(floor(p / spacing));
+
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let cell = home + vec2<i32>(dx, dy);
+            let bits = noise_hash(cell.x, cell.y, seed);
+            let jitter = vec2<f32>(f32(bits & 0x3ffu), f32((bits >> 10u) & 0x3ffu)) * (1.0 / 1024.0);
+            let grade = f32((bits >> 20u) & 0x3fu) * (1.0 / 64.0);
+            let wants = f32((bits >> 26u) & 0x3fu) * (1.0 / 64.0);
+
+            let grow = cover_fade(clamp((density - wants) / COVER_EDGE, 0.0, 1.0));
+            if (grow <= 0.0) {
+                continue;
+            }
+            let middle = (vec2<f32>(cell) + jitter) * spacing;
+            let scale = grow * (0.72 + 0.28 * grade);
+            let reach = max(radius * scale, 1.0 / 1024.0);
+            let height = stature * mix(shortest, tallest, grade) * grow;
+
+            let u = length(p - middle) / reach;
+            if (u < 1.0) {
+                let cone = 1.0 - u;
+                let dome = sqrt(max(1.0 - u * u, 0.0));
+                found = max(found, height * mix(cone, dome, STONE_ROUNDNESS));
+            }
+        }
+    }
+    return found;
+}
+
+// How many samples across a texel each walk takes.
+//
+// A quarter of the finest radius in play, floored at four however fine the texel
+// is and capped at thirty-two however coarse. Both halves serve one end: a crown
+// rises eight metres for every metre of ground, so a sample that misses the apex
+// misses the height by an amount that depends on the texel size -- and a
+// clipping that varies by level is a stand that changes height at every ring,
+// which is the pop the crates were rebuilt to remove.
+fn canopy_samples(texel: f32) -> u32 {
+    return clamp(u32(ceil(texel / (0.25 * CANOPY_RADIUS))), 4u, 32u);
+}
+
+fn stone_samples(texel: f32) -> u32 {
+    let radius = select(BOULDER_RADIUS, RUBBLE_RADIUS, texel <= RUBBLE_TEXEL);
+    return clamp(u32(ceil(texel / (0.25 * radius))), 4u, 32u);
+}
+
+// Buckets the order statistic below counts its samples into.
+const COVER_BUCKETS: u32 = 16u;
+
+// The mean of the tallest `share` of a block, from cumulative counts and sums.
+//
+// The answer has to be an *average*, or it does not survive a change of texel
+// size: averaging is scale-invariant, so a stand keeps its height however coarse
+// the texel holding it gets, while a maximum climbs -- a wider block has more
+// chances to land on an apex, and `8c928a9` measured a closed stand growing
+// eleven metres from a one-metre texel to a sixteen-metre one, a step at every
+// ring and forest that grows as you fly away from it. It also has to be an
+// average of the *tall* part, or a distant forest draws as a green-painted
+// hillside twenty metres short of its own treetops, because the honest mean of
+// this canopy is a quarter of its own height.
+//
+// The crates get that by sorting the block and taking a prefix. A shader cannot:
+// a hundred samples is a hundred registers, and an array indexed by a running
+// position lands in scratch memory. So the samples are counted into sixteen
+// buckets on the way past -- cumulatively, `counts[k]` being how many reached
+// the k'th edge, which is what makes the accumulation sixteen fixed adds rather
+// than one indexed one -- and the quantile is read back off them, interpolating
+// inside whichever bucket the boundary falls in. That approximates the exact
+// order statistic by at most the spread within one bucket, and it approximates
+// it the same way at every level, which is the property that actually matters
+// here: what must not move between two levels is the *bias*.
+fn tallest_mean(
+    counts: array<f32, 17>,
+    sums: array<f32, 17>,
+    samples: f32,
+    share: f32,
+) -> f32 {
+    let taken = max(1.0, ceil(samples * share));
+    var mean = 0.0;
+    var found = false;
+    // Downwards, so the first bucket holding enough samples is the tightest one
+    // that does. The seventeenth entry is never written and is therefore zero,
+    // which is what makes `k + 1` safe at the top.
+    for (var k = i32(COVER_BUCKETS) - 1; k >= 0; k--) {
+        if (!found && counts[k] >= taken) {
+            let above = counts[k + 1];
+            let above_sum = sums[k + 1];
+            let inside = max(counts[k] - above, 1e-6);
+            mean = (above_sum + (sums[k] - above_sum) * (taken - above) / inside) / taken;
+            found = true;
+        }
+    }
+    return mean;
+}
+
+// What one texel carries once the crowns and stones on it have been looked at.
+struct Standing {
+    // How high what stands here reaches, in metres above the earth under it.
+    lift: f32,
+    // The id this texel should be painted with, or zero to keep the ground's
+    // own. Taken from the same walk as the height, because a texel that is drawn
+    // as a tree and painted as a meadow is worse than either.
+    id: u32,
+}
+
+// The trees on a texel, given how closed the stand is and how well it grows.
+fn canopy_baked(centre: vec2<f32>, texel: f32, density: f32, health: f32) -> Standing {
+    let across = canopy_samples(texel);
+    let step = texel / f32(across);
+    // Sample centres, so the block is symmetric about the texel and a texel
+    // twice the size of its neighbour covers the same ground its four children
+    // did between them.
+    let first = 0.5 * step - 0.5 * texel;
+    let floor_height = CANOPY_FLOOR * CANOPY_SHORTEST * health * min(density, 1.0);
+    let top = max(health * CANOPY_TALLEST, 1e-6);
+
+    var counts = array<f32, 17>();
+    var sums = array<f32, 17>();
+    var under = 0.0;
+    var samples = 0.0;
+    for (var row = 0u; row < across; row++) {
+        for (var column = 0u; column < across; column++) {
+            let at = centre + first + vec2<f32>(f32(column), f32(row)) * step;
+            let here = crown_at(at, density, health);
+            let rung = here * (f32(COVER_BUCKETS) / top);
+            for (var k = 0; k < i32(COVER_BUCKETS); k++) {
+                let hit = select(0.0, 1.0, f32(k) <= rung);
+                counts[k] += hit;
+                sums[k] += here * hit;
+            }
+            // A sample is under a crown when it stands on something taller than
+            // the forest floor.
+            under += select(0.0, 1.0, here > floor_height);
+            samples += 1.0;
+        }
+    }
+
+    var out: Standing;
+    out.lift = tallest_mean(counts, sums, samples, CANOPY_SILHOUETTE);
+    out.id = select(0u, CANOPY_ID, under / samples >= PAINTED);
+    return out;
+}
+
+// The stones on a texel, given what is scattered on it.
+fn stone_baked(
+    centre: vec2<f32>,
+    texel: f32,
+    boulders: f32,
+    rubble: f32,
+    stature: f32,
+) -> Standing {
+    let across = stone_samples(texel);
+    let step = texel / f32(across);
+    let first = 0.5 * step - 0.5 * texel;
+    let strewn = texel <= RUBBLE_TEXEL;
+    let top = max(stature * BOULDER_TALLEST, 1e-6);
+
+    var counts = array<f32, 17>();
+    var sums = array<f32, 17>();
+    var under_boulder = 0.0;
+    var under_stone = 0.0;
+    var samples = 0.0;
+    for (var row = 0u; row < across; row++) {
+        for (var column = 0u; column < across; column++) {
+            let at = centre + first + vec2<f32>(f32(column), f32(row)) * step;
+            let block = stone_class(
+                at,
+                boulders,
+                stature,
+                BOULDER_SPACING,
+                BOULDER_RADIUS,
+                BOULDER_SHORTEST,
+                BOULDER_TALLEST,
+                BOULDER_SEED,
+            );
+            var here = block;
+            if (strewn) {
+                here = max(
+                    here,
+                    stone_class(
+                        at,
+                        rubble,
+                        stature,
+                        RUBBLE_SPACING,
+                        RUBBLE_RADIUS,
+                        RUBBLE_SHORTEST,
+                        RUBBLE_TALLEST,
+                        RUBBLE_SEED,
+                    ),
+                );
+            }
+            let rung = here * (f32(COVER_BUCKETS) / top);
+            for (var k = 0; k < i32(COVER_BUCKETS); k++) {
+                let hit = select(0.0, 1.0, f32(k) <= rung);
+                counts[k] += hit;
+                sums[k] += here * hit;
+            }
+            // No floor to compare against: the ground between the stones is the
+            // ground, so anything above it is a stone.
+            under_boulder += select(0.0, 1.0, block > 0.0);
+            under_stone += select(0.0, 1.0, here > 0.0);
+            samples += 1.0;
+        }
+    }
+
+    var out: Standing;
+    out.lift = tallest_mean(counts, sums, samples, STONE_SILHOUETTE);
+    // Boulder first, so a texel with both gets the coarser answer, which is the
+    // one a viewer can actually resolve.
+    out.id = select(
+        select(0u, RUBBLE_ID, under_stone / samples >= STREWN),
+        BOULDER_ID,
+        under_boulder / samples >= BOULDERED,
+    );
+    return out;
+}
+
+// Ground-cover ids this file reads or writes; see
+// `crates/terrain-materials/src/lib.rs`.
+const CANOPY_ID: u32 = 0x0304u;
+const BOULDER_ID: u32 = 0x0508u;
+const RUBBLE_ID: u32 = 0x0509u;
+const SCRUB_ID: u32 = 0x0400u;
+const SHRUBBERY_ID: u32 = 0x0401u;
+const HEATH_ID: u32 = 0x0402u;
+const GRASSLAND_ID: u32 = 0x0403u;
+const MEADOW_ID: u32 = 0x0405u;
+const FELL_ID: u32 = 0x0407u;
+const BARE_ROCK_ID: u32 = 0x0500u;
+const SCREE_ID: u32 = 0x0501u;
+const SHINGLE_ID: u32 = 0x0502u;
+const SAND_ID: u32 = 0x0503u;
+const BARE_EARTH_ID: u32 = 0x0506u;
+const CLEARCUT_ID: u32 = 0x0303u;
+const FOREST_COVER: u32 = 3u;
+
+// What the survey's ground cover and the slope under it grow or shed.
+//
+// `terrain-generate` has a classifier for this and it is a much better one: it
+// asks the fields it built the landscape out of -- the treeline, the flow, the
+// hardness of the bed, where the ice dropped its load -- about the very point it
+// is writing. None of that exists for a survey. What exists is one ground-cover
+// id per base texel, rasterized from OpenStreetMap, and the slope of the
+// measured ground under it, so this is what those two can say.
+//
+// That is less of a loss than it sounds. The mapped cover already knows where
+// the treeline is, because the polygons stop there -- a fact about *this*
+// landscape rather than a model of one -- so the terms `timber` drops are the
+// ones the survey has already answered. The terms it keeps are the ones the
+// survey cannot: how a stand thins on a slope, and the mottling that stops one
+// density per polygon drawing as one flat density, which the noise fields above
+// put back.
+//
+// The five kinds of strewn ground come straight from `classify::rocks`, with the
+// generator's `hardness` and `filling` -- fields no survey carries -- taken at
+// their midpoint, and its `mottle` dropped because `stone_field` and
+// `stone_strew` already vary the same numbers over the same distances.
+fn cover_slope_footing(slope: f32) -> f32 {
+    // Steep ground holds less soil and fewer trees, and what it holds is
+    // smaller. It does not stop the forest -- conifers root on slopes nobody
+    // would walk up, which is why the cover says wooded here at all.
+    return 1.0 - smoothstep(0.30, 0.85, slope);
+}
+
+fn standing_on(cover: u32, centre: vec2<f32>, texel: f32, slope: f32) -> Standing {
+    let clump = canopy_clump(centre);
+    if (cover >> 8u) == FOREST_COVER && cover != CLEARCUT_ID && cover != CANOPY_ID {
+        let footing = mix(0.78, 1.0, cover_slope_footing(slope));
+        return canopy_baked(centre, texel, 0.92 * footing * clump, 0.95 * footing);
+    }
+    // Krummholz: the same trees, beaten down to head height and scattered. Flat
+    // numbers, because nothing about this belt varies in a way that reads from
+    // the air -- what makes it look right is that it is sparse and short.
+    if (cover == SCRUB_ID || cover == SHRUBBERY_ID) {
+        return canopy_baked(centre, texel, 0.30 * clump, 0.17);
+    }
+
+    let steep = smoothstep(0.20, 1.00, slope);
+    let field = stone_field(centre);
+    let strew = stone_strew(centre);
+    var scatter = vec3<f32>(0.0);
+    if (cover == SCREE_ID) {
+        // Talus: the rubble a cliff sheds, with the blocks that did not break up
+        // lying in it.
+        scatter = vec3<f32>(0.40, 0.72, 0.7);
+    } else if (cover == BARE_ROCK_ID) {
+        // A cliff: swept, with what the ledges managed to hold. A face steep
+        // enough to read as bare rock has already sent anything loose to the
+        // talus below it, so the rubble fades out with the steepness.
+        scatter = vec3<f32>(0.22, 0.15 * (1.0 - steep), 0.9);
+    } else if (cover == FELL_ID || cover == HEATH_ID) {
+        // Felsenmeer: the alpine plateau, shattered in place. The blocks want
+        // flat ground, because anything steep enough to shed them has.
+        scatter = vec3<f32>(0.18 + 0.12 * (1.0 - steep), 0.50, 0.75);
+    } else if (cover == SHINGLE_ID) {
+        // A gravel bar: cobbles and not much else. The stature is what is low
+        // rather than the densities -- a river that could roll a five-metre
+        // block would not have left it here.
+        scatter = vec3<f32>(0.05, 0.65, 0.35);
+    } else if (
+        cover == GRASSLAND_ID
+        || cover == MEADOW_ID
+        || cover == SAND_ID
+        || cover == BARE_EARTH_ID
+    ) {
+        // Erratics: single blocks standing on ground that has none of their
+        // kind. The sparsest and the most visible, which is not a contradiction
+        // -- a valley floor is flat, open and looked at from low down, so one
+        // block on it reads from a long way off, and it is the case
+        // `Material::Boulder` exists for because the ground under it is grass.
+        scatter = vec3<f32>(0.18, 0.05, 1.0);
+    } else {
+        var bare: Standing;
+        bare.lift = 0.0;
+        bare.id = 0u;
+        return bare;
+    }
+    return stone_baked(centre, texel, scatter.x * field, scatter.y * strew, scatter.z);
+}
+
+// The middle of a texel of some level, in metres from the raster origin.
+//
+// The centre rather than the corner the height is indexed at, because a walk
+// covers the *block* a texel stands for: a level-`l` sample is a mean over the
+// square of level-0 texels starting at `cell << l`, so centring the block there
+// is what makes a coarse texel cover exactly the ground its four children do.
+fn cover_centre(cell: vec2<i32>, level: u32) -> vec2<f32> {
+    let texels = f32(1u << level);
+    return (vec2<f32>(cell) + 0.5) * texels * terrain.metres_per_texel.x;
+}
+
+// One thread per pair of cells across, as `cs_maxima` is and for the same
+// reason: the cells go out through a storage buffer as packed halves.
+@compute @workgroup_size(8, 8)
+fn cs_cover(@builtin(global_invocation_id) id: vec3<u32>) {
+    let pairs = (job.size.x + 1u) / 2u;
+    if (id.x >= pairs || id.y >= job.size.y) {
+        return;
+    }
+    let at = job.origin + vec2<i32>(i32(id.x) * 2, i32(id.y));
+    let low = level_lift(at);
+    var high = low;
+    if (id.x * 2u + 1u < job.size.x) {
+        high = level_lift(at + vec2<i32>(1, 0));
+    }
+    out_halves[id.y * job.stride + id.x] = ceiling_half(low) | (ceiling_half(high) << 16u);
+    // The raised surface goes out beside the lift, off the same walk, because
+    // the walk is the expensive half of this file and doing it twice to get two
+    // numbers out of it would double the load.
+    //
+    // Both are wanted afterwards and neither can be recovered from the other
+    // cheaply: the march reads a surface and must not pay two fetches a step to
+    // get one, and `cs_detail` reads the survey underneath -- a generated level
+    // grows its own crowns at its own texel size, so interpolating the base's
+    // would count them twice.
+}
+
+// One thread per pair of cells across, over the same rectangles once the whole
+// lift chain is written.
+//
+// A second sweep rather than a second output of the first, because the walk
+// above reads the survey and this writes over it. Adding as it went would leave
+// the pass reading rectangles it had already raised -- and what it reads them
+// for is the slope, which is a question about the ground rather than about what
+// is standing on it.
+@compute @workgroup_size(8, 8)
+fn cs_raise(@builtin(global_invocation_id) id: vec3<u32>) {
+    let pairs = (job.size.x + 1u) / 2u;
+    if (id.x >= pairs || id.y >= job.size.y) {
+        return;
+    }
+    let at = job.origin + vec2<i32>(i32(id.x) * 2, i32(id.y));
+    let wide = id.y * job.wide_stride + id.x * 2u;
+    out_surface[wide] = level_surface(at);
+    if (id.x * 2u + 1u < job.size.x) {
+        out_surface[wide + 1u] = level_surface(at + vec2<i32>(1, 0));
+    }
+}
+
+fn level_surface(cell: vec2<i32>) -> f32 {
+    let height = resident_height_at(job.level, cell);
+    // Nothing stands on a hole. The sentinel is what says the survey measured
+    // nothing here, and a hole with trees on it is ground.
+    if (height < NODATA_BELOW) {
+        return height;
+    }
+    return height + lift_at(job.level, cell);
+}
+
+// How much of one resident texel's surface is what stands on it.
+//
+// Walked at the base and *averaged* at every level above it, and that split is
+// the whole design of this pass rather than a saving in it.
+//
+// Walking every level is what the offline generator did, and it is the answer
+// each level would give for itself: the mean of the tallest fraction of its own
+// block, which climbs a little as the block widens because a wider block reaches
+// further into the tall tail. Averaging instead gives a level the mean of its
+// four children, which is not quite that number -- a coarse level comes out a
+// couple of metres short of what it would have found on its own -- and in
+// exchange the chain has *no step anywhere in it*, because a parent is the mean
+// of its children by construction rather than by an argument about how nearly
+// scale-invariant an order statistic is.
+//
+// The cost decides it either way. A thirty-two metre texel wants a thousand
+// crown samples where an eight-metre one wants a hundred, so walking the chain
+// honestly is three times the base pass again, and it buys a step at every ring
+// where averaging leaves none.
+fn level_lift(cell: vec2<i32>) -> f32 {
+    if (resident_height_at(job.level, cell) < NODATA_BELOW) {
+        return 0.0;
+    }
+    if (job.level == terrain.resident_base) {
+        return standing_at(cell, job.level).lift;
+    }
+    // Holes are dropped from the mean rather than averaged in, exactly as the
+    // heights under them were when the tools built this level: a texel half
+    // outside the survey carries what the measured half of it carries, not half
+    // of it.
+    var sum = 0.0;
+    var found = 0.0;
+    for (var dy = 0; dy < 2; dy++) {
+        for (var dx = 0; dx < 2; dx++) {
+            let child = cell * 2 + vec2<i32>(dx, dy);
+            if (resident_height_at(job.level - 1u, child) >= NODATA_BELOW) {
+                sum += lift_at(job.level - 1u, child);
+                found += 1.0;
+            }
+        }
+    }
+    if (found <= 0.0) {
+        return 0.0;
+    }
+    return sum / found;
+}
+
+// What stands on one texel of any level, generated or resident.
+//
+// One function for both, which is what stops the near field and the far field
+// growing two different forests. A generated texel asks the *base* texel it
+// falls in for its cover and its slope, so every texel under one base texel is
+// handed the same stand -- the same density, the same health, and therefore the
+// same trunks off the same lattice. What differs between the levels is only how
+// finely that stand is sampled, which is the difference the order statistic is
+// built to be indifferent to.
+//
+// The slope comes from the mip above the base rather than from a texel's own
+// neighbours. `footing` asks how steep the *hillside* is, which is a question
+// about a couple of hundred metres of ground, and a single pair of eight-metre
+// texels answers it more noisily than the thing being asked about. Taking it
+// from a level nothing writes also keeps this pass off ground it is raising.
+fn standing_at(cell: vec2<i32>, level: u32) -> Standing {
+    let base = terrain.resident_base;
+    let parent = cell >> vec2<u32>(base - level);
+    let above = min(base + 1u, terrain.level_count - 1u);
+    let coarse = parent >> vec2<u32>(above - base);
+    let metres = f32(1u << above) * terrain.metres_per_texel.x;
+    // The survey's own ground, which is what a hillside's steepness is a fact
+    // about: a stand thins on a slope because the soil does, and the slope of
+    // the canopy over it says nothing about that.
+    //
+    // Written as a subtraction rather than as a read of an unraised level,
+    // because there is no longer such a level -- and it is the same subtraction
+    // whether this runs while the chain is being built or while a tile is being
+    // generated. The pass that walks this reaches the base before the level
+    // above it, so the lift it reads there is still the zero a texture starts
+    // at, and the heights are still the survey's; afterwards both have been
+    // written and the difference is the same number.
+    let fall = vec2<f32>(
+        bare_above(above, coarse + vec2<i32>(1, 0)) - bare_above(above, coarse - vec2<i32>(1, 0)),
+        bare_above(above, coarse + vec2<i32>(0, 1)) - bare_above(above, coarse - vec2<i32>(0, 1)),
+    );
+    let slope = length(fall / (2.0 * metres));
+    let cover = textureLoad(materials, slot(base, parent), mip(base)).r;
+    let texel = f32(1u << level) * terrain.metres_per_texel.x;
+    return standing_on(cover, cover_centre(cell, level), texel, slope);
 }
 
 // The smallest half float that is not below `height`, as bits.
@@ -1727,7 +2488,7 @@ fn cs_maxima(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x * 2u + 1u < job.size.x) {
         high = ceiling_half(derived_ceiling(at + vec2<i32>(1, 0)));
     }
-    out_maxima[id.y * job.stride + id.x] = low | (high << 16u);
+    out_halves[id.y * job.stride + id.x] = low | (high << 16u);
 }
 
 // One thread per pixel the reprojection could not answer.
