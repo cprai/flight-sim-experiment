@@ -69,7 +69,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use terrain_tiles::{MATERIAL_PRODUCT, Manifest, TILE_SIZE};
+use terrain_tiles::{MATERIAL_PRODUCT, Manifest, RESIDENT_BASE_LEVEL, TILE_SIZE};
 
 use fields::Fields;
 use shape::Relief;
@@ -138,6 +138,19 @@ struct Arguments {
     /// continues the chain in memory above whatever it finds.
     #[arg(long, value_name = "L", default_value_t = 8)]
     max_level: u32,
+
+    /// Finest level to store.
+    ///
+    /// Defaults to what the renderer holds. Every level is generated straight
+    /// out of the fields rather than reduced from the one below it, so a finer
+    /// base costs the whole of its own tiles and buys nothing: the renderer
+    /// holds its raster resident from this level up and never opens a finer
+    /// one. For the default extent that is 15 GB of elevation against 250 MB.
+    ///
+    /// Zero writes the whole pyramid, for comparing what a finer base would
+    /// have looked like against what it costs.
+    #[arg(long, value_name = "L", default_value_t = RESIDENT_BASE_LEVEL)]
+    base_level: u32,
 
     /// Ground covered by one cell of the erosion grid, in metres.
     ///
@@ -220,8 +233,8 @@ impl Arguments {
             product: product.into(),
             epsg: u32::from(terrain_tiles::write::EPSG_LAMBERT),
             tile_size: TILE_SIZE,
-            base_level: 0,
-            level_count: self.max_level + 1,
+            base_level: self.base_level,
+            level_count: self.max_level - self.base_level + 1,
             base_metres_per_texel: 1.0,
             origin_metres: self.origin,
             extent_texels: self.extent,
@@ -230,26 +243,18 @@ impl Arguments {
         }
     }
 
-    /// The ground cover, stored from level 0 rather than from
-    /// `MATERIAL_BASE_LEVEL`.
+    /// The ground cover, stored over exactly the levels the elevation is.
     ///
-    /// That constant is the level *vector* data is worth rasterising at, and it
-    /// belongs to `terrain-process`, which draws OSM ways onto a grid and gains
-    /// nothing from a finer one. This product is a per-texel function of the
-    /// fields, so it can be evaluated at whatever resolution is asked for, and
-    /// now it has a reason to be: the crowns are in here. A texel says `Canopy`
-    /// where a tree stands on it, and a four-metre texel would draw the gaps
-    /// between seven-metre trunks in four-metre blocks.
-    ///
-    /// It costs disk and nothing else. The renderer allocates this texture at one
-    /// texel per level-0 texel either way -- storing it coarser only meant every
-    /// fine level was a magnified copy of level 2 -- so a finer product is fewer
-    /// magnified reads, not more memory.
+    /// Not `MATERIAL_BASE_LEVEL`, which is the level *vector* data is worth
+    /// rasterising at and belongs to `terrain-process`. This product is a
+    /// per-texel function of the fields, so it can be evaluated at whatever
+    /// resolution is asked for -- and it has to be evaluated wherever the
+    /// elevation is, because the crowns are in both: a texel says `Canopy` where
+    /// a tree stands on it, and the height under that id was raised by the same
+    /// walk that wrote it.
     fn material_manifest(&self) -> Manifest {
         Manifest {
             product: MATERIAL_PRODUCT.into(),
-            base_level: 0,
-            level_count: self.max_level + 1,
             nodata: 0.0,
             ..self.elevation_manifest(MATERIAL_PRODUCT)
         }
@@ -496,10 +501,11 @@ mod tests {
         let elevation = arguments.elevation_manifest(ELEVATION_PRODUCT);
         let materials = arguments.material_manifest();
         assert!(elevation.covers_same_ground_as(&materials));
-        // Level 0, not `MATERIAL_BASE_LEVEL`: the crowns are written into this
-        // product, and a four-metre texel would draw the gaps between
-        // seven-metre trunks in four-metre blocks. See `material_manifest`.
-        assert_eq!(materials.base_level, 0);
+        // The same levels as the elevation, top and bottom, and not
+        // `MATERIAL_BASE_LEVEL`: the crowns are in both products at once, so a
+        // level that held a `Canopy` id and no raised height under it -- or the
+        // reverse -- would draw a tree the march cannot meet.
+        assert_eq!(materials.base_level, elevation.base_level);
         assert_eq!(materials.max_level(), elevation.max_level());
     }
 

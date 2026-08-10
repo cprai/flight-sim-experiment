@@ -30,7 +30,7 @@ pub mod read;
 pub mod texel;
 pub mod write;
 
-pub use manifest::{COLOUR_BASE_LEVEL, MATERIAL_BASE_LEVEL, Manifest};
+pub use manifest::{COLOUR_BASE_LEVEL, MATERIAL_BASE_LEVEL, Manifest, RESIDENT_BASE_LEVEL};
 pub use texel::{
     COLOUR_IS_SRGB_ENCODED, NODATA_BELOW, Srgb8, Texel, linear_to_srgb, srgb_to_linear,
 };

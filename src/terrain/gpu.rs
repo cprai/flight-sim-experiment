@@ -433,7 +433,12 @@ impl Terrain {
         // and the budget will take it depends on the raster, which only becomes
         // known here.
         let residency = Residency {
-            resident_base: residency.fit_base(raster, available, device.limits().max_texture_dimension_2d),
+            resident_base: residency.fit_base(
+                raster,
+                heights.base_level().max(materials.base_level()),
+                available,
+                device.limits().max_texture_dimension_2d,
+            ),
             ..residency
         };
         let resident_base = residency.resident_base;

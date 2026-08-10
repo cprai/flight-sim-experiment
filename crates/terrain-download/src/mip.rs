@@ -40,13 +40,22 @@ const HALF: usize = (TILE_SIZE / 2) as usize;
 /// peak RSS and saved under a second.
 const REDUCE_THREADS: usize = 4;
 
-/// Builds every level above `base_level`, reading children back off disk.
+/// Builds every level above `base_level`, reading children back off disk, and
+/// drops the levels below `keep` behind it.
+///
+/// Dropping happens *here*, one level at a time, rather than in a sweep at the
+/// end: a level is finished with the moment the level above it has been reduced
+/// out of it, so deleting it there keeps the peak on disk at two levels rather
+/// than at the whole pyramid. For a metre survey that is the difference between
+/// needing 76 GB free and needing 71 GB free at the worst moment, and between
+/// leaving 76 GB behind and leaving one.
 ///
 /// Returns how many tiles were written.
 pub fn build_levels(
     root: &Path,
     extent: &TileExtent,
     base_level: u32,
+    keep: u32,
     bands: usize,
     nodata: f32,
 ) -> Result<u64> {
@@ -97,6 +106,16 @@ pub fn build_levels(
             across * down
         );
         written += level_written;
+
+        // The level under this one has now been read for the last time.
+        if level > 0 && level - 1 < keep {
+            let directory = root.join(format!("{:02}", level - 1));
+            if directory.is_dir() {
+                std::fs::remove_dir_all(&directory)
+                    .with_context(|| format!("removing {}", directory.display()))?;
+                log::info!("level {}: dropped, below --base-level", level - 1);
+            }
+        }
     }
 
     Ok(written)

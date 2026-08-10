@@ -116,6 +116,20 @@ struct Arguments {
     #[arg(short, long, value_name = "DIR")]
     output: PathBuf,
 
+    /// The finest level to leave on disk, for elevation products.
+    ///
+    /// Zero by default: this tool's output is the archive, and re-fetching tens
+    /// of gigabytes over the network to recover a level is a worse trade than
+    /// keeping it. Everything finer than this is still downloaded and still
+    /// reduced -- a coarse texel is the mean of what was measured under it, so
+    /// the fine levels have to exist to be averaged -- and is deleted as soon as
+    /// the level above it has been built.
+    ///
+    /// Pass `terrain-process`'s own default to keep only what the renderer can
+    /// hold, which for a metre survey turns 76 GB of elevation into one.
+    #[arg(long, value_name = "LEVEL", default_value_t = 0)]
+    base_level: u32,
+
     /// What to fetch: bare ground, colour, or raw OpenStreetMap data.
     #[arg(long, value_enum, default_value = "dtm")]
     product: Product,
@@ -436,9 +450,9 @@ async fn fetch_elevation(
     }
 
     drop((canvas, samples));
-    written += mip::build_levels(root, extent, 0, 1, nodata)?;
+    written += mip::build_levels(root, extent, 0, arguments.base_level, 1, nodata)?;
     extent
-        .manifest(arguments.product.label(), 0, 1, nodata)
+        .manifest(arguments.product.label(), arguments.base_level, 1, nodata)
         .write(root)?;
 
     let shares = tally.percentages();
@@ -632,7 +646,7 @@ async fn fetch_albedo(
     }
 
     drop((canvas, samples));
-    written += mip::build_levels(root, extent, COLOUR_BASE_LEVEL, 3, 0.0)?;
+    written += mip::build_levels(root, extent, COLOUR_BASE_LEVEL, COLOUR_BASE_LEVEL, 3, 0.0)?;
     extent
         .manifest(arguments.product.label(), COLOUR_BASE_LEVEL, 3, 0.0)
         .write(root)?;

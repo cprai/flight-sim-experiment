@@ -309,9 +309,14 @@ fn runs(indices: &[i64]) -> Vec<(i32, std::ops::Range<usize>)> {
 
 impl<T: TileSample> RasterSource for TileStore<T> {
     fn level_count(&self) -> u32 {
-        // Counted from level 0 even when nothing is stored there, because the
-        // clipmap indexes both products with the same level numbers.
+        // Counted from level 0 even when nothing is stored there, because both
+        // products are indexed with the same level numbers however deep each
+        // one goes.
         self.manifest.max_level() + 1
+    }
+
+    fn base_level(&self) -> u32 {
+        self.manifest.base_level
     }
 
     fn read_rect(&self, level: u32, origin: IVec2, size: UVec2, out: &mut [u8]) {

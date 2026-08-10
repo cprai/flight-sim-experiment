@@ -27,6 +27,18 @@ pub trait RasterSource {
     /// Number of levels, where 0 is the full-resolution raster.
     fn level_count(&self) -> u32;
 
+    /// The finest level that is actually stored.
+    ///
+    /// Zero for a raster held whole. A tile store answers a request below its
+    /// own base by repeating texels out of the finest level it has, which is
+    /// what magnifies colour -- and which would silently hand the terrain
+    /// sixty-four times the memory for no detail if it held a base finer than
+    /// what was written. [`Residency::fit_base`] takes this as its floor for
+    /// exactly that reason.
+    fn base_level(&self) -> u32 {
+        0
+    }
+
     /// Copies `size` texels starting at `origin` into `out`, tightly packed.
     ///
     /// Reads outside the raster clamp to the nearest edge texel, so a window

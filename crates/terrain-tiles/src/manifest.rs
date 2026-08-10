@@ -35,6 +35,21 @@ pub const COLOUR_BASE_LEVEL: u32 = 4;
 /// serves finer requests by repeating texels, as it already does for colour.
 pub const MATERIAL_BASE_LEVEL: u32 = 2;
 
+/// The finest level the renderer holds, and so the finest worth storing.
+///
+/// Three, which is 8 m texels on a metre survey. The renderer keeps its whole
+/// raster in GPU memory from this level up and *generates* everything under it
+/// -- fractal detail, tree crowns and stones, all pure functions of position --
+/// so a level below this is bytes on a disk that nothing will ever open. For
+/// the survey this flies that is the difference between 117 GB and about 2.
+///
+/// A restatement of `Residency::resident_base`'s default in the renderer, which
+/// cannot be depended on from here because it is a binary, and which
+/// `the_stored_base_is_the_one_the_renderer_holds` pins to this. The renderer
+/// may hold a *coarser* base than this when a device or a budget will not take
+/// it, which needs nothing stored; it never asks for a finer one.
+pub const RESIDENT_BASE_LEVEL: u32 = 3;
+
 /// Describes one product's tile tree.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Manifest {

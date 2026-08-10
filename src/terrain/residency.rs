@@ -179,15 +179,30 @@ impl Residency {
             .sum()
     }
 
-    /// The finest base no finer than this one that the device and the budget
-    /// will both take.
+    /// The finest base no finer than this one that the products, the device and
+    /// the budget will all take.
     ///
     /// Coarsening once quarters the memory and halves each dimension, so this
     /// converges in a couple of steps from anywhere sensible. `available` is how
     /// many levels the source products actually hold: asking for a base past the
     /// end of the stored chain would leave nothing to read.
-    pub fn fit_base(&self, raster: UVec2, available: u32, max_dimension: u32) -> u32 {
-        let mut base = self.resident_base;
+    ///
+    /// `stored` is the other end of the same question, and it is the one thing
+    /// here that fails *quietly* if it is not asked. A tile store answers a
+    /// request below its own base by repeating texels out of the finest level it
+    /// has, so a base two levels finer than what was written would fill sixteen
+    /// times the memory with the same ground magnified -- no error, no hole,
+    /// just a survey that is not there. Now that the tools write from
+    /// [`terrain_tiles::RESIDENT_BASE_LEVEL`] up, that is the ordinary case
+    /// rather than a misconfiguration.
+    pub fn fit_base(
+        &self,
+        raster: UVec2,
+        stored: u32,
+        available: u32,
+        max_dimension: u32,
+    ) -> u32 {
+        let mut base = self.resident_base.max(stored);
         while base + 1 < available {
             let size = Self {
                 resident_base: base,
@@ -488,11 +503,31 @@ mod tests {
             resident_base: 2,
             ..Default::default()
         };
-        assert_eq!(residency.fit_base(RASTER, 9, 16384), 3, "4 m is too wide");
+        assert_eq!(residency.fit_base(RASTER, 0, 9, 16384), 3, "4 m is too wide");
         assert_eq!(
-            residency.fit_base(RASTER, 9, 8192),
+            residency.fit_base(RASTER, 5, 9, 16384),
+            5,
+            "a base finer than the products hold would be magnified, not read"
+        );
+        assert_eq!(
+            residency.fit_base(RASTER, 0, 9, 8192),
             4,
             "at the WebGPU default even 8 m is too wide"
+        );
+    }
+
+    /// The tools store from one level and the renderer holds from another, and
+    /// the two numbers are written down in different crates. This is what says
+    /// they are the same number.
+    ///
+    /// Getting it wrong is quiet in both directions. Stored coarser than held
+    /// and the base is magnified texels rather than a survey; stored finer and
+    /// the extra levels are gigabytes nothing opens.
+    #[test]
+    fn the_stored_base_is_the_one_the_renderer_holds() {
+        assert_eq!(
+            Residency::default().resident_base,
+            terrain_tiles::RESIDENT_BASE_LEVEL
         );
     }
 
@@ -513,7 +548,7 @@ mod tests {
             bytes as f64 / (1 << 20) as f64,
             residency.memory_budget as f64 / (1 << 20) as f64
         );
-        assert_eq!(residency.fit_base(RASTER, 9, 16384), 3);
+        assert_eq!(residency.fit_base(RASTER, 0, 9, 16384), 3);
     }
 
     /// A chain is four thirds of its base and no more, which is what makes

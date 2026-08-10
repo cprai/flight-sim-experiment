@@ -30,6 +30,20 @@
 //! terrain-process --input assets/download --output assets/terrain
 //! flight-sim --terrain assets/terrain
 //! ```
+//!
+//! # What comes out is a fraction of what goes in
+//!
+//! Only levels at and above `--base-level` are copied, which defaults to the
+//! level the renderer holds its raster resident from. Everything finer is
+//! downloaded, reduced and left behind: the renderer generates the levels under
+//! its base -- fractal detail, tree crowns and stones, all pure functions of
+//! position -- and has not opened a stored one since `9ad0ca5`.
+//!
+//! Measured over the survey this flies: `dtm` 57 GB to 926 MB and `materials`
+//! 3.6 GB to 926 MB, with the `-max` product that used to sit beside them gone
+//! entirely. The same three cameras draw the 1.9 GB tree and the 117 GB one
+//! *pixel for pixel identically*, which is the only interesting thing to say
+//! about a change like this.
 
 mod tiles;
 mod osm;
@@ -39,7 +53,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
-use terrain_tiles::{MATERIAL_PRODUCT, Manifest};
+use terrain_tiles::{MATERIAL_PRODUCT, Manifest, RESIDENT_BASE_LEVEL};
 
 
 #[derive(Parser, Debug)]
@@ -63,6 +77,19 @@ struct Arguments {
     /// of gigabytes of measurements beside it have not moved.
     #[arg(long)]
     no_copy: bool,
+
+    /// The finest level to write, as a level of the download's own pyramid.
+    ///
+    /// Defaults to what the renderer holds. Every finer level is skipped rather
+    /// than copied, which for a metre survey is the difference between 57 GB of
+    /// elevation and under one: the renderer keeps its whole raster resident
+    /// from this level up and generates everything under it, so a finer level
+    /// would be opened by nothing.
+    ///
+    /// Zero writes the download whole, which is what to pass when measuring a
+    /// finer base against what it costs.
+    #[arg(long, value_name = "LEVEL", default_value_t = RESIDENT_BASE_LEVEL)]
+    base_level: u32,
 
 }
 
@@ -89,9 +116,31 @@ fn main() -> Result<()> {
         terrain_tiles::manifest::MANIFEST_NAME
     );
 
-    for (name, _) in &products {
+    for (name, manifest) in &products {
+        anyhow::ensure!(
+            arguments.base_level <= manifest.max_level(),
+            "{name} stores levels {}..={} and --base-level asks for {}",
+            manifest.base_level,
+            manifest.max_level(),
+            arguments.base_level
+        );
         if !arguments.no_copy {
-            copy_product(&arguments.input.join(name), &arguments.output.join(name))?;
+            let base = arguments.base_level.max(manifest.base_level);
+            copy_product(
+                &arguments.input.join(name),
+                &arguments.output.join(name),
+                base,
+            )?;
+            // The copy's own manifest, not the source's: the tree being written
+            // starts at a different level from the one being read, and a
+            // manifest that said otherwise would send the renderer looking for
+            // directories that were deliberately left behind.
+            Manifest {
+                base_level: base,
+                level_count: manifest.max_level() - base + 1,
+                ..manifest.clone()
+            }
+            .write(&arguments.output.join(name))?;
         }
     }
 
@@ -102,7 +151,12 @@ fn main() -> Result<()> {
             .into_iter()
             .next()
             .context("materials need an existing product to take the grid from")?;
-        osm::build(&arguments.input, &arguments.output, &reference)?;
+        osm::build(
+            &arguments.input,
+            &arguments.output,
+            &reference,
+            arguments.base_level,
+        )?;
     }
     Ok(())
 }
@@ -127,14 +181,22 @@ fn discover(root: &Path, wanted: &[String]) -> Result<Vec<(String, Manifest)>> {
     Ok(products)
 }
 
-/// Copies one product directory across, skipping files already there.
+/// Copies one product directory across, from `base` up, skipping files already
+/// there.
 ///
 /// The skip is what makes a re-run cheap: the measurements do not change, so
 /// after the first pass this costs a stat per tile rather than a copy. Size
 /// rather than a checksum, because a tile is a fixed-size file written whole --
 /// a truncated one differs in length, and nothing rewrites a tile in place.
-fn copy_product(source: &Path, destination: &Path) -> Result<()> {
-    let files = walk(source)?;
+///
+/// The manifest is not copied. The caller writes one describing the tree that
+/// came out rather than the one that went in.
+fn copy_product(source: &Path, destination: &Path, base: u32) -> Result<()> {
+    let files: Vec<PathBuf> = walk(source)?
+        .into_iter()
+        .filter(|relative| level_of(relative).is_none_or(|level| level >= base))
+        .filter(|relative| relative != Path::new(terrain_tiles::manifest::MANIFEST_NAME))
+        .collect();
     let copied = std::sync::atomic::AtomicU64::new(0);
     log::info!(
         "copying {} to {}: {} files",
@@ -168,6 +230,21 @@ fn copy_product(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Which level a tile's path belongs to, or [`None`] for anything that is not
+/// under a level directory.
+///
+/// Tiles live in a directory named for their level, two digits wide, so this is
+/// the whole of what a copy needs to know to leave the fine ones behind.
+fn level_of(relative: &Path) -> Option<u32> {
+    relative
+        .components()
+        .next()?
+        .as_os_str()
+        .to_str()?
+        .parse()
+        .ok()
+}
+
 /// Every file under `root`, as paths relative to it.
 fn walk(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
@@ -191,4 +268,23 @@ fn walk(root: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A copy leaves the fine levels behind by reading the level out of a path,
+    /// so this is the whole of what decides whether 57 GB is written or one.
+    #[test]
+    fn a_paths_level_is_the_directory_it_sits_in() {
+        assert_eq!(level_of(Path::new("03/-239_-122.tif")), Some(3));
+        assert_eq!(level_of(Path::new("00/0_0.tif")), Some(0));
+        assert_eq!(level_of(Path::new("12/1_1.tif")), Some(12));
+        // Anything that is not a level directory is kept whatever the base is,
+        // which is the safe direction: a file this cannot read is a file it has
+        // no business deleting.
+        assert_eq!(level_of(Path::new("manifest.json")), None);
+        assert_eq!(level_of(Path::new("notes/03/x.tif")), None);
+    }
 }

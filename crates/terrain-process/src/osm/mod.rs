@@ -40,12 +40,20 @@ pub mod read;
 /// about the ground is copied from it. The materials manifest is written
 /// last, so a run killed partway leaves a directory the renderer refuses to
 /// open rather than a pyramid with holes.
-pub fn build(input: &Path, output: &Path, reference: &Manifest) -> Result<()> {
+///
+/// `keep` is the finest level to leave on disk. The vector data is always
+/// rasterized at [`MATERIAL_BASE_LEVEL`] whatever it says, and the levels below
+/// `keep` are dropped once the coarse ones have been reduced out of them --
+/// because a coarse material id is the commonest of the four under it, and
+/// rasterizing an eight-metre texel directly would decide a pond's shoreline
+/// from one sample where reducing decides it from four.
+pub fn build(input: &Path, output: &Path, reference: &Manifest, keep: u32) -> Result<()> {
     anyhow::ensure!(
         reference.max_level() >= MATERIAL_BASE_LEVEL,
         "the {} product stores nothing at or above level {MATERIAL_BASE_LEVEL}",
         reference.product
     );
+    let kept = keep.max(MATERIAL_BASE_LEVEL).min(reference.max_level());
     let manifest = Manifest {
         product: MATERIAL_PRODUCT.into(),
         base_level: MATERIAL_BASE_LEVEL,
@@ -76,12 +84,29 @@ pub fn build(input: &Path, output: &Path, reference: &Manifest) -> Result<()> {
     let base = rasterize::rasterize(&polygons, &strokes, &manifest, &root)?;
     fill::fill(&manifest, &root)?;
     let coarse = mip::build_levels(&manifest, &root)?;
-    manifest.write(&root)?;
+
+    // Written from `kept` up, whatever was rasterized. The finer levels have
+    // done their job -- every level above them was reduced out of them -- and
+    // nothing opens them afterwards.
+    let stored = Manifest {
+        base_level: kept,
+        level_count: manifest.max_level() - kept + 1,
+        ..manifest.clone()
+    };
+    for level in manifest.base_level..kept {
+        let directory = root.join(format!("{level:02}"));
+        if directory.is_dir() {
+            std::fs::remove_dir_all(&directory)
+                .with_context(|| format!("removing {}", directory.display()))?;
+        }
+    }
+    stored.write(&root)?;
     log::info!(
-        "built {MATERIAL_PRODUCT}: {base} base tiles and {coarse} coarse tiles in {:.1?}",
+        "built {MATERIAL_PRODUCT}: {base} base tiles and {coarse} coarse tiles in {:.1?}, \
+         stored from level {kept}",
         started.elapsed()
     );
-    log_histogram(&manifest, &root).context("summarising the ground")?;
+    log_histogram(&stored, &root).context("summarising the ground")?;
     Ok(())
 }
 
