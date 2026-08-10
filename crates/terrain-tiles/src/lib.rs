@@ -24,7 +24,6 @@
 use std::path::{Path, PathBuf};
 
 pub mod manifest;
-pub mod maxima;
 #[cfg(feature = "project")]
 pub mod project;
 pub mod read;
@@ -38,26 +37,9 @@ pub use texel::{
 
 /// What the ground-cover product's directory is called.
 ///
-/// Named here for the same reason [`maxima_product`] is: the tool that writes
-/// it and the renderer that will open it must not spell it differently.
+/// Named here because the tool that writes it and the renderer that will open
+/// it must not spell it differently.
 pub const MATERIAL_PRODUCT: &str = "materials";
-
-/// What marks a product directory as a max pyramid rather than a measurement.
-pub const MAXIMA_SUFFIX: &str = "-max";
-
-/// What a max pyramid's product directory is called, given the elevation it was
-/// reduced from.
-///
-/// A suffix rather than one shared name because a bound belongs to the surface
-/// it was reduced from, and nothing about a ceiling over the bare earth bounds
-/// a canopy or a rooftop. Only `dtm` is fetched and drawn today, so the tool
-/// writes one of these; naming it after its source is what keeps a second
-/// elevation product from silently inheriting this one's ceilings. Derived here
-/// so the tool that writes it and the renderer that opens it cannot spell it
-/// differently.
-pub fn maxima_product(elevation: &str) -> String {
-    format!("{elevation}{MAXIMA_SUFFIX}")
-}
 
 /// Side length of every tile, in texels, at every level.
 ///

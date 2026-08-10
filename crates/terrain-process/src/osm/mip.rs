@@ -34,7 +34,7 @@ use terrain_tiles::write::{TilePlacement, write_material_tile};
 use terrain_tiles::{MATERIAL_BASE_LEVEL, Manifest, TILE_SIZE, Tile};
 
 use super::classify::precedence;
-use crate::build::tile_range;
+use crate::tiles::tile_range;
 
 /// How many coarse tiles build at once; see the module doc for the budget.
 const TILE_THREADS: usize = 4;

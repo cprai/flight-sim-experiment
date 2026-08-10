@@ -12,8 +12,8 @@
 //! flight-sim --terrain assets/terrain_generated
 //! ```
 //!
-//! The output is the renderer's tree, not a download: `dtm`, `dtm-max` and
-//! `materials`, in the byte format `terrain-tiles` writes, so nothing in the
+//! The output is the renderer's tree, not a download: `dtm` and `materials`,
+//! in the byte format `terrain-tiles` writes, so nothing in the
 //! renderer knows or cares which of the two producers made the directory it was
 //! pointed at. `albedo` is not written, because the renderer never opens it.
 //!
@@ -52,7 +52,7 @@
 //! that would stay offline, and its channels are what such a shader would
 //! upload.
 
-mod build;
+mod tiles;
 mod classify;
 mod creep;
 mod detail;
@@ -64,7 +64,6 @@ mod incise;
 mod noise;
 mod shape;
 mod thermal;
-mod tiles;
 
 use std::path::PathBuf;
 
@@ -289,8 +288,8 @@ impl Arguments {
             self.extent[1],
             self.max_level
         );
-        // Every level of the max pyramid reads the level below at twice its own
-        // indices, which is only the same ground if the origin is a whole
+        // The renderer's chain reads every level at twice the indices of the
+        // level below, which is only the same ground if the origin is a whole
         // number of the coarsest level's texels from the projection's own.
         let coarsest = f64::from(step);
         for (axis, metres) in ["easting", "northing"].iter().zip(self.origin) {
@@ -327,10 +326,6 @@ fn main() -> Result<()> {
 
     let elevation = arguments.elevation_manifest(ELEVATION_PRODUCT);
     let materials = arguments.material_manifest();
-    let maxima = Manifest {
-        product: terrain_tiles::maxima_product(ELEVATION_PRODUCT),
-        ..elevation.clone()
-    };
     log::info!(
         "generating {} x {} texels at {} m from seed {}, levels up to {}",
         elevation.extent_texels[0],
@@ -362,9 +357,6 @@ fn main() -> Result<()> {
             arguments.seed,
             arguments.relief(),
         )?;
-    }
-    if arguments.wants(&maxima.product) {
-        written += build::maxima(&arguments.output, ELEVATION_PRODUCT, &elevation)?;
     }
 
     println!(
@@ -497,24 +489,18 @@ mod tests {
     }
 
     /// The renderer refuses a tree whose products disagree about the ground, so
-    /// the three manifests must agree by construction rather than by review.
+    /// the two manifests must agree by construction rather than by review.
     #[test]
     fn every_product_of_a_run_covers_the_same_ground() {
         let arguments = arguments();
         let elevation = arguments.elevation_manifest(ELEVATION_PRODUCT);
         let materials = arguments.material_manifest();
-        let maxima = Manifest {
-            product: terrain_tiles::maxima_product(ELEVATION_PRODUCT),
-            ..elevation.clone()
-        };
         assert!(elevation.covers_same_ground_as(&materials));
-        assert!(elevation.covers_same_ground_as(&maxima));
         // Level 0, not `MATERIAL_BASE_LEVEL`: the crowns are written into this
         // product, and a four-metre texel would draw the gaps between
         // seven-metre trunks in four-metre blocks. See `material_manifest`.
         assert_eq!(materials.base_level, 0);
         assert_eq!(materials.max_level(), elevation.max_level());
-        assert_eq!(maxima.product, "dtm-max");
     }
 
     /// An extent that does not divide into the coarsest level would be caught
@@ -532,9 +518,9 @@ mod tests {
         assert!(message.contains("does not divide"), "got {message}");
     }
 
-    /// The max pyramid's own check that a level sits at twice the indices of
-    /// the level below fires deep inside a run; this is the same condition,
-    /// stated where a user can act on it.
+    /// The renderer's own check that a level sits at twice the indices of the
+    /// level below fires after a whole landscape has been written; this is the
+    /// same condition, stated where a user can act on it.
     #[test]
     fn an_origin_off_the_coarsest_lattice_is_refused_up_front() {
         let arguments = Arguments::parse_from([
@@ -572,7 +558,6 @@ mod tests {
         ]);
         assert!(only_materials.wants("materials"));
         assert!(!only_materials.wants("dtm"));
-        assert!(!only_materials.wants("dtm-max"));
         assert!(arguments().wants("dtm"), "no filter means everything");
     }
 }

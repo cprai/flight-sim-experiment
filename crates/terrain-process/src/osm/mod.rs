@@ -92,7 +92,7 @@ fn log_histogram(manifest: &Manifest, root: &Path) -> Result<()> {
     use terrain_tiles::read::read_material_tile;
     let level = 4;
     let grid = manifest.grid();
-    let (first, across, down) = crate::build::tile_range(manifest, level);
+    let (first, across, down) = crate::tiles::tile_range(manifest, level);
     let mut counts: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     for row in 0..down {
         for column in 0..across {

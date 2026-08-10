@@ -339,10 +339,9 @@ const COMPACT_TILE: u32 = 8;
 impl Terrain {
     /// Opens the tile pyramids and builds the terrain around them.
     ///
-    /// `root` holds one directory per product: elevation, materials, and the
-    /// max pyramid `terrain-process` reduced from the elevation. Nothing is
-    /// decoded here beyond three manifests -- the tiles themselves are read as
-    /// the camera reaches them.
+    /// `root` holds one directory per product: elevation and materials.
+    /// Nothing is decoded here beyond two manifests -- the tiles themselves are
+    /// read once the first update comes round.
     pub fn from_tiles(
         device: &wgpu::Device,
         camera_layout: &wgpu::BindGroupLayout,
@@ -381,10 +380,11 @@ impl Terrain {
             elevation.display(),
             material.display()
         );
-        // `<product>-max` is no longer opened at all. The pyramid is built on
-        // the GPU out of the heights once they are resident, which is one
-        // spelling of the recurrence instead of two and 57 GB of tiles that no
-        // longer have to exist. See `build_pyramid`.
+        // `<product>-max` is no longer opened at all -- and as of this stage no
+        // longer written either. The pyramid is built on the GPU out of the
+        // heights once they are resident, which is one spelling of the
+        // recurrence instead of two and 57 GB of tiles that no longer exist.
+        // See `build_pyramid`.
 
         let placement = heights.placement();
         log::info!(

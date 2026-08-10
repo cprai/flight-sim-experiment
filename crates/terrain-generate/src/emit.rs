@@ -9,7 +9,7 @@
 //! The work is one tile per task. A tile is a quarter of a megabyte of samples
 //! and about a megabyte of file, so a worker's whole state is one buffer and
 //! there is nothing to share, which is what lets this run on every core the
-//! machine has without any of the blocking the max pyramid needs.
+//! machine has, one tile at a time.
 //!
 //! A tile may hang off the edge of the raster: the grid is anchored at the
 //! projection's origin, so a coarse tile's span does not divide the download's
@@ -28,7 +28,7 @@ use terrain_materials::Material;
 use terrain_tiles::write::{TilePlacement, write_height_tile, write_material_tile};
 use terrain_tiles::{Manifest, TILE_SIZE, Tile};
 
-use crate::build::tile_range;
+use crate::tiles::tile_range;
 use crate::classify::material;
 use crate::detail::{self, OUTSIDE};
 use crate::fields::Fields;

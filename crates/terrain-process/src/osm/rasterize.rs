@@ -40,7 +40,7 @@ use terrain_tiles::write::{TilePlacement, write_material_tile};
 use terrain_tiles::{MATERIAL_BASE_LEVEL, Manifest, TILE_SIZE, Tile};
 
 use super::assemble::{Polygon, Stroke};
-use crate::build::tile_range;
+use crate::tiles::tile_range;
 
 /// The first layer that paints *over* the strokes: wetland, then open water.
 const LAYERS_ABOVE_STROKES: u8 = 4;
