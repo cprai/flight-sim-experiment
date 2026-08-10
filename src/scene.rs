@@ -309,7 +309,7 @@ impl Scene {
     /// most a few tiles, so crossing a tile boundary costs a known amount
     /// rather than a stall, and a level that falls behind is drawn coarser at
     /// its outer edge rather than wrongly.
-    pub fn update(&mut self, queue: &wgpu::Queue) {
+    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let clock = crate::profile::Clock::start(self.terrain.spans().is_some());
         queue.write_buffer(
             &self.camera_buffer,
@@ -334,7 +334,7 @@ impl Scene {
         self.was_basis = self.camera.ray_basis();
         self.was_eye = self.camera.position;
         self.was_view_proj = self.camera.view_projection();
-        self.terrain.update(queue, self.camera.position);
+        self.terrain.update(device, queue, self.camera.position);
     }
 
     /// How the last frame's pixels were settled: carried over, sky, or marched.
@@ -371,16 +371,16 @@ impl Scene {
     ///
     /// For anything that draws one frame and stops -- a screenshot, a test --
     /// where streaming in over the next second is no use to anybody.
-    pub fn settle(&mut self, queue: &wgpu::Queue) {
+    pub fn settle(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         // Settling is not time passing. It runs an unpredictable number of
         // updates -- however many the tiles happen to need -- and the dither's
         // phase belongs to frames that are actually drawn, so it is put back
         // afterwards. Without this the pattern at the first drawn frame would
         // depend on how much of the pyramid was on disk.
         let frame = self.frame;
-        self.update(queue);
+        self.update(device, queue);
         while self.terrain.pending() {
-            self.update(queue);
+            self.update(device, queue);
         }
         self.frame = frame;
         self.reproject.set_frame(
@@ -834,10 +834,10 @@ mod tests {
         let destination = scene.camera.position;
         for step in path {
             scene.camera.position = *step;
-            scene.update(&queue);
+            scene.update(&device, &queue);
         }
         scene.camera.position = destination;
-        scene.update(&queue);
+        scene.update(&device, &queue);
 
         // `SIZE * 4` is already a multiple of the 256-byte copy alignment.
         let bytes_per_row = SIZE * 4;
@@ -1456,7 +1456,7 @@ mod tests {
 
         let mut scene = test_scene(&device, format, test_residency(), heights, flat_ground());
         aim(&mut scene.camera);
-        scene.update(&queue);
+        scene.update(&device, &queue);
 
         // One float a texel, and `SIZE * 4` is already a multiple of the
         // 256-byte copy alignment.
@@ -1578,7 +1578,7 @@ mod tests {
 
         let mut scene = test_scene(&device, format, test_residency(), heights, flat_ground());
         aim(&mut scene.camera);
-        scene.update(&queue);
+        scene.update(&device, &queue);
 
         // Four half floats a texel, and `SIZE * 8` is already a multiple of
         // the 256-byte copy alignment.
@@ -2005,11 +2005,11 @@ mod tests {
             scene.camera.position = home - Vec3::new(steps as f32, 0.0, steps as f32);
             for _ in 0..steps {
                 scene.camera.position += Vec3::new(1.0, 0.0, 1.0);
-                scene.update(&queue);
+                scene.update(&device, &queue);
             }
             scene.camera.position = home;
         }
-        scene.settle(&queue);
+        scene.settle(&device, &queue);
         eprintln!(
             "filled every level in {:.2?}, finest level {}",
             started.elapsed(),
@@ -2234,7 +2234,7 @@ mod tests {
         let mut read_levels = |at: Vec3| {
             reads.borrow_mut().clear();
             scene.camera.position = at;
-            scene.update(&queue);
+            scene.update(&device, &queue);
             let seen: std::collections::HashSet<u32> = reads.borrow().iter().copied().collect();
             (seen, scene.terrain.base_level())
         };
@@ -2322,7 +2322,7 @@ mod tests {
             heights.clone(),
             flat_ground(),
         );
-        quiet.update(&queue);
+        quiet.update(&device, &queue);
         quiet.record(&mut frame);
         assert_eq!(frame.cpu.terrain, crate::profile::Terrain::default());
 
@@ -2330,7 +2330,7 @@ mod tests {
         // plenty to report.
         let mut watched = test_scene(&device, format, test_residency(), heights, flat_ground());
         watched.profile(true);
-        watched.update(&queue);
+        watched.update(&device, &queue);
         watched.record(&mut frame);
 
         let spans = frame.cpu.terrain;
@@ -2412,7 +2412,7 @@ mod tests {
         // behind a path this view happened not to take.
         scene.camera.position = Vec3::new(0.0, 3000.0, 0.0);
         scene.camera.orientation = Camera::from_yaw_pitch_roll(0.0, -20f32.to_radians(), 0.0);
-        scene.settle(&queue);
+        scene.settle(&device, &queue);
 
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("coverage target"),
@@ -2438,7 +2438,7 @@ mod tests {
         assert_eq!(first.total(), pixels, "{first:?}");
         assert_eq!(first.reprojected, 0, "{first:?}");
 
-        scene.update(&queue);
+        scene.update(&device, &queue);
 
         // The second is the first that can take all three paths.
         let second = settled_pixels(&device, &queue, &scene, &view);
@@ -2482,7 +2482,7 @@ mod tests {
             flat_ground(),
         );
         straight_down(&mut scene.camera);
-        scene.settle(&queue);
+        scene.settle(&device, &queue);
 
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen target"),
@@ -2513,7 +2513,7 @@ mod tests {
         // run against their own cameras -- the same reason
         // `crate::headless::capture` loops that way.
         scene.camera.position.y = GROUND - 100.0;
-        scene.update(&queue);
+        scene.update(&device, &queue);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut gpu = profiler.scope("gpu", &mut encoder);
@@ -2523,7 +2523,7 @@ mod tests {
 
         // Back out above it, where every ray meets the ground again.
         scene.camera.position.y = 3000.0;
-        scene.update(&queue);
+        scene.update(&device, &queue);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut gpu = profiler.scope("gpu", &mut encoder);
@@ -2622,7 +2622,7 @@ mod tests {
             read: bool,
         ) -> Vec<u8> {
             scene.camera.position = at;
-            scene.update(queue);
+            scene.update(device, queue);
             let mut encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             {
@@ -2729,7 +2729,7 @@ mod tests {
         let mut flown = test_scene(&device, format, test_residency(), hill(), flat_ground());
         aim(&mut flown.camera);
         flown.camera.position = from;
-        flown.settle(&queue);
+        flown.settle(&device, &queue);
         let start = screen.step(&device, &queue, &mut flown, from, true);
         for i in 1..steps {
             let at = from - Vec3::Z * (step_metres * i as f32);
@@ -2740,7 +2740,7 @@ mod tests {
         let mut marched = test_scene(&device, format, test_residency(), hill(), flat_ground());
         aim(&mut marched.camera);
         marched.camera.position = to;
-        marched.settle(&queue);
+        marched.settle(&device, &queue);
         let fresh = screen.step(&device, &queue, &mut marched, to, true);
 
         let (start, carried, fresh) = (count_sky(&start), count_sky(&carried), count_sky(&fresh));
@@ -2843,7 +2843,7 @@ mod tests {
         );
         aim(&mut flown.camera);
         flown.camera.position = from;
-        flown.settle(&queue);
+        flown.settle(&device, &queue);
         let start = screen.step(&device, &queue, &mut flown, from, true);
         for i in 1..steps {
             let at = from - Vec3::Z * (step_metres * i as f32);
@@ -2854,7 +2854,7 @@ mod tests {
         let mut marched = test_scene(&device, format, test_residency(), heights, materials);
         aim(&mut marched.camera);
         marched.camera.position = to;
-        marched.settle(&queue);
+        marched.settle(&device, &queue);
         let fresh = screen.step(&device, &queue, &mut marched, to, true);
 
         let (start, carried, fresh) = (
@@ -2921,7 +2921,7 @@ mod tests {
         scene.camera.orientation = Camera::from_yaw_pitch_roll(0.0, -2f32.to_radians(), 0.0);
         let start = Vec3::new(0.0, 1200.0, 1700.0);
         scene.camera.position = start;
-        scene.settle(&queue);
+        scene.settle(&device, &queue);
 
         // A few metres a frame, which is about what a key tapped at the fly
         // speed covers.
@@ -2978,7 +2978,7 @@ mod tests {
             flat_ground(),
         );
         straight_down(&mut scene.camera);
-        scene.settle(&queue);
+        scene.settle(&device, &queue);
 
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("coverage target"),
@@ -3022,7 +3022,7 @@ mod tests {
             if arrived.is_some() {
                 break;
             }
-            scene.update(&queue);
+            scene.update(&device, &queue);
         }
 
         let coverage = arrived.expect("the reader never delivered a coverage in 16 frames");

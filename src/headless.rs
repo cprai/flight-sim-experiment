@@ -206,7 +206,7 @@ pub fn capture(
         }
         queue.submit(std::iter::once(encoder.finish()));
         flight.advance(scene);
-        scene.update(queue);
+        scene.update(device, queue);
     }
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -306,7 +306,7 @@ fn settled(
     );
 
     let started = std::time::Instant::now();
-    scene.settle(queue);
+    scene.settle(device, queue);
     log::info!("filled every level in {:.2?}", started.elapsed());
     Ok(scene)
 }
@@ -396,7 +396,7 @@ pub fn profile(
         if index > 0 {
             flight.advance(&mut scene);
         }
-        scene.update(&queue);
+        scene.update(&device, &queue);
         scene.record(&mut frame);
 
         let clock = crate::profile::Clock::start(true);
@@ -516,7 +516,7 @@ fn coverage(
     });
 
     flight.advance(scene);
-    scene.update(queue);
+    scene.update(device, queue);
     let profiler = crate::profile::profiler(device, false);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("coverage"),

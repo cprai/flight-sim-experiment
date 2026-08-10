@@ -1202,6 +1202,145 @@ fn cs_reach(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(out_reach, cell, vec4<f32>(nearest, 0.0, 0.0, 0.0));
 }
 
+// Deriving the max pyramid from the heights already resident, rather than
+// streaming it as a product of its own.
+//
+// `terrain-process` builds the pyramid offline over the whole raster and the
+// clipmap carries it in as a third set of tiles. Everything the recurrence
+// needs is already in texture memory, though: this level's heights, and the
+// level below's cells. So
+//
+//     M[l] = max(quad_max(level-l heights), reduce_max(M[l - 1]))
+//
+// which is the recurrence in `crates/terrain-tiles/src/maxima.rs` with the
+// second term taken only over children a ray could actually descend into.
+//
+// Dropping the rest is not an approximation. The march descends into a finer
+// level only where that level is resident -- see the descent in `march` -- so a
+// child no ray can reach has nothing this cell must bound. A derived cell is
+// therefore at or below the offline product's and never above it: every term it
+// keeps is a term the offline chain has too, so the march cannot come out
+// slower for reading these instead.
+//
+// What this cannot see on its own is a finer tile arriving after the coarse
+// cells above it were written. Re-deriving those is the host's job; see
+// `derive_maxima` in `src/terrain/gpu.rs`.
+
+// One rectangle of one level to derive.
+//
+// Rectangles rather than whole levels because almost nothing changes between
+// frames: a tile arrives, and what it invalidates is its own ground at every
+// level from its own upwards.
+struct MaximaJob {
+    // North-west cell of the rectangle, in this level's own texels from the
+    // raster origin -- an index, not a slot. `slot` wraps it, exactly as the
+    // march does, so a rectangle is written where a ray will look for it.
+    origin: vec2<i32>,
+    // How many cells across and down.
+    size: vec2<u32>,
+    // The layer being written.
+    level: u32,
+    // Whether there is a level below to carry from. Zero at the finest level
+    // resident, which has nothing under it.
+    carry: u32,
+    // The level below's resident range, in its own texels, exactly as the march
+    // tests it -- so a child is carried if and only if a ray could descend to
+    // it. Read only when `carry` is set.
+    below_low: vec2<i32>,
+    below_high: vec2<i32>,
+    // `u32`s per row of `out_maxima`, which is the byte stride the copy out of
+    // it uses divided by four.
+    stride: u32,
+    padding: u32,
+};
+
+@group(3) @binding(12) var<uniform> job: MaximaJob;
+// Cells go out through a buffer rather than a storage texture because `r16float`
+// is not a storage format in WebGPU. A buffer costs one copy afterwards and
+// needs no format widened, no feature asked for and no render pipeline in a
+// file that has none.
+@group(3) @binding(13) var<storage, read_write> out_maxima: array<u32>;
+
+// The smallest half float that is not below `height`, as bits.
+//
+// A transcription of `ceiling_half` in `src/terrain/maxima.rs`, and it has to
+// stay one: the pyramid is stored at half precision, and a cell rounded the
+// wrong way is a ceiling below the ground it bounds -- a ridge with a hole
+// through it, which is the one failure this whole structure exists to prevent.
+//
+// Written as convert-then-correct rather than as a conversion trusted to round
+// the right way. `pack2x16float` is round-to-nearest on most backends and
+// towards zero on some, and neither is towards positive infinity. No rounding
+// mode is out by more than one representable step, so one step always closes it.
+fn ceiling_half(height: f32) -> u32 {
+    let bits = pack2x16float(vec2<f32>(height, 0.0)) & 0xffffu;
+    if (unpack2x16float(bits).x >= height) {
+        return bits;
+    }
+    // One step away from zero within a sign, which is one step towards positive
+    // infinity. Negative zero cannot arrive here: anything that rounds to it
+    // came from a value at or below zero, which it is therefore not below.
+    if ((bits & 0x8000u) != 0u) {
+        return bits - 1u;
+    }
+    return bits + 1u;
+}
+
+// The ceiling one cell of `job.level` holds.
+fn derived_ceiling(cell: vec2<i32>) -> f32 {
+    let level = job.level;
+    // This level's own samples over the cell's *closed* square: the four around
+    // it, reaching one sample past it, because the bilinear patch the march
+    // solves against here is fed by the neighbour. Nodata needs no case of its
+    // own -- the sentinel is far below any ground, so a maximum ignores a hole
+    // beside real ground and a cell of nothing but holes stays at the sentinel.
+    var top = height_at(level, cell);
+    top = max(top, height_at(level, cell + vec2<i32>(1, 0)));
+    top = max(top, height_at(level, cell + vec2<i32>(0, 1)));
+    top = max(top, height_at(level, cell + vec2<i32>(1, 1)));
+    if (job.carry == 0u) {
+        return top;
+    }
+
+    // Everything finer, carried up. Two adjacent closed squares share their
+    // boundary, so the four cells under this one cover its whole square between
+    // them and nothing has to be widened.
+    //
+    // Tested per child rather than for the group, because the square's edge can
+    // fall between them: a ray may descend into one child of a cell and not its
+    // neighbour, and the one it can reach is the one that has to be bounded.
+    let below = i32(level - 1u);
+    for (var dy = 0; dy < 2; dy++) {
+        for (var dx = 0; dx < 2; dx++) {
+            let child = cell * 2 + vec2<i32>(dx, dy);
+            if (all(child >= job.below_low) && all(child < job.below_high)) {
+                top = max(top, textureLoad(maxima, slot(child), below, 0).r);
+            }
+        }
+    }
+    return top;
+}
+
+// One thread per pair of cells across, because the smallest thing a storage
+// buffer can be written in is four bytes and a cell is two.
+@compute @workgroup_size(8, 8)
+fn cs_maxima(@builtin(global_invocation_id) id: vec3<u32>) {
+    let pairs = (job.size.x + 1u) / 2u;
+    if (id.x >= pairs || id.y >= job.size.y) {
+        return;
+    }
+    let at = job.origin + vec2<i32>(i32(id.x) * 2, i32(id.y));
+    let low = ceiling_half(derived_ceiling(at));
+    // An odd-width rectangle leaves the last pair half empty. Those two bytes
+    // are in the buffer but not in the copy out of it, so they are filled by
+    // repeating rather than by reading a cell the rectangle does not cover.
+    var high = low;
+    if (id.x * 2u + 1u < job.size.x) {
+        high = ceiling_half(derived_ceiling(at + vec2<i32>(1, 0)));
+    }
+    out_maxima[id.y * job.stride + id.x] = low | (high << 16u);
+}
+
 // One thread per pixel the reprojection could not answer.
 @compute @workgroup_size(64)
 fn cs_march(@builtin(global_invocation_id) id: vec3<u32>) {

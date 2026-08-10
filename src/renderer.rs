@@ -195,7 +195,7 @@ impl Renderer {
                 label: Some("frame"),
             });
 
-        self.scene.update(&self.queue);
+        self.scene.update(&self.device, &self.queue);
         self.scene.record(&mut self.frame);
         // What the coverage is a share of, the ceiling a climbing ray has to
         // clear before it can be settled as sky for free, and the viewpoint the
