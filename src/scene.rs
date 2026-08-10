@@ -107,6 +107,14 @@ pub struct Scene {
     shading: Shading,
     /// What the last camera upload cost, zero unless a run asked to be timed.
     camera_span: std::time::Duration,
+    /// Inert unless [`Scene::profile`] turned it on; see [`crate::profile`].
+    ///
+    /// Owned here rather than by the caller because the scene submits work of
+    /// its own: the terrain generates and derives on encoders of their own,
+    /// before the frame's, and those submissions have to be scoped by the same
+    /// profiler and land in the same frame as the passes -- or they show up
+    /// nowhere, which is what they did.
+    profiler: wgpu_profiler::GpuProfiler,
 }
 
 impl Scene {
@@ -275,6 +283,7 @@ impl Scene {
             was_view_proj: camera.view_projection(),
             shading,
             camera_span: std::time::Duration::ZERO,
+            profiler: crate::profile::profiler(device, false),
         }
     }
 
@@ -305,10 +314,12 @@ impl Scene {
 
     /// Uploads the current camera and brings residency up to date with it.
     ///
-    /// Call once per frame before [`Scene::draw`]. Bounded: a frame reads at
-    /// most a few tiles, so crossing a tile boundary costs a known amount
+    /// Call once per frame before [`Scene::draw`]. Bounded: a frame generates
+    /// at most a few tiles, so crossing a tile boundary costs a known amount
     /// rather than a stall, and a level that falls behind is drawn coarser at
-    /// its outer edge rather than wrongly.
+    /// its outer edge rather than wrongly. What that costs is the `detail` and
+    /// `maxima` rows of the readout -- 0.72 ms and 0.18 ms of GPU on average
+    /// at 4 km/s, against 0 on a frame that crossed nothing.
     pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let clock = crate::profile::Clock::start(self.terrain.spans().is_some());
         queue.write_buffer(
@@ -334,7 +345,11 @@ impl Scene {
         self.was_basis = self.camera.ray_basis();
         self.was_eye = self.camera.position;
         self.was_view_proj = self.camera.view_projection();
-        self.terrain.update(device, queue, self.camera.position);
+        // Scoped by this scene's own profiler, on the terrain's own encoders.
+        // They are submitted before the frame's, so the timestamps are already
+        // written by the time the frame encoder resolves the query set.
+        self.terrain
+            .update(device, queue, self.camera.position, &self.profiler);
     }
 
     /// How the last frame's pixels were settled: carried over, sky, or marched.
@@ -354,11 +369,36 @@ impl Scene {
         self.terrain.ceiling()
     }
 
-    /// Starts or stops accounting for where an update's time goes.
+    /// Starts or stops accounting for where a frame's time goes.
     ///
-    /// Off by default, and off costs nothing: see [`crate::profile`].
-    pub fn profile(&mut self, on: bool) {
+    /// Off by default, and off costs nothing: see [`crate::profile`]. Both
+    /// clocks are switched together, because a run that wants one wants the
+    /// other -- the CPU rows only mean anything beside the GPU rows they
+    /// overlap.
+    pub fn profile(&mut self, device: &wgpu::Device, on: bool) {
         self.terrain.profile(on);
+        self.profiler = crate::profile::profiler(device, on);
+    }
+
+    /// The profiler every scope of this scene's work is opened on.
+    ///
+    /// Handed out so a caller can time work of its own -- the overlay, which is
+    /// drawn over the frame and is not the scene's -- against the same clock
+    /// and in the same frame.
+    pub fn profiler(&self) -> &wgpu_profiler::GpuProfiler {
+        &self.profiler
+    }
+
+    /// The same profiler, for the frame bookkeeping only the caller can do.
+    ///
+    /// [`GpuProfiler::resolve_queries`] and [`GpuProfiler::end_frame`] both want
+    /// `&mut`, and both belong to whoever owns the frame's encoder rather than
+    /// to the scene, which does not know when the frame is finished.
+    ///
+    /// [`GpuProfiler::resolve_queries`]: wgpu_profiler::GpuProfiler::resolve_queries
+    /// [`GpuProfiler::end_frame`]: wgpu_profiler::GpuProfiler::end_frame
+    pub fn profiler_mut(&mut self) -> &mut wgpu_profiler::GpuProfiler {
+        &mut self.profiler
     }
 
     /// Fills in the CPU side of `frame` from the update just run.
@@ -402,16 +442,18 @@ impl Scene {
     /// coordinate and the dispatch is sized to the viewport the terrain was
     /// last told about.
     ///
-    /// Both passes are opened through `gpu` so each is timed at its boundaries.
-    /// That is the whole of the GPU side of [`crate::profile`], and it costs an
-    /// unprofiled run nothing: a disabled profiler writes no timestamps and the
-    /// scopes fall away. `gpu` derefs to the encoder it wraps for anything else
-    /// the caller wants to record.
-    pub fn draw(
-        &self,
-        gpu: &mut wgpu_profiler::Scope<'_, wgpu::CommandEncoder>,
-        view: &wgpu::TextureView,
-    ) {
+    /// Every pass is opened through a `passes` scope on [`Scene::profiler`], so
+    /// each is timed at its boundaries and the whole block is timed around
+    /// them. It costs an unprofiled run nothing: a disabled profiler writes no
+    /// timestamps and the scopes fall away.
+    ///
+    /// `passes` is not the whole of the GPU's frame and is not named `gpu` for
+    /// that reason. The terrain generates tiles and raises its pyramid on
+    /// submissions of its own, from [`Scene::update`], and those are scoped
+    /// separately -- the readout adds them up.
+    pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+        let mut scope = self.profiler.scope(crate::profile::PASSES, encoder);
+        let gpu = &mut scope;
         let target = |view, clear| {
             Some(wgpu::RenderPassColorAttachment {
                 view,
@@ -2325,7 +2367,7 @@ mod tests {
         // On, and the first update is the one that reads the chain in, so it
         // has plenty to report.
         let mut watched = test_scene(&device, format, test_residency(), heights, flat_ground());
-        watched.profile(true);
+        watched.profile(&device, true);
         watched.update(&device, &queue);
         watched.record(&mut frame);
         let load = frame.cpu.terrain;

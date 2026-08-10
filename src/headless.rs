@@ -195,15 +195,11 @@ pub fn capture(
         mapped_at_creation: false,
     });
 
-    let profiler = crate::profile::profiler(device, false);
     for _ in 1..flight.frames.max(1) {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("capture"),
         });
-        {
-            let mut gpu = profiler.scope("gpu", &mut encoder);
-            scene.draw(&mut gpu, &view);
-        }
+        scene.draw(&mut encoder, &view);
         queue.submit(std::iter::once(encoder.finish()));
         flight.advance(scene);
         scene.update(device, queue);
@@ -212,10 +208,7 @@ pub fn capture(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("capture"),
     });
-    {
-        let mut gpu = profiler.scope("gpu", &mut encoder);
-        scene.draw(&mut gpu, &view);
-    }
+    scene.draw(&mut encoder, &view);
     encoder.copy_texture_to_buffer(
         target.as_image_copy(),
         wgpu::TexelCopyBufferInfo {
@@ -368,7 +361,9 @@ pub fn profile(
     let frames = flight.frames;
     let (device, queue) = device()?;
     let mut scene = settled(&device, &queue, terrain_root, size, placement)?;
-    scene.profile(true);
+    // After settling, so the chain is already read in and the load's own
+    // dispatches are not measured as if they were a frame's.
+    scene.profile(&device, true);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("profile target"),
@@ -386,7 +381,6 @@ pub fn profile(
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let mut profiler = crate::profile::profiler(&device, true);
     let mut measured: Vec<crate::profile::Frame> = Vec::with_capacity(frames as usize);
     let mut last = std::time::Instant::now();
 
@@ -403,11 +397,8 @@ pub fn profile(
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("profile frame"),
         });
-        {
-            let mut gpu = profiler.scope("gpu", &mut encoder);
-            scene.draw(&mut gpu, &view);
-        }
-        profiler.resolve_queries(&mut encoder);
+        scene.draw(&mut encoder, &view);
+        scene.profiler_mut().resolve_queries(&mut encoder);
         frame.cpu.encode = clock.elapsed();
 
         let clock = crate::profile::Clock::start(true);
@@ -424,10 +415,12 @@ pub fn profile(
         frame.interval = now.duration_since(last);
         last = now;
 
-        profiler
+        scene
+            .profiler_mut()
             .end_frame()
             .context("the profiler was left with a scope open")?;
-        if let Some(results) = profiler.process_finished_frame(queue.get_timestamp_period()) {
+        let period = queue.get_timestamp_period();
+        if let Some(results) = scene.profiler_mut().process_finished_frame(period) {
             frame.take_gpu(&results);
         }
 
@@ -438,9 +431,10 @@ pub fn profile(
 
     // The last frames' timestamps are still in flight; drain them so they are
     // not silently dropped, and attach them to the frames still missing theirs.
+    let period = queue.get_timestamp_period();
     for frame in measured.iter_mut().filter(|frame| frame.gpu.is_empty()) {
         device.poll(wgpu::PollType::wait_indefinitely())?;
-        if let Some(results) = profiler.process_finished_frame(queue.get_timestamp_period()) {
+        if let Some(results) = scene.profiler_mut().process_finished_frame(period) {
             frame.take_gpu(&results);
         }
     }
@@ -517,14 +511,10 @@ fn coverage(
 
     flight.advance(scene);
     scene.update(device, queue);
-    let profiler = crate::profile::profiler(device, false);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("coverage"),
     });
-    {
-        let mut gpu = profiler.scope("gpu", &mut encoder);
-        scene.draw(&mut gpu, view);
-    }
+    scene.draw(&mut encoder, view);
     encoder.copy_buffer_to_buffer(
         scene.tally(),
         0,

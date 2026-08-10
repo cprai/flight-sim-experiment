@@ -1228,8 +1228,26 @@ impl Terrain {
     ///
     /// The load is one-off and unbounded: it is the whole raster, and there is
     /// no frame to protect while it happens. Every update after it is a little
-    /// arithmetic and one small uniform write, because nothing streams.
-    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, camera: Vec3) {
+    /// arithmetic, one small uniform write, and -- when the camera has crossed
+    /// into ground no generated tile covers -- a dispatch per tile and a sweep
+    /// of the pyramid over them.
+    ///
+    /// `profiler` scopes those dispatches. They go out on encoders of their own
+    /// rather than into the frame's, because they have to be submitted before
+    /// the march that reads what they wrote, and the frame's encoder does not
+    /// exist yet when this is called. That is why they are timed here instead of
+    /// in [`Scene::draw`]: for two stages of this plan they were in no row at
+    /// all, and the difference between the `frame` row and everything under it
+    /// was where they were hiding.
+    ///
+    /// [`Scene::draw`]: crate::scene::Scene::draw
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        camera: Vec3,
+        profiler: &wgpu_profiler::GpuProfiler,
+    ) {
         // Cleared rather than accumulated: a row in the readout is what this
         // frame cost, not what every frame since the run began cost.
         if let Some(spans) = self.spans.as_mut() {
@@ -1237,7 +1255,7 @@ impl Terrain {
         }
 
         if let Some(sources) = self.sources.take() {
-            self.load(device, queue, &sources);
+            self.load(device, queue, &sources, profiler);
         }
 
         let camera_texels = self
@@ -1279,13 +1297,13 @@ impl Terrain {
         let uniform = clock.elapsed();
 
         let clock = crate::profile::Clock::start(timed);
-        self.generate_tiles(device, queue, &work);
-        self.raise_pyramid(device, queue);
-        let generate = clock.elapsed();
+        self.generate_tiles(device, queue, &work, profiler);
+        self.raise_pyramid(device, queue, profiler);
+        let dispatch = clock.elapsed();
 
         if let Some(spans) = self.spans.as_mut() {
             spans.advance += advance;
-            spans.generate += generate;
+            spans.dispatch += dispatch;
             spans.write += uniform;
         }
     }
@@ -1294,7 +1312,13 @@ impl Terrain {
     ///
     /// One pass for all of them: a tile is a whole slot, tiles are disjoint, so
     /// nothing here overlaps anything else and there is no ordering to keep.
-    fn generate_tiles(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, work: &[Wanted]) {
+    fn generate_tiles(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        work: &[Wanted],
+        profiler: &wgpu_profiler::GpuProfiler,
+    ) {
         if work.is_empty() {
             return;
         }
@@ -1335,7 +1359,11 @@ impl Terrain {
             label: Some("terrain generate"),
         });
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            // One scope around the whole burst rather than one per tile: what
+            // the row is for is the cost of a step across the ground, and the
+            // tiles a step asks for vary in number from one frame to the next.
+            let mut scope = profiler.scope(crate::profile::DETAIL, &mut encoder);
+            let mut pass = scope.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("terrain generate"),
                 timestamp_writes: None,
             });
@@ -1367,7 +1395,12 @@ impl Terrain {
     /// levels and on into the resident chain, whose cells were derived before
     /// this ground had any detail on it. Miss that and a coarse cell reads too
     /// low, which is a ray passing through a ridge.
-    fn raise_pyramid(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    fn raise_pyramid(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &wgpu_profiler::GpuProfiler,
+    ) {
         self.jobs.clear();
         let generated = std::mem::take(&mut self.generated);
         if generated.is_empty() {
@@ -1415,7 +1448,7 @@ impl Terrain {
             self.jobs.len(),
             self.job_slots
         );
-        self.run_jobs(device, queue);
+        self.run_jobs(device, queue, profiler);
     }
 
     /// Starts or stops accounting for where an update's time goes.
@@ -1508,7 +1541,13 @@ impl Terrain {
     /// A block of rows at a time rather than a level at a time: mip zero of
     /// this raster is 704 MB of heights, and staging it whole would cost more
     /// resident memory than the texture it is on its way into.
-    fn load(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, sources: &Sources) {
+    fn load(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sources: &Sources,
+        profiler: &wgpu_profiler::GpuProfiler,
+    ) {
         /// Rows of one mip staged at once. A hundred and forty megabytes at the
         /// widest, which is a fifth of what a whole level would be.
         const LOAD_ROWS: u32 = 512;
@@ -1598,7 +1637,7 @@ impl Terrain {
         // shader bug rather than an ordering one.
         self.write_uniform(queue);
         self.raise_surface(device, queue);
-        self.build_pyramid(device, queue);
+        self.build_pyramid(device, queue, profiler);
         self.ceiling = self.read_ceiling(device, queue);
         log::info!(
             "terrain: read {} mips and built the pyramid in {:.2?}, highest ground {:.0} m",
@@ -1770,7 +1809,12 @@ impl Terrain {
     ///
     /// One sweep, once. There is nothing incremental about it because there is
     /// nothing incremental left: the heights under it never change.
-    fn build_pyramid(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    fn build_pyramid(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &wgpu_profiler::GpuProfiler,
+    ) {
         self.jobs.clear();
         for level in self.levels() {
             let size = self.level_size(level).as_ivec2();
@@ -1782,7 +1826,7 @@ impl Terrain {
             self.jobs.len(),
             self.job_slots
         );
-        self.run_jobs(device, queue);
+        self.run_jobs(device, queue, profiler);
     }
 
     /// Cuts one rectangle of one level into jobs and records them.
@@ -1829,7 +1873,12 @@ impl Terrain {
     }
 
     /// Dispatches every planned rectangle and copies its cells into the chain.
-    fn run_jobs(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    fn run_jobs(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &wgpu_profiler::GpuProfiler,
+    ) {
         if self.jobs.is_empty() {
             return;
         }
@@ -1844,13 +1893,17 @@ impl Terrain {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("terrain derive"),
         });
+        // One scope around every rectangle of the sweep, for the reason the
+        // generate pass has one: a row that split by rectangle would change
+        // shape whenever the camera crossed a different number of tiles.
+        let mut scope = profiler.scope(crate::profile::MAXIMA, &mut encoder);
         for (index, job) in self.jobs.iter().enumerate() {
             {
                 // A pass of its own per rectangle, which is what orders a
                 // coarse level's reads after the fine level's copy: the cells
                 // go out through one scratch buffer, so nothing here overlaps
                 // anything else anyway.
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let mut pass = scope.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("terrain derive"),
                     timestamp_writes: None,
                 });
@@ -1877,7 +1930,7 @@ impl Terrain {
             } else {
                 (&self.detail_maxima_texture, 0, job.level)
             };
-            encoder.copy_buffer_to_texture(
+            scope.copy_buffer_to_texture(
                 wgpu::TexelCopyBufferInfo {
                     buffer: &self.derive_scratch,
                     layout: wgpu::TexelCopyBufferLayout {
@@ -1903,6 +1956,9 @@ impl Terrain {
                 },
             );
         }
+        // Closed before the encoder can be finished: the scope writes its
+        // closing timestamp on drop, and it holds the encoder until then.
+        drop(scope);
         queue.submit(std::iter::once(encoder.finish()));
         self.jobs.clear();
     }
@@ -2206,6 +2262,16 @@ mod tests {
         top
     }
 
+    /// A profiler that measures nothing, for the tests that only need the
+    /// dispatches to run.
+    ///
+    /// Every scope on it is a no-op and no query set is ever allocated, so a
+    /// test pays nothing for the argument. What a scope costs when it is *not*
+    /// inert is measured by `flight-sim profile`, not here.
+    fn unwatched(device: &wgpu::Device) -> wgpu_profiler::GpuProfiler {
+        crate::profile::profiler(device, false)
+    }
+
     /// A terrain over a rugged raster, held from `resident_base` upwards.
     fn terrain_over(device: &wgpu::Device, resident_base: u32) -> Terrain {
         terrain_from(device, resident_base, 0.0, 30.0, 0)
@@ -2392,8 +2458,9 @@ mod tests {
         let mut flat = terrain_with_relief(&device, 2, 0.0);
         let mut rough = terrain_with_relief(&device, 2, RELIEF);
         let at = Vec3::new(137.0, 100.0, -71.0);
-        flat.update(&device, &queue, at);
-        rough.update(&device, &queue, at);
+        let watch = unwatched(&device);
+        flat.update(&device, &queue, at, &watch);
+        rough.update(&device, &queue, at, &watch);
 
         for level in 0..rough.resident_base {
             let smooth = read_level(&device, &queue, &flat, &flat.detail_height_texture, level, 4);
@@ -2529,8 +2596,9 @@ mod tests {
         let mut bald = terrain_from(&device, BASE, 0.0, 2.0, 0);
         let mut wooded = terrain_from(&device, BASE, 0.0, 2.0, WOODED);
         let at = Vec3::new(64.0, 200.0, -64.0);
-        bald.update(&device, &queue, at);
-        wooded.update(&device, &queue, at);
+        let watch = unwatched(&device);
+        bald.update(&device, &queue, at, &watch);
+        wooded.update(&device, &queue, at, &watch);
         assert_eq!(wooded.base_level(), 0, "the test wants every level generated");
 
         // The base first, where the lift is stored as well as added.
@@ -2691,8 +2759,9 @@ mod tests {
         let mut bald = terrain_from(&device, BASE, 0.0, 2.0, 0);
         let mut strewn = terrain_from(&device, BASE, 0.0, 2.0, SCREE);
         let at = Vec3::new(64.0, 200.0, -64.0);
-        bald.update(&device, &queue, at);
-        strewn.update(&device, &queue, at);
+        let watch = unwatched(&device);
+        bald.update(&device, &queue, at, &watch);
+        strewn.update(&device, &queue, at, &watch);
 
         let mut carried = Vec::new();
         let mut painted_rubble = Vec::new();
@@ -2782,7 +2851,8 @@ mod tests {
         let (device, queue) = crate::scene::test_device();
         let raster = Pyramid::build(Level::new(RASTER, RASTER, rugged()));
         let mut terrain = terrain_over(&device, 0);
-        terrain.update(&device, &queue, Vec3::new(137.0, 100.0, -71.0));
+        let at = Vec3::new(137.0, 100.0, -71.0);
+        terrain.update(&device, &queue, at, &unwatched(&device));
         assert_eq!(terrain.base_level(), 0, "the test wants every level built");
 
         let raster: &dyn RasterSource = &raster;
@@ -2894,7 +2964,8 @@ mod tests {
         for cover in [0, 0x0300] {
             let (device, queue) = crate::scene::test_device();
             let mut terrain = terrain_from(&device, 1, 0.0, 30.0, cover);
-            terrain.update(&device, &queue, Vec3::new(137.0, 100.0, -71.0));
+            let at = Vec3::new(137.0, 100.0, -71.0);
+            terrain.update(&device, &queue, at, &unwatched(&device));
             check_recurrence(&device, &queue, &terrain);
         }
     }
@@ -2997,7 +3068,8 @@ mod tests {
         // alone. With detail on, a level carries an octave the base does not
         // and the two are meant to differ; the test below is what bounds that.
         let mut terrain = terrain_over(&device, 2);
-        terrain.update(&device, &queue, Vec3::new(137.0, 100.0, -71.0));
+        let at = Vec3::new(137.0, 100.0, -71.0);
+        terrain.update(&device, &queue, at, &unwatched(&device));
         assert_eq!(terrain.base_level(), 0, "the test wants both generated levels");
 
         let base = read_level(

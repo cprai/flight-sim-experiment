@@ -3,12 +3,29 @@
 //! Two kinds of measurement, kept apart because they cannot be compared.
 //!
 //! **GPU**, through [`wgpu_profiler`]: timestamps written at the boundaries of
-//! the render passes, read back a frame or two later. This is the only honest
-//! account of what the hardware did, and it covers the passes and nothing else.
-//! Note in particular that the load is *not* in it: it goes onto wgpu's staging
-//! belt through `queue.write_texture` and is flushed outside the encoder these
-//! scopes wrap, and the pass that builds the max pyramid over it is submitted
-//! on its own.
+//! the passes, read back a frame or two later. This is the only honest account
+//! of what the hardware did. It is in two groups, because the GPU's frame is in
+//! two submissions:
+//!
+//! - [`PASSES`], the frame's own encoder -- reprojection, compaction, march,
+//!   shading. [`crate::scene::Scene::draw`] opens it.
+//! - [`DETAIL`] and [`MAXIMA`], the terrain's, submitted from
+//!   [`crate::scene::Scene::update`] before the frame's encoder exists, because
+//!   the march has to read what they wrote. They generate the levels below the
+//!   resident base and raise the max pyramid over what they generated.
+//!
+//! Both groups go through one profiler, owned by the scene, and are added up
+//! into a single `gpu` row. That row used to be the first group alone, and the
+//! second was most of the gap between it and the `frame` row. Flying at 4 km/s
+//! over the survey, means across sixty frames: 2.38 ms of `frame` against
+//! 1.20 ms of `gpu` before, 2.42 ms against 2.10 ms after. The frame did not
+//! change -- the two builds render the same three cameras pixel for pixel --
+//! only what the readout admits to.
+//!
+//! The load is still in no row. It goes onto wgpu's staging belt through
+//! `queue.write_texture`, which is flushed outside any encoder a scope wraps,
+//! and the sweep that grows the crowns over it waits on the device rather than
+//! being pipelined; both are logged with their own timings instead.
 //!
 //! **CPU**, through plain [`Instant`] spans: the work the GPU clock is blind
 //! to. That used to be streaming, and a frame that stuttered had usually lost
@@ -16,7 +33,7 @@
 //! the first update and never again -- so these are all but empty after that
 //! first frame, which is the point.
 //!
-//! Both are off unless a run asked for them. The scopes below are no-ops when
+//! Both are off unless a run asked for them. The scopes are no-ops when
 //! [`profiler`] was built disabled, and the CPU spans are an [`Option`] that
 //! stays [`None`], so an unprofiled frame does not so much as read the clock.
 
@@ -26,6 +43,24 @@ use glam::{Quat, Vec3};
 use wgpu_profiler::{GpuProfiler, GpuProfilerSettings, GpuTimerQueryResult};
 
 use crate::camera::Camera;
+
+/// The scope [`crate::scene::Scene::draw`] opens around the frame's own passes.
+pub const PASSES: &str = "passes";
+
+/// The scope the terrain opens around a burst of generated tiles.
+///
+/// The names live here rather than only at the `profiler.scope` calls because
+/// this is where they are read back out: [`Frame::rows`] looks each one up so
+/// its row is drawn whether or not this frame did any of that work, and a name
+/// that drifted from the one the scope was opened with would quietly read as
+/// zero forever instead of failing.
+pub const DETAIL: &str = "detail";
+
+/// The scope the terrain opens around the pyramid sweep over those tiles.
+pub const MAXIMA: &str = "maxima";
+
+/// The terrain's own submissions, in the order the GPU runs them.
+const TERRAIN_SCOPES: [&str; 2] = [DETAIL, MAXIMA];
 
 /// A duration in milliseconds, and the rate a frame of that length sustains.
 pub fn ms_and_fps(frame: Duration) -> (f64, f64) {
@@ -91,14 +126,19 @@ fn smooth(previous: Option<Duration>, sample: Duration, dt: Duration) -> Duratio
     previous.mul_f64(1.0 - alpha) + sample.mul_f64(alpha)
 }
 
-/// What the terrain spent on itself, for one frame.
+/// What the terrain's *CPU* spent on itself, for one frame.
 ///
-/// Split the way the work splits: deciding, reading, converting, uploading.
-/// Only the first frame of a run reads anything -- the chain is read in whole
-/// and then never again -- so on every frame after it these are the arithmetic
-/// that picks a descent floor and one small uniform write. A tile count used to
-/// sit beside them and explained most of their variance; there are no tiles to
-/// count now, and a row that is always zero explains nothing.
+/// Split the way the work splits: deciding, reading, converting, recording,
+/// uploading. Only the first frame of a run reads or converts anything -- the
+/// chain is read in whole and then never again -- so on every frame after it
+/// these are the arithmetic that picks a descent floor, one small uniform
+/// write, and whatever recording a step across the ground asked for. A tile
+/// count used to sit beside them and explained most of their variance; there
+/// are no tiles to count now, and a row that is always zero explains nothing.
+///
+/// What the GPU does for the terrain is not here. It is measured properly, by
+/// the [`DETAIL`] and [`MAXIMA`] scopes, and shown under `gpu` beside the
+/// frame's own passes.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Terrain {
     /// Choosing the finest level worth descending to. Pure arithmetic.
@@ -107,13 +147,14 @@ pub struct Terrain {
     pub read: Duration,
     /// Exaggerating heights and narrowing ground-cover ids to sixteen bits.
     pub convert: Duration,
-    /// Recording and submitting the dispatch that fills a generated tile.
+    /// Recording and submitting the dispatches a step across the ground needs.
     ///
-    /// The CPU half of it only. What the GPU spends generating is in no row:
-    /// the pass is submitted next to the streaming it replaced rather than into
-    /// the frame's encoder, so no timestamp scope reaches it.
-    pub generate: Duration,
-    /// Handing the bytes to `queue.write_texture`.
+    /// The CPU half of generating tiles and raising the pyramid over them:
+    /// writing the job descriptions, filling two encoders and submitting them.
+    /// The GPU half is the [`DETAIL`] and [`MAXIMA`] rows.
+    pub dispatch: Duration,
+    /// Handing bytes to the queue: `write_texture` on the one loading frame,
+    /// and the small uniform describing the chain on every frame after it.
     pub write: Duration,
 }
 
@@ -225,6 +266,15 @@ impl Frame {
         flatten(results, 0, &mut self.gpu);
     }
 
+    /// A top-level GPU scope by name, or nothing if this frame has none.
+    fn scope(&self, label: &str) -> Duration {
+        self.gpu
+            .iter()
+            .find(|row| row.depth == 0 && row.label == label)
+            .map(|row| row.value)
+            .unwrap_or_default()
+    }
+
     /// Every row to show, in the order they are drawn or printed.
     pub fn rows(&self) -> Vec<Row> {
         let row = |depth, label: &str, value, rate| Row {
@@ -235,14 +285,49 @@ impl Frame {
         };
         let terrain = &self.cpu.terrain;
         let terrain_total =
-            terrain.advance + terrain.read + terrain.convert + terrain.generate + terrain.write;
+            terrain.advance + terrain.read + terrain.convert + terrain.dispatch + terrain.write;
 
         let mut rows = vec![row(0, "frame", self.interval, true)];
-        // The GPU scopes bring their own labels and nesting -- the outer one is
-        // named "gpu" where it is opened -- so they go in as they come. They sit
-        // apart from the CPU rows below because the two are different clocks
+
+        // Everything the GPU did, which is more than one submission: the
+        // terrain's dispatches go out ahead of the frame's encoder and come
+        // back as top-level scopes of their own. Summing every top-level scope
+        // is what makes this row the whole of the GPU's frame rather than the
+        // part of it that happened to share an encoder with the shading.
+        let detail = self.scope(DETAIL);
+        let maxima = self.scope(MAXIMA);
+        rows.push(row(
+            0,
+            "gpu",
+            self.gpu
+                .iter()
+                .filter(|row| row.depth == 0)
+                .map(|row| row.value)
+                .sum(),
+            false,
+        ));
+        // Written out rather than taken from `self.gpu`, so the rows are there
+        // on a frame that generated nothing. They come and go with the camera
+        // crossing a tile boundary, and a row set that changed shape every few
+        // frames would restart the smoothing every few frames with it, leaving
+        // every number on screen raw.
+        rows.push(row(1, "terrain", detail + maxima, false));
+        rows.push(row(2, DETAIL, detail, false));
+        rows.push(row(2, MAXIMA, maxima, false));
+        // The rest as the profiler nested them, one level deeper: `passes` is a
+        // group inside the GPU's frame now, not the whole of it.
+        rows.extend(
+            self.gpu
+                .iter()
+                .filter(|row| !(row.depth == 0 && TERRAIN_SCOPES.contains(&row.label.as_str())))
+                .map(|row| Row {
+                    depth: row.depth + 1,
+                    ..row.clone()
+                }),
+        );
+
+        // The CPU sits apart from all of that: the two are different clocks
         // measuring overlapping work, and adding them up would be nonsense.
-        rows.extend(self.gpu.iter().cloned());
         rows.push(row(
             0,
             "cpu",
@@ -254,7 +339,7 @@ impl Frame {
         rows.push(row(2, "advance", terrain.advance, false));
         rows.push(row(2, "read", terrain.read, false));
         rows.push(row(2, "convert", terrain.convert, false));
-        rows.push(row(2, "generate", terrain.generate, false));
+        rows.push(row(2, "dispatch", terrain.dispatch, false));
         rows.push(row(2, "write", terrain.write, false));
         rows.push(row(1, "encode", self.cpu.encode, false));
         rows.push(row(1, "submit", self.cpu.submit, false));
@@ -263,7 +348,11 @@ impl Frame {
 }
 
 /// Widest label column the rows use, indentation included, plus a space.
-const LABEL: usize = 12;
+///
+/// Fourteen because the deepest GPU row is now `reproject` at depth two --
+/// four spaces of indent and nine of label -- since the frame's passes became a
+/// group inside `gpu` rather than the whole of it.
+const LABEL: usize = 14;
 
 /// One row as text, in fixed-width columns a monospace face lines up.
 fn line(row: &Row) -> String {
@@ -373,10 +462,10 @@ impl Smoothed {
             // frame's worth, which would mean it is not being cleared.
             let unaccounted = i64::from(self.pixels) - i64::from(coverage.total());
             text.push_str(&format!("\n{:<LABEL$}{unaccounted:>7} px", "unaccounted"));
-            text.push_str(&format!(
-                "\n{:<LABEL$}{:>7} wg",
-                "dispatch", coverage.groups
-            ));
+            // `groups`, not `dispatch`: the terrain has a CPU row called that
+            // now, and two rows of the same name a few lines apart -- one a
+            // duration, one a count -- read as one number contradicting itself.
+            text.push_str(&format!("\n{:<LABEL$}{:>7} wg", "groups", coverage.groups));
         }
         // Not a share of anything, so these are written plainly. The ceiling is
         // the highest resident ground, which the eye -- the `y` below it -- has
@@ -532,20 +621,110 @@ mod tests {
         }
     }
 
+    /// One duration and one depth is not enough to name a row: the terrain has
+    /// a row on both clocks, and they are different numbers about different
+    /// work. Found by parent so the two cannot be confused.
+    fn under(rows: &[Row], parent: &str, label: &str) -> Duration {
+        let start = rows
+            .iter()
+            .position(|row| row.label == parent && row.depth == 0)
+            .unwrap_or_else(|| panic!("no {parent} row"));
+        rows[start..]
+            .iter()
+            .take_while(|row| row.depth > 0 || row.label == parent)
+            .find(|row| row.label == label && row.depth > 0)
+            .unwrap_or_else(|| panic!("no {label} under {parent}"))
+            .value
+    }
+
     #[test]
     fn a_parent_row_totals_its_children() {
         let mut sample = frame(16, 3);
         sample.cpu.terrain.advance = Duration::from_millis(1);
         sample.cpu.camera = Duration::from_millis(2);
         let rows = sample.rows();
-        let find = |label: &str| {
+        let top = |label: &str| {
             rows.iter()
-                .find(|row| row.label == label)
-                .expect(label)
+                .find(|row| row.label == label && row.depth == 0)
+                .unwrap_or_else(|| panic!("no {label} row"))
                 .value
         };
-        assert_eq!(find("terrain"), Duration::from_millis(4));
-        assert_eq!(find("cpu"), Duration::from_millis(6));
+        assert_eq!(under(&rows, "cpu", "terrain"), Duration::from_millis(4));
+        assert_eq!(top("cpu"), Duration::from_millis(6));
+    }
+
+    /// The terrain's dispatches go out on submissions of their own, so their
+    /// scopes come back beside `passes` rather than inside it. Both belong to
+    /// the same frame of the same GPU, and the row that says what the hardware
+    /// spent has to be the sum -- the gap between it and the `frame` row is the
+    /// only place a reader would otherwise see this work at all.
+    #[test]
+    fn the_gpu_row_is_every_submission_and_not_just_the_frame_encoder() {
+        let mut sample = frame(16, 0);
+        let scope = |label: &str, ms| Row {
+            depth: 0,
+            label: label.to_owned(),
+            value: Duration::from_millis(ms),
+            rate: false,
+        };
+        sample.gpu = vec![
+            scope(DETAIL, 5),
+            scope(MAXIMA, 2),
+            scope(PASSES, 1),
+            Row {
+                depth: 1,
+                label: "march".to_owned(),
+                value: Duration::from_micros(900),
+                rate: false,
+            },
+        ];
+        let rows = sample.rows();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.label == "gpu" && row.depth == 0)
+                .expect("a gpu row")
+                .value,
+            Duration::from_millis(8)
+        );
+        assert_eq!(under(&rows, "gpu", "terrain"), Duration::from_millis(7));
+        assert_eq!(under(&rows, "gpu", DETAIL), Duration::from_millis(5));
+        assert_eq!(under(&rows, "gpu", MAXIMA), Duration::from_millis(2));
+        // Pushed a level down as the group it now is, children and all.
+        let find = |label: &str| rows.iter().find(|row| row.label == label).expect(label);
+        assert_eq!(find(PASSES).depth, 1);
+        assert_eq!(find("march").depth, 2);
+        // And not left behind at the top as well, which would double the sum a
+        // reader takes off the screen.
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.label == DETAIL || row.label == MAXIMA)
+                .count(),
+            2
+        );
+    }
+
+    /// The camera crosses a tile boundary every few seconds and generates
+    /// nothing in between. If the rows came and went with the work, the shape
+    /// would change with them and [`Smoothed`] would restart on every change,
+    /// leaving the whole readout raw.
+    #[test]
+    fn the_terrain_keeps_its_gpu_rows_on_a_frame_that_generated_nothing() {
+        let quiet = frame(16, 0).rows();
+        assert_eq!(under(&quiet, "gpu", DETAIL), Duration::ZERO);
+        assert_eq!(under(&quiet, "gpu", MAXIMA), Duration::ZERO);
+
+        let mut busy = frame(16, 0);
+        busy.gpu = vec![Row {
+            depth: 0,
+            label: DETAIL.to_owned(),
+            value: Duration::from_millis(3),
+            rate: false,
+        }];
+        let busy = busy.rows();
+        assert_eq!(quiet.len(), busy.len());
+        for (quiet, busy) in quiet.iter().zip(&busy) {
+            assert_eq!((quiet.depth, &quiet.label), (busy.depth, &busy.label));
+        }
     }
 
     #[test]
@@ -556,6 +735,39 @@ mod tests {
             smoothed.text().lines().map(str::len).collect::<Vec<_>>()
         };
         assert_eq!(widths(&frame(2, 1)), widths(&frame(120, 115)));
+    }
+
+    /// The label column has to be wide enough for the longest row there is, or
+    /// the number beside that one row shifts right and the column stops being a
+    /// column. It has been outgrown once already, by the frame's passes moving
+    /// a level deeper.
+    #[test]
+    fn every_label_fits_the_column_it_is_printed_in() {
+        let mut sample = frame(16, 4);
+        sample.gpu = vec![
+            Row {
+                depth: 0,
+                label: PASSES.to_owned(),
+                value: Duration::from_millis(1),
+                rate: false,
+            },
+            // The longest of the pass labels, which is what sets the width.
+            Row {
+                depth: 1,
+                label: "reproject".to_owned(),
+                value: Duration::from_micros(180),
+                rate: false,
+            },
+        ];
+        for row in sample.rows() {
+            let width = row.depth * 2 + row.label.chars().count();
+            assert!(
+                width < LABEL,
+                "{:?} at depth {} needs {width} columns of {LABEL}",
+                row.label,
+                row.depth
+            );
+        }
     }
 
     /// The overlay is the only place the reprojection's share is visible while
@@ -612,7 +824,7 @@ mod tests {
         assert_eq!(width("reprojected"), width("cpu"));
         for label in [
             "unaccounted",
-            "dispatch",
+            "groups",
             "ceiling",
             "x",
             "y",

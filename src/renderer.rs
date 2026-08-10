@@ -15,8 +15,6 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     scene: Scene,
-    /// Inert unless the run asked for profiling; see [`crate::profile`].
-    profiler: wgpu_profiler::GpuProfiler,
     profiling: bool,
     /// When the frame being drawn started, for the interval to the next one.
     last_frame: Option<std::time::Instant>,
@@ -105,13 +103,12 @@ impl Renderer {
             glam::UVec2::new(config.width, config.height),
             terrain_root,
         )?;
-        scene.profile(profiling);
+        scene.profile(&device, profiling);
 
         // No overlay at all on an unprofiled run: there is nothing to put in it.
         let hud =
             profiling.then(|| Hud::new(&device, &queue, format, window.scale_factor() as f32));
         let coverage = profiling.then(|| crate::reproject::CoverageReader::new(&device));
-        let profiler = profile::profiler(&device, profiling);
 
         Ok(Self {
             window,
@@ -120,7 +117,6 @@ impl Renderer {
             queue,
             config,
             scene,
-            profiler,
             profiling,
             last_frame: None,
             frame: profile::Frame::default(),
@@ -208,43 +204,48 @@ impl Renderer {
         self.frame.orientation = self.scene.camera.orientation;
 
         let clock = profile::Clock::start(self.profiling);
-        {
-            let mut gpu = self.profiler.scope("gpu", &mut encoder);
-            self.scene.draw(&mut gpu, &view);
+        self.scene.draw(&mut encoder, &view);
 
-            // Over the top of the shaded frame, and only here: the overlay
-            // reports on the renderer rather than being part of what it
-            // renders, so the screenshot path in `crate::headless`, which
-            // shares `Scene::draw`, stays free of it. It also wants `&mut` to
-            // lay the text out, which `Scene::draw` does not take.
-            if let Some(hud) = self.hud.as_mut() {
-                // The rows are last frame's: the frame being drawn cannot
-                // report times it has not finished taking, and the GPU ones
-                // come back later still.
-                hud.draw(
-                    &self.device,
-                    &self.queue,
-                    &mut gpu,
-                    crate::hud::Target {
-                        view: &view,
-                        resolution: glam::UVec2::new(self.config.width, self.config.height),
-                        scale_factor: self.window.scale_factor() as f32,
-                    },
-                    &self.readout.text(),
-                );
-            }
+        // Over the top of the shaded frame, and only here: the overlay reports
+        // on the renderer rather than being part of what it renders, so the
+        // screenshot path in `crate::headless`, which shares `Scene::draw`,
+        // stays free of it. It also wants `&mut` to lay the text out, which
+        // `Scene::draw` does not take.
+        //
+        // In a scope of its own, beside the scene's rather than inside it: the
+        // overlay is not one of the passes it reports on, and drawing several
+        // hundred glyphs is not free enough to hide inside another row.
+        if let Some(hud) = self.hud.as_mut() {
+            let mut gpu = self.scene.profiler().scope("hud", &mut encoder);
+            // The rows are last frame's: the frame being drawn cannot report
+            // times it has not finished taking, and the GPU ones come back
+            // later still.
+            hud.draw(
+                &self.device,
+                &self.queue,
+                &mut gpu,
+                crate::hud::Target {
+                    view: &view,
+                    resolution: glam::UVec2::new(self.config.width, self.config.height),
+                    scale_factor: self.window.scale_factor() as f32,
+                },
+                &self.readout.text(),
+            );
         }
         self.frame.cpu.encode = clock.elapsed();
 
-        // Outside the `gpu` scope closed just above, so the twelve-byte copy is
-        // not charged to the passes it reports on.
+        // Outside every scope closed above, so the twelve-byte copy is not
+        // charged to the passes it reports on.
         if let Some(coverage) = self.coverage.as_mut() {
             coverage.record(&mut encoder, self.scene.tally());
         }
 
         // Has to follow every scope on this encoder and precede its `finish`:
-        // this is the copy that moves the query set into a readable buffer.
-        self.profiler.resolve_queries(&mut encoder);
+        // this is the copy that moves the query set into a readable buffer. It
+        // covers the terrain's scopes too -- those were submitted from
+        // `Scene::update` above, so their timestamps are already written by the
+        // time this resolve runs.
+        self.scene.profiler_mut().resolve_queries(&mut encoder);
 
         let clock = profile::Clock::start(self.profiling);
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -273,14 +274,12 @@ impl Renderer {
         if !self.profiling {
             return;
         }
-        if let Err(err) = self.profiler.end_frame() {
+        if let Err(err) = self.scene.profiler_mut().end_frame() {
             log::warn!("the profiler dropped a frame: {err}");
             return;
         }
-        if let Some(results) = self
-            .profiler
-            .process_finished_frame(self.queue.get_timestamp_period())
-        {
+        let period = self.queue.get_timestamp_period();
+        if let Some(results) = self.scene.profiler_mut().process_finished_frame(period) {
             self.frame.take_gpu(&results);
         }
         // Lags further than the timestamps do -- one read is in flight at a
