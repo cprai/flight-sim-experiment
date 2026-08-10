@@ -567,6 +567,12 @@ impl Terrain {
         // a dispatch rather than copied in, and `r16uint` is not a storage
         // format in WebGPU. Widening costs 96 MiB at the default window and
         // saves a whole buffer-and-copy path for a product written per tile.
+        //
+        // Holds the whole id, ground cover included, rather than only what
+        // stands on the ground: a generated level upscales the survey's cover
+        // onto its own texels with a fractal warp, so its ids are no longer
+        // recoverable from the base texel underneath. See `cover_upscaled` in
+        // `src/terrain.wgsl`.
         let detail_material_texture = window(
             "terrain detail materials",
             wgpu::TextureFormat::R32Uint,
@@ -2291,6 +2297,27 @@ mod tests {
         metres: f64,
         cover: u32,
     ) -> Terrain {
+        terrain_covered(
+            device,
+            resident_base,
+            relief,
+            metres,
+            vec![MaterialId(cover); (RASTER * RASTER) as usize],
+        )
+    }
+
+    /// The same, over a ground cover laid out texel by texel.
+    ///
+    /// What one id cannot show is a boundary, and a boundary is the whole
+    /// question the upscaling asks: an id that is the same everywhere comes back
+    /// the same however the place it was read from is moved.
+    fn terrain_covered(
+        device: &wgpu::Device,
+        resident_base: u32,
+        relief: f32,
+        metres: f64,
+        cover: Vec<MaterialId>,
+    ) -> Terrain {
         Terrain::new(
             device,
             &crate::scene::test_camera_layout(device),
@@ -2307,11 +2334,7 @@ mod tests {
             Georeferencing::square(RASTER, RASTER, metres),
             Sources {
                 heights: Box::new(Pyramid::build(Level::new(RASTER, RASTER, rugged()))),
-                materials: Box::new(Pyramid::build(Level::new(
-                    RASTER,
-                    RASTER,
-                    vec![MaterialId(cover); (RASTER * RASTER) as usize],
-                ))),
+                materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, cover))),
             },
         )
     }
@@ -2832,6 +2855,284 @@ mod tests {
             carried[0],
             carried[0] / 2.0
         );
+    }
+
+    /// The ground cover of a generated level wanders across the blocks the
+    /// survey stored it in, without shredding into speckle.
+    ///
+    /// Three properties, and they pull against each other, which is why they are
+    /// measured together over one checkerboard of two kinds of ground:
+    ///
+    /// - **It moves.** A boundary that came back on the base grid would be the
+    ///   staircase this exists to remove.
+    /// - **It cannot reach.** Every id that comes out is one the survey wrote
+    ///   within the warp's own amplitude of the texel asking, so the upscaling
+    ///   can bend a boundary but never invent a patch of ground away from one.
+    ///   The bound is exact rather than statistical: gradient noise with unit
+    ///   gradients is bounded by one after `GRADIENT_SCALE` and the octaves sum
+    ///   to the normalisation, so a texel painted the other cover has to sit
+    ///   within `COVER_WARP` base texels of a boundary.
+    /// - **It stays a boundary.** Past about a base texel the warp folds -- the
+    ///   map from a texel to the place it reads stops being one-to-one -- and
+    ///   what was a coastline becomes detached specks of one cover stranded in
+    ///   the other. Counted here as texels that match none of their four
+    ///   neighbours.
+    ///
+    /// The crowns are in it deliberately. `standing_at` is handed the upscaled
+    /// cover rather than the base texel's own, so trees have to stop where the
+    /// warped boundary does; painting and growing off two different answers
+    /// would put crowns on ground painted as marsh. That is what the canopy-side
+    /// count pins -- with the stand reading the block instead, no crown ever
+    /// appears on the far side of one.
+    ///
+    /// Forest against marsh because both are covers nature drew the edge of, and
+    /// only those wander; see [`a_boundary_somebody_drew_stays_where_it_was`].
+    /// Neither grows a stone, so every id that comes back is one of the two or a
+    /// crown, and an unexpected one is a real failure rather than the boulder
+    /// field opening.
+    #[test]
+    fn the_cover_wanders_across_the_blocks_it_was_stored_in() {
+        /// `ForestNeedleleaved`, `Marsh`, and `Material::Canopy`; see
+        /// `crates/terrain-materials`.
+        const WOODED: u32 = 0x0300;
+        const MARSH: u32 = 0x0200;
+        const CANOPY: u32 = 0x0304;
+        const BASE: u32 = 2;
+        /// Metres to a level-zero texel, so the base is at eight -- the shipped
+        /// arrangement.
+        const METRES: f64 = 2.0;
+        /// `COVER_WARP` in `src/terrain.wgsl`, which this cannot import.
+        const WARP: f64 = 1.0;
+        /// Base texels to a side of one square of the checkerboard.
+        ///
+        /// Three rather than two so that a square is wider than twice the
+        /// warp: the middle of one is then out of reach of every boundary
+        /// along an axis, which is what lets a moved texel there be attributed
+        /// to the field along the other axis.
+        const SQUARE: i32 = 3;
+
+        let base_across = (RASTER >> BASE) as i32;
+        let square = |base: IVec2| (base.x / SQUARE + base.y / SQUARE) % 2 == 0;
+        let cover = (0..RASTER * RASTER)
+            .map(|i| {
+                let at = IVec2::new((i % RASTER) as i32, (i / RASTER) as i32) >> BASE;
+                MaterialId(if square(at) { WOODED } else { MARSH })
+            })
+            .collect();
+
+        let (device, queue) = crate::scene::test_device();
+        let mut terrain = terrain_covered(&device, BASE, 0.0, METRES, cover);
+        // The world origin is the raster's centre, so this puts the window over
+        // the middle of the checkerboard rather than over the corner the other
+        // tests are happy to have it at.
+        let at = Vec3::new(0.0, 200.0, 0.0);
+        terrain.update(&device, &queue, at, &unwatched(&device));
+
+        let base_metres = METRES * f64::from(1u32 << BASE);
+        let square_metres = base_metres * f64::from(SQUARE);
+        // What the fractal divides by, which is every octave the base could
+        // hold rather than the ones this level carries. That is the whole point
+        // of the band limit: a coarse level is the same warp with its finest
+        // octaves dropped, so it wanders less rather than differently.
+        let whole: f64 = (0..BASE).map(|k| 0.5f64.powi(k as i32)).sum();
+        for level in 0..BASE {
+            let painted = read_level(
+                &device,
+                &queue,
+                &terrain,
+                &terrain.detail_material_texture,
+                level,
+                4,
+            );
+            let carried: f64 = (0..BASE - level).map(|k| 0.5f64.powi(k as i32)).sum();
+            let bound = WARP * base_metres * carried / whole;
+            let texel = METRES * f64::from(1u32 << level);
+            // A base texel in from each edge, because `slot` clamps out there
+            // and the cover past the raster is the edge column repeated rather
+            // than the checkerboard continued.
+            let shift = BASE - level;
+            let (low, high) = terrain.level_valid(level);
+            let lo = low.max(IVec2::splat(1 << shift));
+            let hi = high.min(IVec2::splat((base_across - 1) << shift));
+            let span = hi - lo;
+            assert!(
+                span.x > 8 && span.y > 8,
+                "level {level} left a {span} window to look at, from {low}..{high}"
+            );
+
+            let mut sides = vec![false; (span.x * span.y) as usize];
+            let (mut moved, mut across, mut down) = (0u32, 0u32, 0u32);
+            let (mut canopy_over, mut worst) = (0u32, 0.0f64);
+            for y in lo.y..hi.y {
+                for x in lo.x..hi.x {
+                    let cell = IVec2::new(x, y);
+                    let id = painted(cell).to_bits();
+                    let here = match id {
+                        WOODED | CANOPY => true,
+                        MARSH => false,
+                        other => panic!(
+                            "level {level} cell {cell} was painted {other:#06x}, which is \
+                             neither cover the survey holds"
+                        ),
+                    };
+                    sides[((y - lo.y) * span.x + (x - lo.x)) as usize] = here;
+                    let block = square(cell >> shift);
+                    if here == block {
+                        continue;
+                    }
+                    moved += 1;
+                    canopy_over += u32::from(id == CANOPY);
+                    // How far this texel's centre is from the nearest boundary
+                    // the survey drew, along each axis. A texel can only be
+                    // painted the other cover by the warp having carried its
+                    // centre across one of them.
+                    let away = |i: i32| {
+                        let inside = ((f64::from(i) + 0.5) * texel).rem_euclid(square_metres);
+                        inside.min(square_metres - inside)
+                    };
+                    let (dx, dy) = (away(x), away(y));
+                    let near = dx.min(dy);
+                    assert!(
+                        near <= bound + 1e-3,
+                        "level {level} cell {cell} took the cover from {near:.2} m away, \
+                         where the warp reaches {bound:.2} m"
+                    );
+                    worst = worst.max(near);
+                    // Which of the two fields carried it, where that can be
+                    // said at all: a texel further than the amplitude from
+                    // every boundary along one axis cannot have crossed one
+                    // along that axis, so the other field moved it. A texel
+                    // near a corner is claimed by neither.
+                    across += u32::from(dy > bound);
+                    down += u32::from(dx > bound);
+                }
+            }
+
+            // Texels matching none of their four neighbours: the shredding the
+            // amplitude is held down to avoid.
+            let side = |sides: &[bool], at: IVec2| sides[(at.y * span.x + at.x) as usize];
+            let mut specks = 0u32;
+            for y in 1..span.y - 1 {
+                for x in 1..span.x - 1 {
+                    let at = IVec2::new(x, y);
+                    let here = side(&sides, at);
+                    let lone = [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y]
+                        .iter()
+                        .all(|step| side(&sides, at + *step) != here);
+                    specks += u32::from(lone);
+                }
+            }
+
+            let counted = (span.x * span.y) as u32;
+            eprintln!(
+                "level {level}: {moved} of {counted} texels moved ({across} across, {down} \
+                 down), {canopy_over} of them wooded, worst {worst:.2} m of {bound:.2} m, \
+                 {specks} specks"
+            );
+            // Enough of the window in the boundary band that the blocks are
+            // gone, little enough that the two covers have not been stirred
+            // together. The reach above is exact and per texel; this is what
+            // says the warp is using it. `worst` is printed rather than
+            // asserted on, because what it can reach is quantised by the level:
+            // a level-1 texel centre is 2 m or 6 m from a boundary and 6 m is
+            // past the amplitude, so 2 m is the largest number that level can
+            // report however far the warp goes.
+            assert!(
+                (counted / 20..counted / 4).contains(&moved),
+                "level {level} moved {moved} of {counted} texels, which is outside the band \
+                 a boundary that bends but does not dissolve leaves"
+            );
+            assert!(
+                across > 0 && down > 0,
+                "level {level} moved {across} texels across and {down} down, so one of the \
+                 two warp fields is doing nothing"
+            );
+            assert!(
+                canopy_over > 0,
+                "level {level} grew no crown on the far side of a block boundary, so the \
+                 stand is reading the block rather than the cover painted over it"
+            );
+            assert!(
+                specks * 20 < moved,
+                "level {level} left {specks} specks against {moved} texels moved, so the \
+                 warp is folding rather than bending"
+            );
+        }
+    }
+
+    /// A boundary somebody drew comes back exactly where they drew it.
+    ///
+    /// The other half of the rule the warp is under. A forest edge is where a
+    /// process left it and the base grid squared it off, so bending it back is
+    /// restoring something; a field boundary, a road or a fairway is a line
+    /// somebody surveyed, and roughening one invents the opposite of what is
+    /// true. Over a town at a full-texel warp that was not subtle -- the road
+    /// network dissolved into grey blotches while the forest beside it improved
+    /// -- so `drawn_by_nature` freezes any boundary with a drawn cover on either
+    /// side of it, staircase and all.
+    ///
+    /// The same checkerboard as the test above, with farmland in place of the
+    /// marsh, and the expected answer is the exact opposite: nothing moves at
+    /// all. Ground the crowns cover is the one thing that may differ, and only
+    /// on the wooded squares.
+    #[test]
+    fn a_boundary_somebody_drew_stays_where_it_was() {
+        /// `ForestNeedleleaved`, `Farmland`, and `Material::Canopy`.
+        const WOODED: u32 = 0x0300;
+        const FARMLAND: u32 = 0x0600;
+        const CANOPY: u32 = 0x0304;
+        const BASE: u32 = 2;
+        const METRES: f64 = 2.0;
+        const SQUARE: i32 = 2;
+
+        let square = |base: IVec2| (base.x / SQUARE + base.y / SQUARE) % 2 == 0;
+        let cover = (0..RASTER * RASTER)
+            .map(|i| {
+                let at = IVec2::new((i % RASTER) as i32, (i / RASTER) as i32) >> BASE;
+                MaterialId(if square(at) { WOODED } else { FARMLAND })
+            })
+            .collect();
+
+        let (device, queue) = crate::scene::test_device();
+        let mut terrain = terrain_covered(&device, BASE, 0.0, METRES, cover);
+        let at = Vec3::new(0.0, 200.0, 0.0);
+        terrain.update(&device, &queue, at, &unwatched(&device));
+
+        let base_across = (RASTER >> BASE) as i32;
+        let mut checked = 0u32;
+        for level in 0..BASE {
+            let painted = read_level(
+                &device,
+                &queue,
+                &terrain,
+                &terrain.detail_material_texture,
+                level,
+                4,
+            );
+            let (low, high) = terrain.level_valid(level);
+            let lo = low.max(IVec2::splat(1 << (BASE - level)));
+            let hi = high.min(IVec2::splat((base_across - 1) << (BASE - level)));
+            for y in lo.y..hi.y {
+                for x in lo.x..hi.x {
+                    let cell = IVec2::new(x, y);
+                    let id = painted(cell).to_bits();
+                    let wooded = square(cell >> (BASE - level));
+                    let want: &[u32] = if wooded {
+                        &[WOODED, CANOPY]
+                    } else {
+                        &[FARMLAND]
+                    };
+                    assert!(
+                        want.contains(&id),
+                        "level {level} cell {cell} came back {id:#06x} on a square the survey \
+                         drew as {:#06x}",
+                        want[0]
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000, "only {checked} texels were looked at");
     }
 
     /// Every cell of the pyramid bounds the ground it claims, at every level.

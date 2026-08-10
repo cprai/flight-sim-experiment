@@ -146,8 +146,10 @@ struct Terrain {
 // would have it grow them twice. Half precision, which a lift of tens of metres
 // is far more than served by.
 @group(1) @binding(6) var lift: texture_2d<f32>;
-// What a generated texel is painted as, where what stands on it hides the ground
-// -- a crown or a stone -- and zero everywhere else.
+// What a generated texel is painted as: the survey's ground cover upscaled onto
+// this level's texels, or what stands on it where a crown or a stone hides the
+// ground. One id per texel, complete in itself -- the resident chain is not
+// consulted for a texel this covers.
 @group(1) @binding(7) var detail_materials: texture_2d_array<u32>;
 
 // Elevations below this are the raster's nodata rather than ground.
@@ -1025,24 +1027,22 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // pass that raised it wrote a canopy id at the same time, so the gaps
     // between the trees keep the floor's own colour and the trees do not.
     //
-    // Two products, because there are two surfaces. The survey's ground cover is
-    // held only on the resident chain -- nothing finer than the base has a
-    // material anyone measured -- so a generated level falls back to the cover
-    // of the ground under it, and overrides it only where its own walk found
-    // enough crown or stone to hide that ground.
-    let cover = max(hit.level, terrain.resident_base);
-    let cover_cell = cell >> vec2<u32>(cover - hit.level);
-    out.material = textureLoad(materials, slot(cover, cover_cell), mip(cover)).r;
+    // Two products, because there are two chains. The survey's ground cover is
+    // held only on the resident one -- nothing finer than the base has a
+    // material anyone measured -- and a generated level carries its own ids,
+    // written by the pass that generated its heights: the survey's cover
+    // upscaled onto its texels, with a crown or a stone painted over it wherever
+    // that pass grew enough to hide the ground.
+    //
+    // A whole id either way, so there is nothing to combine here. It used to
+    // read the base's cover and let a non-zero detail id override it, which was
+    // the same answer while a generated level had nothing to say about the
+    // ground itself; now it does, and the level that was descended to is the
+    // level that answers.
     if (hit.level < terrain.resident_base) {
-        let standing = textureLoad(
-            detail_materials,
-            slot(hit.level, cell),
-            i32(hit.level),
-            0,
-        ).r;
-        if (standing != 0u) {
-            out.material = standing;
-        }
+        out.material = textureLoad(detail_materials, slot(hit.level, cell), i32(hit.level), 0).r;
+    } else {
+        out.material = textureLoad(materials, slot(hit.level, cell), mip(hit.level)).r;
     }
     out.position = hit.position;
     // The ray was cast through the centre of the pixel, so that is where the
@@ -1414,7 +1414,9 @@ struct DetailJob {
 // Thirty-two bits for an id that fits in twelve, because `r16uint` is not a
 // storage format either and a generated level is written by a dispatch rather
 // than copied in. Three levels of a four-thousand-texel window is 192 MiB, which
-// is the price of a near field that paints what it draws.
+// is the price of a near field that paints what it draws -- and it buys the
+// ground cover as well as the crowns, since a level whose ids are its own is a
+// level whose boundaries can sit somewhere the base grid could not put them.
 @group(3) @binding(17) var out_detail_ids: texture_storage_2d_array<r32uint, write>;
 
 // The fractal detail the survey does not hold, transcribed from
@@ -1517,8 +1519,13 @@ fn gradient_noise(p: vec2<f32>, seed: u32) -> f32 {
 // base. A bound rather than a choice: WGSL wants a loop it can unroll.
 const DETAIL_OCTAVES: u32 = 8u;
 
-// A constant, because nothing that crosses a pipeline boundary depends on it.
+// Constants, because nothing that crosses a pipeline boundary depends on them.
+// The heights get one field and the cover's two-component warp gets two more,
+// all independent: one field used twice would put the warp on the diagonal, and
+// a warp sharing the height's field would tie a boundary to a ridge.
 const DETAIL_SEED: u32 = 0x4465746cu;
+const COVER_SEED_X: u32 = 0x43767278u;
+const COVER_SEED_Y: u32 = 0x43767279u;
 
 // The fractal, in `-1..=1`, stopped before any octave this level cannot hold.
 //
@@ -1533,7 +1540,7 @@ const DETAIL_SEED: u32 = 0x4465746cu;
 // being *the same surface with its finest octaves removed* and it being a
 // differently scaled one -- renormalising would make every coarse level louder
 // than the one under it, and the handover would draw as the ground breathing.
-fn fractal(p: vec2<f32>, wavelength: f32, octaves: u32, whole: u32) -> f32 {
+fn fractal(p: vec2<f32>, wavelength: f32, octaves: u32, whole: u32, seed: u32) -> f32 {
     var frequency = 1.0 / wavelength;
     var amplitude = 1.0;
     var sum = 0.0;
@@ -1544,7 +1551,7 @@ fn fractal(p: vec2<f32>, wavelength: f32, octaves: u32, whole: u32) -> f32 {
         }
         total += amplitude;
         if (octave < octaves) {
-            sum += gradient_noise(p * frequency, DETAIL_SEED ^ (octave * 0x51ed270bu)) * amplitude;
+            sum += gradient_noise(p * frequency, seed ^ (octave * 0x51ed270bu)) * amplitude;
         }
         frequency *= 2.0;
         amplitude *= 0.5;
@@ -1558,6 +1565,126 @@ fn fractal(p: vec2<f32>, wavelength: f32, octaves: u32, whole: u32) -> f32 {
 // The high byte of a ground-cover id, which is its category. Water is 0x01xx;
 // see `crates/terrain-materials/src/lib.rs`.
 const WATER_COVER: u32 = 1u;
+
+// The last category nature draws the edges of. See `drawn_by_nature`.
+const BARE_COVER: u32 = 5u;
+
+// How far the cover boundary may wander from where the rasterizer left it, as a
+// fraction of a base texel.
+//
+// A ceiling, not a typical displacement, and the difference is the whole reason
+// this number is as large as it is. Gradient noise reaches its bound at one
+// point in a lattice cell and is a small fraction of it nearly everywhere else,
+// so an amplitude picked to keep the *worst* case inside half a base texel
+// leaves the boundary sitting on the staircase it was meant to leave. At a
+// quarter of a texel the checkerboard in
+// `the_cover_wanders_across_the_blocks_it_was_stored_in` moved two texels of
+// nine hundred and sixty-one; the blocks were still the blocks.
+//
+// What decides the number is where the warp starts folding. `centre +
+// warp(centre)` is a displacement of the plane only while the warp's gradient
+// stays under one; past that the map stops being one-to-one and a boundary
+// stops being a boundary, fraying into detached specks of one cover stranded in
+// the other -- which reads as dither rather than as a coastline. The gradient
+// cannot be argued from the amplitude alone, because every octave contributes
+// about the same slope and they add. So it was measured, on that checkerboard
+// and by eye over a glacial lake in the installed survey:
+//
+// | `COVER_WARP` | texels moved | stranded | the shoreline            |
+// | ---          | ---          | ---      | ---                      |
+// | 0.25         | 2 of 961     | 0        | the 8 m staircase        |
+// | 0.5          | 45           | 2        | the staircase, corners   |
+// |              |              |          | bitten off               |
+// | 1.0          | 137          | 3        | ragged and coherent      |
+// | 1.5          | 196          | 7        | starting to fray         |
+// | 2.0          | 231          | 14       | frayed                   |
+// | 3.0          | 286          | 15       | dithered                 |
+//
+// One base texel, then. The stranded fraction of what moved is at its lowest
+// there -- 2% against 4% below it, where nothing much moves at all, and 6%
+// above it -- which is the folding and the wandering being weighed against each
+// other rather than a number chosen by taste.
+const COVER_WARP: f32 = 1.0;
+
+// The survey's ground cover under one texel of any level.
+//
+// The base texel a texel falls in, exactly: the grids are aligned, so a level-`l`
+// texel covers level-0 texels `[cell << l, (cell + 1) << l)` and every one of
+// them sits in the same base texel.
+fn cover_at(cell: vec2<i32>, level: u32) -> u32 {
+    let base = terrain.resident_base;
+    return textureLoad(materials, slot(base, cell >> vec2<u32>(base - level)), mip(base)).r;
+}
+
+// That cover, upscaled to one texel of a generated level.
+//
+// The same trade the heights make, for a quantity that cannot take it the same
+// way. A height is a number and a level below the base gets the base
+// interpolated smoothly and fractal relief added to it; an id is a label, and
+// there is no interpolating between two labels -- the mean of a lake and a
+// meadow is not a third kind of ground, it is a wrong one. So the fractal moves
+// the *place the label is read from* instead of the label: the id at a texel is
+// the survey's id at that texel's centre displaced by a band-limited fractal
+// vector. Nothing is invented -- every id that comes out is an id the survey
+// wrote within a base texel of here -- and what changes is only where one gives
+// way to the next, which is exactly the thing the base grid quantised.
+//
+// Band-limited by the level, as the relief is and for the same reason: the warp
+// carries one octave per level below the base, so a coarse generated level is
+// the same displacement with its finest octaves dropped rather than a different
+// one, and the wander shrinks as the level approaches the base the survey is
+// stored at. That is what bounds the ring where the coarsest generated level
+// hands over to the unwarped base: it carries one octave of the normalisation's
+// 1.75, so its boundary can jog by at most `COVER_WARP / 1.75` of a base texel,
+// and the ring is by definition the distance at which a base texel is about a
+// pixel. Ceiling 0.57 of a pixel, then, against the half pixel the crates budget
+// a handover -- and the ceiling is not what happens: the coarsest generated
+// level of the checkerboard test reached 2 m of its 8 m base texel, a quarter of
+// a pixel.
+//
+// Anchored in metres from the raster origin rather than in texels, so the same
+// ground gets the same cover at every level and after every regeneration.
+fn cover_upscaled(cell: vec2<i32>, level: u32, octaves: u32) -> u32 {
+    let base = terrain.resident_base;
+    let metres = terrain.metres_per_texel.x * f32(1u << base);
+    let centre = cover_centre(cell, level);
+    let warp = COVER_WARP * metres * vec2<f32>(
+        fractal(centre, metres, octaves, base, COVER_SEED_X),
+        fractal(centre, metres, octaves, base, COVER_SEED_Y),
+    );
+    // Which base texel the displaced point landed in. With no displacement this
+    // is `cover_at`'s own shift exactly -- `(cell + 0.5) / 2^(base - level)`
+    // floors to `cell >> (base - level)` -- so the warp is the only thing that
+    // moves an id, and turning it off gives the blocks back rather than
+    // something a half texel off them.
+    let node = vec2<i32>(floor((centre + warp) / metres));
+    let there = textureLoad(materials, slot(base, node), mip(base)).r;
+    let here = cover_at(cell, level);
+    if (there == here || !drawn_by_nature(there) || !drawn_by_nature(here)) {
+        return here;
+    }
+    return there;
+}
+
+// Whether a boundary this cover takes part in is one nature drew.
+//
+// The categories are ordered, and the order is not an accident: water, wetland,
+// forest, scrub, bare ground -- then agriculture, developed ground, and
+// maintained leisure ground. Everything up to bare ground has an edge that some
+// process put where it is and the base grid then squared off, which is exactly
+// what the warp is for. Everything after it has an edge somebody *drew*: a
+// field boundary, a road, a fairway. Those were straight before the survey
+// quantised them, and roughening a straight line invents the opposite of what
+// is true -- rendered over a town at the amplitude below, the road network
+// dissolved into grey blotches while the forest beside it improved. So a
+// boundary with a drawn cover on either side of it stays exactly where the
+// survey left it, staircase and all, and only nature's boundaries move.
+//
+// `Null` counts as nature's. It is the id for ground no mapped area covers,
+// which is wilderness rather than a decision about a boundary.
+fn drawn_by_nature(cover: u32) -> bool {
+    return (cover >> 8u) <= BARE_COVER;
+}
 
 // Slopes between which the relief comes in, as a rise over run.
 //
@@ -1673,10 +1800,17 @@ fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
     let base = terrain.resident_base;
     let at = vec2<f32>(cell) / f32(1u << (base - level));
     var height = base_height(at);
-    var painted = 0u;
+    // The survey's ground cover, upscaled to this level's texels. Everything
+    // below reads this one answer rather than the base texel's own id: the
+    // water it holds flat, the stand it grows, and the id it paints are all the
+    // same question about the same texel, and asking it twice at two
+    // resolutions is how a crown ends up standing on ground painted as meadow.
+    var painted = cover_upscaled(cell, level, detail.octaves);
 
     // Nothing is added to a hole. The sentinel is what says the survey measured
-    // nothing here, and a hole with texture on it is ground.
+    // nothing here, and a hole with texture on it is ground. The cover still
+    // stands: a hole is ground nobody measured the height of, not ground nobody
+    // mapped, and the id is what the shading has to paint it with either way.
     if (height >= NODATA_BELOW) {
         // How steep the base is under this point, as a rise over run, from the
         // four samples around the node. The relief comes in with it: a box
@@ -1692,9 +1826,9 @@ fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
         var relief = detail.relief * smoothstep(RELIEF_FLAT, RELIEF_STEEP, slope);
 
         // A lake with waves in it is worse than a lake with none, and the
-        // survey is right about water being flat.
-        let cover = textureLoad(materials, slot(base, node), mip(base)).r;
-        if ((cover >> 8u) == WATER_COVER) {
+        // survey is right about water being flat. Asked of the upscaled cover,
+        // so the flat ends exactly where the blue does.
+        if ((painted >> 8u) == WATER_COVER) {
             relief = 0.0;
         }
 
@@ -1702,15 +1836,19 @@ fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
         // world rather than to the window: a tile regenerated after the camera
         // has been away comes back exactly as it was.
         let world = vec2<f32>(cell) * f32(1u << level) * terrain.metres_per_texel;
-        height += relief * fractal(world, detail.wavelength, detail.octaves, base);
+        height += relief * fractal(world, detail.wavelength, detail.octaves, base, DETAIL_SEED);
 
         // And then what stands on it, at this level's own texel size. The base
         // carries the same stand sampled over eight metres; here it is sampled
         // over one, so a crown is a crown rather than the eighth of a hillside
         // it averages into up there.
-        let grown = standing_at(cell, level);
+        let grown = standing_at(painted, cell, level);
         height += grown.lift;
-        painted = grown.id;
+        // Only where something stands: a crown hides the ground and takes the
+        // texel's id with it, and everything else leaves the ground's own.
+        if (grown.id != 0u) {
+            painted = grown.id;
+        }
     }
 
     textureStore(
@@ -1719,9 +1857,12 @@ fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
         i32(level),
         vec4<f32>(height, 0.0, 0.0, 0.0),
     );
-    // Zero where nothing stands, which is what says "keep the ground's own id".
-    // A crown drawn and a meadow painted is the failure both shares exist to
-    // prevent, and it can only be prevented by writing them off the same walk.
+    // The whole id, ground and stand together, because both were decided here
+    // and neither can be recovered from the survey afterwards: the ground's own
+    // id is the upscaled one rather than the base texel's, and what stands on it
+    // is a walk of this texel. A crown drawn and a meadow painted is the failure
+    // both shares exist to prevent, and it can only be prevented by writing them
+    // off the same walk.
     textureStore(out_detail_ids, cell & terrain.levels[level].mask, i32(level), vec4<u32>(painted));
 }
 
@@ -2347,7 +2488,9 @@ fn level_lift(cell: vec2<i32>) -> f32 {
         return 0.0;
     }
     if (job.level == terrain.resident_base) {
-        return standing_at(cell, job.level).lift;
+        // The survey's own id, unwarped: this texel *is* the resolution the
+        // cover was stored at, so there is nothing here to upscale.
+        return standing_at(cover_at(cell, job.level), cell, job.level).lift;
     }
     // Holes are dropped from the mean rather than averaged in, exactly as the
     // heights under them were when the tools built this level: a texel half
@@ -2373,19 +2516,27 @@ fn level_lift(cell: vec2<i32>) -> f32 {
 // What stands on one texel of any level, generated or resident.
 //
 // One function for both, which is what stops the near field and the far field
-// growing two different forests. A generated texel asks the *base* texel it
-// falls in for its cover and its slope, so every texel under one base texel is
-// handed the same stand -- the same density, the same health, and therefore the
-// same trunks off the same lattice. What differs between the levels is only how
-// finely that stand is sampled, which is the difference the order statistic is
-// built to be indifferent to.
+// growing two different forests. The stand is a function of the cover and of
+// the slope of the hillside, and both are answered at the base or above it, so
+// a run of texels under one cover is handed one stand -- the same density, the
+// same health, and therefore the same trunks off the same lattice. What differs
+// between the levels is only how finely that stand is sampled, which is the
+// difference the order statistic is built to be indifferent to.
+//
+// The cover comes in rather than being read here, because a generated level
+// does not read it where a resident one does: it asks [`cover_upscaled`] and
+// gets a boundary that wanders inside the base texel. The trees have to follow
+// that boundary and not the block -- what is grown and what is painted are
+// written off one walk precisely so a crown is never drawn on ground painted as
+// meadow -- and handing the cover in is what keeps the two answering to the
+// same id.
 //
 // The slope comes from the mip above the base rather than from a texel's own
 // neighbours. `footing` asks how steep the *hillside* is, which is a question
 // about a couple of hundred metres of ground, and a single pair of eight-metre
 // texels answers it more noisily than the thing being asked about. Taking it
 // from a level nothing writes also keeps this pass off ground it is raising.
-fn standing_at(cell: vec2<i32>, level: u32) -> Standing {
+fn standing_at(cover: u32, cell: vec2<i32>, level: u32) -> Standing {
     let base = terrain.resident_base;
     let parent = cell >> vec2<u32>(base - level);
     let above = min(base + 1u, terrain.level_count - 1u);
@@ -2407,7 +2558,6 @@ fn standing_at(cell: vec2<i32>, level: u32) -> Standing {
         bare_above(above, coarse + vec2<i32>(0, 1)) - bare_above(above, coarse - vec2<i32>(0, 1)),
     );
     let slope = length(fall / (2.0 * metres));
-    let cover = textureLoad(materials, slot(base, parent), mip(base)).r;
     let texel = f32(1u << level) * terrain.metres_per_texel.x;
     return standing_on(cover, cover_centre(cell, level), texel, slope);
 }
