@@ -3,6 +3,7 @@ mod controls;
 mod deferred;
 mod headless;
 mod hud;
+mod memory;
 mod palette;
 mod profile;
 mod renderer;

@@ -25,6 +25,9 @@ pub struct Renderer {
     /// Absent unless profiling: an unprofiled run has nowhere to show this and
     /// no reason to spend a copy a frame producing it.
     coverage: Option<crate::reproject::CoverageReader>,
+    /// Absent unless profiling, for the same reason: reading the two pools
+    /// costs a handful of file reads that an unwatched run has no use for.
+    memory: Option<crate::memory::Meter>,
 }
 
 impl Renderer {
@@ -109,6 +112,9 @@ impl Renderer {
         let hud =
             profiling.then(|| Hud::new(&device, &queue, format, window.scale_factor() as f32));
         let coverage = profiling.then(|| crate::reproject::CoverageReader::new(&device));
+        // Built from the adapter rather than the device: what the card holds is
+        // the kernel's to say, and the adapter is what names the card.
+        let memory = profiling.then(|| crate::memory::Meter::new(&adapter));
 
         Ok(Self {
             window,
@@ -123,6 +129,7 @@ impl Renderer {
             readout: profile::Smoothed::default(),
             hud: hud.flatten(),
             coverage,
+            memory,
         })
     }
 
@@ -202,6 +209,9 @@ impl Renderer {
         self.frame.ceiling = self.scene.ceiling();
         self.frame.position = self.scene.camera.position;
         self.frame.orientation = self.scene.camera.orientation;
+        if let Some(meter) = self.memory.as_mut() {
+            self.frame.memory = meter.sample(&self.device);
+        }
 
         let clock = profile::Clock::start(self.profiling);
         self.scene.draw(&mut encoder, &view);

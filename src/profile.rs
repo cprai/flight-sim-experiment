@@ -1,6 +1,6 @@
-//! Where a frame's time actually went.
+//! Where a frame's time actually went, and what it is using while it does.
 //!
-//! Two kinds of measurement, kept apart because they cannot be compared.
+//! Three kinds of measurement, kept apart because they cannot be compared.
 //!
 //! **GPU**, through [`wgpu_profiler`]: timestamps written at the boundaries of
 //! the passes, read back a frame or two later. This is the only honest account
@@ -33,9 +33,16 @@
 //! the first update and never again -- so these are all but empty after that
 //! first frame, which is the point.
 //!
-//! Both are off unless a run asked for them. The scopes are no-ops when
-//! [`profiler`] was built disabled, and the CPU spans are an [`Option`] that
-//! stays [`None`], so an unprofiled frame does not so much as read the clock.
+//! **Memory**, through [`crate::memory`]: not a duration and not per frame, but
+//! the other thing a run can exhaust. The whole design here trades disk and
+//! streaming for resident memory -- 2240 MiB of chain and 480 MiB of generated
+//! window -- so how close that sits to what the card has is the number that says
+//! whether a coarser base is being forced.
+//!
+//! All of it is off unless a run asked for it. The scopes are no-ops when
+//! [`profiler`] was built disabled, the CPU spans are an [`Option`] that stays
+//! [`None`], and the meter is never built, so an unprofiled frame does not so
+//! much as read the clock.
 
 use std::time::{Duration, Instant};
 
@@ -43,6 +50,7 @@ use glam::{Quat, Vec3};
 use wgpu_profiler::{GpuProfiler, GpuProfilerSettings, GpuTimerQueryResult};
 
 use crate::camera::Camera;
+use crate::memory::Memory;
 
 /// The scope [`crate::scene::Scene::draw`] opens around the frame's own passes.
 pub const PASSES: &str = "passes";
@@ -239,6 +247,12 @@ pub struct Frame {
     /// there to be compared against.
     pub position: Vec3,
     pub orientation: Quat,
+    /// What the run and the machine are using, when a meter was sampled.
+    ///
+    /// Not a duration, not smoothed, and not of this frame in particular -- see
+    /// [`crate::memory::Meter`], which answers no more often than four times a
+    /// second because nothing here moves faster than that.
+    pub memory: Memory,
 }
 
 /// Flattens the profiler's tree into rows, keeping the nesting as `depth`.
@@ -378,6 +392,7 @@ pub struct Smoothed {
     ceiling: f32,
     position: Vec3,
     orientation: Quat,
+    memory: Memory,
 }
 
 impl Smoothed {
@@ -397,6 +412,7 @@ impl Smoothed {
         self.ceiling = frame.ceiling;
         self.position = frame.position;
         self.orientation = frame.orientation;
+        self.memory = frame.memory;
         // The GPU rows appear a frame or two late and the hud scope comes and
         // goes, so the row set is not fixed. Smoothing across a changed shape
         // would pair a value with the wrong label.
@@ -486,8 +502,52 @@ impl Smoothed {
         for (label, radians) in [("yaw", angles.x), ("pitch", angles.y), ("roll", angles.z)] {
             text.push_str(&format!("\n{label:<LABEL$}{:>8.1} °", radians.to_degrees()));
         }
+        text.push_str(&memory_block(&self.memory));
         text
     }
+}
+
+/// The two memory pools as rows, in the same columns the timings use.
+///
+/// Nested the way the timing rows are, so the indentation means the same thing:
+/// what this process took is part of what the pool has in use, which is part of
+/// what the pool holds. That is why the capacity is the parent and not, as it
+/// first reads, the wrong way up -- a run whose `ours` row approaches the `in
+/// use` row above it is a run that has the card to itself, and one where the two
+/// are far apart is sharing it with a compositor.
+///
+/// A pool nothing could be read for is left out entirely rather than drawn as
+/// zeroes. `total` of zero would say the card has no memory, which is a claim,
+/// where an absent block says only that this machine did not answer -- which is
+/// every platform without `/proc`, and every GPU whose driver does not publish
+/// its pool under `/sys/class/drm`.
+pub fn memory_block(memory: &Memory) -> String {
+    /// A bare byte count is unreadable at this size and a fraction of a
+    /// gibibyte is unreadable at any size, so: whole mebibytes throughout.
+    fn mib(bytes: u64) -> f64 {
+        bytes as f64 / (1 << 20) as f64
+    }
+    let mut text = String::new();
+    let mut pool = |label: &str, total: u64, used: u64, ours: u64| {
+        if total == 0 && used == 0 && ours == 0 {
+            return;
+        }
+        for (label, bytes) in [
+            (label.to_owned(), total),
+            ("  in use".to_owned(), used),
+            ("  ours".to_owned(), ours),
+        ] {
+            text.push_str(&format!("\n{label:<LABEL$}{:>6.0} MiB", mib(bytes)));
+        }
+    };
+    pool(
+        "vram",
+        memory.vram_total,
+        memory.vram_used,
+        memory.vram_ours,
+    );
+    pool("system", memory.ram_total, memory.ram_used, memory.ram_ours);
+    text
 }
 
 /// The smallest, middle and average of a run of samples.
@@ -618,6 +678,7 @@ mod tests {
             ceiling: 0.0,
             position: Vec3::ZERO,
             orientation: Quat::IDENTITY,
+            memory: Memory::default(),
         }
     }
 
@@ -768,6 +829,54 @@ mod tests {
                 row.depth
             );
         }
+    }
+
+    /// What the readout says about memory when the machine answered about both
+    /// pools: three rows each, nested so that `ours` reads as part of `in use`
+    /// and `in use` as part of the capacity above them.
+    #[test]
+    fn the_overlay_reports_both_pools_against_what_they_hold() {
+        let mib = 1u64 << 20;
+        // The figures a run over the installed survey actually reports, so the
+        // nesting the doc claims -- ours within in use within total -- holds of
+        // the sample as well as of the format.
+        let text = memory_block(&Memory {
+            vram_total: 12272 * mib,
+            vram_used: 3925 * mib,
+            vram_ours: 3073 * mib,
+            ram_total: 15128 * mib,
+            ram_used: 8658 * mib,
+            ram_ours: 167 * mib,
+        });
+        for (label, mib) in [
+            ("vram", 12272.0),
+            ("  in use", 3925.0),
+            ("  ours", 3073.0),
+            ("system", 15128.0),
+        ] {
+            let expected = format!("{label:<LABEL$}{mib:>6.0} MiB");
+            assert!(text.contains(&expected), "no {expected:?} in {text}");
+        }
+        // `in use` and `ours` appear under both pools, so a row count is what
+        // says the second block is there at all.
+        assert_eq!(text.lines().filter(|line| !line.is_empty()).count(), 6);
+    }
+
+    /// A machine that publishes nothing about a pool must show no rows for it.
+    /// Zeroes would be a claim -- that the card has no memory -- where silence
+    /// is only the absence of an answer, which is what every platform without
+    /// `/proc` and every driver that hides its pool actually gives.
+    #[test]
+    fn a_pool_that_could_not_be_read_is_left_out_rather_than_drawn_as_zero() {
+        let text = memory_block(&Memory {
+            ram_total: 1 << 30,
+            ram_used: 1 << 29,
+            ram_ours: 1 << 20,
+            ..Memory::default()
+        });
+        assert!(!text.contains("vram"), "{text}");
+        assert!(text.contains("system"), "{text}");
+        assert!(memory_block(&Memory::default()).is_empty());
     }
 
     /// The overlay is the only place the reprojection's share is visible while

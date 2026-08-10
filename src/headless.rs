@@ -90,6 +90,15 @@ impl FromStr for Placement {
 /// on a machine with a discrete GPU, an integrated one and a software fallback
 /// is a coin toss. `WGPU_POWER_PREF` decides it.
 pub fn device() -> Result<(wgpu::Device, wgpu::Queue)> {
+    let (_adapter, device, queue) = device_and_adapter()?;
+    Ok((device, queue))
+}
+
+/// The same device, with the adapter it was requested from.
+///
+/// Only [`profile`] wants the adapter, and only to name the card to the kernel
+/// so the memory rows can be read; see [`crate::memory::Meter::new`].
+pub fn device_and_adapter() -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -109,7 +118,7 @@ pub fn device() -> Result<(wgpu::Device, wgpu::Queue)> {
         ..Default::default()
     }))
     .context("failed to create device")?;
-    Ok((device, queue))
+    Ok((adapter, device, queue))
 }
 
 /// How far the camera is taken to move between one frame and the next, per
@@ -359,11 +368,12 @@ pub fn profile(
     flight: Flight,
 ) -> Result<()> {
     let frames = flight.frames;
-    let (device, queue) = device()?;
+    let (adapter, device, queue) = device_and_adapter()?;
     let mut scene = settled(&device, &queue, terrain_root, size, placement)?;
     // After settling, so the chain is already read in and the load's own
     // dispatches are not measured as if they were a frame's.
     scene.profile(&device, true);
+    let mut meter = crate::memory::Meter::new(&adapter);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("profile target"),
@@ -440,6 +450,11 @@ pub fn profile(
     }
 
     print!("{}", crate::profile::table(&measured));
+    // Once, at the end, rather than a column of a table: none of it is per
+    // frame. What the run holds is settled by the time the first frame is
+    // drawn -- the chain is read in whole and nothing allocates afterwards --
+    // so a spread across sixty frames would be sixty copies of one number.
+    println!("{}", crate::profile::memory_block(&meter.sample(&device)));
 
     let coverage = coverage(&device, &queue, &mut scene, &view, flight)?;
     let pixels = size.x * size.y;
