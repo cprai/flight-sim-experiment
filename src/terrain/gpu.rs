@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::terrain::geotiff::Georeferencing;
 use crate::terrain::pyramid::RasterSource;
-use crate::terrain::residency::{Residency, detail_base};
+use crate::terrain::residency::{Residency, TileResidency, Wanted, detail_base};
 use crate::terrain::tiles::{MaterialId, TileStore};
 use anyhow::{Context, Result};
 use glam::{DVec2, IVec2, UVec2, Vec2, Vec3};
@@ -73,6 +73,23 @@ struct TerrainUniform {
     viewport: [u32; 2],
 }
 
+/// Mirrors `DetailJob` in the shader: one rectangle of one level to generate.
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct DetailJob {
+    origin: [i32; 2],
+    size: [u32; 2],
+    level: u32,
+    octaves: u32,
+    wavelength: f32,
+    relief: f32,
+}
+
+/// Threads per side of a `cs_detail` workgroup.
+///
+/// Must match `@workgroup_size` on `cs_detail` in `src/terrain.wgsl`.
+const DETAIL_GROUP: u32 = 8;
+
 /// Mirrors `MaximaJob` in the shader: one rectangle of one level to derive.
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -116,6 +133,22 @@ const COPY_ALIGN: u32 = 256;
 /// in anything smaller than four, and rounded up to what a copy demands.
 fn derive_row_bytes(cells: u32) -> u32 {
     (cells.div_ceil(2) * 4).div_ceil(COPY_ALIGN) * COPY_ALIGN
+}
+
+/// How much of `[at, end)` one derive job may take along an axis.
+///
+/// As much as the scratch buffer holds, and never past the next wrap: a
+/// rectangle straddling one is two rectangles in the texture, and the copy out
+/// of the buffer would have to start partway along a row at an offset it is not
+/// allowed to start at. An identity mask is a level that does not wrap at all,
+/// which is every resident one.
+fn span(at: i32, end: i32, mask: i32) -> u32 {
+    let to_wrap = if mask == -1 {
+        i32::MAX
+    } else {
+        mask + 1 - (at & mask)
+    };
+    (end - at).min(to_wrap).min(DERIVE_CHUNK as i32) as u32
 }
 
 /// How far past a cell wall the march has to put a ray for the next step to
@@ -213,6 +246,15 @@ pub struct Terrain {
     /// a pixel into the ray through it. Followed by [`Terrain::resize`].
     viewport: UVec2,
 
+    /// Which tiles each generated level holds, and what to fill next.
+    windows: TileResidency,
+    /// Texels across one generated level's window.
+    detail_across: u32,
+    /// Tiles generated since the last derive, waiting to be turned into jobs.
+    generated: Vec<Wanted>,
+    /// This update's generation rectangles.
+    detail_jobs_cpu: Vec<DetailJob>,
+
     /// The chain's rectangles, coarsest last.
     ///
     /// Ordered by level because a cell carries from the level below, which must
@@ -224,8 +266,26 @@ pub struct Terrain {
     height_texture: wgpu::Texture,
     material_texture: wgpu::Texture,
     maxima_texture: wgpu::Texture,
+    /// The generated levels: one array layer per level below the base.
+    ///
+    /// Kept alive by the views the bind groups hold, so nothing outside a test
+    /// reaches for the texture itself -- but owning it here is what says the
+    /// terrain owns the memory.
+    #[allow(dead_code, reason = "read by the tests that check what was generated")]
+    detail_height_texture: wgpu::Texture,
+    detail_maxima_texture: wgpu::Texture,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// Fills one rectangle of one generated level.
+    generate: wgpu::ComputePipeline,
+    /// Group 1 for [`Terrain::generate`], which is the terrain *without* the
+    /// generated textures: it writes one of them, and a texture may not be
+    /// bound as writable storage and read as a texture in the same dispatch.
+    generate_terrain_group: wgpu::BindGroup,
+    /// Group 3 for [`Terrain::generate`]: the job, and the layer it writes.
+    generate_bind_group: wgpu::BindGroup,
+    /// One generation job per 256-byte slot, addressed by dynamic offset.
+    generate_jobs: wgpu::Buffer,
     /// Derives one rectangle of one level from the heights and the level below.
     derive: wgpu::ComputePipeline,
     /// Group 3 for [`Terrain::derive`]: the job, and the cells it writes.
@@ -392,7 +452,12 @@ impl Terrain {
         // can be read back off the top of the chain and so a test can check the
         // pyramid against a reference built on the CPU.
         let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
-        let height_texture = chain("terrain heights", wgpu::TextureFormat::R32Float, usage);
+        // `COPY_SRC` so a test can read a level back; see the maxima below.
+        let height_texture = chain(
+            "terrain heights",
+            wgpu::TextureFormat::R32Float,
+            usage | wgpu::TextureUsages::COPY_SRC,
+        );
         // Sixteen bits rather than thirty-two. Ids reach 0x080c and the palette
         // is 2304 entries, so the top half was never carrying anything, and at
         // this size that half was 470 MB of it.
@@ -406,8 +471,71 @@ impl Terrain {
             usage | wgpu::TextureUsages::COPY_SRC,
         );
 
+        // The generated levels. One layer per level below the base, all the
+        // same width, wrapped onto their slots -- which is the clipmap the
+        // resident chain replaced, kept for exactly the levels that still have
+        // to move. `resident_base` of zero means there is nothing under the
+        // base to generate, and a texture may not have no layers, so it
+        // degenerates to one texel that nothing ever reads.
+        let detail_levels = resident_base.max(1);
+        let detail_across = if resident_base > 0 {
+            residency.detail_tiles * residency.detail_tile_texels
+        } else {
+            // Nothing under the base to generate, and a texture may not be
+            // empty. One texel that nothing ever reads.
+            1
+        };
+        let window = |label, format, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: detail_across,
+                    height: detail_across,
+                    depth_or_array_layers: detail_levels,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        // `COPY_SRC` on both is not needed to draw, only so a test can read a
+        // window back and check the pyramid over it against its own heights.
+        let detail_height_texture = window(
+            "terrain detail heights",
+            wgpu::TextureFormat::R32Float,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        );
+        let detail_maxima_texture = window(
+            "terrain detail maxima",
+            wgpu::TextureFormat::R16Float,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+        );
+        if resident_base > 0 {
+            log::info!(
+                "terrain: {resident_base} generated levels of {} x {} tiles, {detail_across} \
+                 texels each, {:.0} MiB, reaching {} texels from the camera",
+                residency.detail_tiles,
+                residency.detail_tiles,
+                (detail_across as usize).pow(2) * 6 * resident_base as usize / (1 << 20),
+                residency.detail_reach() << (resident_base - 1),
+            );
+        }
+
         let array_view = |texture: &wgpu::Texture| {
             texture.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let layer_view = |texture: &wgpu::Texture| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            })
         };
 
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -417,9 +545,17 @@ impl Terrain {
             mapped_at_creation: false,
         });
 
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("terrain layout"),
-            entries: &[
+        let generated_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let layout_entries = [
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -462,11 +598,63 @@ impl Terrain {
                     },
                     count: None,
                 },
+        ];
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("terrain layout"),
+            entries: &[
+                layout_entries[0],
+                layout_entries[1],
+                layout_entries[2],
+                layout_entries[3],
+                generated_entry(4),
+                generated_entry(5),
             ],
+        });
+        // The same terrain without the generated arrays. `cs_detail` writes one
+        // of them, and wgpu will not have a texture bound as writable storage
+        // and read as a texture in one dispatch -- so the pass that generates a
+        // level binds only what it reads, which is the base.
+        let base_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("terrain base layout"),
+            entries: &layout_entries[..4],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("terrain bind group"),
             layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&array_view(&height_texture)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&array_view(&material_texture)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&array_view(&maxima_texture)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&layer_view(
+                        &detail_height_texture,
+                    )),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&layer_view(
+                        &detail_maxima_texture,
+                    )),
+                },
+            ],
+        });
+        let generate_terrain_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terrain base bind group"),
+            layout: &base_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -588,19 +776,26 @@ impl Terrain {
         // Every mip is swept whole in rectangles no wider than the scratch, and
         // a chain is four thirds of its base, so this is a little over four
         // thirds of what mip zero alone takes.
-        let job_slots: usize = (0..mips)
+        let sweep: usize = (0..mips)
             .map(|mip| {
                 let level = UVec2::new(base_size.x >> mip, base_size.y >> mip).max(UVec2::ONE);
                 (level.x.div_ceil(DERIVE_CHUNK) * level.y.div_ceil(DERIVE_CHUNK)) as usize
             })
             .sum();
+        // A generated tile raises every level above it, and each of those
+        // rectangles is cut at the wrap into at most four pieces.
+        let cascade = residency.detail_per_update as usize
+            * (resident_base + mips) as usize
+            * 4;
+        let job_slots = sweep.max(cascade);
         let derive_jobs = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terrain derive jobs"),
             size: JOB_SLOT * job_slots as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let chunk = DERIVE_CHUNK.min(base_size.x.max(base_size.y));
+        let widest = base_size.x.max(base_size.y).max(detail_across);
+        let chunk = DERIVE_CHUNK.min(widest);
         let derive_scratch = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terrain derive cells"),
             size: u64::from(derive_row_bytes(chunk)) * u64::from(chunk),
@@ -633,6 +828,75 @@ impl Terrain {
             });
         let derive = stage("terrain derive pipeline", "cs_maxima", &derive_pipeline_layout);
 
+        // Generating a level: reads the base through group 1, writes one layer
+        // of the generated heights through group 3.
+        let generate_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("terrain generate layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(size_of::<DetailJob>() as u64),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        // A window moves by whole tiles and hands out at most
+        // `detail_per_update` of them, and a tile is cut at the wrap into at
+        // most four rectangles.
+        let generate_slots = (residency.detail_per_update as usize * 4).max(4);
+        let generate_jobs = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain generate jobs"),
+            size: JOB_SLOT * generate_slots as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let generate_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terrain generate bind group"),
+            layout: &generate_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &generate_jobs,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(size_of::<DetailJob>() as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::TextureView(&layer_view(
+                        &detail_height_texture,
+                    )),
+                },
+            ],
+        });
+        let generate_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("terrain generate pipeline layout"),
+                bind_group_layouts: &[None, Some(&base_layout), None, Some(&generate_layout)],
+                immediate_size: 0,
+            });
+        let generate = stage(
+            "terrain generate pipeline",
+            "cs_detail",
+            &generate_pipeline_layout,
+        );
+
         let height_range = Self::coarsest_height_range(heights.as_ref(), &placement);
         let ground_level = (resident_base + GROUND_MIP).min(resident_base + mips - 1);
         let ground_size = UVec2::new(
@@ -652,6 +916,10 @@ impl Terrain {
             ground_level,
             ceiling: f32::INFINITY,
             sources: Some(Sources { heights, materials }),
+            windows: TileResidency::new(residency, resident_base),
+            detail_across,
+            generated: Vec::new(),
+            detail_jobs_cpu: Vec::new(),
             spans: None,
             viewport,
             jobs: Vec::new(),
@@ -659,8 +927,14 @@ impl Terrain {
             height_texture,
             material_texture,
             maxima_texture,
+            detail_height_texture,
+            detail_maxima_texture,
             uniform,
             bind_group,
+            generate,
+            generate_terrain_group,
+            generate_bind_group,
+            generate_jobs,
             derive,
             derive_bind_group,
             derive_jobs,
@@ -715,6 +989,38 @@ impl Terrain {
         self.resident_base + self.mips - 1
     }
 
+    /// The texels of a level a ray may read, as a half-open range.
+    ///
+    /// Two conventions, because the two halves fail differently past their
+    /// edge. A resident level advertises the whole of itself and `slot` clamps,
+    /// so the last texel's patch repeats the border -- past the raster there is
+    /// nothing, and repeating is what the tile store did too. A window
+    /// advertises itself one texel short, because past *its* edge sits a real
+    /// texel of somewhere else that the wrap would fold in.
+    fn level_valid(&self, level: u32) -> (IVec2, IVec2) {
+        if level >= self.resident_base {
+            return (IVec2::ZERO, self.level_size(level).as_ivec2());
+        }
+        if level < self.base {
+            return (IVec2::ZERO, IVec2::ZERO);
+        }
+        let tile = self.residency.detail_tile_texels as i32;
+        let (low, high) = self.windows.level(level).valid(self.residency.detail_tiles);
+        if low == high {
+            return (IVec2::ZERO, IVec2::ZERO);
+        }
+        (low * tile, high * tile - IVec2::ONE)
+    }
+
+    /// What wraps a level's texel index onto its texture coordinate.
+    fn level_mask(&self, level: u32) -> IVec2 {
+        if level >= self.resident_base {
+            IVec2::NEG_ONE
+        } else {
+            IVec2::splat(self.detail_across as i32 - 1)
+        }
+    }
+
     /// The size of one level, in its own texels.
     fn level_size(&self, level: u32) -> UVec2 {
         let mip = level - self.resident_base;
@@ -739,7 +1045,7 @@ impl Terrain {
     /// moving window any more -- there is no window -- but `settle` still wants
     /// to know whether a frame drawn now would draw anything.
     pub fn pending(&self) -> bool {
-        self.sources.is_some()
+        self.sources.is_some() || self.windows.pending()
     }
 
     /// Reads the chain in on the first call, then follows the camera.
@@ -771,23 +1077,169 @@ impl Terrain {
         // Never finer than what is held. `detail_base` answers in absolute
         // levels, so below the base it is answering about ground that is not
         // there.
+        // No longer clamped to the base: the levels under it exist again, and
+        // this is what decides how many of them are worth generating.
         self.base = detail_base(
             &self.residency,
             metres_per_texel,
             f64::from(camera.y - ground),
             self.resident_base + self.mips,
-        )
-        .max(self.resident_base);
+        );
+        // Below the base nothing is generated, and a window that has been given
+        // up is refilled whole when the camera comes back down to it.
+        let work = self
+            .windows
+            .advance(camera_texels, self.base.min(self.resident_base));
         let advance = clock.elapsed();
 
+        // Before anything is generated or derived, because both read the chain
+        // and the windows through this uniform -- the level masks above all.
+        // Deriving against a stale one wrote every texel of every generated
+        // level to slot zero, which reads as a shader bug and is an ordering
+        // one. The same mistake, one level down, as building the chain's own
+        // pyramid before its uniform existed.
         let clock = crate::profile::Clock::start(timed);
         self.write_uniform(queue);
         let uniform = clock.elapsed();
 
+        let clock = crate::profile::Clock::start(timed);
+        self.generate_tiles(device, queue, &work);
+        self.raise_pyramid(device, queue);
+        let generate = clock.elapsed();
+
         if let Some(spans) = self.spans.as_mut() {
             spans.advance += advance;
+            spans.generate += generate;
             spans.write += uniform;
         }
+    }
+
+    /// Fills the tiles a window has just asked for.
+    ///
+    /// One pass for all of them: a tile is a whole slot, tiles are disjoint, so
+    /// nothing here overlaps anything else and there is no ordering to keep.
+    fn generate_tiles(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, work: &[Wanted]) {
+        if work.is_empty() {
+            return;
+        }
+        let tile = self.residency.detail_tile_texels;
+        // The first octave is the base's own texel, so the base cannot hold it
+        // -- a level can only carry features larger than two of its texels --
+        // and every level under the base carries one halving more than the one
+        // outside it. That is what makes the fractal *restore* what the box
+        // filter took out rather than paint something new over it.
+        let base_metres = self
+            .placement
+            .metres_per_texel_x
+            .min(self.placement.metres_per_texel_z) as f32
+            * (1u32 << self.resident_base) as f32;
+        self.detail_jobs_cpu.clear();
+        for wanted in work {
+            self.detail_jobs_cpu.push(DetailJob {
+                origin: (wanted.tile * tile as i32).to_array(),
+                size: [tile, tile],
+                level: wanted.level,
+                // One octave per level below the base: the first is the base's
+                // own texel, which its Nyquist already excludes, and each level
+                // under it can hold one more halving.
+                octaves: self.resident_base - wanted.level,
+                wavelength: base_metres,
+                relief: self.residency.detail_relief,
+            });
+        }
+        for (index, job) in self.detail_jobs_cpu.iter().enumerate() {
+            queue.write_buffer(
+                &self.generate_jobs,
+                index as u64 * JOB_SLOT,
+                bytemuck::bytes_of(job),
+            );
+        }
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("terrain generate"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("terrain generate"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.generate);
+            pass.set_bind_group(1, &self.generate_terrain_group, &[]);
+            for (index, job) in self.detail_jobs_cpu.iter().enumerate() {
+                pass.set_bind_group(
+                    3,
+                    &self.generate_bind_group,
+                    &[(index as u64 * JOB_SLOT) as u32],
+                );
+                pass.dispatch_workgroups(
+                    job.size[0].div_ceil(DETAIL_GROUP),
+                    job.size[1].div_ceil(DETAIL_GROUP),
+                    1,
+                );
+            }
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        self.generated.extend_from_slice(work);
+    }
+
+    /// Derives the pyramid over the tiles just generated, and raises every
+    /// level above them.
+    ///
+    /// A tile changes the pyramid at every level from its own upwards: its
+    /// heights feed the cells of its own level directly, and those cells are
+    /// carried up into every coarser cell above them -- through the generated
+    /// levels and on into the resident chain, whose cells were derived before
+    /// this ground had any detail on it. Miss that and a coarse cell reads too
+    /// low, which is a ray passing through a ridge.
+    fn raise_pyramid(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.jobs.clear();
+        let generated = std::mem::take(&mut self.generated);
+        if generated.is_empty() {
+            return;
+        }
+        let tile = self.residency.detail_tile_texels as i32;
+        for level in self.base..self.resident_base + self.mips {
+            let (valid_low, valid_high) = self.level_valid(level);
+            for wanted in generated.iter().filter(|w| w.level <= level) {
+                let shift = level - wanted.level;
+                let side = (tile >> shift).max(1);
+                let corner = IVec2::new(
+                    (wanted.tile.x * tile) >> shift,
+                    (wanted.tile.y * tile) >> shift,
+                );
+                // A tile's own slots are its own whatever the window says: its
+                // heights went into them a moment ago, and the square only
+                // admits them once the step finishes. Coarser cells are not its
+                // to write, and one outside will be derived by whichever tile
+                // makes it valid.
+                let (mut low, high) = if shift == 0 {
+                    (corner, corner + IVec2::splat(side))
+                } else {
+                    (
+                        corner.max(valid_low),
+                        (corner + IVec2::splat(side)).min(valid_high),
+                    )
+                };
+                // One cell back along each axis, because a cell is closed by a
+                // sample past itself: the last row and column of the ground
+                // before this tile could not be closed until it arrived.
+                let back = low - IVec2::ONE;
+                if back.x >= valid_low.x && back.x < valid_high.x {
+                    low.x = back.x;
+                }
+                if back.y >= valid_low.y && back.y < valid_high.y {
+                    low.y = back.y;
+                }
+                self.emit(level, low, high);
+            }
+        }
+        debug_assert!(
+            self.jobs.len() <= self.job_slots,
+            "{} rectangles to derive against room for {}",
+            self.jobs.len(),
+            self.job_slots
+        );
+        self.run_jobs(device, queue);
     }
 
     /// Starts or stops accounting for where an update's time goes.
@@ -828,21 +1280,18 @@ impl Terrain {
         };
 
         for level in self.base..self.resident_base + self.mips {
-            let size = self.level_size(level);
+            let (low, high) = self.level_valid(level);
             uniform.levels[level as usize] = LevelUniform {
-                valid_low: [0, 0],
-                // The whole level. `slot` clamps reads into it, so the last
-                // texel is readable and its patch repeats the border, which is
-                // what the tile store does past the edge of a survey.
-                valid_high: [size.x as i32, size.y as i32],
+                valid_low: low.to_array(),
+                valid_high: high.to_array(),
                 // One figure for every level: they all bound the same whole
                 // raster, so the highest cell of one is the highest cell of any
-                // to within how coarsely it closes its squares.
+                // to within how coarsely it closes its squares. A generated
+                // level cannot exceed it either -- it is the base plus detail
+                // the base's own cell already bounds.
                 ceiling: self.ceiling,
                 padding: 0.0,
-                // A texel index is a texture coordinate while the whole raster
-                // is resident, so nothing is wrapped.
-                mask: [-1, -1],
+                mask: self.level_mask(level).to_array(),
             };
         }
 
@@ -1043,29 +1492,31 @@ impl Terrain {
 
     /// Cuts one rectangle of one level into jobs and records them.
     ///
-    /// Bounded by the scratch buffer the cells go out through, and by nothing
-    /// else: a resident level's texel index is its texture coordinate, so a
-    /// rectangle cannot straddle a wrap the way a window's could.
+    /// Two things bound a job: the scratch buffer its cells go out through, and
+    /// the wrap. A rectangle straddling a wrap is two rectangles in the texture
+    /// and cannot be copied in one go, so it is cut there rather than copied in
+    /// pieces at offsets a copy would refuse to start at. A resident level has
+    /// no wrap to cut at, which is what the identity mask says.
     fn emit(&mut self, level: u32, low: IVec2, high: IVec2) {
         if low.x >= high.x || low.y >= high.y {
             return;
         }
+        let mask = self.level_mask(level).x;
         // The level below, bounded exactly as the march bounds it, so a child
         // is carried if and only if a ray could descend into it.
-        let carry = level > self.resident_base;
+        let carry = level > self.base;
         let (below_low, below_high) = if carry {
-            (IVec2::ZERO, self.level_size(level - 1).as_ivec2())
+            self.level_valid(level - 1)
         } else {
             (IVec2::ZERO, IVec2::ZERO)
         };
 
-        let chunk = DERIVE_CHUNK as i32;
         let mut y = low.y;
         while y < high.y {
-            let rows = (high.y - y).min(chunk) as u32;
+            let rows = span(y, high.y, mask);
             let mut x = low.x;
             while x < high.x {
-                let columns = (high.x - x).min(chunk) as u32;
+                let columns = span(x, high.x, mask);
                 self.jobs.push(MaximaJob {
                     origin: [x, y],
                     size: [columns, rows],
@@ -1121,6 +1572,16 @@ impl Terrain {
                     1,
                 );
             }
+            // A resident level is a mip of the chain at its own index; a
+            // generated one is a layer of the window, wrapped onto its slot the
+            // same way the shader wrapped it.
+            let resident = job.level >= self.resident_base;
+            let mask = self.level_mask(job.level).x as u32;
+            let (texture, mip, layer) = if resident {
+                (&self.maxima_texture, job.level - self.resident_base, 0)
+            } else {
+                (&self.detail_maxima_texture, 0, job.level)
+            };
             encoder.copy_buffer_to_texture(
                 wgpu::TexelCopyBufferInfo {
                     buffer: &self.derive_scratch,
@@ -1131,12 +1592,12 @@ impl Terrain {
                     },
                 },
                 wgpu::TexelCopyTextureInfo {
-                    texture: &self.maxima_texture,
-                    mip_level: job.level - self.resident_base,
+                    texture,
+                    mip_level: mip,
                     origin: wgpu::Origin3d {
-                        x: job.origin[0] as u32,
-                        y: job.origin[1] as u32,
-                        z: 0,
+                        x: job.origin[0] as u32 & mask,
+                        y: job.origin[1] as u32 & mask,
+                        z: layer,
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
@@ -1327,9 +1788,19 @@ mod tests {
     use crate::terrain::pyramid::{Level, Pyramid};
 
     /// The whole test raster, held at whatever base the test asks for.
+    ///
+    /// Generated windows of four tiles of eight texels rather than the shipped
+    /// eight of five hundred and twelve, because a raster a test can afford to
+    /// build is smaller than one real tile and none of the wrapping would be
+    /// exercised at all.
     fn test_residency(resident_base: u32) -> Residency {
         Residency {
             resident_base,
+            detail_relief: 0.0,
+            detail_tiles: 4,
+            detail_tile_texels: 8,
+            // Whole windows per update, so a test never has to drain a queue.
+            detail_per_update: 4096,
             ..Default::default()
         }
     }
@@ -1583,6 +2054,155 @@ mod tests {
         checked
     }
 
+    /// A terrain over a rugged raster with the relief turned up.
+    fn terrain_with_relief(device: &wgpu::Device, resident_base: u32, relief: f32) -> Terrain {
+        Terrain::new(
+            device,
+            &crate::scene::test_camera_layout(device),
+            &crate::deferred::storage_layout(device),
+            &crate::reproject::work_layout(device),
+            &crate::reproject::args_layout(device),
+            &crate::reproject::risk_layout(device),
+            &crate::reproject::reach_layout(device),
+            Residency {
+                detail_relief: relief,
+                ..test_residency(resident_base)
+            },
+            UVec2::splat(RASTER),
+            Georeferencing::square(RASTER, RASTER, 30.0),
+            Sources {
+                heights: Box::new(Pyramid::build(Level::new(RASTER, RASTER, rugged()))),
+                materials: Box::new(Pyramid::build(Level::new(
+                    RASTER,
+                    RASTER,
+                    vec![MaterialId(0); (RASTER * RASTER) as usize],
+                ))),
+            },
+        )
+    }
+
+    /// The detail is real, it stays inside the relief it was given, and it
+    /// moves no sample the survey actually measured.
+    ///
+    /// Measured against the same terrain with the relief at zero, so what is
+    /// left is the fractal and nothing else -- no second spelling of the
+    /// interpolation under it, which is the whole reason to difference two runs
+    /// rather than model one.
+    ///
+    /// The third assertion is the surprising one and it is why there is no seam
+    /// where a generated level hands over to the base. The fractal's first
+    /// octave is the base's own texel, so its lattice *is* the base grid, and
+    /// gradient noise is zero at every lattice point of every octave. The
+    /// detail therefore interpolates between the measured samples without ever
+    /// moving one of them -- a property of where the octaves were put rather
+    /// than of anything that enforces it, which is exactly the kind that stops
+    /// being true by accident.
+    #[test]
+    fn generated_detail_is_there_bounded_and_pinned_to_the_survey() {
+        const RELIEF: f32 = 12.0;
+
+        let (device, queue) = crate::scene::test_device();
+        let mut flat = terrain_with_relief(&device, 2, 0.0);
+        let mut rough = terrain_with_relief(&device, 2, RELIEF);
+        let at = Vec3::new(137.0, 100.0, -71.0);
+        flat.update(&device, &queue, at);
+        rough.update(&device, &queue, at);
+
+        for level in 0..rough.resident_base {
+            let smooth = read_level(&device, &queue, &flat, &flat.detail_height_texture, level, 4);
+            let detailed =
+                read_level(&device, &queue, &rough, &rough.detail_height_texture, level, 4);
+            let step = 1 << (rough.resident_base - level);
+            let (low, high) = rough.level_valid(level);
+            let (mut moved, mut worst, mut nodes) = (0u32, 0.0f32, 0u32);
+            for cell_y in low.y..high.y {
+                for cell_x in low.x..high.x {
+                    let cell = IVec2::new(cell_x, cell_y);
+                    let difference = detailed(cell) - smooth(cell);
+                    worst = worst.max(difference.abs());
+                    moved += u32::from(difference != 0.0);
+                    if cell.x % step == 0 && cell.y % step == 0 {
+                        // Zero to a micron rather than to the bit. The octave
+                        // lands on its own lattice point exactly, but the
+                        // reciprocal of the wavelength does not divide exactly,
+                        // so the fraction comes out a few ulps off zero and the
+                        // gradient is dotted with that rather than with nothing.
+                        assert!(
+                            difference.abs() < 1e-3,
+                            "level {level} moved base node {} by {difference} m",
+                            cell / step
+                        );
+                        nodes += 1;
+                    }
+                }
+            }
+            assert!(moved > 100, "level {level} moved only {moved} texels");
+            assert!(nodes > 16, "level {level} shared only {nodes} nodes");
+            assert!(worst > 0.05, "level {level} moved by at most {worst} m");
+            assert!(
+                worst <= RELIEF,
+                "level {level} moved a texel {worst} m against a {RELIEF} m relief"
+            );
+        }
+
+        // And a coarser level is never *louder* than the one under it, at the
+        // points the two share. It carries a subset of the same octaves at the
+        // same amplitudes, so it cannot be -- unless the sum is renormalised
+        // over the octaves that survive the band limit, which would make every
+        // level as loud as the finest. A ray crossing a window edge would then
+        // step onto ground of the same roughness at half the resolution, which
+        // draws as the terrain breathing as the ring goes by and which every
+        // other check here passes happily. Measured: 0.052 m against 0.034 m
+        // renormalised, and equal both ways when it is not.
+        //
+        // Equal, not quieter, and the reason is worth writing down because it
+        // looks like the test failing to see anything. The points the two
+        // levels share are every other texel of the finer one, which is exactly
+        // the lattice of the octave the coarser one dropped -- and gradient
+        // noise is zero at its own lattice points. The dropped octave
+        // contributes nothing *at these particular points*, so what is left is
+        // the same sum on both sides. It is the normalisation that differs.
+        //
+        // Compared at matched world points rather than level against level: a
+        // coarser window covers twice the ground, and on ground this uneven
+        // that difference swamps the one being looked for.
+        for level in 1..rough.resident_base {
+            let pair = |terrain: &Terrain, at| {
+                read_level(&device, &queue, terrain, &terrain.detail_height_texture, at, 4)
+            };
+            let (fine_flat, fine_rough) = (pair(&flat, level - 1), pair(&rough, level - 1));
+            let (coarse_flat, coarse_rough) = (pair(&flat, level), pair(&rough, level));
+            // Only where the two windows overlap. A coarser window covers
+            // twice the ground, so most of it has no finer texel to compare
+            // against -- and reading one anyway wraps onto a tile of somewhere
+            // else, which is ground rather than nonsense and so goes unnoticed.
+            let (low, high) = rough.level_valid(level);
+            let (under_low, under_high) = rough.level_valid(level - 1);
+            let low = low.max((under_low + IVec2::ONE) / 2);
+            let high = high.min(under_high / 2);
+            let (mut fine, mut coarse, mut counted) = (0.0f64, 0.0f64, 0u32);
+            for cell_y in low.y..high.y {
+                for cell_x in low.x..high.x {
+                    let cell = IVec2::new(cell_x, cell_y);
+                    let here = f64::from(coarse_rough(cell) - coarse_flat(cell));
+                    let under = f64::from(fine_rough(cell * 2) - fine_flat(cell * 2));
+                    coarse += here * here;
+                    fine += under * under;
+                    counted += 1;
+                }
+            }
+            let (fine, coarse) = (
+                (fine / f64::from(counted)).sqrt(),
+                (coarse / f64::from(counted)).sqrt(),
+            );
+            assert!(
+                coarse <= fine * 1.02,
+                "level {level} came back at {coarse:.4} m against {fine:.4} m for the level \
+                 under it, so dropping an octave made it louder"
+            );
+        }
+    }
+
     /// Every cell of the pyramid bounds the ground it claims, at every level.
     ///
     /// With the base at level zero the derivation has every level a cell is
@@ -1611,44 +2231,237 @@ mod tests {
         );
     }
 
-    /// A chain held from a coarser base carries only what a ray can reach.
+    /// One level of a texture read back, indexed by texel rather than by slot.
     ///
-    /// This is the trade the resident base makes, stated as a test. Level one
-    /// is the finest thing held, so no cell answers for level-zero detail --
-    /// the chain is legitimately *lower* than one built over the whole raster
-    /// would be, and correct anyway, because no ray can descend to ground that
-    /// is not there.
+    /// A resident level is a mip of a chain and its index *is* its coordinate;
+    /// a generated one is a layer of a window and wraps. The closure hides
+    /// which, so a check can be written once against both.
+    fn read_level(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        terrain: &Terrain,
+        texture: &wgpu::Texture,
+        level: u32,
+        bytes: u32,
+    ) -> impl Fn(IVec2) -> f32 + use<> {
+        let resident = level >= terrain.resident_base;
+        let (size, mip, layer) = if resident {
+            (terrain.level_size(level), level - terrain.resident_base, 0)
+        } else {
+            (UVec2::splat(terrain.detail_across), 0, level)
+        };
+        let stride = (size.x * bytes).div_ceil(256) * 256;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("level readback"),
+            size: u64::from(stride * size.y),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: mip,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(size.y),
+                },
+            },
+            wgpu::Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll failed");
+        let data = readback.get_mapped_range(..).expect("buffer not mapped")[..].to_vec();
+        let mask = if resident {
+            IVec2::NEG_ONE
+        } else {
+            IVec2::splat(terrain.detail_across as i32 - 1)
+        };
+        let last = size.as_ivec2() - IVec2::ONE;
+        move |cell: IVec2| {
+            let at = (cell & mask).clamp(IVec2::ZERO, last);
+            let byte = at.y as usize * stride as usize + at.x as usize * bytes as usize;
+            if bytes == 4 {
+                f32::from_le_bytes(data[byte..byte + 4].try_into().expect("four bytes"))
+            } else {
+                half::f16::from_bits(u16::from_le_bytes(
+                    data[byte..byte + 2].try_into().expect("two bytes"),
+                ))
+                .to_f32()
+            }
+        }
+    }
+
+    /// Every cell of the pyramid is exactly the recurrence over the heights
+    /// that are actually in the textures.
+    ///
+    /// Read back rather than modelled. The oracle above knows what the survey
+    /// holds, which is the right thing to check while every level is measured
+    /// and the wrong thing the moment one is generated: a generated level is
+    /// whatever the shader put there, and Catmull-Rom legitimately overshoots
+    /// the samples it passes through. Checking against the textures asks the
+    /// only question that stays meaningful either way -- does the pyramid bound
+    /// the surface the march will actually solve against -- and it tests the
+    /// closed square, the carry, the residency test and the rounding at once.
     #[test]
-    fn a_coarser_base_bounds_only_the_levels_it_holds() {
+    fn the_pyramid_is_the_recurrence_over_the_heights_that_are_there() {
         let (device, queue) = crate::scene::test_device();
-        let raster = Pyramid::build(Level::new(RASTER, RASTER, rugged()));
         let mut terrain = terrain_over(&device, 1);
         terrain.update(&device, &queue, Vec3::new(137.0, 100.0, -71.0));
+        assert_eq!(terrain.base_level(), 0, "the test wants the generated level");
 
-        let raster: &dyn RasterSource = &raster;
-        let checked = check_pyramid(&device, &queue, &terrain, raster);
-        assert!(checked > 100, "only {checked} cells to check");
+        let mut checked = 0;
+        for level in terrain.base..terrain.resident_base + terrain.mips {
+            let heights = read_level(
+                &device,
+                &queue,
+                &terrain,
+                if level >= terrain.resident_base {
+                    &terrain.height_texture
+                } else {
+                    &terrain.detail_height_texture
+                },
+                level,
+                4,
+            );
+            let ceilings = read_level(
+                &device,
+                &queue,
+                &terrain,
+                if level >= terrain.resident_base {
+                    &terrain.maxima_texture
+                } else {
+                    &terrain.detail_maxima_texture
+                },
+                level,
+                2,
+            );
+            let below = (level > terrain.base).then(|| {
+                read_level(
+                    &device,
+                    &queue,
+                    &terrain,
+                    if level > terrain.resident_base {
+                        &terrain.maxima_texture
+                    } else {
+                        &terrain.detail_maxima_texture
+                    },
+                    level - 1,
+                    2,
+                )
+            });
+            let (low, high) = terrain.level_valid(level);
+            let (child_low, child_high) = terrain.level_valid(level - 1.min(level));
 
-        // ... and it really is lower somewhere, or the test above would have
-        // covered this one and the base would be buying nothing.
-        let level = 1;
-        let (bytes, stride) = read_mip(&device, &queue, &terrain, level);
-        let size = terrain.level_size(level).as_ivec2();
-        let mut tighter = 0;
-        for cell_y in 0..size.y - 1 {
-            for cell_x in 0..size.x - 1 {
-                let cell = IVec2::new(cell_x, cell_y);
-                let whole = ceiling_half(cell_defined(raster, level, cell)).to_f32();
-                if mip_cell(&bytes, stride, cell) < whole {
-                    tighter += 1;
+            for cell_y in low.y..high.y {
+                for cell_x in low.x..high.x {
+                    let cell = IVec2::new(cell_x, cell_y);
+                    // This level's own samples over the cell's closed square.
+                    let mut want = f32::NEG_INFINITY;
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            want = want.max(heights(cell + IVec2::new(dx, dy)));
+                        }
+                    }
+                    // Every child a ray could descend into, and no other.
+                    if let Some(below) = &below {
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let child = cell * 2 + IVec2::new(dx, dy);
+                                if child.cmpge(child_low).all() && child.cmplt(child_high).all() {
+                                    want = want.max(below(child));
+                                }
+                            }
+                        }
+                    }
+                    let got = ceilings(cell);
+                    assert_eq!(
+                        got,
+                        ceiling_half(want).to_f32(),
+                        "level {level} cell {cell} holds {got} where the heights under \
+                         it come to {want}"
+                    );
+                    checked += 1;
                 }
             }
         }
-        assert!(
-            tighter > 0,
-            "no cell of level {level} came out below what a whole-raster chain holds, \
-             so dropping level zero cost nothing and bought nothing"
+        assert!(checked > 1000, "only {checked} cells checked");
+    }
+
+    /// A generated level agrees with the base wherever the two grids meet.
+    ///
+    /// This is the whole of what stage one gave up and this puts back, stated
+    /// as a property rather than as a picture: level `l`'s sample `i` sits at
+    /// level-0 texel `i * 2^l`, so every base node is also a node of every
+    /// level under it, and Catmull-Rom passes through the nodes. If it did not,
+    /// the ground would step wherever a ray handed over between a generated
+    /// level and the base -- and the window's edge is exactly where that
+    /// happens, several kilometres out, where a step is hardest to notice and
+    /// hardest to attribute.
+    #[test]
+    fn a_generated_level_meets_the_base_at_every_shared_node() {
+        let (device, queue) = crate::scene::test_device();
+        // Relief off, from `test_residency`, so what is left is the smooth read
+        // alone. With detail on, a level carries an octave the base does not
+        // and the two are meant to differ; the test below is what bounds that.
+        let mut terrain = terrain_over(&device, 2);
+        terrain.update(&device, &queue, Vec3::new(137.0, 100.0, -71.0));
+        assert_eq!(terrain.base_level(), 0, "the test wants both generated levels");
+
+        let base = read_level(
+            &device,
+            &queue,
+            &terrain,
+            &terrain.height_texture,
+            terrain.resident_base,
+            4,
         );
+        for level in 0..terrain.resident_base {
+            let generated = read_level(
+                &device,
+                &queue,
+                &terrain,
+                &terrain.detail_height_texture,
+                level,
+                4,
+            );
+            let step = 1 << (terrain.resident_base - level);
+            let (low, high) = terrain.level_valid(level);
+            let mut shared = 0;
+            for cell_y in low.y..high.y {
+                for cell_x in low.x..high.x {
+                    let cell = IVec2::new(cell_x, cell_y);
+                    if cell.x % step != 0 || cell.y % step != 0 {
+                        continue;
+                    }
+                    let node = cell / step;
+                    assert_eq!(
+                        generated(cell),
+                        base(node),
+                        "level {level} cell {cell} sits on base node {node} and disagrees"
+                    );
+                    shared += 1;
+                }
+            }
+            assert!(shared > 16, "level {level} shared only {shared} nodes");
+        }
     }
 
 }

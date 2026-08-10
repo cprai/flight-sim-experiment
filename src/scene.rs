@@ -630,6 +630,11 @@ mod tests {
     fn test_residency() -> Residency {
         Residency {
             resident_base: 0,
+            detail_tiles: 8,
+            detail_tile_texels: 8,
+            // Whole windows per update, so no test has to drain a queue to see
+            // a settled frame.
+            detail_per_update: 4096,
             // A far coarser pixel than any real viewport, because the rule for
             // giving up a level compares its texels to one. This raster's are
             // thirty metres, which a 256-pixel frame still resolves from

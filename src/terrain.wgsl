@@ -132,6 +132,12 @@ struct Terrain {
 @group(1) @binding(1) var heights: texture_2d<f32>;
 @group(1) @binding(2) var materials: texture_2d<u32>;
 @group(1) @binding(3) var maxima: texture_2d<f32>;
+// Levels below the base, which are generated rather than measured. A window of
+// whole tiles around the camera per level, wrapped onto its slots the way the
+// streamed clipmap was -- there is no measured ground under the base to hold
+// whole, so these are the one thing left that moves.
+@group(1) @binding(4) var detail_heights: texture_2d_array<f32>;
+@group(1) @binding(5) var detail_maxima: texture_2d_array<f32>;
 
 // Elevations below this are the raster's nodata rather than ground.
 //
@@ -187,7 +193,16 @@ fn resident(level: u32, cell: vec2<i32>) -> bool {
 // less than that is none.
 fn slot(level: u32, cell: vec2<i32>) -> vec2<i32> {
     let info = terrain.levels[level];
-    return clamp(cell & info.mask, info.valid_low, info.valid_high - vec2<i32>(1));
+    if (level >= terrain.resident_base) {
+        return clamp(cell, info.valid_low, info.valid_high - vec2<i32>(1));
+    }
+    // A window wraps and does not clamp. The cells being generated or derived
+    // are deliberately outside what it currently advertises -- that is what a
+    // step in flight means -- and clamping them would fold a whole tile onto
+    // its own edge. Nothing reads past the edge either: a window advertises
+    // itself one texel short, so the neighbour a bilinear patch reaches for is
+    // still a texel of the same square.
+    return cell & info.mask;
 }
 
 // Which mip of the resident chain a level is.
@@ -195,8 +210,30 @@ fn mip(level: u32) -> i32 {
     return i32(level - terrain.resident_base);
 }
 
-fn height_at(level: u32, cell: vec2<i32>) -> f32 {
+// A height off the resident chain, which is every level from the base up.
+//
+// Kept apart from `height_at` because `cs_detail` may only touch this one: it
+// writes a layer of the generated heights, and a shader that so much as names
+// that texture elsewhere has it bound both ways in the same dispatch, which
+// wgpu refuses. The branch below would never be taken in that pass, and naga
+// counts the global as used all the same.
+fn resident_height_at(level: u32, cell: vec2<i32>) -> f32 {
     return textureLoad(heights, slot(level, cell), mip(level)).r;
+}
+
+fn height_at(level: u32, cell: vec2<i32>) -> f32 {
+    if (level >= terrain.resident_base) {
+        return resident_height_at(level, cell);
+    }
+    return textureLoad(detail_heights, slot(level, cell), i32(level), 0).r;
+}
+
+// The ceiling one cell of one level carries, from whichever pyramid holds it.
+fn ceiling_at(level: u32, cell: vec2<i32>) -> f32 {
+    if (level >= terrain.resident_base) {
+        return textureLoad(maxima, slot(level, cell), mip(level)).r;
+    }
+    return textureLoad(detail_maxima, slot(level, cell), i32(level), 0).r;
 }
 
 // The four corner heights of one texel, in the order [`surface`] expects: the
@@ -425,7 +462,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         );
         let exit = min(t + max(span, 0.0), limit);
 
-        let ceiling = textureLoad(maxima, slot(level, cell), mip(level)).r;
+        let ceiling = ceiling_at(level, cell);
         // The texel bounds its whole closed square, so a ray above that ceiling
         // at both ends of the segment is above it throughout.
         if (min(eye.y + dir.y * t, eye.y + dir.y * exit) > ceiling) {
@@ -977,7 +1014,14 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // one already: `terrain-generate` writes a canopy id into this product
     // wherever the crowns cover enough of a texel, so the gaps between the
     // trees keep the floor's own colour and the trees do not.
-    out.material = textureLoad(materials, slot(hit.level, cell), mip(hit.level)).r;
+    // Ground cover is held only on the resident chain: nothing finer than the
+    // base has a material anyone measured, and a generated level stands on the
+    // cover of the ground under it. Reading the coarser texel directly rather
+    // than magnifying one into a texture of its own saves a whole array and
+    // says the same thing.
+    let cover = max(hit.level, terrain.resident_base);
+    let cover_cell = cell >> vec2<u32>(cover - hit.level);
+    out.material = textureLoad(materials, slot(cover, cover_cell), mip(cover)).r;
     out.position = hit.position;
     // The ray was cast through the centre of the pixel, so that is where the
     // hit sits inside it, exactly.
@@ -1297,6 +1341,316 @@ struct MaximaJob {
 // file that has none.
 @group(3) @binding(13) var<storage, read_write> out_maxima: array<u32>;
 
+// Generating the levels below the base, which no survey holds.
+//
+// The base is the finest ground anyone measured. Everything under it used to be
+// streamed at a metre and is now invented: a level is a pure function of its
+// position, so tiles are seamless with no overlap to handle and a window can be
+// refilled a tile at a time as it moves.
+//
+// This pass writes the *surface*, once per texel. That distinction is the whole
+// reason it is affordable -- see the archaeology above the march, where growing
+// crowns per ray-texel cost three quarters of the frame and baking them per
+// texel cost nothing measurable.
+//
+// What it adds so far is nothing at all: a generated level is the base read
+// smoothly and no more, so the picture is the base's picture and what is being
+// tested is the plumbing under it. The fractal detail goes in on top of this.
+struct DetailJob {
+    // North-west cell of the rectangle, in this level's own texels.
+    origin: vec2<i32>,
+    size: vec2<u32>,
+    // The level being generated. Always below `resident_base`.
+    level: u32,
+    // Octaves of the fractal this level may carry: the ones whose features are
+    // larger than two of its texels. Everything finer would alias into a
+    // shimmer that moves with the camera rather than a detail that stays put.
+    octaves: u32,
+    // Feature size of the first octave, in metres.
+    wavelength: f32,
+    // Metres of relief the whole fractal adds where the ground is steepest.
+    relief: f32,
+};
+
+@group(3) @binding(14) var<uniform> detail: DetailJob;
+// Written as storage rather than through a buffer and a copy, which is what the
+// max pyramid has to do: `r32float` is a storage format and `r16float` is not.
+@group(3) @binding(15) var out_detail: texture_storage_2d_array<r32float, write>;
+
+// The fractal detail the survey does not hold, transcribed from
+// `crates/terrain-generate/src/noise.rs`.
+//
+// That module was written to be transcribed -- `f32` arithmetic, `u32` bit
+// twiddling, fixed loop bounds, a gradient table small enough to be a `const`
+// array rather than a buffer to bind -- and this is the transcription it was
+// waiting for. The values must not drift: a landscape generated offline and one
+// generated here are meant to be the same landscape.
+
+const GRADIENT_COUNT: u32 = 16u;
+const DIAGONAL: f32 = 0.70710678;
+const NEAR_AXIS: f32 = 0.9238795;
+const OFF_AXIS: f32 = 0.3826834;
+
+// Unit vectors at every 22.5 degrees. Sixteen rather than the eight a
+// three-bit selector would give: eight leaves gradient noise with a visible
+// bias along the axes and diagonals, which on a mountain reads as ridges that
+// all run the same four ways.
+const GRADIENTS = array<vec2<f32>, 16>(
+    vec2<f32>(1.0, 0.0),
+    vec2<f32>(NEAR_AXIS, OFF_AXIS),
+    vec2<f32>(DIAGONAL, DIAGONAL),
+    vec2<f32>(OFF_AXIS, NEAR_AXIS),
+    vec2<f32>(0.0, 1.0),
+    vec2<f32>(-OFF_AXIS, NEAR_AXIS),
+    vec2<f32>(-DIAGONAL, DIAGONAL),
+    vec2<f32>(-NEAR_AXIS, OFF_AXIS),
+    vec2<f32>(-1.0, 0.0),
+    vec2<f32>(-NEAR_AXIS, -OFF_AXIS),
+    vec2<f32>(-DIAGONAL, -DIAGONAL),
+    vec2<f32>(-OFF_AXIS, -NEAR_AXIS),
+    vec2<f32>(0.0, -1.0),
+    vec2<f32>(OFF_AXIS, -NEAR_AXIS),
+    vec2<f32>(DIAGONAL, -DIAGONAL),
+    vec2<f32>(NEAR_AXIS, -OFF_AXIS),
+);
+
+// What unit gradient noise has to be multiplied by to reach `-1..=1`.
+const GRADIENT_SCALE: f32 = 1.4142136;
+
+// Wellons' `lowbias32`, whose avalanche is measured rather than assumed: one
+// input bit flips about half the output bits, which is what stops neighbouring
+// lattice points drawing correlated gradients and putting a grain in the
+// terrain.
+fn noise_mix(bits: u32) -> u32 {
+    var b = bits;
+    b ^= b >> 16u;
+    b = b * 0x7feb352du;
+    b ^= b >> 15u;
+    b = b * 0x846ca68bu;
+    b ^= b >> 16u;
+    return b;
+}
+
+// The two coordinates are folded in one at a time, each through its own mixer,
+// rather than combined and mixed once. Combining first is cheaper and wrong in
+// a way that shows: they would meet only through a single xor, so whole
+// diagonals of the lattice collide and the noise grows a herringbone.
+fn noise_hash(x: i32, y: i32, seed: u32) -> u32 {
+    var bits = seed * 0x9e3779b1u;
+    bits = noise_mix(bits ^ (u32(x) * 0x3504f333u));
+    bits = noise_mix(bits ^ (u32(y) * 0xf1bbcdcbu));
+    return bits;
+}
+
+// Perlin's quintic interpolant, which has zero first *and* second derivative at
+// both ends. The cubic is cheaper and leaves a second-derivative jump at every
+// lattice line -- invisible in the height and very visible in the shading,
+// because the normal comes from the heights.
+fn noise_fade(t: f32) -> f32 {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+fn noise_corner(at: vec2<i32>, offset: vec2<f32>, seed: u32) -> f32 {
+    return dot(GRADIENTS[noise_hash(at.x, at.y, seed) % GRADIENT_COUNT], offset);
+}
+
+// Gradient noise in `-1..=1`, zero at every lattice point.
+fn gradient_noise(p: vec2<f32>, seed: u32) -> f32 {
+    let cell = floor(p);
+    let f = p - cell;
+    let at = vec2<i32>(cell);
+    let u = vec2<f32>(noise_fade(f.x), noise_fade(f.y));
+    let bottom = mix(
+        noise_corner(at, f, seed),
+        noise_corner(at + vec2<i32>(1, 0), f - vec2<f32>(1.0, 0.0), seed),
+        u.x,
+    );
+    let top = mix(
+        noise_corner(at + vec2<i32>(0, 1), f - vec2<f32>(0.0, 1.0), seed),
+        noise_corner(at + vec2<i32>(1, 1), f - vec2<f32>(1.0, 1.0), seed),
+        u.x,
+    );
+    return mix(bottom, top, u.y) * GRADIENT_SCALE;
+}
+
+// The most octaves any generated level sums, which is one per level below the
+// base. A bound rather than a choice: WGSL wants a loop it can unroll.
+const DETAIL_OCTAVES: u32 = 8u;
+
+// A constant, because nothing that crosses a pipeline boundary depends on it.
+const DETAIL_SEED: u32 = 0x4465746cu;
+
+// The fractal, in `-1..=1`, stopped before any octave this level cannot hold.
+//
+// Doubling exactly, rather than the 2.017 the offline generator uses to stop
+// octaves reinforcing on the lattice lines they share. Here the octaves are
+// *meant* to line up with something: a level's texels are a power of two, so an
+// octave at twice a texel is the finest thing it can represent, and a lacunarity
+// that drifted would put the band limits between levels instead of on them.
+//
+// The sum is normalised by the whole fractal's amplitude rather than by the
+// octaves that survive the limit. That is the difference between a coarse level
+// being *the same surface with its finest octaves removed* and it being a
+// differently scaled one -- renormalising would make every coarse level louder
+// than the one under it, and the handover would draw as the ground breathing.
+fn fractal(p: vec2<f32>, wavelength: f32, octaves: u32, whole: u32) -> f32 {
+    var frequency = 1.0 / wavelength;
+    var amplitude = 1.0;
+    var sum = 0.0;
+    var total = 0.0;
+    for (var octave = 0u; octave < DETAIL_OCTAVES; octave++) {
+        if (octave >= whole) {
+            break;
+        }
+        total += amplitude;
+        if (octave < octaves) {
+            sum += gradient_noise(p * frequency, DETAIL_SEED ^ (octave * 0x51ed270bu)) * amplitude;
+        }
+        frequency *= 2.0;
+        amplitude *= 0.5;
+    }
+    if (total <= 0.0) {
+        return 0.0;
+    }
+    return sum / total;
+}
+
+// The high byte of a ground-cover id, which is its category. Water is 0x01xx;
+// see `crates/terrain-materials/src/lib.rs`.
+const WATER_COVER: u32 = 1u;
+
+// Slopes between which the relief comes in, as a rise over run.
+//
+// Flat ground gets none. A survey's flat ground is genuinely flat -- a field, a
+// lake, a road -- and roughening it invents texture where the measurement says
+// there is none, which reads as noise rather than as terrain. A hillside is
+// where the box filter that made the base threw detail away, and it is where
+// putting some back is honest.
+const RELIEF_FLAT: f32 = 0.08;
+const RELIEF_STEEP: f32 = 0.60;
+
+// What the four nodes around a position contribute to it, for a fraction of the
+// way from the second to the third.
+//
+// The Catmull-Rom cubic: the curve passes through the two middle nodes, and its
+// slope at each is the central difference of that node's own neighbours, which
+// is what makes the pieces meet with a matching gradient. The four weights
+// always add to one, so a flat field stays flat and a lake stays exactly at its
+// own level.
+fn catmull_rom(t: f32) -> vec4<f32> {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    return vec4<f32>(
+        -0.5 * t3 + t2 - 0.5 * t,
+        1.5 * t3 - 2.5 * t2 + 1.0,
+        -1.5 * t3 + 2.0 * t2 + 0.5 * t,
+        0.5 * t3 - 0.5 * t2,
+    );
+}
+
+// The base surface at a point given in the base level's own texels.
+//
+// Sixteen taps rather than a bilinear four, and the reason is the same one
+// `fade` exists for one level down: a bilinear surface is continuous but its
+// gradient is not, so every cell line draws as a crease. That is invisible in
+// the height and very visible in the shading, because the normal is derived
+// from the heights. Measured in the offline generator, the second difference
+// along a row was 11.1 times larger on the lattice than off it, and Catmull-Rom
+// took that to 1.33.
+//
+// A quintic fade on the bilinear weights is cheaper and also smooth, and it was
+// rejected there for a reason that holds here: it forces the gradient to zero
+// at every node, so a hillside comes out as a quilt of level patches with steps
+// between them. Catmull-Rom passes through the nodes with the slope the data
+// implies and reproduces any linear surface exactly, so a ramp gains no ripples
+// and a lake stays flat.
+fn base_height(at: vec2<f32>) -> f32 {
+    let base = terrain.resident_base;
+    let node = floor(at);
+    let across = catmull_rom(at.x - node.x);
+    let down = catmull_rom(at.y - node.y);
+    let corner = vec2<i32>(node) - vec2<i32>(1);
+
+    var total = 0.0;
+    var deepest = NEVER;
+    for (var row = 0; row < 4; row++) {
+        var line = 0.0;
+        for (var column = 0; column < 4; column++) {
+            let sample = resident_height_at(base, corner + vec2<i32>(column, row));
+            line += across[column] * sample;
+            deepest = min(deepest, sample);
+        }
+        total += down[row] * line;
+    }
+    // A hole may not be interpolated. Three real metres blended with one
+    // sentinel comes out around -8000, which is far below any ground and
+    // nowhere near the sentinel, so the march's own test would read it as a
+    // cliff dropping eight kilometres rather than as a hole. Spreading the hole
+    // by the width of the kernel instead draws slightly more of the survey's
+    // edge as nothing, which is the safe direction.
+    if (deepest < NODATA_BELOW) {
+        return deepest;
+    }
+    return total;
+}
+
+// One thread per texel of a generated tile.
+@compute @workgroup_size(8, 8)
+fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= detail.size.x || id.y >= detail.size.y) {
+        return;
+    }
+    let level = detail.level;
+    let cell = detail.origin + vec2<i32>(id.xy);
+    // This texel's position in the base level's own texels. The grids line up
+    // exactly -- level `l`'s sample `i` sits at level-0 texel `i * 2^l` -- so a
+    // generated sample at an even index falls on a base node, and Catmull-Rom
+    // passes through it. That is what stops the handover between a generated
+    // level and the base from showing.
+    let base = terrain.resident_base;
+    let at = vec2<f32>(cell) / f32(1u << (base - level));
+    var height = base_height(at);
+
+    // Nothing is added to a hole. The sentinel is what says the survey measured
+    // nothing here, and a hole with texture on it is ground.
+    if (height >= NODATA_BELOW) {
+        // How steep the base is under this point, as a rise over run, from the
+        // four samples around the node. The relief comes in with it: a box
+        // filter throws away most on a hillside and nothing at all on a flat,
+        // so that is where putting some back is honest.
+        let node = vec2<i32>(floor(at));
+        let metres = terrain.metres_per_texel * f32(1u << base);
+        let fall = vec2<f32>(
+            resident_height_at(base, node + vec2<i32>(1, 0))
+                - resident_height_at(base, node - vec2<i32>(1, 0)),
+            resident_height_at(base, node + vec2<i32>(0, 1))
+                - resident_height_at(base, node - vec2<i32>(0, 1)),
+        );
+        let slope = length(fall / (2.0 * metres));
+        var relief = detail.relief * smoothstep(RELIEF_FLAT, RELIEF_STEEP, slope);
+
+        // A lake with waves in it is worse than a lake with none, and the
+        // survey is right about water being flat.
+        let cover = textureLoad(materials, slot(base, node), mip(base)).r;
+        if ((cover >> 8u) == WATER_COVER) {
+            relief = 0.0;
+        }
+
+        // In metres from the raster origin, so the detail is anchored to the
+        // world rather than to the window: a tile regenerated after the camera
+        // has been away comes back exactly as it was.
+        let world = vec2<f32>(cell) * f32(1u << level) * terrain.metres_per_texel;
+        height += relief * fractal(world, detail.wavelength, detail.octaves, base);
+    }
+
+    textureStore(
+        out_detail,
+        cell & terrain.levels[level].mask,
+        i32(level),
+        vec4<f32>(height, 0.0, 0.0, 0.0),
+    );
+}
+
 // The smallest half float that is not below `height`, as bits.
 //
 // A transcription of `ceiling_half` in `src/terrain/maxima.rs`, and it has to
@@ -1345,12 +1699,11 @@ fn derived_ceiling(cell: vec2<i32>) -> f32 {
     // Tested per child rather than for the group, because the square's edge can
     // fall between them: a ray may descend into one child of a cell and not its
     // neighbour, and the one it can reach is the one that has to be bounded.
-    let below = mip(level - 1u);
     for (var dy = 0; dy < 2; dy++) {
         for (var dx = 0; dx < 2; dx++) {
             let child = cell * 2 + vec2<i32>(dx, dy);
             if (all(child >= job.below_low) && all(child < job.below_high)) {
-                top = max(top, textureLoad(maxima, slot(level - 1u, child), below).r);
+                top = max(top, ceiling_at(level - 1u, child));
             }
         }
     }

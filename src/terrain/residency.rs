@@ -1,8 +1,16 @@
-//! How much of the raster is resident, and at what resolution.
+//! How much of the raster is resident, at what resolution, and what is made up.
 //!
-//! The whole raster is resident, from a base level upwards, as a mip chain that
-//! never moves. Nothing streams. A camera crossing the world costs no tile
-//! reads at all, because there is no window to slide and no slot to swap.
+//! Two halves. The whole raster is resident from a base level upwards, as a mip
+//! chain that never moves and never streams -- a camera crossing the world
+//! costs no tile reads at all. Below the base there is no measured ground to
+//! hold, so those levels are *generated* into a square of whole tiles around
+//! the camera, which does move, a tile at a time, as it does.
+//!
+//! The window below is the clipmap the chain replaced, kept for exactly the
+//! levels that still have to move, and filled by a compute dispatch rather than
+//! by a disk read. That is the difference that makes it affordable: a tile is
+//! generated once per texel, where a level a metre across cost 1 MB of I/O and
+//! a per-row decode.
 //!
 //! ## What this replaced, and why
 //!
@@ -21,12 +29,14 @@
 //!
 //! ## Addressing
 //!
-//! Level `l` is mip `l - base` of each texture, so a texel index *is* its
-//! texture coordinate and the wrap the clipmap needed is gone: a level's mask is
-//! all ones and `slot` is the identity. Level `l`'s index is still exactly half
-//! level `l - 1`'s, which is what lets a ray hand over between levels with
-//! nothing to correct, and it is now true by construction rather than by
-//! arrangement.
+//! A resident level `l` is mip `l - base` of each texture, so a texel index *is*
+//! its texture coordinate: its mask is all ones and `slot` is the identity. A
+//! generated level is a layer of a window `detail_tiles` tiles square, a power
+//! of two, so a texel at index `x` lives at `x & (N * tile - 1)` -- a pure
+//! function of position, with no window origin to carry.
+//!
+//! Level `l`'s index is exactly half level `l - 1`'s either way, which is what
+//! lets a ray hand over between levels with nothing to correct.
 //!
 //! ## Two limits decide the base level
 //!
@@ -37,7 +47,7 @@
 //! coarsens the base until both hold, which is the same job
 //! `fit_tiles` did for the square it replaced.
 
-use glam::UVec2;
+use glam::{DVec2, IVec2, UVec2};
 
 /// Bytes one texel of the three resident products costs between them.
 ///
@@ -73,6 +83,36 @@ pub struct Residency {
     /// A field rather than a constant so a test can starve it on purpose and
     /// see what the march does when it runs out.
     pub march_texels: u32,
+
+    /// Tiles across one *generated* level's window. A power of two.
+    ///
+    /// Levels below the base are not held: there is no measured ground under
+    /// them to hold. They are synthesised into a square of whole tiles around
+    /// the camera, which moves as it does, and this is how far that square
+    /// reaches -- eight tiles of 512 puts level zero at 1536 texels in every
+    /// direction, which is what the streamed clipmap reached with the same
+    /// arrangement.
+    pub detail_tiles: u32,
+    /// Side of one generated tile, in texels.
+    ///
+    /// The unit a window moves and regenerates in. Smaller spreads the cost of
+    /// crossing a boundary over more updates and wastes more of each dispatch
+    /// on its edges; settable so a test can work at a scale where a raster is
+    /// more than a single tile across.
+    pub detail_tile_texels: u32,
+    /// Metres of relief a generated level adds where the ground is steepest.
+    ///
+    /// The whole fractal's amplitude, shared out over its octaves, so a level
+    /// with one octave carries about two thirds of it and the finest carries
+    /// nearly all. Two metres against an eight metre base is about what a box
+    /// filter takes off a mountainside; a test sets it to zero to check that
+    /// what is left underneath lines up with the base exactly.
+    pub detail_relief: f32,
+    /// How many tiles may be generated in one update.
+    ///
+    /// The bound on what crossing a tile boundary costs. A level that falls
+    /// behind is not wrong, only coarser at its outer edge until it catches up.
+    pub detail_per_update: u32,
 }
 
 /// The angle one pixel subtends, for a viewport of this height.
@@ -94,6 +134,10 @@ impl Default for Residency {
             // 1080p at sixty degrees, replaced wherever a real viewport is known.
             pixel_angle: 2.0 * (30f64.to_radians()).tan() / 1080.0,
             march_texels: 512,
+            detail_tiles: 8,
+            detail_tile_texels: 512,
+            detail_relief: 2.0,
+            detail_per_update: 4,
         }
     }
 }
@@ -160,6 +204,16 @@ impl Residency {
         base
     }
 
+    /// How far a generated level reaches from the camera, in its own texels.
+    ///
+    /// The window is centred on the tile the camera stands in, so half of it
+    /// lies behind whichever way the camera faces. This is the half that is
+    /// guaranteed in every direction, which is one tile short of half the
+    /// square: the camera may stand anywhere within its own tile.
+    pub const fn detail_reach(&self) -> u32 {
+        (self.detail_tiles / 2 - 1) * self.detail_tile_texels
+    }
+
     /// How many texels a ray may cross in total before the march gives up.
     pub const fn march_steps(&self, levels: u32) -> u32 {
         levels * self.march_texels
@@ -190,6 +244,212 @@ pub fn detail_base(
     let resolvable = distance * residency.pixel_angle / metres_per_texel;
     let t = resolvable.max(1.0).log2().clamp(0.0, f64::from(coarsest));
     (t.floor() as u32).min(coarsest)
+}
+
+/// A tile of one generated level, by its index on the raster's tile grid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Wanted {
+    pub level: u32,
+    pub tile: IVec2,
+}
+
+/// One generated level's square of tiles, and the step it is part way through.
+#[derive(Clone, Debug)]
+pub struct LevelResidency {
+    /// North-west tile of the square that is fully loaded.
+    origin: IVec2,
+    /// Whether anything at all has been loaded yet.
+    filled: bool,
+    /// The step in flight: which way the square is moving, and which of the
+    /// new edge's tiles are still to come.
+    step: Option<Step>,
+}
+
+#[derive(Clone, Debug)]
+struct Step {
+    /// One of the four unit directions the square is moving in.
+    towards: IVec2,
+    /// Tiles of the new edge not yet uploaded, nearest the middle first.
+    pending: Vec<IVec2>,
+}
+
+impl LevelResidency {
+    fn new() -> Self {
+        Self {
+            origin: IVec2::ZERO,
+            filled: false,
+            step: None,
+        }
+    }
+
+    /// The tiles a ray may read, as a half-open range of tile indices.
+    ///
+    /// One narrower than the square on the trailing side while a step is in
+    /// flight, because the new edge is being written over the slots the
+    /// trailing edge is using -- and empty altogether while a whole square is
+    /// being filled, which has no trailing side to give up because every slot
+    /// it will use is being written at once.
+    ///
+    /// A ray outside this falls to the level beyond, which for the coarsest
+    /// generated level is the resident chain: there is always something to
+    /// fall to, so a window part way through a step costs detail rather than
+    /// correctness.
+    pub fn valid(&self, tiles_across: u32) -> (IVec2, IVec2) {
+        let across = tiles_across as i32;
+        let (mut low, mut high) = (self.origin, self.origin + IVec2::splat(across));
+        if let Some(step) = &self.step {
+            if step.towards == IVec2::ZERO {
+                // A whole square being filled at once, not an edge sliding by
+                // one: nothing here is loaded, so nothing here may be read.
+                // Every slot the square will use is being written, and until
+                // the tile arrives the slot holds either an untouched texture
+                // or a tile of somewhere else entirely -- the second of which
+                // reads as real ground in the wrong place.
+                return (IVec2::ZERO, IVec2::ZERO);
+            }
+            // Moving east writes the column at `origin.x + across`, whose slot
+            // is the one `origin.x` is using; moving west writes `origin.x - 1`,
+            // which is the slot of the last column.
+            low += step.towards.max(IVec2::ZERO);
+            high += step.towards.min(IVec2::ZERO);
+        }
+        (low, high)
+    }
+}
+
+/// Which tiles every level holds, and the queue of what to load next.
+#[derive(Clone, Debug)]
+pub struct TileResidency {
+    residency: Residency,
+    levels: Vec<LevelResidency>,
+}
+
+impl TileResidency {
+    pub fn new(residency: Residency, levels: u32) -> Self {
+        Self {
+            residency,
+            levels: vec![LevelResidency::new(); levels as usize],
+        }
+    }
+
+    pub fn level(&self, level: u32) -> &LevelResidency {
+        &self.levels[level as usize]
+    }
+
+    /// Whether any level is part way through a step and short of tiles it wants.
+    pub fn pending(&self) -> bool {
+        self.levels.iter().any(|level| level.step.is_some())
+    }
+
+    /// The tile a level's square should start at, for a camera here.
+    ///
+    /// `camera` is in level-0 texels from the raster's origin. The square is
+    /// centred on the tile the camera stands in, so it starts half a square
+    /// back from it.
+    fn wanted_origin(&self, level: u32, camera: DVec2) -> IVec2 {
+        let texels = camera / f64::from(1u32 << level);
+        let span = f64::from(self.residency.detail_tile_texels);
+        let tile = IVec2::new(
+            (texels.x / span).floor() as i32,
+            (texels.y / span).floor() as i32,
+        );
+        tile - IVec2::splat(self.residency.detail_tiles as i32 / 2)
+    }
+
+    /// Advances every level towards where the camera now is, and returns the
+    /// tiles to generate this update.
+    ///
+    /// `base` is the finest level worth drawing; below it nothing is generated
+    /// and whatever those squares hold is abandoned until the camera comes back
+    /// down to them.
+    pub fn advance(&mut self, camera: DVec2, base: u32) -> Vec<Wanted> {
+        let across = self.residency.detail_tiles as i32;
+        let mut budget = self.residency.detail_per_update;
+        let mut work = Vec::new();
+
+        // Coarsest first. A ray leaving a fine level hands over to the one
+        // outside it, so the outer levels are the ones that must not be
+        // missing, and they are also the ones that move least often.
+        for level in (base..self.levels.len() as u32).rev() {
+            let wanted = self.wanted_origin(level, camera);
+            let state = &mut self.levels[level as usize];
+
+            // Nothing shared with where it should be -- a first fill, or a jump
+            // far enough that stepping there a tile at a time is pointless.
+            let apart = (wanted - state.origin).abs().max_element();
+            if !state.filled || apart >= across {
+                state.origin = wanted;
+                state.filled = true;
+                state.step = Some(Step {
+                    towards: IVec2::ZERO,
+                    pending: square(wanted, across),
+                });
+            } else if state.step.is_none() && wanted != state.origin {
+                // One tile at a time, along whichever axis is further out.
+                let difference = wanted - state.origin;
+                let towards = if difference.x.abs() >= difference.y.abs() {
+                    IVec2::new(difference.x.signum(), 0)
+                } else {
+                    IVec2::new(0, difference.y.signum())
+                };
+                state.step = Some(Step {
+                    towards,
+                    pending: edge(state.origin, across, towards),
+                });
+            }
+
+            // Hand out as much of the step as the budget allows. A step that
+            // finishes moves the square; one that does not is picked up next
+            // update, with the square still advertising itself narrower.
+            if let Some(step) = &mut state.step {
+                while budget > 0 {
+                    let Some(tile) = step.pending.pop() else {
+                        break;
+                    };
+                    work.push(Wanted { level, tile });
+                    budget -= 1;
+                }
+                if step.pending.is_empty() {
+                    state.origin += step.towards;
+                    state.step = None;
+                }
+            }
+        }
+        work
+    }
+}
+
+/// Every tile of a square, nearest the middle last so popping takes those
+/// first.
+fn square(origin: IVec2, across: i32) -> Vec<IVec2> {
+    let middle = origin + IVec2::splat(across / 2);
+    let mut tiles: Vec<IVec2> = (0..across)
+        .flat_map(|y| (0..across).map(move |x| origin + IVec2::new(x, y)))
+        .collect();
+    tiles.sort_by_key(|tile| -(*tile - middle).abs().max_element());
+    tiles
+}
+
+/// The edge a square about to move in `towards` has to load, nearest the middle
+/// last.
+fn edge(origin: IVec2, across: i32, towards: IVec2) -> Vec<IVec2> {
+    // Moving east, the new column is one past the far side; moving west, it is
+    // one before the near side.
+    let along = |step: i32| {
+        if step > 0 { across } else { -1 }
+    };
+    let mut tiles: Vec<IVec2> = (0..across)
+        .map(|at| {
+            if towards.x != 0 {
+                origin + IVec2::new(along(towards.x), at)
+            } else {
+                origin + IVec2::new(at, along(towards.y))
+            }
+        })
+        .collect();
+    let middle = origin + IVec2::splat(across / 2);
+    tiles.sort_by_key(|tile| -(*tile - middle).abs().max_element());
+    tiles
 }
 
 #[cfg(test)]

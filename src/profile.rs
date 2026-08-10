@@ -107,6 +107,12 @@ pub struct Terrain {
     pub read: Duration,
     /// Exaggerating heights and narrowing ground-cover ids to sixteen bits.
     pub convert: Duration,
+    /// Recording and submitting the dispatch that fills a generated tile.
+    ///
+    /// The CPU half of it only. What the GPU spends generating is in no row:
+    /// the pass is submitted next to the streaming it replaced rather than into
+    /// the frame's encoder, so no timestamp scope reaches it.
+    pub generate: Duration,
     /// Handing the bytes to `queue.write_texture`.
     pub write: Duration,
 }
@@ -228,7 +234,8 @@ impl Frame {
             rate,
         };
         let terrain = &self.cpu.terrain;
-        let terrain_total = terrain.advance + terrain.read + terrain.convert + terrain.write;
+        let terrain_total =
+            terrain.advance + terrain.read + terrain.convert + terrain.generate + terrain.write;
 
         let mut rows = vec![row(0, "frame", self.interval, true)];
         // The GPU scopes bring their own labels and nesting -- the outer one is
@@ -247,6 +254,7 @@ impl Frame {
         rows.push(row(2, "advance", terrain.advance, false));
         rows.push(row(2, "read", terrain.read, false));
         rows.push(row(2, "convert", terrain.convert, false));
+        rows.push(row(2, "generate", terrain.generate, false));
         rows.push(row(2, "write", terrain.write, false));
         rows.push(row(1, "encode", self.cpu.encode, false));
         rows.push(row(1, "submit", self.cpu.submit, false));
