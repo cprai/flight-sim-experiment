@@ -68,6 +68,8 @@ const GROUND_ALBEDO: f32 = 0.3;
 const TRANSMITTANCE_WIDTH: u32 = 256u;
 const TRANSMITTANCE_HEIGHT: u32 = 64u;
 const MULTISCATTER_SIZE: u32 = 32u;
+const SKYVIEW_WIDTH: u32 = 192u;
+const SKYVIEW_HEIGHT: u32 = 108u;
 
 // Steps along a ray when building each table.
 //
@@ -76,6 +78,9 @@ const MULTISCATTER_SIZE: u32 = 32u;
 // runs sixty-four rays per texel and is the expensive one.
 const TRANSMITTANCE_STEPS: u32 = 40u;
 const MULTISCATTER_STEPS: u32 = 20u;
+// Steps along a sky-view ray. Thirty because this one is rebuilt every frame:
+// 192 x 108 x 30 is 622k samples, which is a fraction of a millisecond.
+const SKYVIEW_STEPS: u32 = 30u;
 // Directions sampled per multiple-scattering texel, as an eight-by-eight grid
 // over the sphere. Must match the workgroup size of `cs_multiscatter`.
 const MULTISCATTER_DIRECTIONS: u32 = 64u;
@@ -85,11 +90,22 @@ const PI: f32 = 3.14159265358979;
 // The phase function of something that scatters every way alike.
 const UNIFORM_PHASE: f32 = 0.0795774715459477; // 1 / (4 pi)
 
-// Mirrors `SkyUniform` in `src/sky.rs`. Declared for the module, read by the
-// per-frame entry points rather than by the two builds below, which are
-// functions of the medium alone.
+// Mirrors `SkyUniform` in `src/sky.rs`. Read by the per-frame entry points
+// rather than by the two build-once ones, which are functions of the medium
+// alone.
 struct Sky {
+    // The unit vector pointing at the sun. `w` is unused.
     sun: vec4<f32>,
+    // The eye in planet space -- world space with the planet's centre at the
+    // origin -- and its radius in `w`.
+    eye: vec4<f32>,
+    // The local up at the eye. `w` is unused.
+    up: vec4<f32>,
+    // The sun projected into the eye's tangent plane and normalised: the
+    // sky-view table's azimuth zero. Built on the CPU so the degenerate case --
+    // the sun exactly overhead, where the projection vanishes -- is decided
+    // once, there, instead of by a branch in every thread.
+    sun_tangent: vec4<f32>,
 };
 
 @group(1) @binding(0) var<uniform> sky: Sky;
@@ -102,9 +118,14 @@ struct Sky {
 @group(2) @binding(0) var lut_sampler: sampler;
 @group(2) @binding(1) var transmittance_lut: texture_2d<f32>;
 @group(2) @binding(2) var multiscatter_lut: texture_2d<f32>;
+// Wrapping in `u`, clamped in `v`: the azimuth comes back round and the zenith
+// does not. See `skyview_u`.
+@group(2) @binding(3) var skyview_sampler: sampler;
+@group(2) @binding(4) var skyview_lut: texture_2d<f32>;
 
 @group(3) @binding(0) var out_transmittance: texture_storage_2d<rgba16float, write>;
 @group(3) @binding(1) var out_multiscatter: texture_storage_2d<rgba16float, write>;
+@group(3) @binding(2) var out_skyview: texture_storage_2d<rgba16float, write>;
 
 // The half-texel correction, both ways.
 //
@@ -292,6 +313,163 @@ fn cs_transmittance(@builtin(global_invocation_id) id: vec3<u32>) {
     let params = transmittance_params(uv);
     let transmittance = exp(-optical_depth(params.x, params.y));
     textureStore(out_transmittance, vec2<i32>(id.xy), vec4<f32>(transmittance, 1.0));
+}
+
+// The zenith angle of the horizon, seen from radius `r`.
+//
+// Greater than a right angle from anywhere above the ground: from twelve
+// kilometres up the horizon is three and a half degrees *below* level, which is
+// exactly the feature the sky-view table's vertical mapping is built to
+// resolve. On the ground it is a right angle exactly.
+fn horizon_zenith(r: f32) -> f32 {
+    return PI - asin(clamp(GROUND_RADIUS / max(r, GROUND_RADIUS), -1.0, 1.0));
+}
+
+// Where a zenith angle sits down the sky-view table.
+//
+// Hillaire's mapping: zenith to 0, the horizon to exactly 0.5, straight down to
+// 1, with a square root on each side so texels crowd towards the horizon. That
+// is where the whole interesting part of a sky is -- the pale band, the sunset
+// -- and a linear axis would spend half its rows on the featureless dome
+// overhead.
+fn skyview_v(r: f32, zenith: f32) -> f32 {
+    let horizon = horizon_zenith(r);
+    if (zenith < horizon) {
+        return 0.5 * (1.0 - sqrt(max(1.0 - zenith / horizon, 0.0)));
+    }
+    return 0.5 + 0.5 * sqrt(max((zenith - horizon) / (PI - horizon), 0.0));
+}
+
+// The same backwards, which is what building the table needs.
+fn skyview_zenith(r: f32, v: f32) -> f32 {
+    let horizon = horizon_zenith(r);
+    if (v < 0.5) {
+        let away = 1.0 - 2.0 * v;
+        return horizon * (1.0 - away * away);
+    }
+    let past = 2.0 * v - 1.0;
+    return horizon + (PI - horizon) * past * past;
+}
+
+// Where a direction sits across the sky-view table: its azimuth from the sun.
+//
+// A deliberate departure from the paper, which uses `0.5 * cos(azimuth) + 0.5`.
+// That mapping's derivative vanishes at the sun itself, so it puts its fewest
+// texels exactly where the sky changes fastest -- around the aureole. A signed
+// angle is uniform instead, 1.875 degrees a texel over the full circle, and it
+// makes no assumption that the sky is symmetric about the sun-zenith plane,
+// which stops being true the moment terrain shadowing or a cloud arrives.
+//
+// It costs a wrapping sampler in `u`, or the seam behind the sun is a line.
+//
+// No half-texel correction on this axis, and that is not an oversight. The
+// correction exists to reach the ends of a range that stops; this range does not
+// stop, it comes back round. With `Repeat` addressing the texel centres are at
+// `(i + 0.5) / n` and the last interpolates into the first, so an azimuth maps
+// straight to a coordinate and the seam behind the sun closes exactly.
+fn skyview_u(direction: vec3<f32>) -> f32 {
+    let up = sky.up.xyz;
+    let forward = sky.sun_tangent.xyz;
+    let side = cross(up, forward);
+    let flat = normalize(direction - up * dot(up, direction));
+    return 0.5 + atan2(dot(side, flat), dot(forward, flat)) * (0.5 / PI);
+}
+
+// The sky in a direction, from the table.
+//
+// Below the horizon as well as above it, and that is worth explaining because
+// the obvious move is to clamp there. A ray pointing down past the edge of the
+// survey has no ground to meet -- the terrain is a plane that stops -- so the
+// question is what to draw instead, and the table's own answer turns out to be
+// the right one.
+//
+// It is the right one because `cs_skyview` marches the *air* and never adds
+// what the ground reflects. Below the horizon its rays stop at the ground
+// sphere and carry only the haze in between, which is exactly what a downward
+// ray over a world with no more terrain should show. Clamping to the horizon
+// instead was tried and is plainly worse: it smears one colour flat across the
+// whole lower half of the frame, where the unclamped table darkens away
+// smoothly like distance haze over water.
+fn sample_skyview(direction: vec3<f32>) -> vec3<f32> {
+    let zenith = acos(clamp(dot(sky.up.xyz, direction), -1.0, 1.0));
+    let uv = vec2<f32>(
+        skyview_u(direction),
+        to_texture(skyview_v(sky.eye.w, zenith), f32(SKYVIEW_HEIGHT)),
+    );
+    return textureSampleLevel(skyview_lut, skyview_sampler, uv, 0.0).rgb;
+}
+
+// The sky the eye sees in every direction, for this frame's eye and sun.
+//
+// The first of the two tables that cannot be precomputed. It is a raymarch from
+// a particular altitude with the sun in a particular place, and those two facts
+// are what let it be two-dimensional rather than four: baking them in as axes
+// would make a faithful table gigabytes, and a table small enough to ship would
+// throw away the horizon crowding above and band every sunset.
+@compute @workgroup_size(8, 8, 1)
+fn cs_skyview(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= SKYVIEW_WIDTH || id.y >= SKYVIEW_HEIGHT) {
+        return;
+    }
+    // The azimuth axis wraps, so its coordinate is the parameter; the zenith
+    // axis stops at both ends, so its is corrected. See `skyview_u`.
+    let u = (f32(id.x) + 0.5) / f32(SKYVIEW_WIDTH);
+    let v = to_unit((f32(id.y) + 0.5) / f32(SKYVIEW_HEIGHT), f32(SKYVIEW_HEIGHT));
+
+    let r = sky.eye.w;
+    let zenith = skyview_zenith(r, v);
+    let azimuth = (u - 0.5) * 2.0 * PI;
+    let up = sky.up.xyz;
+    let forward = sky.sun_tangent.xyz;
+    let side = cross(up, forward);
+    let flat = forward * cos(azimuth) + side * sin(azimuth);
+    let direction = up * cos(zenith) + flat * sin(zenith);
+
+    let mu = cos(zenith);
+    let end = ray_end(r, mu);
+    let step = end / f32(SKYVIEW_STEPS);
+
+    // Constant along a straight ray, so the two phase functions are evaluated
+    // once rather than at every step.
+    let cos_theta = dot(direction, sky.sun.xyz);
+    let phase = vec2<f32>(rayleigh_phase(cos_theta), mie_phase(cos_theta));
+
+    var scattered = vec3<f32>(0.0);
+    var throughput = vec3<f32>(1.0);
+    for (var i = 0u; i < SKYVIEW_STEPS; i = i + 1u) {
+        let t = (f32(i) + 0.5) * step;
+        // In the eye's own frame the start is straight up at radius r, so a
+        // point along the ray is this. Only the radius and the sun angle are
+        // ever asked for, so no world position is needed.
+        let position = up * r + direction * t;
+        let radius = length(position);
+        let local_up = position / radius;
+        let air = medium(radius - GROUND_RADIUS);
+
+        let sun_mu = dot(local_up, sky.sun.xyz);
+        var sunlight = sample_transmittance(radius, sun_mu);
+        if (ground_distance(radius, sun_mu) >= 0.0) {
+            sunlight = vec3<f32>(0.0);
+        }
+        let multiple = sample_multiscatter(radius, sun_mu);
+
+        // Single scattering carries the phase functions -- which way the light
+        // was turned decides how much of it comes this way -- and multiple
+        // scattering does not, having forgotten.
+        let single = (air.rayleigh * phase.x + vec3<f32>(air.mie) * phase.y) * sunlight;
+        let bounced = (air.rayleigh + vec3<f32>(air.mie)) * multiple;
+
+        let extinction = max(air.extinction, vec3<f32>(1e-12));
+        let survived = exp(-extinction * step);
+        // Hillaire's energy-conserving segment integral rather than a midpoint
+        // rectangle: exact for a constant medium over the step, which is what
+        // lets thirty steps stand in for a smooth integral.
+        scattered = scattered
+            + throughput * (single + bounced) * (vec3<f32>(1.0) - survived) / extinction;
+        throughput = throughput * survived;
+    }
+
+    textureStore(out_skyview, vec2<i32>(id.xy), vec4<f32>(scattered, 1.0));
 }
 
 // One thread per direction, sixty-four directions per texel.

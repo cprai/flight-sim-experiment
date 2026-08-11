@@ -7,11 +7,17 @@ use crate::deferred::{GBuffer, Shading};
 use crate::terrain::gpu::Terrain;
 use crate::terrain::residency::Residency;
 
-/// Sky the terrain is drawn against.
+/// What an interrupted frame shows.
 ///
-/// Kept in step with `SKY` in `src/shading.wgsl`, which is what actually
-/// paints it: the shading pass writes every pixel, so the clear only shows
-/// if a frame is somehow interrupted between the passes.
+/// It was the sky once, kept in step by hand with a constant of the same value
+/// in `src/shading.wgsl`. There is no such constant now: the sky is a gradient
+/// read out of the sky-view table, different in every direction and different
+/// again when the sun moves, and no single colour stands for it.
+///
+/// So this is only the clear, and the clear never survives -- the shading pass
+/// writes every pixel. It is kept because a frame interrupted between the
+/// passes showing a plausible daylit blue beats one showing whatever was in the
+/// buffer.
 pub const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     r: 0.30,
     g: 0.55,
@@ -363,7 +369,7 @@ impl Scene {
         // the sun yet, so this rewrites the same sixteen bytes each time --
         // which is cheaper than the branch that would avoid it, and is what
         // will already be right the day something does move it.
-        self.sky.set_frame(queue, self.sun);
+        self.sky.set_frame(queue, self.sun, self.camera.position);
         // What this frame draws becomes the next one's history, so the basis it
         // is drawn with is the basis that history will have to be read back
         // through.
@@ -493,6 +499,22 @@ impl Scene {
 
         // Counted up from nothing every frame by `cs_compact`.
         gpu.clear_buffer(&self.carried.tally, 0, None);
+
+        {
+            // First, because it depends on nothing this frame produces -- only
+            // on the camera and the sun, both already uploaded -- and because
+            // every pass after it may read what it writes.
+            //
+            // A scope of its own with the build named inside it, so the
+            // overlay and the profile table both show what the atmosphere
+            // costs as one row with its parts under it. Note what that row is
+            // and is not: it is the cost of *building* the tables. The cost of
+            // *reading* them is the growth in `shading`, which cannot be
+            // separated out without a toggle to turn the sky off.
+            let mut atmosphere = gpu.scope(crate::profile::ATMOSPHERE);
+            let mut pass = atmosphere.scoped_compute_pass("sky-view");
+            self.sky.draw(&mut pass);
+        }
 
         {
             // Reads the G-buffer -- still holding last frame, because nothing
@@ -2390,6 +2412,96 @@ mod tests {
             toward < 0.98,
             "sunlit ground came out at {toward:.4}, which has clipped: the \
              exposure is too high for the light the model produces"
+        );
+    }
+
+    /// The sky is a gradient, and it turns over as the sun sets.
+    ///
+    /// The sky used to be one constant, so nothing in this file had anything to
+    /// say about it beyond where it was. Two things worth pinning now that it
+    /// is computed: it is darker overhead than at the horizon, which is the
+    /// shape of every daytime sky and would be flat if the table were being
+    /// sampled at one row; and that shape survives the sun going down while the
+    /// colour does not, which is what says the table is rebuilt per frame
+    /// rather than baked once at load.
+    #[test]
+    fn the_sky_is_darker_overhead_than_at_the_horizon_and_reddens_at_dusk() {
+        // Level ground, and the camera aimed level and towards the sun's own
+        // bearing. Level matters: the sunset band is a couple of degrees deep
+        // and an eye tilted up by ten misses it entirely, which is what the
+        // first draft of this test did.
+        let aim = |camera: &mut Camera| {
+            camera.position = Vec3::new(0.0, 2000.0, 0.0);
+            camera.orientation = Camera::from_yaw_pitch_roll(
+                crate::sky::Sun::DEFAULT_AZIMUTH.to_radians(),
+                0.0,
+                0.0,
+            );
+        };
+        let band = |frame: &Frame, row: u32| {
+            let mut sum = Vec3::ZERO;
+            let mut count = 0.0;
+            for x in 0..SIZE {
+                if !frame.sky(x, row) {
+                    continue;
+                }
+                let pixel = frame.pixel(x, row);
+                sum += Vec3::new(
+                    f32::from(pixel[0]),
+                    f32::from(pixel[1]),
+                    f32::from(pixel[2]),
+                );
+                count += 1.0;
+            }
+            assert!(count > 100.0, "row {row} holds only {count} pixels of sky");
+            sum / count
+        };
+        let sky_at = |elevation: f32| {
+            let frame = render_sunlit(
+                test_residency(),
+                vec![0.0; (RASTER * RASTER) as usize],
+                flat_ground(),
+                aim,
+                &[],
+                crate::sky::Sun::from_angles(elevation, crate::sky::Sun::DEFAULT_AZIMUTH),
+            );
+            // Row four is about 29 degrees up; four rows above the middle is
+            // just under a degree above level, which is where a sunset is.
+            (band(&frame, 4), band(&frame, SIZE / 2 - 4))
+        };
+
+        let (high_zenith, high_horizon) = sky_at(45.0);
+        println!("noon: overhead {high_zenith}, horizon {high_horizon}");
+        assert!(
+            high_zenith.length() < high_horizon.length(),
+            "the sky overhead is {high_zenith} against {high_horizon} at the \
+             horizon, and a sky is supposed to be paler as it comes down"
+        );
+        assert!(
+            high_zenith.z / high_zenith.x > high_horizon.z / high_horizon.x,
+            "the sky overhead is {high_zenith} against {high_horizon} lower \
+             down, which is not bluer at the top"
+        );
+
+        // A low sun turns the horizon it is behind orange, which the zenith
+        // never does: it is the long path through the air that reddens, and
+        // straight up is the shortest path there is.
+        let (dusk_zenith, dusk_horizon) = sky_at(2.0);
+        println!("dusk: overhead {dusk_zenith}, horizon {dusk_horizon}");
+        let warmth = |colour: Vec3| colour.x / colour.z.max(1.0);
+        assert!(
+            warmth(dusk_horizon) > 2.0 * warmth(high_horizon),
+            "the horizon goes from {:.2} red-to-blue at noon to {:.2} at dusk, \
+             which is not a sunset",
+            warmth(high_horizon),
+            warmth(dusk_horizon)
+        );
+        assert!(
+            warmth(dusk_horizon) > 1.5 * warmth(dusk_zenith),
+            "at dusk the horizon is {:.2} red-to-blue and the zenith {:.2}, so \
+             the whole sky reddened together rather than the low sky alone",
+            warmth(dusk_horizon),
+            warmth(dusk_zenith)
         );
     }
 

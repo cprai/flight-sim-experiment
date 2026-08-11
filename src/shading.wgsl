@@ -12,10 +12,6 @@
 // last assigned category block.
 const PALETTE_SIZE: u32 = 2304u;
 
-// Must match `CLEAR_COLOR` in `src/scene.rs`. The sky is drawn here rather
-// than left to the clear because this pass writes every pixel.
-const SKY: vec4<f32> = vec4<f32>(0.30, 0.55, 0.85, 1.0);
-
 // Missing data. Ids at or past the table's end can only come from a corrupt
 // tile -- in-range unassigned ids are magenta in the table itself.
 const MAGENTA: vec4<f32> = vec4<f32>(1.0, 0.0, 1.0, 1.0);
@@ -31,6 +27,7 @@ const TOP_RADIUS: f32 = 6460000.0;
 const TRANSMITTANCE_WIDTH: u32 = 256u;
 const TRANSMITTANCE_HEIGHT: u32 = 64u;
 const MULTISCATTER_SIZE: u32 = 32u;
+const SKYVIEW_HEIGHT: u32 = 108u;
 
 const PI: f32 = 3.14159265358979;
 
@@ -70,6 +67,9 @@ struct Palette {
 // padding.
 struct Sky {
     sun: vec4<f32>,
+    eye: vec4<f32>,
+    up: vec4<f32>,
+    sun_tangent: vec4<f32>,
 };
 
 // Group 0 is the camera, as it is for every pipeline in this program: the
@@ -84,6 +84,9 @@ struct Sky {
 @group(2) @binding(0) var lut_sampler: sampler;
 @group(2) @binding(1) var transmittance_lut: texture_2d<f32>;
 @group(2) @binding(2) var multiscatter_lut: texture_2d<f32>;
+// Wrapping in `u`; see `skyview_u` in `src/sky.wgsl`.
+@group(2) @binding(3) var skyview_sampler: sampler;
+@group(2) @binding(4) var skyview_lut: texture_2d<f32>;
 
 @group(3) @binding(0) var<uniform> palette: Palette;
 // A material id in the low sixteen bits and where inside its pixel the ground
@@ -162,6 +165,38 @@ fn sample_multiscatter(r: f32, mu_s: f32) -> vec3<f32> {
     return textureSampleLevel(multiscatter_lut, lut_sampler, uv, 0.0).rgb;
 }
 
+// The zenith angle of the horizon. Must match `horizon_zenith` in
+// `src/sky.wgsl`.
+fn horizon_zenith(r: f32) -> f32 {
+    return PI - asin(clamp(GROUND_RADIUS / max(r, GROUND_RADIUS), -1.0, 1.0));
+}
+
+// Must match `skyview_v` in `src/sky.wgsl`.
+fn skyview_v(r: f32, zenith: f32) -> f32 {
+    let horizon = horizon_zenith(r);
+    if (zenith < horizon) {
+        return 0.5 * (1.0 - sqrt(max(1.0 - zenith / horizon, 0.0)));
+    }
+    return 0.5 + 0.5 * sqrt(max((zenith - horizon) / (PI - horizon), 0.0));
+}
+
+// The sky in a direction, from the table. Must match `sample_skyview` in
+// `src/sky.wgsl`, including that it reads below the horizon as well as above:
+// the table marches air and never adds what the ground reflects, so its lower
+// half is the haze a downward ray crosses, which is what a world whose terrain
+// simply stops should show.
+fn sample_skyview(direction: vec3<f32>) -> vec3<f32> {
+    let up = sky.up.xyz;
+    let forward = sky.sun_tangent.xyz;
+    let side = cross(up, forward);
+    let flat = normalize(direction - up * dot(up, direction));
+    // No half-texel correction across: that axis wraps. See `src/sky.wgsl`.
+    let u = 0.5 + atan2(dot(side, flat), dot(forward, flat)) * (0.5 / PI);
+    let zenith = acos(clamp(dot(up, direction), -1.0, 1.0));
+    let v = to_texture(skyview_v(sky.eye.w, zenith), f32(SKYVIEW_HEIGHT));
+    return textureSampleLevel(skyview_lut, skyview_sampler, vec2<f32>(u, v), 0.0).rgb;
+}
+
 // Radiance to a displayable colour: expose, then roll the top off.
 //
 // Extended Reinhard, per channel, and chosen over a fitted curve like ACES for
@@ -194,8 +229,12 @@ fn fs_shade(@builtin(position) clip: vec4<f32>) -> @location(0) vec4<f32> {
     // The march writes zero depth where its ray found no ground, and the
     // reversed-infinite projection cannot write zero for any finite hit, so
     // this test is exact: nothing is there and it is sky.
+    //
+    // Recomputed here every frame rather than stored, which is what keeps a
+    // moving sun honest: the reprojection carries sky pixels between frames as
+    // a fact about a *direction*, and a direction is all this needs.
     if (textureLoad(depth, pixel, 0).r == 0.0) {
-        return SKY;
+        return vec4<f32>(tonemap(sample_skyview(normalize(ray_raw_at(clip.xy)))), 1.0);
     }
 
     let id = textureLoad(material, pixel, 0).r & MATERIAL_MASK;

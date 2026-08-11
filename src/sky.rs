@@ -61,25 +61,63 @@ impl Default for Sun {
     }
 }
 
-/// Mirrors the `Sky` uniform block in `src/shading.wgsl`.
+/// Mirrors the `Sky` uniform block in `src/sky.wgsl` and `src/shading.wgsl`.
 ///
-/// One member so far. It grows as the scattering does -- the tables want the
-/// eye's radius and the local up as well -- and it is a block of its own rather
-/// than three more words on the camera because the camera is where the eye is
-/// and this is what the world is lit by. Two different things, changed by two
-/// different parts of the frame.
+/// A block of its own rather than more words on the camera, because the camera
+/// is where the eye is and this is what the world is lit by: two different
+/// things, written by two different parts of the frame.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SkyUniform {
     /// The unit vector pointing at the sun. `w` is unused padding; uniform
     /// members are aligned to sixteen bytes anyway.
     sun: [f32; 4],
+    /// The eye in planet space, with its radius in `w`.
+    ///
+    /// Planet space is world space with the planet's centre at the origin, so
+    /// this is the camera plus one ground radius of `y`. The radius is carried
+    /// rather than recomputed because every table lookup wants it and a length
+    /// of a six-million-metre vector is worth doing once, on the CPU, in double
+    /// precision -- an `f32` holding 6.36e6 has metre-scale steps left.
+    eye: [f32; 4],
+    /// The local up at the eye. `w` is unused.
+    up: [f32; 4],
+    /// The sun projected into the eye's tangent plane, normalised: where the
+    /// sky-view table's azimuth is measured from.
+    ///
+    /// Built here rather than in the shader so the degenerate case is decided
+    /// once. With the sun exactly overhead the projection vanishes and any
+    /// direction in the tangent plane will do -- the sky is then circularly
+    /// symmetric, so the choice cannot be seen.
+    sun_tangent: [f32; 4],
 }
 
 impl SkyUniform {
-    fn new(sun: Sun) -> Self {
+    fn new(sun: Sun, eye: Vec3) -> Self {
+        // Doubles for the one subtraction that needs them: the eye is metres
+        // from a centre six thousand kilometres away, and an `f32` there has
+        // steps of about half a metre.
+        let centred = glam::DVec3::new(
+            f64::from(eye.x),
+            f64::from(eye.y) + f64::from(GROUND_RADIUS),
+            f64::from(eye.z),
+        );
+        let radius = centred.length().max(f64::from(GROUND_RADIUS));
+        let up = (centred / radius).as_vec3();
+        let flat = sun.direction - up * sun.direction.dot(up);
+        // Any tangent direction when the sun is overhead; see the field's doc.
+        let tangent = if flat.length_squared() > 1e-12 {
+            flat.normalize()
+        } else {
+            up.cross(Vec3::X)
+                .try_normalize()
+                .unwrap_or(up.cross(Vec3::Z).normalize())
+        };
         Self {
             sun: sun.direction.extend(0.0).to_array(),
+            eye: centred.as_vec3().extend(radius as f32).to_array(),
+            up: up.extend(0.0).to_array(),
+            sun_tangent: tangent.extend(0.0).to_array(),
         }
     }
 }
@@ -141,6 +179,20 @@ pub const TRANSMITTANCE_SIZE: glam::UVec2 = glam::UVec2::new(256, 64);
 /// has bounced more than once has been averaged over every direction and has no
 /// sharp horizon feature left to resolve.
 pub const MULTISCATTER_SIZE: glam::UVec2 = glam::UVec2::new(32, 32);
+
+/// Size of the sky-view table: the sky in every direction, for this frame's
+/// eye altitude and sun.
+///
+/// The first table that cannot be precomputed. It is a raymarch from a
+/// particular altitude with the sun in a particular place, and baking those two
+/// in as extra axes is what would make it four-dimensional -- 3.4 GB at a
+/// resolution that keeps the horizon crowding, and a shippable 16 MB only by
+/// throwing that crowding away and banding every sunset. Marching 192 x 108 x 30
+/// samples once a frame is cheaper than either.
+///
+/// 192 across is 1.875 degrees a texel of azimuth; 108 down is the same aspect
+/// as the window, which is not required but keeps the two comparable.
+pub const SKYVIEW_SIZE: glam::UVec2 = glam::UVec2::new(192, 108);
 
 /// Steps the shader integrates the optical depth in. Must match `src/sky.wgsl`.
 #[allow(
@@ -244,6 +296,15 @@ pub struct Sky {
     transmittance: wgpu::Texture,
     #[allow(dead_code, reason = "read only by the table readback tests")]
     multiscatter: wgpu::Texture,
+    #[allow(dead_code, reason = "read only by the table readback tests")]
+    skyview: wgpu::Texture,
+    /// The per-frame build: rebuilt every frame, so it is kept rather than
+    /// dropped the way the two one-off builds are.
+    skyview_build: wgpu::ComputePipeline,
+    /// Group 2 for that build: the sampler and the two finished tables, and
+    /// deliberately not the sky-view table it is writing. See [`Build`].
+    read_tables: wgpu::BindGroup,
+    write_skyview: wgpu::BindGroup,
     /// Group 2 in full: the sampler and both tables.
     tables_layout: wgpu::BindGroupLayout,
     tables_bind_group: wgpu::BindGroup,
@@ -280,7 +341,7 @@ impl Sky {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let sky_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sky bind group layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -298,7 +359,7 @@ impl Sky {
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sky bind group"),
-            layout: &layout,
+            layout: &sky_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: buffer.as_entire_binding(),
@@ -327,8 +388,10 @@ impl Sky {
         };
         let transmittance = table("transmittance table", TRANSMITTANCE_SIZE);
         let multiscatter = table("multiple scattering table", MULTISCATTER_SIZE);
+        let skyview = table("sky view table", SKYVIEW_SIZE);
         let transmittance_view = transmittance.create_view(&Default::default());
         let multiscatter_view = multiscatter.create_view(&Default::default());
+        let skyview_view = skyview.create_view(&Default::default());
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("scattering table sampler"),
@@ -359,26 +422,62 @@ impl Sky {
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
         };
+        // The sky-view table's azimuth runs the whole way round, so it has to
+        // wrap or the seam behind the sun draws as a line. Its own sampler
+        // rather than wrapping the shared one, because every other table has an
+        // axis that genuinely stops and would then read the far end of itself.
+        let wrapping = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sky view sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let sampler_at = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
         let tables_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scattering tables layout"),
-            entries: &[sampler_entry, sampled(1), sampled(2)],
+            entries: &[
+                sampler_entry,
+                sampled(1),
+                sampled(2),
+                sampler_at(3),
+                sampled(4),
+            ],
         });
         let sampler_binding = wgpu::BindGroupEntry {
             binding: 0,
             resource: wgpu::BindingResource::Sampler(&sampler),
+        };
+        let transmittance_binding = wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::TextureView(&transmittance_view),
+        };
+        let multiscatter_binding = wgpu::BindGroupEntry {
+            binding: 2,
+            resource: wgpu::BindingResource::TextureView(&multiscatter_view),
         };
         let tables_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scattering tables bind group"),
             layout: &tables_layout,
             entries: &[
                 sampler_binding.clone(),
+                transmittance_binding.clone(),
+                multiscatter_binding.clone(),
                 wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&transmittance_view),
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&wrapping),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&multiscatter_view),
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&skyview_view),
                 },
             ],
         });
@@ -391,13 +490,20 @@ impl Sky {
         let read_transmittance = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("transmittance read bind group"),
             layout: &read_layout,
-            entries: &[
-                sampler_binding,
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&transmittance_view),
-                },
-            ],
+            entries: &[sampler_binding.clone(), transmittance_binding.clone()],
+        });
+
+        // The same, for the sky-view build: both finished tables and neither of
+        // the table it writes.
+        let read_tables_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("finished tables read layout"),
+                entries: &[sampler_entry, sampled(1), sampled(2)],
+            });
+        let read_tables = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("finished tables read bind group"),
+            layout: &read_tables_layout,
+            entries: &[sampler_binding, transmittance_binding, multiscatter_binding],
         });
 
         let written = |binding| wgpu::BindGroupLayoutEntry {
@@ -428,6 +534,7 @@ impl Sky {
         };
         let write_transmittance_layout = write_layout("transmittance write layout", 0);
         let write_multiscatter_layout = write_layout("multiscatter write layout", 1);
+        let write_skyview_layout = write_layout("sky view write layout", 2);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky shader"),
@@ -449,12 +556,33 @@ impl Sky {
             })
         };
 
+        // Built before the struct literal, because the literal moves
+        // `sky_layout` into the `layout` field and this borrows it.
+        let skyview_build = stage(
+            "sky view build",
+            "cs_skyview",
+            &[
+                None,
+                Some(&sky_layout),
+                Some(&read_tables_layout),
+                Some(&write_skyview_layout),
+            ],
+        );
+
         Self {
             buffer,
-            layout,
+            layout: sky_layout,
             bind_group,
             tables_layout,
             tables_bind_group,
+            skyview_build,
+            read_tables,
+            write_skyview: write_bind(
+                "sky view write bind group",
+                &write_skyview_layout,
+                2,
+                &skyview_view,
+            ),
             build: Some(Build {
                 // Neither build binds the sky uniform: both tables are
                 // functions of the medium's own constants and of nothing else,
@@ -490,6 +618,7 @@ impl Sky {
             }),
             transmittance,
             multiscatter,
+            skyview,
         }
     }
 
@@ -553,9 +682,26 @@ impl Sky {
         );
     }
 
-    /// Uploads where the sun is for the frame about to be drawn.
-    pub fn set_frame(&self, queue: &wgpu::Queue, sun: Sun) {
-        queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&SkyUniform::new(sun)));
+    /// Uploads where the sun and the eye are, for the frame about to be drawn.
+    pub fn set_frame(&self, queue: &wgpu::Queue, sun: Sun, eye: Vec3) {
+        queue.write_buffer(
+            &self.buffer,
+            0,
+            bytemuck::bytes_of(&SkyUniform::new(sun, eye)),
+        );
+    }
+
+    /// Records the per-frame table builds into an already-started pass.
+    ///
+    /// The sky-view table depends on this frame's eye altitude and sun and on
+    /// nothing the frame produces, so it is built before anything else in
+    /// `Scene::draw` rather than fitted around the march.
+    pub fn draw(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.skyview_build);
+        pass.set_bind_group(1, &self.bind_group, &[]);
+        pass.set_bind_group(2, &self.read_tables, &[]);
+        pass.set_bind_group(3, &self.write_skyview, &[]);
+        pass.dispatch_workgroups(SKYVIEW_SIZE.x.div_ceil(8), SKYVIEW_SIZE.y.div_ceil(8), 1);
     }
 
     pub fn layout(&self) -> &wgpu::BindGroupLayout {
@@ -581,6 +727,11 @@ impl Sky {
     #[cfg(test)]
     pub fn tables(&self) -> (&wgpu::Texture, &wgpu::Texture) {
         (&self.transmittance, &self.multiscatter)
+    }
+
+    #[cfg(test)]
+    pub fn sky_view(&self) -> &wgpu::Texture {
+        &self.skyview
     }
 }
 
@@ -977,6 +1128,43 @@ mod tests {
         );
     }
 
+    /// The two shaders map the sky the same way.
+    ///
+    /// `skyview_v` is written twice by hand -- once in `src/sky.wgsl`, which
+    /// builds the table, and once in `src/shading.wgsl`, which reads it. If the
+    /// two parted, every direction would be looked up in the wrong row and the
+    /// result would still be a smooth, plausible gradient: the horizon would
+    /// simply be somewhere else.
+    ///
+    /// Nothing numeric catches that, and this was checked rather than assumed.
+    /// Making the build's mapping linear where the fetch's crowds towards the
+    /// horizon leaves every test in the suite passing, because the table is
+    /// still monotone, its horizon is still at the row the mapping puts it, and
+    /// the frame is still darker overhead than low down. So the text is what
+    /// there is to compare, the same defence the half-texel correction gets.
+    #[test]
+    fn both_shaders_map_the_sky_the_same_way() {
+        let body = |source: &str, name: &str| {
+            let start = source
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("no {name}"));
+            let end = source[start..].find("\n}").expect("unterminated");
+            source[start..start + end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let build = include_str!("sky.wgsl");
+        let shade = include_str!("shading.wgsl");
+        for name in ["horizon_zenith", "skyview_v"] {
+            assert_eq!(
+                body(build, name),
+                body(shade, name),
+                "{name} differs between src/sky.wgsl and src/shading.wgsl"
+            );
+        }
+    }
+
     /// The transmittance parameterisation inverts to where it came from.
     #[test]
     fn the_transmittance_mapping_round_trips() {
@@ -1196,6 +1384,128 @@ mod tests {
             source.contains("saturate(x * (1.0 + x / (WHITE * WHITE)) / (1.0 + x))"),
             "src/shading.wgsl's tonemap is not the curve src/sky.rs mirrors"
         );
+    }
+
+    /// The sky-view table puts the horizon exactly down its middle.
+    ///
+    /// The whole point of the vertical mapping, and the thing that fails
+    /// quietly if it is wrong: a table whose horizon sat a few rows off would
+    /// still look like a sky, with the pale band in slightly the wrong place.
+    /// Found by looking for the row of steepest change rather than by trusting
+    /// the formula, which is the same formula the shader used to build it.
+    #[test]
+    fn the_sky_view_table_puts_the_horizon_down_the_middle() {
+        let (_, _, table) = built_sky_view(3000.0);
+        let at = |x: u32, y: u32| table[(y * SKYVIEW_SIZE.x + x) as usize];
+
+        // Straight away from the sun, where nothing but the horizon is
+        // happening: the aureole would otherwise be the steepest thing in the
+        // column.
+        let column = 0;
+        let (mut steepest, mut steepest_row) = (0.0f32, 0u32);
+        for y in 1..SKYVIEW_SIZE.y {
+            let change = (at(column, y) - at(column, y - 1)).length();
+            if change > steepest {
+                steepest = change;
+                steepest_row = y;
+            }
+        }
+        let middle = SKYVIEW_SIZE.y / 2;
+        assert!(
+            steepest_row.abs_diff(middle) <= 1,
+            "the sky changes fastest at row {steepest_row} of {}, not at the \
+             horizon in the middle at {middle}",
+            SKYVIEW_SIZE.y
+        );
+
+        // And the sky is blue overhead and paler at the horizon, which is the
+        // one fact about a daytime sky everyone can check by looking up.
+        let zenith = at(column, 0);
+        let horizon = at(column, middle - 2);
+        assert!(
+            zenith.z / zenith.x > horizon.z / horizon.x,
+            "the zenith is {zenith} and the horizon {horizon}, which is not a \
+             sky that gets paler as it comes down"
+        );
+    }
+
+    /// Climbing lowers the horizon, and by how much.
+    ///
+    /// The geometry the sky-view table's vertical mapping is built around, and
+    /// the thing a stack of flat slabs could not produce at all: on a flat
+    /// world the horizon is level from every altitude, so the sky would meet
+    /// the ground in the same place from a hilltop as from orbit.
+    ///
+    /// The table cannot show this and it is worth saying why: the mapping puts
+    /// the horizon exactly half way down at every altitude, which is the point
+    /// of it. What moves is the *angle* that row stands for, which is what this
+    /// measures.
+    #[test]
+    fn climbing_lowers_the_horizon() {
+        // `horizon_zenith` in `src/sky.wgsl`, mirrored: the angle from straight
+        // up to the horizon, a right angle on the ground and more above it.
+        let dip_degrees = |altitude: f32| {
+            let r = GROUND_RADIUS + altitude;
+            let zenith = std::f32::consts::PI
+                - (GROUND_RADIUS / r.max(GROUND_RADIUS))
+                    .clamp(-1.0, 1.0)
+                    .asin();
+            (zenith - std::f32::consts::FRAC_PI_2).to_degrees()
+        };
+        assert!(
+            dip_degrees(0.0).abs() < 1e-3,
+            "on the ground the horizon should be level, and it dips {}",
+            dip_degrees(0.0)
+        );
+        // Against the small-angle form, `sqrt(2h/R)` radians, which is a
+        // genuinely separate derivation rather than the arcsine restated: it
+        // comes from the tangent-line right triangle instead of from the
+        // sphere's own geometry, and the two only agree if both are right.
+        for altitude in [500.0f32, 1500.0, 3000.0, 12_000.0] {
+            let got = dip_degrees(altitude);
+            let want = (2.0 * altitude / GROUND_RADIUS).sqrt().to_degrees();
+            assert!(
+                (got - want).abs() < 0.01,
+                "from {altitude} m the horizon dips {got} degrees where the \
+                 small-angle form says {want}"
+            );
+            assert!(
+                got > dip_degrees(altitude * 0.5),
+                "climbing has to lower the horizon, not raise it"
+            );
+        }
+        // And the magnitude, so this cannot all agree on nothing: a degree and
+        // a quarter from 1500 m, three and a half from twelve kilometres.
+        assert!((dip_degrees(1500.0) - 1.244).abs() < 0.01);
+        assert!((dip_degrees(12_000.0) - 3.520).abs() < 0.01);
+    }
+
+    /// Builds the sky-view table for an eye at `altitude`, and reads it back.
+    ///
+    /// Returns the eye's radius alongside, because half of what the table means
+    /// is which radius it was built for.
+    fn built_sky_view(altitude: f32) -> (f32, f32, Vec<Vec3>) {
+        let (device, queue) = crate::headless::device().expect("no headless device");
+        let mut sky = Sky::new(&device);
+        sky.ensure_built(&device, &queue);
+        let eye = Vec3::new(0.0, altitude, 0.0);
+        sky.set_frame(&queue, Sun::default(), eye);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sky view"),
+                timestamp_writes: None,
+            });
+            sky.draw(&mut pass);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        let radius = f64::from(altitude) + f64::from(GROUND_RADIUS);
+        (
+            radius as f32,
+            altitude,
+            read_table(&device, &queue, sky.sky_view(), SKYVIEW_SIZE),
+        )
     }
 
     /// The raster never reaches the planet's horizon.

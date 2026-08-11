@@ -67,6 +67,20 @@ pub const DETAIL: &str = "detail";
 /// The scope the terrain opens around the pyramid sweep over those tiles.
 pub const MAXIMA: &str = "maxima";
 
+/// The scope [`crate::scene::Scene::draw`] opens around the scattering tables
+/// it rebuilds every frame.
+///
+/// Nested inside [`PASSES`] rather than beside it, because unlike the terrain's
+/// work this really is part of the frame's own encoder. It groups one row per
+/// table so the readout says both what the atmosphere costs altogether and
+/// which table it went on.
+///
+/// What it measures is the *building*. Reading the tables is a handful of
+/// filtered fetches in the shading pass, and it shows up as `shading` growing
+/// rather than as a row of its own -- there is nothing to time it against
+/// without a switch to draw the frame without a sky.
+pub const ATMOSPHERE: &str = "atmosphere";
+
 /// The terrain's own submissions, in the order the GPU runs them.
 const TERRAIN_SCOPES: [&str; 2] = [DETAIL, MAXIMA];
 
