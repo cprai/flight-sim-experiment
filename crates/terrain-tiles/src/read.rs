@@ -99,9 +99,7 @@ pub fn read_height_tile(path: &Path) -> Result<Option<Vec<f32>>> {
 pub fn read_material_tile(path: &Path) -> Result<Option<Vec<u32>>> {
     match read_tile(path, 1)? {
         None => Ok(None),
-        Some(DecodingResult::U16(values)) => {
-            Ok(Some(values.into_iter().map(u32::from).collect()))
-        }
+        Some(DecodingResult::U16(values)) => Ok(Some(values.into_iter().map(u32::from).collect())),
         Some(DecodingResult::U32(values)) => Ok(Some(values)),
         Some(_) => bail!(
             "{} holds something other than 16- or 32-bit unsigned ids",
