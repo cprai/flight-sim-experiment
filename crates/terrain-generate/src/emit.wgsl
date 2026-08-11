@@ -29,6 +29,10 @@ struct Params {
     // Texels across the tile, and the seed the landscape was built from.
     tile_size: u32,
     seed: u32,
+    // The relief the landscape spans. Every band the classifier draws is a
+    // share of this rather than a fixed number of metres.
+    valley_metres: f32,
+    peak_metres: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -38,6 +42,7 @@ struct Params {
 @group(0) @binding(4) var<storage, read> deposit: array<f32>;
 @group(0) @binding(5) var<storage, read> filled: array<f32>;
 @group(0) @binding(6) var<storage, read_write> out_height: array<f32>;
+@group(0) @binding(7) var<storage, read_write> out_cover: array<u32>;
 
 // ---------------------------------------------------------------- noise.rs
 
@@ -423,6 +428,322 @@ fn bare_height(sample: Sample, ground: Ground, x: f32, y: f32) -> f32 {
     return noise_lerp(land, sample.filled, ground.lake);
 }
 
+// ------------------------------------------------------------- classify.rs
+
+// Material discriminants, from `terrain-materials`. Restated because WGSL
+// cannot read the enum; `the_shader_knows_the_same_material_ids` pins them.
+const MAT_NULL: u32 = 0u;
+const MAT_LAKE: u32 = 0x0101u;
+const MAT_RIVER: u32 = 0x0103u;
+const MAT_STREAM: u32 = 0x0104u;
+const MAT_MARSH: u32 = 0x0200u;
+const MAT_BOG: u32 = 0x0202u;
+const MAT_FOREST_NEEDLELEAVED: u32 = 0x0300u;
+const MAT_FOREST_BROADLEAVED: u32 = 0x0301u;
+const MAT_FOREST_MIXED: u32 = 0x0302u;
+const MAT_SCRUB: u32 = 0x0400u;
+const MAT_HEATH: u32 = 0x0402u;
+const MAT_GRASSLAND: u32 = 0x0403u;
+const MAT_MEADOW: u32 = 0x0405u;
+const MAT_FELL: u32 = 0x0407u;
+const MAT_BARE_ROCK: u32 = 0x0500u;
+const MAT_SCREE: u32 = 0x0501u;
+const MAT_SHINGLE: u32 = 0x0502u;
+const MAT_SAND: u32 = 0x0503u;
+const MAT_GLACIER: u32 = 0x0505u;
+const MAT_BARE_EARTH: u32 = 0x0506u;
+
+const TREELINE_SHARE: f32 = 0.52;
+const SNOWLINE_SHARE: f32 = 0.76;
+const LINE_WAVELENGTH: f32 = 2600.0;
+const LINE_SHARE: f32 = 0.05;
+const ASPECT_SHARE: f32 = 0.063;
+const KRUMMHOLZ_SHARE: f32 = 0.137;
+const ROCK_BAND_SHARE: f32 = 0.079;
+const MOTTLE_WAVELENGTH: f32 = 140.0;
+const MOTTLE_OCTAVES: u32 = 4u;
+const ICE_STEEPNESS: f32 = 0.45;
+const ROCK_THRESHOLD_WOODED: f32 = 0.86;
+const ROCK_THRESHOLD_ALPINE: f32 = 0.42;
+const SCREE_STEEPNESS: f32 = 0.30;
+const SCREE_FILLING: f32 = 0.22;
+const TIMBER_SHARE: f32 = 0.25;
+
+// Every band is a share of the relief rather than a fixed number of metres: a
+// fixed one is right for the range this crate generates by default and wrong
+// for every other.
+struct Lines {
+    treeline: f32,
+    snowline: f32,
+    span: f32,
+    band: f32,
+    mottle: f32,
+}
+
+fn lines_of(sample: Sample, ground: Ground, x: f32, y: f32) -> Lines {
+    // Not band-limited, unlike the mottle: the wobble is 2.6 km across and
+    // survives every level the pyramid stores.
+    let wobble = fbm(x, y, params.seed ^ 0x4b19c2e7u, LINE_WAVELENGTH, 3u, 0.0);
+    // The southward component of downhill is how much the slope faces the sun.
+    let sun = sample.aspect.y * ground.steepness;
+    let base = params.valley_metres;
+    let span = params.peak_metres - params.valley_metres;
+
+    var lines: Lines;
+    lines.span = span;
+    lines.treeline = base + span * (TREELINE_SHARE + wobble * LINE_SHARE + sun * ASPECT_SHARE);
+    lines.snowline =
+        base + span * (SNOWLINE_SHARE + wobble * LINE_SHARE * 0.6 + sun * ASPECT_SHARE * 1.2);
+    lines.band = clamp((sample.height - base) / max(span, 1.0), 0.0, 1.0);
+    lines.mottle = fbm(
+        x,
+        y,
+        params.seed ^ 0xa71f63b9u,
+        MOTTLE_WAVELENGTH,
+        MOTTLE_OCTAVES,
+        2.0 * params.texel_metres,
+    );
+    return lines;
+}
+
+fn alpine(sample: Sample, ground: Ground, lines: Lines) -> u32 {
+    let bare = noise_smoothstep(
+        lines.treeline,
+        lines.snowline,
+        sample.height + lines.mottle * lines.span * LINE_SHARE,
+    );
+    if bare > 0.55 {
+        return MAT_FELL;
+    }
+    if ground.steepness > 0.25 || sample.hardness > 0.6 {
+        return MAT_HEATH;
+    }
+    return MAT_GRASSLAND;
+}
+
+fn wooded(sample: Sample, ground: Ground, lines: Lines) -> u32 {
+    let krummholz_band = noise_smoothstep(
+        lines.treeline - lines.span * KRUMMHOLZ_SHARE,
+        lines.treeline,
+        sample.height + lines.mottle * lines.span * LINE_SHARE * 0.75,
+    );
+    if krummholz_band > 0.6 {
+        return MAT_SCRUB;
+    }
+    // Both qualified by the mottling as well as by height, so they arrive as
+    // stands rather than as an altitude band -- a mixed belt ringing every
+    // mountain at one height is the tell of a rule that keyed off elevation.
+    let low = lines.band < 0.30 + lines.mottle * 0.08;
+    let wet = sample.flow > CHANNEL_FLOW - 3.5;
+    let sunny = sample.aspect.y > 0.25;
+    if low && wet && ground.steepness < 0.3 {
+        return MAT_FOREST_BROADLEAVED;
+    }
+    if low && (sunny || lines.mottle > 0.25) {
+        return MAT_FOREST_MIXED;
+    }
+    return MAT_FOREST_NEEDLELEAVED;
+}
+
+fn valley_floor(sample: Sample, ground: Ground, lines: Lines) -> u32 {
+    if ground.channel > 0.04 && ground.filling > 0.45 {
+        return MAT_SHINGLE;
+    }
+    if ground.filling > 0.7 && lines.mottle > 0.45 {
+        return MAT_SAND;
+    }
+    if ground.filling < 0.1 && sample.slope > 0.12 && lines.mottle < -0.5 {
+        return MAT_BARE_EARTH;
+    }
+    if lines.mottle > 0.15 {
+        return MAT_MEADOW;
+    }
+    return MAT_GRASSLAND;
+}
+
+fn cover_of(sample: Sample, ground: Ground, lines: Lines) -> u32 {
+    // Water first: it covers whatever is underneath it.
+    if ground.lake > 0.5 {
+        return MAT_LAKE;
+    }
+    if ground.channel > 0.62 {
+        return MAT_RIVER;
+    }
+    if ground.channel > 0.28 {
+        return MAT_STREAM;
+    }
+    let boggy = sample.slope < 0.035 && sample.flow > CHANNEL_FLOW - 2.5;
+    if ground.lake > 0.12 || (boggy && ground.filling > 0.25) {
+        if sample.height > lines.treeline {
+            return MAT_BOG;
+        }
+        return MAT_MARSH;
+    }
+
+    if sample.height > lines.snowline + lines.mottle * lines.span * LINE_SHARE
+        && ground.steepness < ICE_STEEPNESS
+    {
+        return MAT_GLACIER;
+    }
+
+    // Rock and the talus under it are about the ground rather than the climate,
+    // so they come before the treeline is consulted: a cliff is bare at any
+    // altitude.
+    let band = lines.span * ROCK_BAND_SHARE;
+    let above_the_trees =
+        noise_smoothstep(lines.treeline - band, lines.treeline + band, sample.height);
+    let bare = noise_lerp(ROCK_THRESHOLD_WOODED, ROCK_THRESHOLD_ALPINE, above_the_trees);
+    if ground.rockiness > bare + lines.mottle * 0.10 {
+        return MAT_BARE_ROCK;
+    }
+    if ground.steepness > SCREE_STEEPNESS && ground.filling > SCREE_FILLING {
+        return MAT_SCREE;
+    }
+
+    if sample.height > lines.treeline {
+        return alpine(sample, ground, lines);
+    }
+    if sample.slope < 0.09 && lines.band < 0.35 {
+        return valley_floor(sample, ground, lines);
+    }
+    return wooded(sample, ground, lines);
+}
+
+// The density is what share of the crown lattice holds a tree; the health
+// scales the crown heights that lattice grows.
+struct Trees {
+    density: f32,
+    health: f32,
+}
+
+fn timber(sample: Sample, ground: Ground, lines: Lines) -> Trees {
+    let exposure = noise_smoothstep(
+        lines.treeline - lines.span * TIMBER_SHARE,
+        lines.treeline,
+        sample.height,
+    );
+    // Steep ground holds less soil and fewer trees, and what it holds is
+    // smaller. It does not stop the forest -- conifers root on slopes nobody
+    // would walk up.
+    let footing = 1.0 - noise_smoothstep(0.30, 0.85, ground.steepness);
+    let damp = noise_smoothstep(CHANNEL_FLOW - 7.0, CHANNEL_FLOW - 2.0, sample.flow);
+
+    var trees: Trees;
+    trees.health = clamp(
+        noise_lerp(1.0, 0.5, exposure) * noise_lerp(0.78, 1.0, footing)
+            + 0.10 * damp
+            + 0.06 * lines.mottle,
+        0.0,
+        1.0,
+    );
+    trees.density = clamp(
+        noise_lerp(1.0, 0.55, exposure) * noise_lerp(0.78, 1.0, footing) + 0.16 * lines.mottle,
+        0.0,
+        1.0,
+    );
+    return trees;
+}
+
+fn krummholz(lines: Lines) -> Trees {
+    var trees: Trees;
+    trees.density = clamp(0.30 + 0.16 * lines.mottle, 0.0, 1.0);
+    trees.health = clamp(0.17 + 0.05 * lines.mottle, 0.0, 1.0);
+    return trees;
+}
+
+fn trees_of(sample: Sample, ground: Ground, lines: Lines, cover: u32) -> Trees {
+    if cover == MAT_FOREST_NEEDLELEAVED
+        || cover == MAT_FOREST_BROADLEAVED
+        || cover == MAT_FOREST_MIXED
+    {
+        return timber(sample, ground, lines);
+    }
+    if cover == MAT_SCRUB {
+        return krummholz(lines);
+    }
+    var none: Trees;
+    none.density = 0.0;
+    none.health = 0.0;
+    return none;
+}
+
+// Two densities and a stature: the densities are the shares of each lattice
+// holding a stone, the stature scales how tall they stand without touching how
+// wide they are.
+struct Rocks {
+    boulders: f32,
+    rubble: f32,
+    stature: f32,
+}
+
+fn rocks_none() -> Rocks {
+    var none: Rocks;
+    none.boulders = 0.0;
+    none.rubble = 0.0;
+    none.stature = 0.0;
+    return none;
+}
+
+fn rocks_of(sample: Sample, ground: Ground, lines: Lines, cover: u32) -> Rocks {
+    var stone: Rocks;
+    if cover == MAT_SCREE {
+        // Talus: the rubble follows the deposit channel, which is the pass that
+        // recorded where material actually piled; the blocks follow the
+        // rockiness, because hard beds shed hard corners.
+        stone.boulders = clamp(0.25 + 0.30 * ground.rockiness + 0.20 * lines.mottle, 0.0, 1.0);
+        stone.rubble = clamp(0.55 + 0.35 * ground.filling + 0.15 * lines.mottle, 0.0, 1.0);
+        stone.stature = 0.7;
+        return stone;
+    }
+    if cover == MAT_BARE_ROCK {
+        // A face steep enough to read as bare rock has already shed anything
+        // loose to the talus below it, so the rubble fades out with steepness
+        // rather than following it up.
+        stone.boulders = clamp(0.12 + 0.20 * lines.mottle, 0.0, 1.0);
+        stone.rubble = clamp(0.15 * (1.0 - ground.steepness), 0.0, 1.0);
+        stone.stature = 0.9;
+        return stone;
+    }
+    if cover == MAT_SHINGLE {
+        // A river that could roll a five-metre block would not have left it
+        // here, so the stature is low rather than the densities.
+        stone.boulders = 0.05;
+        stone.rubble = clamp(0.55 + 0.20 * lines.mottle, 0.0, 1.0);
+        stone.stature = 0.35;
+        return stone;
+    }
+    let frosted = cover == MAT_FELL || cover == MAT_HEATH;
+    let floor_kind = cover == MAT_GRASSLAND
+        || cover == MAT_MEADOW
+        || cover == MAT_SAND
+        || cover == MAT_BARE_EARTH;
+    // `Grassland` comes out of both `alpine` and `floor`, and which one it was
+    // decides what is lying on it: frost-shattered plateau above the treeline,
+    // ground the ice left below it.
+    if frosted || (floor_kind && sample.height > lines.treeline) {
+        // Frost splits the bed it stands on rather than carrying anything, so
+        // hardness is most of the answer and slope is almost none of it.
+        stone.boulders = clamp(
+            0.18 + 0.25 * sample.hardness * (1.0 - ground.steepness) + 0.15 * lines.mottle,
+            0.0,
+            1.0,
+        );
+        stone.rubble = clamp(0.35 + 0.30 * sample.hardness + 0.15 * lines.mottle, 0.0, 1.0);
+        stone.stature = 0.75;
+        return stone;
+    }
+    if floor_kind {
+        // Erratics: keyed on the filling so the blocks land on moraine and
+        // outwash, where the ice actually dropped them, rather than on any flat
+        // ground at all.
+        stone.boulders = clamp(0.05 + 0.25 * ground.filling + 0.12 * lines.mottle, 0.0, 1.0);
+        stone.rubble = clamp(0.10 * ground.filling, 0.0, 1.0);
+        stone.stature = 1.0;
+        return stone;
+    }
+    return rocks_none();
+}
+
 @compute @workgroup_size(8, 8)
 fn cs_bare(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= params.tile_size || id.y >= params.tile_size {
@@ -433,4 +754,35 @@ fn cs_bare(@builtin(global_invocation_id) id: vec3<u32>) {
     let sample = sample_fields(x, y);
     let ground = ground_of(sample);
     out_height[id.y * params.tile_size + id.x] = bare_height(sample, ground, x, y);
+}
+
+// The classifier's three answers, which all come off one set of lines: the
+// ground cover, what grows on it, and what is lying on it. One walk rather than
+// three, because a texel drawn as a tree and painted as a meadow is worse than
+// either -- and because the lines cost two fractals to build.
+//
+// Packed rather than returned as three products: the densities are shares in
+// 0..=1, so eight bits each is finer than anything downstream distinguishes,
+// and one buffer keeps the readback to one copy.
+@compute @workgroup_size(8, 8)
+fn cs_cover(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= params.tile_size || id.y >= params.tile_size {
+        return;
+    }
+    let at = id.y * params.tile_size + id.x;
+    let x = params.origin.x + f32(id.x) * params.texel_metres;
+    let y = params.origin.y + f32(id.y) * params.texel_metres;
+    let sample = sample_fields(x, y);
+    let ground = ground_of(sample);
+    let lines = lines_of(sample, ground, x, y);
+    let cover = cover_of(sample, ground, lines);
+    let trees = trees_of(sample, ground, lines, cover);
+    let stone = rocks_of(sample, ground, lines, cover);
+
+    out_cover[at] = cover;
+    out_height[at * 5u] = trees.density;
+    out_height[at * 5u + 1u] = trees.health;
+    out_height[at * 5u + 2u] = stone.boulders;
+    out_height[at * 5u + 3u] = stone.rubble;
+    out_height[at * 5u + 4u] = stone.stature;
 }
