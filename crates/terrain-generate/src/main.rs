@@ -476,6 +476,81 @@ fn simulate(arguments: &Arguments) -> Fields {
 }
 
 #[cfg(test)]
+mod measure {
+    use super::*;
+
+    /// FNV-1a over the raw bits, so `-0.0` and `0.0` are different answers and
+    /// a NaN would be too. The point is exactness, not similarity.
+    fn fingerprint(values: &[f32]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for value in values {
+            for byte in value.to_bits().to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    /// One number standing for the whole simulation, so a change that was
+    /// supposed to be exact can be proved exact.
+    ///
+    /// Most of the work left in this crate is making the erosion faster without
+    /// making it different, and "without making it different" is far easier to
+    /// claim than to check: a reassociated sum or a neighbour visited in
+    /// another order moves the last bits of every cell, which no property test
+    /// in the crate would notice and no render would show. This runs the real
+    /// `simulate` end to end and hashes what comes out.
+    ///
+    /// At `--sim-metres 64` the grid is 769 x 897 rather than 3073 x 3585, a
+    /// sixteenth of the cells, which is the difference between a check that
+    /// gets run and one that does not. Every pass, every round and every
+    /// arithmetic path is the same; only the scale is smaller.
+    ///
+    /// **An exact change must leave the two fingerprints byte-identical.** A
+    /// deliberate one must show them moving, and then go to a render.
+    ///
+    /// Run with `--release ... -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "runs the whole simulation, tens of seconds"]
+    fn measure_the_landscape_fingerprint() {
+        let arguments = Arguments::parse_from([
+            "terrain-generate",
+            "--output",
+            "/tmp/terrain-generate-fingerprint-writes-nothing",
+            "--sim-metres",
+            "64",
+        ]);
+        let at = std::time::Instant::now();
+        let fields = simulate(&arguments);
+        let elapsed = at.elapsed();
+
+        let (low, high) = fields.height.range();
+        let flooded = fields
+            .filled
+            .values
+            .iter()
+            .zip(&fields.height.values)
+            .filter(|(filled, ground)| *filled - *ground > crate::detail::LAKE_METRES)
+            .count();
+
+        println!(
+            "{} x {} = {} cells in {elapsed:.1?}",
+            fields.width(),
+            fields.rows(),
+            fields.height.values.len(),
+        );
+        println!("height    {:#018x}", fingerprint(&fields.height.values));
+        println!("flow      {:#018x}", fingerprint(&fields.flow.values));
+        println!("range     {low:.6} m to {high:.6} m");
+        println!(
+            "flooded   {:.4}%",
+            flooded as f64 * 100.0 / fields.filled.values.len() as f64
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

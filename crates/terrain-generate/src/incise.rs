@@ -111,7 +111,9 @@ pub fn rivers(fields: &mut Fields, rounds: u32) {
         // balance between the two is what decides how far apart the valleys end
         // up. Run once at the end instead, it would smooth a landscape whose
         // channel spacing had already collapsed to the cell size.
+        let at = std::time::Instant::now();
         creep::settle(&mut fields.height, &mut scratch);
+        log::debug!("incision: the creep took {:.2?}", at.elapsed());
     }
 }
 
@@ -121,6 +123,14 @@ fn cut(fields: &mut Fields) {
     let cell_area = fields.metres_per_cell * fields.metres_per_cell;
 
     let drainage = flow::drainage(fields);
+
+    // Timed apart from the drainage, and at the same `debug` level, because
+    // this sweep and the accumulation inside `flow` have the same shape -- a
+    // serial walk of the flood's order scattering across a 44 MB grid -- and
+    // knowing which of them is worth attacking means seeing them side by side
+    // rather than as one figure for the round.
+    let at = std::time::Instant::now();
+
     // The surface the rivers would leave if there were no hollows, built
     // downstream first so that every cell's receiver is already final.
     let mut bed = drainage.filled.clone();
@@ -149,6 +159,9 @@ fn cut(fields: &mut Fields) {
         bed[index] = (drainage.filled[index] + power * bed[into]) / (1.0 + power);
     }
 
+    log::debug!("incision: the stream-power sweep took {:.2?}", at.elapsed());
+    let at = std::time::Instant::now();
+
     // A ceiling, not an answer: hollows keep their own floor and only the
     // ground that stands proud of the water is cut.
     //
@@ -161,6 +174,8 @@ fn cut(fields: &mut Fields) {
     for (height, ceiling) in fields.height.values.iter_mut().zip(&bed) {
         *height = height.min(*ceiling);
     }
+
+    log::debug!("incision: the ceiling took {:.2?}", at.elapsed());
 }
 
 #[cfg(test)]

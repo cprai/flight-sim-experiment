@@ -509,16 +509,7 @@ mod tests {
     #[test]
     #[ignore = "a measurement on the full grid, not a check"]
     fn measure_how_far_an_iteration_should_look() {
-        let mut fields = Fields::new([49152.0, 57344.0], 16.0);
-        crate::shape::raise(
-            &mut fields,
-            crate::shape::Relief {
-                valley_metres: 700.0,
-                peak_metres: 2600.0,
-            },
-            0,
-        );
-        crate::thermal::relax(&mut fields, crate::thermal::Settling::Bedrock);
+        let fields = crate::fields::shipped_grid();
 
         let gpu = test_gpu();
         let heights = gpu.uploaded("height", &fields.height.values);
@@ -576,16 +567,7 @@ mod tests {
             .filter_level(log::LevelFilter::Debug)
             .is_test(false)
             .try_init();
-        let mut fields = Fields::new([49152.0, 57344.0], 16.0);
-        crate::shape::raise(
-            &mut fields,
-            crate::shape::Relief {
-                valley_metres: 700.0,
-                peak_metres: 2600.0,
-            },
-            0,
-        );
-        crate::thermal::relax(&mut fields, crate::thermal::Settling::Bedrock);
+        let mut fields = crate::fields::shipped_grid();
 
         let at = std::time::Instant::now();
         let drainage = crate::flow::drainage(&fields);
@@ -617,16 +599,7 @@ mod tests {
     fn measure_what_a_warm_start_saves() {
         const ROUNDS: usize = 8;
 
-        let mut fields = Fields::new([49152.0, 57344.0], 16.0);
-        crate::shape::raise(
-            &mut fields,
-            crate::shape::Relief {
-                valley_metres: 700.0,
-                peak_metres: 2600.0,
-            },
-            0,
-        );
-        crate::thermal::relax(&mut fields, crate::thermal::Settling::Bedrock);
+        let mut fields = crate::fields::shipped_grid();
         println!(
             "grid {} x {} cells, {} in all",
             fields.width(),

@@ -242,12 +242,51 @@ pub fn drainage(fields: &Fields) -> Drainage {
     log::debug!("drainage: the receivers took {:.2?}", at.elapsed());
     let at = std::time::Instant::now();
 
-    // One backwards sweep of the pop order, sharing each cell's area among
-    // every neighbour below it. The sweep is still exact in a single pass: a
-    // strictly lower neighbour was popped strictly earlier, so it is still to
-    // come in this direction, and by the time a cell is reached every cell that
-    // could give to it already has.
     let mut area = vec![1.0f32; count];
+    accumulate(
+        width,
+        rows,
+        &filled,
+        &order,
+        &drains_to,
+        &mut area,
+        |fall| fall.powf(SPREAD),
+    );
+
+    log::debug!("drainage: the accumulation took {:.2?}", at.elapsed());
+
+    Drainage {
+        filled,
+        drains_to,
+        area,
+        order,
+    }
+}
+
+/// Shares every cell's drainage among the neighbours below it, in one backwards
+/// sweep of the flood's order.
+///
+/// The sweep is exact in a single pass: a strictly lower neighbour was popped
+/// strictly earlier, so it is still to come in this direction, and by the time a
+/// cell is reached every cell that could give to it already has. That is also
+/// what makes it strictly serial -- a cell reads its own area and adds into up
+/// to eight arbitrary others.
+///
+/// `share` is the spreading rule, `fall.powf(SPREAD)` in a run. It is a
+/// parameter rather than a call so that a measurement can time this sweep with
+/// the exponent swapped out and still be timing *this* sweep. A measurement
+/// that reimplements its subject stops measuring it the moment either one moves
+/// -- see 581ddd0, where a rewritten emit loop reported a hundredth of the
+/// truth. Being generic, it monomorphises to the same code a direct call would.
+fn accumulate(
+    width: usize,
+    rows: usize,
+    filled: &[f32],
+    order: &[u32],
+    drains_to: &[u32],
+    area: &mut [f32],
+    mut share: impl FnMut(f32) -> f32,
+) {
     let mut falls = [0.0f32; 8];
     for index in order.iter().rev() {
         let index = *index as usize;
@@ -276,7 +315,7 @@ pub fn drainage(fields: &Fields) -> Drainage {
                 // without that the four corners would between them take more
                 // than the four sides and the water would drift onto the
                 // diagonals.
-                falls[slot] = fall.powf(SPREAD) / reach;
+                falls[slot] = share(fall) / reach;
                 total += falls[slot];
             }
         }
@@ -300,15 +339,6 @@ pub fn drainage(fields: &Fields) -> Drainage {
             let neighbour = (row + dy) as usize * width + (column + dx) as usize;
             area[neighbour] += sending * falls[slot] / total;
         }
-    }
-
-    log::debug!("drainage: the accumulation took {:.2?}", at.elapsed());
-
-    Drainage {
-        filled,
-        drains_to,
-        area,
-        order,
     }
 }
 
@@ -573,5 +603,233 @@ mod tests {
                 assert!(lowest <= here + 1e-4, "({column}, {row}) has nowhere to go");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod measure {
+    use super::*;
+
+    /// One run of the real sweep, timed, with what it changed against a control.
+    ///
+    /// Generic rather than taking a function pointer, and that is not a
+    /// stylistic choice: through a `fn(f32) -> f32` every variant below would
+    /// compile to the same indirect call and they would all measure the same,
+    /// which is exactly the shape of a measurement that quietly answers a
+    /// different question than the one asked.
+    fn sweep(
+        label: &str,
+        fields: &Fields,
+        drainage: &Drainage,
+        control: Option<&[f32]>,
+        share: impl FnMut(f32) -> f32 + Copy,
+    ) -> Vec<f32> {
+        const REPEATS: usize = 3;
+        let (width, rows) = (fields.width(), fields.rows());
+        let mut area = Vec::new();
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..REPEATS {
+            area = vec![1.0f32; width * rows];
+            let at = std::time::Instant::now();
+            accumulate(
+                width,
+                rows,
+                &drainage.filled,
+                &drainage.order,
+                &drainage.drains_to,
+                &mut area,
+                share,
+            );
+            best = best.min(at.elapsed());
+        }
+
+        match control {
+            None => println!("  {label:38} {best:>8.1?}"),
+            Some(control) => {
+                let mut differing = 0usize;
+                let (mut worst_relative, mut worst_log) = (0.0f32, 0.0f32);
+                for (mine, theirs) in area.iter().zip(control) {
+                    if mine != theirs {
+                        differing += 1;
+                    }
+                    worst_relative =
+                        worst_relative.max((mine - theirs).abs() / theirs.abs().max(1e-9));
+                    // What the classifier actually reads: `route` stores the
+                    // log of the area, so a tenfold change in a headwater
+                    // trickle matters far less than this ratio suggests.
+                    worst_log = worst_log.max((mine.log2() - theirs.log2()).abs());
+                }
+                let share_differing = differing as f64 * 100.0 / area.len() as f64;
+                println!(
+                    "  {label:38} {best:>8.1?}   {share_differing:5.1}% differ, \
+                     worst {worst_relative:.3} relative, {worst_log:.4} in log2",
+                );
+            }
+        }
+        area
+    }
+
+    /// What the spreading exponent costs, and what a cheaper one would change.
+    ///
+    /// The accumulation is 62 s of a 203 s run and two hypotheses fit its
+    /// 61 ns per cell equally well. Either it is arithmetic-bound -- three or
+    /// four `powf` calls a cell at 8-20 ns each -- or it is latency-bound on
+    /// about seven random cache lines a cell over a 220 MB working set, at
+    /// which point the `powf` hides underneath the misses and removing it buys
+    /// nothing. Those lead to completely different work, so the number decides
+    /// the plan rather than decorating it.
+    ///
+    /// The last row is the floor: the same sweep, the same scatter, no
+    /// transcendental at all. If the exponent is free, that row is not much
+    /// faster than the first and the loop is memory-bound.
+    ///
+    /// The second row is the candidate. `x^1.125 = x * x^(1/8)` is three
+    /// correctly-rounded `sqrt` instructions -- exact, deterministic, no table,
+    /// and it transcribes to WGSL -- but 1.125 is not 1.1, so it is a change to
+    /// the landscape and the columns beside the timing are what that change
+    /// costs.
+    ///
+    /// Run with `--release ... -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement on the full grid, not a check"]
+    fn measure_what_the_spreading_exponent_costs() {
+        let fields = crate::fields::shipped_grid();
+        println!(
+            "grid {} x {} = {} cells",
+            fields.width(),
+            fields.rows(),
+            fields.width() * fields.rows()
+        );
+
+        // The real flood, so the sweep walks the order and the surface a run
+        // actually hands it rather than something with a tidier shape.
+        let drainage = drainage(&fields);
+
+        // Counted in its own untimed run, so the counter does not sit in the
+        // loop being measured.
+        let mut calls = 0u64;
+        let mut counted = vec![1.0f32; fields.width() * fields.rows()];
+        accumulate(
+            fields.width(),
+            fields.rows(),
+            &drainage.filled,
+            &drainage.order,
+            &drainage.drains_to,
+            &mut counted,
+            |fall| {
+                calls += 1;
+                fall.powf(SPREAD)
+            },
+        );
+        println!(
+            "the exponent is evaluated {calls} times a sweep, {:.2} per cell",
+            calls as f64 / counted.len() as f64
+        );
+
+        println!("  rule                                       best   against the rule today");
+        let control = sweep("powf(1.1), the rule today", &fields, &drainage, None, |f| {
+            f.powf(SPREAD)
+        });
+        sweep(
+            "f * f^(1/8), i.e. 1.125, three sqrts",
+            &fields,
+            &drainage,
+            Some(&control),
+            |f| f * f.sqrt().sqrt().sqrt(),
+        );
+        sweep(
+            "f, i.e. 1.0, the cheapest exponent",
+            &fields,
+            &drainage,
+            Some(&control),
+            |f| f,
+        );
+        sweep(
+            "1.0, no transcendental at all",
+            &fields,
+            &drainage,
+            Some(&control),
+            |_| 1.0,
+        );
+    }
+
+    /// How deep the drainage network is, and how wide each of its levels is.
+    ///
+    /// The evidence for or against parallelising the accumulation by depth.
+    /// Cells of equal depth never donate to each other, so a level can run
+    /// across all cores -- but only if there are levels worth handing to
+    /// twenty-four threads, and only if working out the depths is cheaper than
+    /// the sweep it is meant to parallelise. Both halves of that are printed
+    /// here rather than argued.
+    ///
+    /// Run with `--release ... -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement on the full grid, not a check"]
+    fn measure_how_deep_the_drainage_network_is() {
+        let fields = crate::fields::shipped_grid();
+        let (width, rows) = (fields.width(), fields.rows());
+        let drainage = drainage(&fields);
+
+        // The same backwards sweep the accumulation does, with the arithmetic
+        // replaced by a max -- which is the point: this is what a level
+        // decomposition would have to pay before it parallelised anything.
+        let at = std::time::Instant::now();
+        let mut depth = vec![0u32; width * rows];
+        for index in drainage.order.iter().rev() {
+            let index = *index as usize;
+            let (column, row) = ((index % width) as i64, (index / width) as i64);
+            let here = drainage.filled[index];
+            let mine = depth[index];
+            let mut fell = false;
+            for (dx, dy) in NEIGHBOURS.iter() {
+                let (nx, ny) = (column + dx, row + dy);
+                if nx < 0 || ny < 0 || nx >= width as i64 || ny >= rows as i64 {
+                    continue;
+                }
+                let neighbour = ny as usize * width + nx as usize;
+                if drainage.filled[neighbour] < here {
+                    depth[neighbour] = depth[neighbour].max(mine + 1);
+                    fell = true;
+                }
+            }
+            if !fell {
+                let into = drainage.drains_to[index];
+                if into != u32::MAX {
+                    depth[into as usize] = depth[into as usize].max(mine + 1);
+                }
+            }
+        }
+        let pre_pass = at.elapsed();
+
+        let levels = *depth.iter().max().expect("a non-empty grid") as usize + 1;
+        let mut population = vec![0usize; levels];
+        for at in &depth {
+            population[*at as usize] += 1;
+        }
+        let thin = population
+            .iter()
+            .filter(|cells| **cells < rayon::current_num_threads())
+            .count();
+        let mut sorted = population.clone();
+        sorted.sort_unstable();
+        let at_percentile = |p: f64| sorted[((sorted.len() - 1) as f64 * p) as usize];
+
+        println!("{levels} levels over {} cells", depth.len());
+        println!(
+            "cells per level: 50th {}, 90th {}, 99th {}, largest {}",
+            at_percentile(0.5),
+            at_percentile(0.9),
+            at_percentile(0.99),
+            sorted[sorted.len() - 1],
+        );
+        println!(
+            "{thin} levels ({:.1}%) hold fewer cells than this machine has threads ({})",
+            thin as f64 * 100.0 / levels as f64,
+            rayon::current_num_threads(),
+        );
+        println!(
+            "working the depths out took {pre_pass:.1?}, which is what a level \
+             decomposition pays before it parallelises anything"
+        );
     }
 }

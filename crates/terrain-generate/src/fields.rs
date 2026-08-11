@@ -279,6 +279,32 @@ impl Fields {
     }
 }
 
+/// The landscape a shipped run has in hand when the incision starts.
+///
+/// `main`'s own defaults -- the extent and `--sim-metres` the tool ships with,
+/// raised and relaxed but not yet cut -- so it is 3073 x 3585 cells, the size
+/// every timing in this crate is quoted against. Takes tens of seconds to
+/// build, which is why only the `#[ignore]`d measurements use it.
+///
+/// One copy rather than four. Three measurements in `flood` each had their own
+/// identical preamble, and the moment one of them drifted their numbers would
+/// have stopped being comparable while still looking like a table of the same
+/// thing.
+#[cfg(test)]
+pub fn shipped_grid() -> Fields {
+    let mut fields = Fields::new([49152.0, 57344.0], 16.0);
+    crate::shape::raise(
+        &mut fields,
+        crate::shape::Relief {
+            valley_metres: 700.0,
+            peak_metres: 2600.0,
+        },
+        0,
+    );
+    crate::thermal::relax(&mut fields, crate::thermal::Settling::Bedrock);
+    fields
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
