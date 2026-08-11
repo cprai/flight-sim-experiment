@@ -67,6 +67,8 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use rayon::prelude::*;
+
 use crate::fields::Fields;
 
 /// The eight neighbours of a cell.
@@ -131,10 +133,18 @@ pub struct Drainage {
 }
 
 /// Fills the hollows and works out where the water goes.
+///
+/// Three phases, and they are timed separately at `debug` because they are not
+/// equally amenable to being sped up: the flood is a heap and inherently
+/// ordered, the receivers are one independent decision per cell, and the
+/// accumulation is a sweep that has to follow the flood's order. Which of them
+/// dominates decides where any effort is worth spending, and that was worth
+/// measuring rather than assuming.
 pub fn drainage(fields: &Fields) -> Drainage {
     let (width, rows) = (fields.width(), fields.rows());
     let count = width * rows;
     let heights: &[f32] = &fields.height.values;
+    let started = std::time::Instant::now();
 
     let mut filled = vec![0f32; count];
     // Which cell reached each one. The flood's own tree, kept because it is the
@@ -184,40 +194,53 @@ pub fn drainage(fields: &Fields) -> Drainage {
         }
     }
 
+    log::debug!("drainage: the flood took {:.2?}", started.elapsed());
+    let at = std::time::Instant::now();
+
     // Where each cell drains to: the steepest neighbour strictly below it on
     // the filled surface, or -- on the flat of a lake, where there is no such
     // neighbour -- whichever cell the flood reached it from, which is by
     // construction on the way to the spill point.
+    // One row per task. Every cell's answer depends only on the finished filled
+    // surface and never on another cell's answer, so this is the one phase of
+    // the three that parallelises by simply being asked to: rayon splitting the
+    // rows cannot change a single value, only how long they take to arrive.
     let mut drains_to = vec![u32::MAX; count];
-    for row in 0..rows {
-        for column in 0..width {
-            let index = row * width + column;
-            let here = filled[index];
-            let (mut best, mut steepest) = (u32::MAX, 0.0f32);
-            for (dx, dy) in NEIGHBOURS {
-                let (nx, ny) = (column as i64 + dx, row as i64 + dy);
-                if nx < 0 || ny < 0 || nx >= width as i64 || ny >= rows as i64 {
-                    continue;
+    drains_to
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(row, drains_to)| {
+            for (column, drains_to) in drains_to.iter_mut().enumerate() {
+                let index = row * width + column;
+                let here = filled[index];
+                let (mut best, mut steepest) = (u32::MAX, 0.0f32);
+                for (dx, dy) in NEIGHBOURS {
+                    let (nx, ny) = (column as i64 + dx, row as i64 + dy);
+                    if nx < 0 || ny < 0 || nx >= width as i64 || ny >= rows as i64 {
+                        continue;
+                    }
+                    let neighbour = ny as usize * width + nx as usize;
+                    let reach = if dx != 0 && dy != 0 {
+                        std::f32::consts::SQRT_2
+                    } else {
+                        1.0
+                    };
+                    let fall = (here - filled[neighbour]) / reach;
+                    if fall > steepest {
+                        steepest = fall;
+                        best = neighbour as u32;
+                    }
                 }
-                let neighbour = ny as usize * width + nx as usize;
-                let reach = if dx != 0 && dy != 0 {
-                    std::f32::consts::SQRT_2
+                *drains_to = if best != u32::MAX {
+                    best
                 } else {
-                    1.0
+                    reached_by[index]
                 };
-                let fall = (here - filled[neighbour]) / reach;
-                if fall > steepest {
-                    steepest = fall;
-                    best = neighbour as u32;
-                }
             }
-            drains_to[index] = if best != u32::MAX {
-                best
-            } else {
-                reached_by[index]
-            };
-        }
-    }
+        });
+
+    log::debug!("drainage: the receivers took {:.2?}", at.elapsed());
+    let at = std::time::Instant::now();
 
     // One backwards sweep of the pop order, sharing each cell's area among
     // every neighbour below it. The sweep is still exact in a single pass: a
@@ -278,6 +301,8 @@ pub fn drainage(fields: &Fields) -> Drainage {
             area[neighbour] += sending * falls[slot] / total;
         }
     }
+
+    log::debug!("drainage: the accumulation took {:.2?}", at.elapsed());
 
     Drainage {
         filled,
