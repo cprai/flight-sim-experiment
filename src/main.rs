@@ -59,17 +59,32 @@ struct Terrain {
 
 /// Which of the four ways to run.
 ///
-/// Subcommands rather than flags because the modes do not share arguments:
+/// Subcommands rather than flags because the modes hardly share arguments:
 /// `--camera` means nothing to a window you can steer, and an output path means
 /// nothing to a run that measures. As flags those had to be bound together with
-/// clap `requires` attributes that said so only after the fact.
+/// clap `requires` attributes that said so only after the fact. The one thing
+/// all four do share, [`Sky`], is flattened into each rather than made a global:
+/// clap cannot require a global, and a global would sit before the subcommand,
+/// which reads oddly for something this specific to the picture.
 #[derive(clap::Subcommand, Debug)]
 enum Mode {
     /// Open a window and fly.
-    Fly(Terrain),
+    Fly {
+        #[command(flatten)]
+        terrain: Terrain,
+
+        #[command(flatten)]
+        sky: Sky,
+    },
 
     /// Open a window and fly, with the frame breakdown drawn in the corner.
-    FlyProfile(Terrain),
+    FlyProfile {
+        #[command(flatten)]
+        terrain: Terrain,
+
+        #[command(flatten)]
+        sky: Sky,
+    },
 
     /// Render a single frame to a PNG and exit, without opening a window.
     ///
@@ -141,13 +156,33 @@ struct View {
     #[arg(long, default_value_t = 0.0, value_name = "M/S")]
     motion: f32,
 
+    #[command(flatten)]
+    sky: Sky,
+}
+
+/// Where the sun is, which every mode needs and none can infer.
+///
+/// Its own struct, flattened into all four modes, so the flag is declared once
+/// and cannot drift between them. The atmosphere is a pure function of the
+/// camera and this, so a `fly` run and the `render` that reproduces a frame from
+/// it have to be able to say the same thing.
+#[derive(clap::Args, Debug)]
+struct Sky {
     /// Where the sun is, as `ELEVATION,AZIMUTH` in degrees.
     ///
     /// Elevation is measured from the horizon and may be negative, which puts
     /// the sun below it; azimuth is a compass bearing, zero north and ninety
     /// east. Without it the sun sits where it always has, 45 degrees up in the
     /// south-east, so every existing invocation draws the frame it drew before.
-    #[arg(long, value_name = "ELEVATION,AZIMUTH")]
+    // Not a doc comment: clap prints those as help, and this is for whoever
+    // edits the flag rather than whoever runs it. `allow_hyphen_values` is what
+    // lets a sun below the horizon be written `--sun -3,120` as well as
+    // `--sun=-3,120`; without it clap reads the leading minus as the start of
+    // another flag and rejects the command. That is a trap worth spending the
+    // setting on, because the elevations worth looking at most are the ones
+    // near and below zero. The cost is that `--sun` will swallow whatever
+    // follows it, which `SunAngles` then rejects for not being two numbers.
+    #[arg(long, value_name = "ELEVATION,AZIMUTH", allow_hyphen_values = true)]
     sun: Option<SunAngles>,
 }
 
@@ -175,6 +210,9 @@ struct App {
     terrain: PathBuf,
     /// Whether to instrument the frame and draw the breakdown over it.
     profiling: bool,
+    /// Where the sun goes once the renderer exists, since the window is built
+    /// on `resumed` rather than here and there is no scene to put it in yet.
+    sun: Option<SunAngles>,
     renderer: Option<Renderer>,
     controls: FlyController,
     /// When the last frame was drawn, for the timestep the controls integrate over.
@@ -182,11 +220,17 @@ struct App {
 }
 
 impl App {
-    fn new(display: OwnedDisplayHandle, terrain: PathBuf, profiling: bool) -> Self {
+    fn new(
+        display: OwnedDisplayHandle,
+        terrain: PathBuf,
+        profiling: bool,
+        sun: Option<SunAngles>,
+    ) -> Self {
         Self {
             display,
             terrain,
             profiling,
+            sun,
             renderer: None,
             controls: FlyController::default(),
             last_frame: Instant::now(),
@@ -218,6 +262,7 @@ impl ApplicationHandler for App {
             self.display.clone(),
             &self.terrain,
             self.profiling,
+            self.sun,
         )) {
             Ok(renderer) => {
                 self.controls = FlyController::new(renderer.camera());
@@ -311,7 +356,7 @@ fn main() -> anyhow::Result<()> {
     // The headless modes run before the event loop is ever built, deliberately:
     // `EventLoop::new` fails outright on a machine with no display server, which
     // is exactly where those modes are for.
-    let (terrain, profiling) = match arguments.mode {
+    let (terrain, profiling, sun) = match arguments.mode {
         Mode::Render {
             terrain,
             output,
@@ -322,7 +367,7 @@ fn main() -> anyhow::Result<()> {
                 &terrain.terrain,
                 view.size.unwrap_or(DEFAULT_SIZE),
                 view.camera,
-                view.sun,
+                view.sky.sun,
                 headless::Flight {
                     frames,
                     speed: view.motion,
@@ -339,22 +384,139 @@ fn main() -> anyhow::Result<()> {
                 &terrain.terrain,
                 view.size.unwrap_or(DEFAULT_SIZE),
                 view.camera,
-                view.sun,
+                view.sky.sun,
                 headless::Flight {
                     frames,
                     speed: view.motion,
                 },
             );
         }
-        Mode::Fly(terrain) => (terrain.terrain, false),
-        Mode::FlyProfile(terrain) => (terrain.terrain, true),
+        Mode::Fly { terrain, sky } => (terrain.terrain, false, sky.sun),
+        Mode::FlyProfile { terrain, sky } => (terrain.terrain, true, sky.sun),
     };
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(event_loop.owned_display_handle(), terrain, profiling);
+    let mut app = App::new(event_loop.owned_display_handle(), terrain, profiling, sun);
     event_loop.run_app(&mut app)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use clap::CommandFactory;
+
+    /// Where a parsed command puts the sun, whichever mode it is.
+    ///
+    /// Written as one function over all four so that a mode which quietly
+    /// stopped carrying `--sun` would fail here rather than be skipped.
+    fn sun_of(argv: &[&str]) -> Option<SunAngles> {
+        let arguments = Arguments::try_parse_from(argv)
+            .unwrap_or_else(|err| panic!("{argv:?} did not parse: {err}"));
+        match arguments.mode {
+            Mode::Fly { sky, .. } | Mode::FlyProfile { sky, .. } => sky.sun,
+            Mode::Render { view, .. } | Mode::Profile { view, .. } => view.sky.sun,
+        }
+    }
+
+    /// clap's own check that the derived command is well formed -- duplicate
+    /// argument ids, a flattened struct colliding with its host, and the like.
+    /// Worth running because `Sky` is now flattened into four places, two of
+    /// them through `View`, and a collision would otherwise surface as a panic
+    /// the first time somebody ran the binary.
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        Arguments::command().debug_assert();
+    }
+
+    #[test]
+    fn every_mode_takes_the_sun() {
+        let angles = SunAngles {
+            elevation_degrees: 5.0,
+            azimuth_degrees: 120.0,
+        };
+        assert_eq!(
+            sun_of(&["flight-sim", "fly", "-t", "x", "--sun", "5,120"]),
+            Some(angles)
+        );
+        assert_eq!(
+            sun_of(&["flight-sim", "fly-profile", "-t", "x", "--sun", "5,120"]),
+            Some(angles)
+        );
+        assert_eq!(
+            sun_of(&[
+                "flight-sim",
+                "render",
+                "-t",
+                "x",
+                "-o",
+                "y",
+                "--sun",
+                "5,120"
+            ]),
+            Some(angles)
+        );
+        assert_eq!(
+            sun_of(&["flight-sim", "profile", "-t", "x", "--sun", "5,120"]),
+            Some(angles)
+        );
+    }
+
+    /// Left out, the sun stays wherever `Sun::default` puts it, so every
+    /// invocation that predates the flag draws the frame it always drew.
+    #[test]
+    fn leaving_the_sun_out_leaves_it_alone() {
+        assert_eq!(sun_of(&["flight-sim", "fly", "-t", "x"]), None);
+        assert_eq!(
+            sun_of(&["flight-sim", "render", "-t", "x", "-o", "y"]),
+            None
+        );
+    }
+
+    /// The elevations worth looking at are the ones near and below zero, so a
+    /// leading minus has to survive both spellings. Without
+    /// `allow_hyphen_values` the separated form is rejected as an unknown flag.
+    #[test]
+    fn a_sun_below_the_horizon_parses_either_way() {
+        let dusk = SunAngles {
+            elevation_degrees: -3.0,
+            azimuth_degrees: 120.0,
+        };
+        assert_eq!(
+            sun_of(&["flight-sim", "fly", "-t", "x", "--sun", "-3,120"]),
+            Some(dusk)
+        );
+        assert_eq!(
+            sun_of(&["flight-sim", "fly", "-t", "x", "--sun=-3,120"]),
+            Some(dusk)
+        );
+    }
+
+    /// `allow_hyphen_values` buys the above at the price of `--sun` swallowing
+    /// whatever follows it. That is tolerable only because the value still has
+    /// to parse as two numbers, so a swallowed flag is an error and not a
+    /// silently wrong sun.
+    #[test]
+    fn the_sun_still_refuses_what_is_not_two_numbers() {
+        for bad in ["--motion", "5", "5,120,90", "up,east"] {
+            assert!(
+                Arguments::try_parse_from([
+                    "flight-sim",
+                    "render",
+                    "-t",
+                    "x",
+                    "-o",
+                    "y",
+                    "--sun",
+                    bad
+                ])
+                .is_err(),
+                "{bad:?} was accepted as a sun"
+            );
+        }
+    }
 }

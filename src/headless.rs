@@ -93,6 +93,16 @@ impl SunAngles {
     pub fn sun(self) -> crate::sky::Sun {
         crate::sky::Sun::from_angles(self.elevation_degrees, self.azimuth_degrees)
     }
+
+    /// The sun these angles name, or the default when the flag was left out.
+    ///
+    /// One function rather than an `if let` at each place that sets a scene's
+    /// sun. The windowed modes went without a `--sun` at all for as long as
+    /// they did partly because every path that had one set it for itself, so
+    /// there was nothing a new path could fail to call.
+    pub fn or_default(angles: Option<Self>) -> crate::sky::Sun {
+        angles.map_or_else(crate::sky::Sun::default, Self::sun)
+    }
 }
 
 impl FromStr for SunAngles {
@@ -344,9 +354,7 @@ fn settled(
     if let Some(placement) = placement {
         placement.apply(&mut scene.camera);
     }
-    if let Some(sun) = sun {
-        scene.sun = sun.sun();
-    }
+    scene.sun = SunAngles::or_default(sun);
     log::info!(
         "camera at {} facing {:?}",
         scene.camera.position,
@@ -628,5 +636,41 @@ mod tests {
         assert!("1,2,3,4".parse::<Placement>().is_err());
         assert!("1,2,3,4,5,6".parse::<Placement>().is_err());
         assert!("1,2,3,4,north".parse::<Placement>().is_err());
+    }
+
+    #[test]
+    fn sun_angles_read_two_numbers() {
+        assert_eq!(
+            "-3, 120".parse::<SunAngles>().unwrap(),
+            SunAngles {
+                elevation_degrees: -3.0,
+                azimuth_degrees: 120.0,
+            }
+        );
+        assert!("5".parse::<SunAngles>().is_err());
+        assert!("5,120,90".parse::<SunAngles>().is_err());
+        assert!("up,east".parse::<SunAngles>().is_err());
+    }
+
+    /// Both the windowed and the headless modes go through this, so an
+    /// invocation with no `--sun` has to land on exactly the sun a scene is
+    /// built with -- otherwise adding the flag would have quietly moved the
+    /// light in every run that never asked for it.
+    #[test]
+    fn leaving_the_angles_out_gives_the_scene_its_default_sun() {
+        assert_eq!(SunAngles::or_default(None), crate::sky::Sun::default());
+    }
+
+    #[test]
+    fn giving_the_angles_puts_the_sun_where_they_say() {
+        let dusk = SunAngles {
+            elevation_degrees: -3.0,
+            azimuth_degrees: 120.0,
+        };
+        assert_eq!(SunAngles::or_default(Some(dusk)), dusk.sun());
+        // Below the horizon, which is the case the flag exists to reach and
+        // the one `Sun::default` cannot express.
+        assert!(SunAngles::or_default(Some(dusk)).direction.y < 0.0);
+        assert!(crate::sky::Sun::default().direction.y > 0.0);
     }
 }

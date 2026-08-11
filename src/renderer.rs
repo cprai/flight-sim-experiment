@@ -36,6 +36,7 @@ impl Renderer {
         display: winit::event_loop::OwnedDisplayHandle,
         terrain_root: &std::path::Path,
         profiling: bool,
+        sun: Option<crate::headless::SunAngles>,
     ) -> anyhow::Result<Self> {
         let size = window.inner_size();
 
@@ -107,6 +108,16 @@ impl Renderer {
             terrain_root,
         )?;
         scene.profile(&device, profiling);
+        // Set once here rather than steered from the controls: the tables the
+        // atmosphere reads are rebuilt from `scene.sun` every frame, so moving
+        // the sun later would cost nothing and need no invalidation -- but that
+        // is a key binding and a HUD readout, and this is the flag that lets a
+        // window be pointed at the same sky a `render` was.
+        scene.sun = crate::headless::SunAngles::or_default(sun);
+        // Said out loud for the same reason the headless modes say it: two runs
+        // that differ only in where the sun was are otherwise indistinguishable
+        // in the log, and the sun decides the colour of every pixel.
+        log::info!("sun towards {}", scene.sun.direction);
 
         // No overlay at all on an unprofiled run: there is nothing to put in it.
         let hud =
