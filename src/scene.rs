@@ -757,7 +757,7 @@ mod tests {
         heights: Vec<f32>,
         materials: Vec<MaterialId>,
         aim: impl FnOnce(&mut Camera),
-    ) -> Vec<u8> {
+    ) -> Frame {
         render_after(heights, materials, aim, &[])
     }
 
@@ -768,22 +768,7 @@ mod tests {
         materials: Vec<MaterialId>,
         aim: impl FnOnce(&mut Camera),
         path: &[Vec3],
-    ) -> Vec<u8> {
-        render_probed(heights, materials, aim, path).0
-    }
-
-    /// As [`render_after`], but also reporting the base level the clipmap chose.
-    ///
-    /// The base level is how much detail the camera's height above the ground
-    /// bought: everything below it was dropped. A test that means to look at
-    /// more than one level has to say so, because a camera high enough leaves
-    /// only the coarsest and the test would pass on an empty promise.
-    fn render_probed(
-        heights: Vec<f32>,
-        materials: Vec<MaterialId>,
-        aim: impl FnOnce(&mut Camera),
-        path: &[Vec3],
-    ) -> (Vec<u8>, u32) {
+    ) -> Frame {
         render_config(test_residency(), heights, materials, aim, path)
     }
 
@@ -836,14 +821,14 @@ mod tests {
         )
     }
 
-    /// As [`render_probed`], but over a residency configured by the caller.
+    /// As [`render_after`], but over a residency configured by the caller.
     fn render_config(
         residency: Residency,
         heights: Vec<f32>,
         materials: Vec<MaterialId>,
         aim: impl FnOnce(&mut Camera),
         path: &[Vec3],
-    ) -> (Vec<u8>, u32) {
+    ) -> Frame {
         let (device, queue) = test_device();
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -876,14 +861,19 @@ mod tests {
         scene.camera.position = destination;
         scene.update(&device, &queue);
 
-        // `SIZE * 4` is already a multiple of the 256-byte copy alignment.
+        // `SIZE * 4` is already a multiple of the 256-byte copy alignment, and
+        // the depth channel is four bytes wide too, so one figure serves both.
         let bytes_per_row = SIZE * 4;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: u64::from(bytes_per_row * SIZE),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let staging = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: u64::from(bytes_per_row * SIZE),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let readback = staging("readback");
+        let depth_readback = staging("depth readback");
 
         let profiler = crate::profile::profiler(&device, false);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -891,25 +881,31 @@ mod tests {
             let mut gpu = profiler.scope("gpu", &mut encoder);
             scene.draw(&mut gpu, &view);
         }
-        encoder.copy_texture_to_buffer(
-            texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(SIZE),
+        let mut copy = |source: wgpu::TexelCopyTextureInfo, into: &wgpu::Buffer| {
+            encoder.copy_texture_to_buffer(
+                source,
+                wgpu::TexelCopyBufferInfo {
+                    buffer: into,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(SIZE),
+                    },
                 },
-            },
-            wgpu::Extent3d {
-                width: SIZE,
-                height: SIZE,
-                depth_or_array_layers: 1,
-            },
-        );
+                wgpu::Extent3d {
+                    width: SIZE,
+                    height: SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+        copy(texture.as_image_copy(), &readback);
+        copy(scene.gbuffer.targets.depth.as_image_copy(), &depth_readback);
         queue.submit(std::iter::once(encoder.finish()));
 
-        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+        for buffer in [&readback, &depth_readback] {
+            buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+        }
         device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll failed");
@@ -919,54 +915,90 @@ mod tests {
             .expect("buffer not mapped")
             .to_vec();
         readback.unmap();
-        (pixels, scene.terrain.base_level())
+        let depths = bytemuck::cast_slice::<u8, f32>(
+            &depth_readback
+                .get_mapped_range(..)
+                .expect("buffer not mapped"),
+        )
+        .to_vec();
+        depth_readback.unmap();
+
+        Frame {
+            pixels,
+            depths,
+            base_level: scene.terrain.base_level(),
+        }
+    }
+
+    /// One rendered frame: the picture, and the G-buffer behind it.
+    ///
+    /// The picture alone used to be enough to say what a pixel *was* -- sky was
+    /// one flat colour and a material was another -- so the helpers here asked
+    /// the bytes. That was always a little false and it is about to be plainly
+    /// so: [`untouched`], the predicate this replaces, had to be stricter than
+    /// its neighbour because "bluer than it is red or green" finds every lake
+    /// in the frame as well as the sky.
+    ///
+    /// So the buffers the march wrote answer what was drawn, and the picture is
+    /// asked only how it was lit. The march covers every pixel exactly once and
+    /// writes zero depth where its ray found no ground -- which the reversed
+    /// infinite projection cannot produce for any finite hit -- so [`Frame::sky`]
+    /// is the same exact test `fs_shade` itself makes, rather than a guess at
+    /// what it produced. `targets` on the G-buffer exists for this; see the
+    /// note on [`crate::deferred::GBuffer::targets`].
+    struct Frame {
+        pixels: Vec<u8>,
+        /// Reversed-Z depth per pixel, straight from the G-buffer.
+        depths: Vec<f32>,
+        /// How much detail the camera's height above the ground bought:
+        /// everything below this level was dropped. A test that means to look
+        /// at more than one level has to say so, because a camera high enough
+        /// leaves only the coarsest and the test would pass on an empty promise.
+        base_level: u32,
+    }
+
+    impl Frame {
+        fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+            pixel(&self.pixels, x, y)
+        }
+
+        /// Whether the march found no ground at this pixel.
+        fn sky(&self, x: u32, y: u32) -> bool {
+            self.depths[(y * SIZE + x) as usize] == 0.0
+        }
+
+        /// How many pixels of the frame are sky.
+        fn count_sky(&self) -> usize {
+            (0..SIZE)
+                .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+                .filter(|&(x, y)| self.sky(x, y))
+                .count()
+        }
+
+        /// Sky pixels that have ground both above and below them.
+        ///
+        /// Sky above a ridge is honest; sky enclosed by ground is a ray that
+        /// should have found something and did not.
+        fn holes(&self) -> Vec<(u32, u32)> {
+            (0..SIZE)
+                .flat_map(|x| {
+                    let drawn: Vec<bool> = (0..SIZE).map(|y| !self.sky(x, y)).collect();
+                    (0..SIZE)
+                        .filter(|&y| {
+                            !drawn[y as usize]
+                                && drawn[..y as usize].iter().any(|hit| *hit)
+                                && drawn[y as usize..].iter().any(|hit| *hit)
+                        })
+                        .map(move |y| (x, y))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
     }
 
     fn pixel(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
         let i = ((y * SIZE + x) * 4) as usize;
         pixels[i..i + 4].try_into().unwrap()
-    }
-
-    fn is_sky([r, g, b, _]: [u8; 4]) -> bool {
-        b > r && b > g
-    }
-
-    /// The bytes of a pixel the march never wrote, which the shading pass
-    /// paints as sky.
-    ///
-    /// Stricter than [`is_sky`], and it has to be for counting holes: the
-    /// water materials are bluer than they are red or green, so a test on the
-    /// channel order alone finds every lake and river as well. One count of
-    /// slack per channel, because the sky is written by a shader from the
-    /// same constant rather than loaded from the clear, and the encoding's
-    /// last bit belongs to the driver.
-    fn untouched(pixel: [u8; 4]) -> bool {
-        let clear = [CLEAR_COLOR.r, CLEAR_COLOR.g, CLEAR_COLOR.b]
-            .map(|channel| terrain_tiles::linear_to_srgb(channel as f32));
-        pixel[..3]
-            .iter()
-            .zip(clear)
-            .all(|(&got, want)| got.abs_diff(want) <= 1)
-    }
-
-    /// Pixels nothing drew that have ground both above and below them.
-    ///
-    /// Sky above a ridge is honest; sky enclosed by ground is a ray that should
-    /// have found something and did not.
-    fn holes(pixels: &[u8]) -> Vec<(u32, u32)> {
-        (0..SIZE)
-            .flat_map(|x| {
-                let drawn: Vec<bool> = (0..SIZE).map(|y| !untouched(pixel(pixels, x, y))).collect();
-                (0..SIZE)
-                    .filter(|&y| {
-                        !drawn[y as usize]
-                            && drawn[..y as usize].iter().any(|hit| *hit)
-                            && drawn[y as usize..].iter().any(|hit| *hit)
-                    })
-                    .map(move |y| (x, y))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
     }
 
     /// Looks straight down from high enough to see most of the raster.
@@ -979,14 +1011,6 @@ mod tests {
     fn world_of(col: f64, row: f64) -> Vec3 {
         let (x, z) = placement().world_of_texel(0, col, row);
         Vec3::new(x as f32, 0.0, z as f32)
-    }
-
-    /// How many pixels of a frame are sky.
-    fn count_sky(pixels: &[u8]) -> usize {
-        (0..SIZE)
-            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
-            .filter(|&(x, y)| is_sky(pixel(pixels, x, y)))
-            .count()
     }
 
     /// Mean absolute difference between two frames, per colour byte.
@@ -1050,7 +1074,6 @@ mod tests {
                 grazing,
                 &[],
             )
-            .0
         };
 
         // A budget far below what the traversal needs, so that rays really do
@@ -1061,7 +1084,7 @@ mod tests {
         // of the budget is where rays start running out and the fallback still
         // covers every one of them.
         let starved = frame(24);
-        let holes = holes(&starved);
+        let holes = starved.holes();
 
         assert!(
             holes.is_empty(),
@@ -1073,7 +1096,7 @@ mod tests {
         // ... and where it had got to is close enough to where it was going
         // that the picture barely notices.
         let whole = frame(Residency::default().march_texels);
-        let difference = mean_difference(&starved, &whole);
+        let difference = mean_difference(&starved.pixels, &whole.pixels);
         assert!(
             difference < 3.0,
             "giving up early moved the frame by {difference:.2} of 255"
@@ -1109,7 +1132,7 @@ mod tests {
             .collect();
 
         let transitions = |residency: Residency| {
-            let (pixels, _) = render_config(
+            let frame = render_config(
                 residency,
                 vec![0.0; (RASTER * RASTER) as usize],
                 check.clone(),
@@ -1120,8 +1143,8 @@ mod tests {
             let mut ground = 0u64;
             for y in 0..SIZE {
                 for x in 0..SIZE - 1 {
-                    let (here, next) = (pixel(&pixels, x, y), pixel(&pixels, x + 1, y));
-                    if is_sky(here) || is_sky(next) {
+                    let (here, next) = (frame.pixel(x, y), frame.pixel(x + 1, y));
+                    if frame.sky(x, y) || frame.sky(x + 1, y) {
                         continue;
                     }
                     ground += 1;
@@ -1159,14 +1182,13 @@ mod tests {
             flat_ground(),
             straight_down,
             &[],
-        )
-        .0;
-        let marched = render_config(test_residency(), heights, flat_ground(), straight_down, &[]).0;
+        );
+        let marched = render_config(test_residency(), heights, flat_ground(), straight_down, &[]);
 
         // Not zero either way: the frame's corners reach past the raster, and
         // that ground is cut by both halves alike. What matters is that marching
         // does not add to it.
-        let (sky, marched_sky) = (count_sky(&rastered), count_sky(&marched));
+        let (sky, marched_sky) = (rastered.count_sky(), marched.count_sky());
         assert!(
             marched_sky < sky + 200,
             "marching showed {marched_sky} sky pixels where the mesh showed {sky}"
@@ -1175,16 +1197,16 @@ mod tests {
 
     #[test]
     fn the_opening_view_looks_out_over_terrain_under_sky() {
-        let pixels = render(vec![0.0; (RASTER * RASTER) as usize], flat_ground(), |_| {});
+        let frame = render(vec![0.0; (RASTER * RASTER) as usize], flat_ground(), |_| {});
 
-        let sky = pixel(&pixels, SIZE / 2, 4);
+        let sky = frame.pixel(SIZE / 2, 4);
         assert_eq!(sky[3], 255, "sky should be opaque");
-        assert!(is_sky(sky), "top of frame should be sky, got {sky:?}");
+        assert!(frame.sky(SIZE / 2, 4), "top of frame should be sky");
 
-        let ground = pixel(&pixels, SIZE / 2, SIZE - 4);
+        let ground = frame.pixel(SIZE / 2, SIZE - 4);
         assert!(
-            !is_sky(ground),
-            "bottom of frame should be ground, got {ground:?}"
+            !frame.sky(SIZE / 2, SIZE - 4),
+            "bottom of frame should be ground"
         );
         assert!(
             shows(Material::Grass, ground),
@@ -1218,7 +1240,7 @@ mod tests {
             }
 
             let mut camera = None;
-            let (pixels, _) = render_config(
+            let frame = render_config(
                 residency,
                 vec![0.0; (RASTER * RASTER) as usize],
                 materials,
@@ -1233,7 +1255,7 @@ mod tests {
 
             let centre = world_of(f64::from(patch_col), f64::from(patch_row));
             let (x, y) = to_pixels(camera.view_projection(), centre, SIZE, SIZE);
-            let found = pixel(&pixels, x.round() as u32, y.round() as u32);
+            let found = frame.pixel(x.round() as u32, y.round() as u32);
 
             assert!(
                 shows(Material::Sand, found),
@@ -1244,7 +1266,7 @@ mod tests {
             // so the patch has not simply been smeared over everything.
             let elsewhere = world_of(f64::from(patch_col), f64::from(RASTER - patch_row));
             let (x, y) = to_pixels(camera.view_projection(), elsewhere, SIZE, SIZE);
-            let found = pixel(&pixels, x.round() as u32, y.round() as u32);
+            let found = frame.pixel(x.round() as u32, y.round() as u32);
             assert!(
                 shows(Material::Grass, found),
                 "base {base}: expected background at ({x:.0}, {y:.0}), got {found:?}"
@@ -1335,7 +1357,6 @@ mod tests {
                 looking_down_from(DISSOLVE_ALTITUDE, east),
                 &[],
             )
-            .0
         };
         let still = frame(0.0);
         let slid = frame((f64::from(across) * metres_per_pixel) as f32);
@@ -1348,11 +1369,11 @@ mod tests {
         // of a few percent and says nothing about the coin. So a pixel counts
         // only where both frames are flat around it -- which is most of every
         // square, and all of what a coin thrown per texel decides.
-        let flat = |frame: &[u8], x: u32, y: u32| {
-            let here = pixel(frame, x, y);
+        let flat = |frame: &Frame, x: u32, y: u32| {
+            let here = frame.pixel(x, y);
             (-1..=1).all(|dy: i32| {
                 (-1..=1).all(|dx: i32| {
-                    pixel(frame, x.wrapping_add_signed(dx), y.wrapping_add_signed(dy)) == here
+                    frame.pixel(x.wrapping_add_signed(dx), y.wrapping_add_signed(dy)) == here
                 })
             })
         };
@@ -1364,7 +1385,7 @@ mod tests {
                 if !flat(&still, x + across, y) || !flat(&slid, x, y) {
                     continue;
                 }
-                if pixel(&still, x + across, y) == pixel(&slid, x, y) {
+                if still.pixel(x + across, y) == slid.pixel(x, y) {
                     same += 1;
                 } else {
                     differ += 1;
@@ -1422,7 +1443,6 @@ mod tests {
                 looking_down_from(DISSOLVE_ALTITUDE, 0.0),
                 &[],
             )
-            .0
         };
         // One is the band shut: the level is used out to its reach and then
         // stops, which from here means the whole frame.
@@ -1435,7 +1455,7 @@ mod tests {
         for y in 0..SIZE {
             for x in 0..SIZE {
                 let radius = Vec2::new(x as f32 - middle as f32, y as f32 - middle as f32).length();
-                let changed = u32::from(pixel(&shut, x, y) != pixel(&open, x, y));
+                let changed = u32::from(shut.pixel(x, y) != open.pixel(x, y));
                 if radius < 0.25 * SIZE as f32 {
                     near_seen += 1;
                     near += changed;
@@ -1480,20 +1500,13 @@ mod tests {
             }
             heights
         };
-        let count_sky = |pixels: &[u8]| {
-            (0..SIZE)
-                .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
-                .filter(|&(x, y)| is_sky(pixel(pixels, x, y)))
-                .count()
-        };
-
-        let solid = count_sky(&render(with_hole(false), flat_ground(), straight_down));
+        let solid = render(with_hole(false), flat_ground(), straight_down).count_sky();
         assert_eq!(
             solid, 0,
             "looking straight down at unbroken ground should show no sky"
         );
 
-        let punched = count_sky(&render(with_hole(true), flat_ground(), straight_down));
+        let punched = render(with_hole(true), flat_ground(), straight_down).count_sky();
         assert!(
             punched > 200,
             "the hole should show sky through it, got {punched} pixels"
@@ -1527,22 +1540,22 @@ mod tests {
             camera.position = Vec3::new(0.0, 400.0, world_of(64.0, 76.0).z + 400.0);
             camera.orientation = Camera::from_yaw_pitch_roll(0.0, -10f32.to_radians(), 0.0);
         };
-        let count_far = |pixels: &[u8]| {
+        let count_far = |frame: &Frame| {
             (0..SIZE)
                 .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
-                .filter(|&(x, y)| shows(Material::Lake, pixel(pixels, x, y)))
+                .filter(|&(x, y)| shows(Material::Lake, frame.pixel(x, y)))
                 .count()
         };
 
         let (heights, materials) = ridges(false);
-        let alone = count_far(&render_config(test_residency(), heights, materials, aim, &[]).0);
+        let alone = count_far(&render_config(test_residency(), heights, materials, aim, &[]));
         assert!(
             alone > 500,
             "the far plateau should be plainly in shot on its own, got {alone} pixels"
         );
 
         let (heights, materials) = ridges(true);
-        let occluded = count_far(&render_config(test_residency(), heights, materials, aim, &[]).0);
+        let occluded = count_far(&render_config(test_residency(), heights, materials, aim, &[]));
         assert_eq!(
             occluded, 0,
             "every ray should have stopped at the near ridge"
@@ -1567,28 +1580,24 @@ mod tests {
             heights
         };
 
-        let solid = count_sky(
-            &render_config(
-                test_residency(),
-                with_hole(false),
-                flat_ground(),
-                straight_down,
-                &[],
-            )
-            .0,
-        );
+        let solid = render_config(
+            test_residency(),
+            with_hole(false),
+            flat_ground(),
+            straight_down,
+            &[],
+        )
+        .count_sky();
         assert_eq!(solid, 0, "unbroken ground should show no sky");
 
-        let punched = count_sky(
-            &render_config(
-                test_residency(),
-                with_hole(true),
-                flat_ground(),
-                straight_down,
-                &[],
-            )
-            .0,
-        );
+        let punched = render_config(
+            test_residency(),
+            with_hole(true),
+            flat_ground(),
+            straight_down,
+            &[],
+        )
+        .count_sky();
         // Sized, not merely present. The hole is sixteen texels of 30 m, so
         // 480 m across; from 3000 m up, over a frame spanning 3464 m in 256
         // pixels, it projects to about 35 pixels a side and so 1250 of them. A
@@ -1610,19 +1619,17 @@ mod tests {
         // shot. Rings reach past it and reads out there repeat the border texel,
         // so a march that did not cut at the data bounds would draw a plateau of
         // invented ground rather than sky.
-        let beyond = count_sky(
-            &render_config(
-                test_residency(),
-                with_hole(false),
-                flat_ground(),
-                |camera| {
-                    camera.position = Vec3::new(0.0, 6000.0, 0.0);
-                    camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
-                },
-                &[],
-            )
-            .0,
-        );
+        let beyond = render_config(
+            test_residency(),
+            with_hole(false),
+            flat_ground(),
+            |camera| {
+                camera.position = Vec3::new(0.0, 6000.0, 0.0);
+                camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+            },
+            &[],
+        )
+        .count_sky();
         assert!(
             beyond > 2000,
             "the ground should stop at the raster's edge, got {beyond} sky pixels"
@@ -1639,15 +1646,19 @@ mod tests {
         let null = vec![MaterialId(0); (RASTER * RASTER) as usize];
 
         let flat = vec![0.0f32; (RASTER * RASTER) as usize];
-        let pixels = render(flat.clone(), null.clone(), straight_down);
-        let centre = pixel(&pixels, SIZE / 2, SIZE / 2);
+        let frame = render(flat.clone(), null.clone(), straight_down);
+        let centre = frame.pixel(SIZE / 2, SIZE / 2);
         let [r, g, b] = lit(crate::palette::MAGENTA);
         assert_eq!(
             centre,
             [r, g, b, 255],
             "unmapped ground should be magenta, lit like the level ground it is"
         );
-        assert!(is_magenta(centre) && !untouched(centre));
+        assert!(is_magenta(centre));
+        assert!(
+            !frame.sky(SIZE / 2, SIZE / 2),
+            "a ray that met unmapped ground still met ground"
+        );
 
         let mut holed = flat;
         for row in 56..72 {
@@ -1655,11 +1666,11 @@ mod tests {
                 holed[(row * RASTER + col) as usize] = -32767.0;
             }
         }
-        let pixels = render(holed, null, straight_down);
-        let centre = pixel(&pixels, SIZE / 2, SIZE / 2);
+        let frame = render(holed, null, straight_down);
         assert!(
-            untouched(centre),
-            "a hole in the heights should read as sky, got {centre:?}"
+            frame.sky(SIZE / 2, SIZE / 2),
+            "a hole in the heights should read as sky, got {:?}",
+            frame.pixel(SIZE / 2, SIZE / 2)
         );
     }
 
@@ -1668,12 +1679,12 @@ mod tests {
     /// as whatever colour a neighbouring table slot happens to hold.
     #[test]
     fn an_unassigned_id_draws_as_missing_data() {
-        let pixels = render(
+        let frame = render(
             vec![0.0; (RASTER * RASTER) as usize],
             vec![UNASSIGNED; (RASTER * RASTER) as usize],
             straight_down,
         );
-        let centre = pixel(&pixels, SIZE / 2, SIZE / 2);
+        let centre = frame.pixel(SIZE / 2, SIZE / 2);
         let [r, g, b] = lit(crate::palette::MAGENTA);
         assert_eq!(centre, [r, g, b, 255], "unassigned ids are magenta");
     }
@@ -2120,15 +2131,15 @@ mod tests {
         };
 
         let check = |fall: f32, light: f32, slope: &str| {
-            let (pixels, _) = render_config(test_residency(), plane(fall), flat_ground(), aim, &[]);
+            let frame = render_config(test_residency(), plane(fall), flat_ground(), aim, &[]);
             let want = shade(crate::palette::flat_colour(Material::Grass), light);
             let mut ground = 0;
             for y in 0..SIZE {
                 for x in 0..SIZE {
-                    let got = pixel(&pixels, x, y);
-                    if untouched(got) {
+                    if frame.sky(x, y) {
                         continue;
                     }
+                    let got = frame.pixel(x, y);
                     ground += 1;
                     assert!(
                         got[..3]
@@ -2185,9 +2196,16 @@ mod tests {
             .collect();
         let walked = render_after(heights, materials, aim, &steps);
 
+        // Byte-exact, as it has always been. Reported as a count rather than
+        // through `assert_eq!` only because the two sides are a quarter of a
+        // megabyte each and the difference is the readable part of them.
+        let differing = (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| direct.pixel(x, y) != walked.pixel(x, y))
+            .count();
         assert_eq!(
-            direct, walked,
-            "incremental clipmap updates diverged from a full refresh"
+            differing, 0,
+            "incremental clipmap updates diverged from a full refresh in {differing} pixels"
         );
     }
 
@@ -2339,7 +2357,7 @@ mod tests {
         // it is: over rough terrain a tall peak inside the raster projects onto
         // the same pixel as a spot outside it, and the two cannot be told apart.
         let mut camera = None;
-        let pixels = render(vec![0.0; (RASTER * RASTER) as usize], flat_ground(), |c| {
+        let frame = render(vec![0.0; (RASTER * RASTER) as usize], flat_ground(), |c| {
             // High enough that the raster's edge sits well inside the frame.
             c.position = Vec3::new(0.0, 6000.0, 0.0);
             c.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
@@ -2348,7 +2366,7 @@ mod tests {
         let camera = camera.expect("camera captured");
         let at = |world: Vec3| {
             let (x, y) = to_pixels(camera.view_projection(), world, SIZE, SIZE);
-            pixel(&pixels, x.round() as u32, y.round() as u32)
+            (x.round() as u32, y.round() as u32)
         };
 
         let ((min_x, min_z), (max_x, max_z)) = placement().data_bounds();
@@ -2364,20 +2382,22 @@ mod tests {
             Vec3::new(max_x, 0.0, max_z),
         ] {
             let outside = corner + Vec3::new(corner.x.signum(), 0.0, corner.z.signum()) * 150.0;
+            let (x, y) = at(outside);
             assert!(
-                is_sky(at(outside)),
+                frame.sky(x, y),
                 "{outside} lies beyond the raster but was drawn as terrain: {:?}",
-                at(outside)
+                frame.pixel(x, y)
             );
         }
 
         // ... and the data itself is still drawn right up to its edge, so this
         // has not simply clipped the terrain away.
         let inside = Vec3::new(max_x - 150.0, 0.0, max_z - 150.0);
+        let (x, y) = at(inside);
         assert!(
-            !is_sky(at(inside)),
+            !frame.sky(x, y),
             "{inside} is inside the raster but was cut away: {:?}",
-            at(inside)
+            frame.pixel(x, y)
         );
     }
 
@@ -2410,13 +2430,15 @@ mod tests {
         // and a fine window's worth of tile reads on fetching it.
         let (heights, materials) = rugged();
 
-        let (_, low) = render_probed(
+        let low = render_after(
             heights.clone(),
             materials.clone(),
             from_altitude(900.0),
             &[],
-        );
-        let (pixels, high) = render_probed(heights, materials, from_altitude(4000.0), &[]);
+        )
+        .base_level;
+        let frame = render_after(heights, materials, from_altitude(4000.0), &[]);
+        let high = frame.base_level;
 
         assert_eq!(low, 0, "close to the ground every level is worth drawing");
         assert!(
@@ -2430,7 +2452,7 @@ mod tests {
         // honest there.
         let holes: Vec<(u32, u32)> = (SIZE / 4..SIZE * 3 / 4)
             .flat_map(|y| (SIZE / 4..SIZE * 3 / 4).map(move |x| (x, y)))
-            .filter(|&(x, y)| is_sky(pixel(&pixels, x, y)))
+            .filter(|&(x, y)| frame.sky(x, y))
             .collect();
         assert!(
             holes.is_empty(),
@@ -2812,8 +2834,10 @@ mod tests {
             let mut gpu = profiler.scope("gpu", &mut encoder);
             scene.draw(&mut gpu, &view);
         }
+        // The depth channel rather than the picture: "no ray came back empty"
+        // is a fact about what the march wrote, and zero depth is exactly that.
         encoder.copy_texture_to_buffer(
-            target.as_image_copy(),
+            scene.gbuffer.targets.depth.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
                 layout: wgpu::TexelCopyBufferLayout {
@@ -2834,12 +2858,12 @@ mod tests {
         device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll failed");
-        let pixels = readback
-            .get_mapped_range(..)
-            .expect("buffer not mapped")
-            .to_vec();
+        let depths = bytemuck::cast_slice::<u8, f32>(
+            &readback.get_mapped_range(..).expect("buffer not mapped"),
+        )
+        .to_vec();
 
-        let sky = count_sky(&pixels);
+        let sky = depths.iter().filter(|&&depth| depth == 0.0).count();
         assert_eq!(
             sky,
             0,
@@ -2858,6 +2882,11 @@ mod tests {
         target: wgpu::Texture,
         view: wgpu::TextureView,
         readback: wgpu::Buffer,
+        /// The G-buffer's depth channel, alongside the picture.
+        ///
+        /// Both flights below count sky, and sky is a fact about what the march
+        /// wrote rather than about what colour came out. See [`Frame`].
+        depth_readback: wgpu::Buffer,
         profiler: wgpu_profiler::GpuProfiler,
     }
 
@@ -2878,13 +2907,17 @@ mod tests {
                 view_formats: &[],
             });
             let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-            Self {
-                readback: device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("readback"),
+            let staging = |label| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
                     size: u64::from(SIZE * 4 * SIZE),
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
-                }),
+                })
+            };
+            Self {
+                readback: staging("readback"),
+                depth_readback: staging("depth readback"),
                 profiler: crate::profile::profiler(device, false),
                 target,
                 view,
@@ -2896,6 +2929,10 @@ mod tests {
         /// One frame per submit, because `queue.write_buffer` is ordered at
         /// submit and each frame has to run against its own camera -- the same
         /// reason `crate::headless::capture` loops that way.
+        ///
+        /// [`None`] when `read` is false: a frame drawn only to advance the
+        /// history has nothing to look at, and an empty [`Frame`] would be a
+        /// trap for whoever indexed it.
         fn step(
             &self,
             device: &wgpu::Device,
@@ -2903,7 +2940,7 @@ mod tests {
             scene: &mut Scene,
             at: Vec3,
             read: bool,
-        ) -> Vec<u8> {
+        ) -> Option<Frame> {
             scene.camera.position = at;
             scene.update(device, queue);
             let mut encoder =
@@ -2913,29 +2950,37 @@ mod tests {
                 scene.draw(&mut gpu, &self.view);
             }
             if read {
-                encoder.copy_texture_to_buffer(
-                    self.target.as_image_copy(),
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &self.readback,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(SIZE * 4),
-                            rows_per_image: Some(SIZE),
+                let mut copy = |source: wgpu::TexelCopyTextureInfo, into: &wgpu::Buffer| {
+                    encoder.copy_texture_to_buffer(
+                        source,
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: into,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(SIZE * 4),
+                                rows_per_image: Some(SIZE),
+                            },
                         },
-                    },
-                    wgpu::Extent3d {
-                        width: SIZE,
-                        height: SIZE,
-                        depth_or_array_layers: 1,
-                    },
+                        wgpu::Extent3d {
+                            width: SIZE,
+                            height: SIZE,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                };
+                copy(self.target.as_image_copy(), &self.readback);
+                copy(
+                    scene.gbuffer.targets.depth.as_image_copy(),
+                    &self.depth_readback,
                 );
             }
             queue.submit(std::iter::once(encoder.finish()));
             if !read {
-                return Vec::new();
+                return None;
             }
-            self.readback
-                .map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+            for buffer in [&self.readback, &self.depth_readback] {
+                buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+            }
             device
                 .poll(wgpu::PollType::wait_indefinitely())
                 .expect("poll failed");
@@ -2945,7 +2990,19 @@ mod tests {
                 .expect("buffer not mapped")
                 .to_vec();
             self.readback.unmap();
-            pixels
+            let depths = bytemuck::cast_slice::<u8, f32>(
+                &self
+                    .depth_readback
+                    .get_mapped_range(..)
+                    .expect("buffer not mapped"),
+            )
+            .to_vec();
+            self.depth_readback.unmap();
+            Some(Frame {
+                pixels,
+                depths,
+                base_level: scene.terrain.base_level(),
+            })
         }
     }
 
@@ -3026,7 +3083,8 @@ mod tests {
         marched.settle(&device, &queue);
         let fresh = screen.step(&device, &queue, &mut marched, to, true);
 
-        let (start, carried, fresh) = (count_sky(&start), count_sky(&carried), count_sky(&fresh));
+        let read = |frame: Option<Frame>| frame.expect("frame read back").count_sky();
+        let (start, carried, fresh) = (read(start), read(carried), read(fresh));
         // The flight has to be one the defect could show up in at all: the
         // crest must really have climbed, taking sky with it, or there would be
         // nothing for the carry to get wrong and this would pass on nothing.
@@ -3075,14 +3133,15 @@ mod tests {
     ///
     /// Sand is warm and grass is green whatever the light does to them, so this
     /// separates the two ridges without pinning either to a colour.
-    fn is_sandy(pixel: [u8; 4]) -> bool {
-        pixel[0] > pixel[1] && !is_sky(pixel)
+    fn is_sandy(frame: &Frame, x: u32, y: u32) -> bool {
+        let pixel = frame.pixel(x, y);
+        pixel[0] > pixel[1] && !frame.sky(x, y)
     }
 
-    fn count_sandy(pixels: &[u8]) -> usize {
+    fn count_sandy(frame: &Frame) -> usize {
         (0..SIZE)
             .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
-            .filter(|&(x, y)| is_sandy(pixel(pixels, x, y)))
+            .filter(|&(x, y)| is_sandy(frame, x, y))
             .count()
     }
 
@@ -3140,9 +3199,14 @@ mod tests {
         marched.settle(&device, &queue);
         let fresh = screen.step(&device, &queue, &mut marched, to, true);
 
-        let sandy_rows = |pixels: &[u8]| -> Vec<usize> {
+        let (start, carried, fresh) = (
+            start.expect("frame read back"),
+            carried.expect("frame read back"),
+            fresh.expect("frame read back"),
+        );
+        let sandy_rows = |frame: &Frame| -> Vec<usize> {
             (0..SIZE)
-                .map(|y| (0..SIZE).filter(|&x| is_sandy(pixel(pixels, x, y))).count())
+                .map(|y| (0..SIZE).filter(|&x| is_sandy(frame, x, y)).count())
                 .collect()
         };
         let (carried_rows, fresh_rows) = (sandy_rows(&carried), sandy_rows(&fresh));
@@ -3250,15 +3314,16 @@ mod tests {
         for _ in 0..24 {
             screen.step(&device, &queue, &mut scene, stopped, false);
         }
-        let settled = screen.step(&device, &queue, &mut scene, stopped, true);
-        let after = screen.step(&device, &queue, &mut scene, stopped, true);
+        let settled = screen
+            .step(&device, &queue, &mut scene, stopped, true)
+            .expect("frame read back");
+        let after = screen
+            .step(&device, &queue, &mut scene, stopped, true)
+            .expect("frame read back");
 
-        let moved: Vec<(u32, u32)> = settled
-            .chunks_exact(4)
-            .zip(after.chunks_exact(4))
-            .enumerate()
-            .filter(|(_, (before, now))| before != now)
-            .map(|(i, _)| (i as u32 % SIZE, i as u32 / SIZE))
+        let moved: Vec<(u32, u32)> = (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| settled.pixel(x, y) != after.pixel(x, y))
             .collect();
         assert!(
             moved.is_empty(),
