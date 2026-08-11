@@ -253,7 +253,6 @@ pub fn write_material_tile(path: &Path, placement: TilePlacement, samples: &[u32
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;

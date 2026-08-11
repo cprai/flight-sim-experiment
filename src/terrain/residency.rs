@@ -279,13 +279,7 @@ impl Residency {
     /// just a survey that is not there. Now that the tools write from
     /// [`terrain_tiles::RESIDENT_BASE_LEVEL`] up, that is the ordinary case
     /// rather than a misconfiguration.
-    pub fn fit_base(
-        &self,
-        raster: UVec2,
-        stored: u32,
-        available: u32,
-        max_dimension: u32,
-    ) -> u32 {
+    pub fn fit_base(&self, raster: UVec2, stored: u32, available: u32, max_dimension: u32) -> u32 {
         let mut base = self.resident_base.max(stored);
         while base + 1 < available {
             let size = Self {
@@ -294,7 +288,8 @@ impl Residency {
             }
             .base_size(raster);
             let fits_device = size.x <= max_dimension && size.y <= max_dimension;
-            let fits_budget = Self::texture_bytes(size, Self::mip_count(size)) <= self.memory_budget;
+            let fits_budget =
+                Self::texture_bytes(size, Self::mip_count(size)) <= self.memory_budget;
             if fits_device && fits_budget {
                 break;
             }
@@ -680,7 +675,11 @@ mod tests {
             resident_base: 2,
             ..Default::default()
         };
-        assert_eq!(residency.fit_base(RASTER, 0, 9, 16384), 3, "4 m is too wide");
+        assert_eq!(
+            residency.fit_base(RASTER, 0, 9, 16384),
+            3,
+            "4 m is too wide"
+        );
         assert_eq!(
             residency.fit_base(RASTER, 5, 9, 16384),
             5,

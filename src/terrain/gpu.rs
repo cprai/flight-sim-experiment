@@ -388,7 +388,9 @@ impl Terrain {
         // download over one snapped extent, so they either describe the same
         // ground exactly or one of them is from a different run.
         anyhow::ensure!(
-            heights.manifest().covers_same_ground_as(materials.manifest()),
+            heights
+                .manifest()
+                .covers_same_ground_as(materials.manifest()),
             "{} and {} do not cover the same ground",
             elevation.display(),
             material.display()
@@ -618,9 +620,8 @@ impl Terrain {
             );
         }
 
-        let array_view = |texture: &wgpu::Texture| {
-            texture.create_view(&wgpu::TextureViewDescriptor::default())
-        };
+        let array_view =
+            |texture: &wgpu::Texture| texture.create_view(&wgpu::TextureViewDescriptor::default());
         let layer_view = |texture: &wgpu::Texture| {
             texture.create_view(&wgpu::TextureViewDescriptor {
                 dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -646,61 +647,61 @@ impl Terrain {
             count: None,
         };
         let layout_entries = [
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    // Integer texels: material ids can only be loaded, never
-                    // sampled, so there is no sampler anywhere in this layout.
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Uint,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                // Integer texels: material ids can only be loaded, never
+                // sampled, so there is no sampler anywhere in this layout.
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
-                // The lift, which the generation pass needs and the march never
-                // touches -- so it belongs in the group both share rather than
-                // in either pass's private one.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+                count: None,
+            },
+            // The lift, which the generation pass needs and the march never
+            // touches -- so it belongs in the group both share rather than
+            // in either pass's private one.
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
+                count: None,
+            },
         ];
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain layout"),
@@ -875,28 +876,28 @@ impl Terrain {
         // bindings go, four groups being all the device promises, and this pass
         // shares none of its with the march.
         let derive_entries = [
-                wgpu::BindGroupLayoutEntry {
-                    binding: 12,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        // One rectangle per dispatch, chosen by offset, so the
-                        // whole update's work goes into one buffer written once.
-                        has_dynamic_offset: true,
-                        min_binding_size: wgpu::BufferSize::new(size_of::<MaximaJob>() as u64),
-                    },
-                    count: None,
+            wgpu::BindGroupLayoutEntry {
+                binding: 12,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    // One rectangle per dispatch, chosen by offset, so the
+                    // whole update's work goes into one buffer written once.
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(size_of::<MaximaJob>() as u64),
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 13,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 13,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
+                count: None,
+            },
         ];
         let derive_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain derive layout"),
@@ -913,9 +914,7 @@ impl Terrain {
             .sum();
         // A generated tile raises every level above it, and each of those
         // rectangles is cut at the wrap into at most four pieces.
-        let cascade = residency.detail_per_update as usize
-            * (resident_base + mips) as usize
-            * 4;
+        let cascade = residency.detail_per_update as usize * (resident_base + mips) as usize * 4;
         let job_slots = sweep.max(cascade);
         let derive_jobs = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terrain derive jobs"),
@@ -955,7 +954,11 @@ impl Terrain {
                 bind_group_layouts: &[None, Some(&layout), None, Some(&derive_layout)],
                 immediate_size: 0,
             });
-        let derive = stage("terrain derive pipeline", "cs_maxima", &derive_pipeline_layout);
+        let derive = stage(
+            "terrain derive pipeline",
+            "cs_maxima",
+            &derive_pipeline_layout,
+        );
 
         // Raising the chain: the same job, the same rectangles and the same
         // half-precision scratch the pyramid goes out through, plus a second
@@ -1007,11 +1010,12 @@ impl Terrain {
                 },
             ],
         });
-        let cover_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("terrain cover pipeline layout"),
-            bind_group_layouts: &[None, Some(&layout), None, Some(&cover_layout)],
-            immediate_size: 0,
-        });
+        let cover_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("terrain cover pipeline layout"),
+                bind_group_layouts: &[None, Some(&layout), None, Some(&cover_layout)],
+                immediate_size: 0,
+            });
         let cover = stage("terrain cover pipeline", "cs_cover", &cover_pipeline_layout);
         let raise = stage("terrain raise pipeline", "cs_raise", &cover_pipeline_layout);
 
@@ -1569,10 +1573,8 @@ impl Terrain {
             return 0.0;
         }
         let texels = camera_texels / f64::from(1u32 << self.ground_level);
-        let at = IVec2::new(texels.x.floor() as i32, texels.y.floor() as i32).clamp(
-            IVec2::ZERO,
-            self.ground_size.as_ivec2() - IVec2::ONE,
-        );
+        let at = IVec2::new(texels.x.floor() as i32, texels.y.floor() as i32)
+            .clamp(IVec2::ZERO, self.ground_size.as_ivec2() - IVec2::ONE);
         let height = self.ground[at.y as usize * self.ground_size.x as usize + at.x as usize];
         // The camera can legally be over ground the raster says nothing about:
         // past the edge of the survey, or over a hole in it. Sea level is the
@@ -1623,7 +1625,9 @@ impl Terrain {
 
                 staging.resize(count * size_of::<f32>(), 0);
                 let clock = crate::profile::Clock::start(timed);
-                sources.heights.read_rect(level, origin, block, &mut staging);
+                sources
+                    .heights
+                    .read_rect(level, origin, block, &mut staging);
                 read += clock.elapsed();
                 let clock = crate::profile::Clock::start(timed);
                 if VERTICAL_EXAGGERATION != 1.0 {
@@ -2292,7 +2296,12 @@ mod tests {
     /// a ray could actually reach from it: its own closed square, and every
     /// finer cell the march would be allowed to descend into. So this is the
     /// same recursion the march performs, with the same residency test.
-    fn cell_reachable(source: &dyn RasterSource, terrain: &Terrain, level: u32, cell: IVec2) -> f32 {
+    fn cell_reachable(
+        source: &dyn RasterSource,
+        terrain: &Terrain,
+        level: u32,
+        cell: IVec2,
+    ) -> f32 {
         let mut top = cell_ceiling(source, level, cell, 1);
         if level <= terrain.resident_base {
             return top;
@@ -2529,9 +2538,22 @@ mod tests {
         rough.update(&device, &queue, at, &watch);
 
         for level in 0..rough.resident_base {
-            let smooth = read_level(&device, &queue, &flat, &flat.detail_height_texture, level, 4);
-            let detailed =
-                read_level(&device, &queue, &rough, &rough.detail_height_texture, level, 4);
+            let smooth = read_level(
+                &device,
+                &queue,
+                &flat,
+                &flat.detail_height_texture,
+                level,
+                4,
+            );
+            let detailed = read_level(
+                &device,
+                &queue,
+                &rough,
+                &rough.detail_height_texture,
+                level,
+                4,
+            );
             let step = 1 << (rough.resident_base - level);
             let (low, high) = rough.level_valid(level);
             let (mut moved, mut worst, mut nodes) = (0u32, 0.0f32, 0u32);
@@ -2588,7 +2610,14 @@ mod tests {
         // that difference swamps the one being looked for.
         for level in 1..rough.resident_base {
             let pair = |terrain: &Terrain, at| {
-                read_level(&device, &queue, terrain, &terrain.detail_height_texture, at, 4)
+                read_level(
+                    &device,
+                    &queue,
+                    terrain,
+                    &terrain.detail_height_texture,
+                    at,
+                    4,
+                )
             };
             let (fine_flat, fine_rough) = (pair(&flat, level - 1), pair(&rough, level - 1));
             let (coarse_flat, coarse_rough) = (pair(&flat, level), pair(&rough, level));
@@ -2665,7 +2694,11 @@ mod tests {
         let watch = unwatched(&device);
         bald.update(&device, &queue, at, &watch);
         wooded.update(&device, &queue, at, &watch);
-        assert_eq!(wooded.base_level(), 0, "the test wants every level generated");
+        assert_eq!(
+            wooded.base_level(),
+            0,
+            "the test wants every level generated"
+        );
 
         // The base first, where the lift is stored as well as added.
         let survey = read_level(&device, &queue, &bald, &bald.height_texture, BASE, 4);
@@ -2738,9 +2771,22 @@ mod tests {
 
         // Then every generated level, over the ground the window holds.
         for level in 0..BASE {
-            let smooth = read_level(&device, &queue, &bald, &bald.detail_height_texture, level, 4);
-            let grown =
-                read_level(&device, &queue, &wooded, &wooded.detail_height_texture, level, 4);
+            let smooth = read_level(
+                &device,
+                &queue,
+                &bald,
+                &bald.detail_height_texture,
+                level,
+                4,
+            );
+            let grown = read_level(
+                &device,
+                &queue,
+                &wooded,
+                &wooded.detail_height_texture,
+                level,
+                4,
+            );
             // `R32Uint` read through the same closure: the bits come back
             // unchanged, which is all an id is.
             let painted = read_level(
@@ -2832,9 +2878,22 @@ mod tests {
         let mut carried = Vec::new();
         let mut painted_rubble = Vec::new();
         for level in 0..BASE {
-            let bare = read_level(&device, &queue, &bald, &bald.detail_height_texture, level, 4);
-            let stony =
-                read_level(&device, &queue, &strewn, &strewn.detail_height_texture, level, 4);
+            let bare = read_level(
+                &device,
+                &queue,
+                &bald,
+                &bald.detail_height_texture,
+                level,
+                4,
+            );
+            let stony = read_level(
+                &device,
+                &queue,
+                &strewn,
+                &strewn.detail_height_texture,
+                level,
+                4,
+            );
             let painted = read_level(
                 &device,
                 &queue,
@@ -3315,7 +3374,11 @@ mod tests {
     }
 
     fn check_recurrence(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &Terrain) {
-        assert_eq!(terrain.base_level(), 0, "the test wants the generated level");
+        assert_eq!(
+            terrain.base_level(),
+            0,
+            "the test wants the generated level"
+        );
 
         let mut checked = 0;
         for level in terrain.base..terrain.resident_base + terrain.mips {
@@ -3414,7 +3477,11 @@ mod tests {
         let mut terrain = terrain_over(&device, 2);
         let at = Vec3::new(137.0, 100.0, -71.0);
         terrain.update(&device, &queue, at, &unwatched(&device));
-        assert_eq!(terrain.base_level(), 0, "the test wants both generated levels");
+        assert_eq!(
+            terrain.base_level(),
+            0,
+            "the test wants both generated levels"
+        );
 
         let base = read_level(
             &device,

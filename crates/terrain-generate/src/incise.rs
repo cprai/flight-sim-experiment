@@ -143,10 +143,9 @@ fn cut(fields: &mut Fields) {
         } * fields.metres_per_cell;
 
         let resistance = 1.0 - HARDNESS_RESISTANCE * fields.hardness.values[index];
-        let power = ERODIBILITY
-            * resistance
-            * (drainage.area[index] * cell_area).powf(AREA_EXPONENT)
-            / reach;
+        let power =
+            ERODIBILITY * resistance * (drainage.area[index] * cell_area).powf(AREA_EXPONENT)
+                / reach;
         bed[index] = (drainage.filled[index] + power * bed[into]) / (1.0 + power);
     }
 

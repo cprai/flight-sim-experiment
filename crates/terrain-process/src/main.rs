@@ -45,8 +45,8 @@
 //! *pixel for pixel identically*, which is the only interesting thing to say
 //! about a change like this.
 
-mod tiles;
 mod osm;
+mod tiles;
 
 use std::path::{Path, PathBuf};
 
@@ -54,7 +54,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
 use terrain_tiles::{MATERIAL_PRODUCT, Manifest, RESIDENT_BASE_LEVEL};
-
 
 #[derive(Parser, Debug)]
 #[command(about = "Build the tree the simulator flies over", long_about = None)]
@@ -90,7 +89,6 @@ struct Arguments {
     /// finer base against what it costs.
     #[arg(long, value_name = "LEVEL", default_value_t = RESIDENT_BASE_LEVEL)]
     base_level: u32,
-
 }
 
 fn main() -> Result<()> {

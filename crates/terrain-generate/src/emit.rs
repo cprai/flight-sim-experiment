@@ -28,11 +28,11 @@ use terrain_materials::Material;
 use terrain_tiles::write::{TilePlacement, write_height_tile, write_material_tile};
 use terrain_tiles::{Manifest, TILE_SIZE, Tile};
 
-use crate::tiles::tile_range;
 use crate::classify::material;
 use crate::detail::{self, OUTSIDE};
 use crate::fields::Fields;
 use crate::shape::Relief;
+use crate::tiles::tile_range;
 
 /// How many tiles to build between progress lines.
 const REPORT_EVERY: u64 = 500;

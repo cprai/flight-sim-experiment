@@ -1077,8 +1077,8 @@ mod tests {
         // Against the baseline rather than this machine's adapter: the cap the
         // grid has to respect is the one the device request promises, and
         // `limits` only raises it where a limit is asked for by name.
-        let cap = crate::deferred::limits(&wgpu::Limits::default())
-            .max_compute_workgroups_per_dimension;
+        let cap =
+            crate::deferred::limits(&wgpu::Limits::default()).max_compute_workgroups_per_dimension;
         let sizes = [
             0,
             1,

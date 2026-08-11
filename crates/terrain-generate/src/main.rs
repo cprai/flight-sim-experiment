@@ -52,7 +52,6 @@
 //! that would stay offline, and its channels are what such a shader would
 //! upload.
 
-mod tiles;
 mod classify;
 mod creep;
 mod detail;
@@ -64,6 +63,7 @@ mod incise;
 mod noise;
 mod shape;
 mod thermal;
+mod tiles;
 
 use std::path::PathBuf;
 
