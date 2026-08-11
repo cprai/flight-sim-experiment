@@ -85,7 +85,14 @@ const ERODIBILITY: f32 = 0.05;
 /// One half is the usual value fitted to real river profiles, and with `n = 1`
 /// it gives the concave long profile every river has: steep at the head, nearly
 /// flat at the mouth.
+///
+/// The sweep computes it as a `sqrt` rather than a `powf`, which is one
+/// correctly-rounded instruction instead of a call into libm, ~10^9 times a
+/// run. The assertion below is what keeps the two spellings honest: change this
+/// constant and the build stops, rather than the code quietly going on taking a
+/// square root of something that is no longer meant to be squared.
 const AREA_EXPONENT: f32 = 0.5;
+const _: () = assert!(AREA_EXPONENT == 0.5);
 
 /// How much of the cutting hard rock refuses.
 ///
@@ -131,6 +138,11 @@ fn cut(fields: &mut Fields) {
     // rather than as one figure for the round.
     let at = std::time::Instant::now();
 
+    // Both reaches, worked out once rather than per cell: there are only two,
+    // and which one a cell wants is a branch rather than a multiply.
+    let cardinal_reach = fields.metres_per_cell;
+    let diagonal_reach = std::f32::consts::SQRT_2 * fields.metres_per_cell;
+
     // The surface the rivers would leave if there were no hollows, built
     // downstream first so that every cell's receiver is already final.
     let mut bed = drainage.filled.clone();
@@ -143,20 +155,32 @@ fn cut(fields: &mut Fields) {
             continue;
         }
         let into = into as usize;
-        let (column, row) = (index % width, index / width);
-        let (into_column, into_row) = (into % width, into / width);
-        let diagonal = column != into_column && row != into_row;
+        // A receiver is always one of the eight neighbours, so the step between
+        // the two indices carries the same information the two row numbers did
+        // and costs two integer divisions instead of four. The row difference
+        // need not be worked out at all: `dx` is in -1..=1, so the receiver is
+        // on another row exactly when the step is not the column shift alone.
+        //
+        // Tempting and wrong: reading the whole thing off `|step|`, as neither
+        // 1 nor `width`. That is only true while `width > 2` -- on a two-column
+        // grid a diagonal step is also 1 -- and it would fail on a narrow test
+        // grid rather than on the shipped one.
+        let step = into as i64 - index as i64;
+        let shift = (into % width) as i64 - (index % width) as i64;
+        let diagonal = shift != 0 && step != shift;
         let reach = if diagonal {
-            std::f32::consts::SQRT_2
+            diagonal_reach
         } else {
-            1.0
-        } * fields.metres_per_cell;
+            cardinal_reach
+        };
 
         let resistance = 1.0 - HARDNESS_RESISTANCE * fields.hardness.values[index];
-        let power =
-            ERODIBILITY * resistance * (drainage.area[index] * cell_area).powf(AREA_EXPONENT)
-                / reach;
-        bed[index] = (drainage.filled[index] + power * bed[into]) / (1.0 + power);
+        let power = ERODIBILITY * resistance * (drainage.area[index] * cell_area).sqrt() / reach;
+        // `bed[index]` still holds `drainage.filled[index]` -- it was cloned
+        // from it and no cell appears twice in the order, so nothing has
+        // written this one yet. Reading it here instead keeps a whole 44 MB
+        // random-access stream out of the loop.
+        bed[index] = (bed[index] + power * bed[into]) / (1.0 + power);
     }
 
     log::debug!("incision: the stream-power sweep took {:.2?}", at.elapsed());
