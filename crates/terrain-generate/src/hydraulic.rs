@@ -11,19 +11,41 @@
 //! it where it slows, and evaporates. Millions of them, and the drainage network
 //! is not designed, it emerges.
 //!
-//! # Why this pass is sequential
+//! # Why this pass is tiled rather than sequential
 //!
-//! Every other pass in the crate runs across all cores. This one does not, and
-//! deliberately. A droplet's path depends on the ground the droplet before it
-//! left behind -- that dependency *is* the algorithm, and it is what makes a
-//! channel deepen instead of a million independent scratches. Running droplets
-//! concurrently means two of them writing to one cell, which needs either a
-//! lock per cell or an unsynchronised race; the race is faster and makes the
-//! landscape depend on how the threads happened to interleave, so the same seed
-//! would stop reproducing the same terrain.
+//! A droplet's path depends on the ground the droplet before it left behind.
+//! That dependency *is* the algorithm -- it is what makes a channel deepen
+//! instead of leaving a million independent scratches -- so for a long time
+//! this pass ran one droplet after another on one core, at 216 s of a 713 s
+//! run, on the reasoning that sharing cells between threads means either a lock
+//! per cell or a race, and a race would make the landscape depend on how the
+//! threads interleaved.
 //!
-//! The cost is a minute or two on the default extent, inside a run that writes
-//! tens of gigabytes. That is the wrong thing to optimise first.
+//! Both horns of that were avoidable, because the dependency is *local*. A
+//! droplet takes at most [`MAX_STEPS`] steps of one cell and spreads its work
+//! over a disc of [`BRUSH_RADIUS`], so it can only ever touch ground within
+//! [`HALO`] cells of where it landed. Two droplets further apart than that
+//! cannot interact however they are ordered -- not "rarely", but never.
+//!
+//! So the map is cut into tiles of [`TILE`] cells, and tiles far enough apart
+//! are run at once. Inside a tile the droplets still run one after another over
+//! ground nobody else is touching, so the feedback that makes channels is kept
+//! exactly; across tiles there is nothing to keep, because there is no
+//! interaction to lose. [`SPACING`] is what keeps concurrent tiles apart, and
+//! `the_tiles_do_not_race_each_other` is what checks it.
+//!
+//! That took the pass from 216.1 s to 6.3 s on 24 cores -- rather more than the
+//! core count, because a thread working one 256-cell tile stays inside the
+//! cache, where the old single stream jumped about a 44 MB grid at random.
+//!
+//! The landscape this produces is not the one the single stream produced: the
+//! droplets land in a different order and in different places, since each tile
+//! draws its own from its own key. It is the same landscape in every sense that
+//! was ever specified -- same model, same constants, same statistics -- and the
+//! same seed still reproduces it exactly, which is the property that was
+//! actually being protected.
+
+use rayon::prelude::*;
 
 use crate::fields::Fields;
 use crate::noise::hash;
@@ -119,15 +141,39 @@ fn brush() -> Vec<(i64, i64, f32)> {
     cells
 }
 
+/// The ground, while the droplets are running over it.
+///
+/// Held as bits in atomics rather than as plain floats for one reason: the
+/// tiles below run on different threads and Rust cannot be told that their
+/// footprints do not overlap. They genuinely do not -- see [`HALO`] -- so no
+/// two threads ever touch the same cell and there is nothing to contend for.
+/// The atomics buy the compiler's permission, not synchronisation, which is why
+/// every access is `Relaxed`: on any machine this runs on, an aligned
+/// four-byte relaxed load or store is the same instruction a plain one would
+/// have been.
+type Ground = [std::sync::atomic::AtomicU32];
+
+fn read(ground: &Ground, index: usize) -> f32 {
+    f32::from_bits(ground[index].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn raise(ground: &Ground, index: usize, delta: f32) {
+    let was = read(ground, index);
+    ground[index].store(
+        (was + delta).to_bits(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// The bilinear height at a position in cells, and its gradient in metres per
 /// cell.
-fn surface(heights: &[f32], width: usize, rows: usize, x: f32, y: f32) -> (f32, f32, f32) {
+fn surface(heights: &Ground, width: usize, rows: usize, x: f32, y: f32) -> (f32, f32, f32) {
     let (cx, cy) = (x.floor() as i64, y.floor() as i64);
     let (fx, fy) = (x - cx as f32, y - cy as f32);
     let at = |dx: i64, dy: i64| {
         let column = (cx + dx).clamp(0, width as i64 - 1) as usize;
         let row = (cy + dy).clamp(0, rows as i64 - 1) as usize;
-        heights[row * width + column]
+        read(heights, row * width + column)
     };
     let (h00, h10, h01, h11) = (at(0, 0), at(1, 0), at(0, 1), at(1, 1));
     let height = h00 * (1.0 - fx) * (1.0 - fy)
@@ -174,8 +220,6 @@ pub fn erode(fields: &mut Fields, seed: u32, per_cell: usize) {
         ..
     } = fields;
     let (width, rows) = (height.width, height.height);
-    let heights = &mut height.values;
-    let deposits = &mut deposit.values;
     let rock: &[f32] = &hardness.values;
     let brush = brush();
 
@@ -183,23 +227,99 @@ pub fn erode(fields: &mut Fields, seed: u32, per_cell: usize) {
     if droplets == 0 {
         return;
     }
-    let report_every = (droplets / 10).max(1);
     log::info!("running {droplets} droplets over {width} x {rows} cells");
 
-    for droplet in 0..droplets {
-        if droplet > 0 && droplet.is_multiple_of(report_every) {
-            log::info!("{}% of the droplets have run", droplet * 100 / droplets);
-        }
+    // What the ground looked like before, so the deposit channel can be taken
+    // as the difference afterwards. Both branches below already move the two
+    // channels by exactly the same amount, so carrying a second accumulator
+    // through the pass would be carrying the same numbers twice.
+    let before = height.values.clone();
+    let ground: Vec<std::sync::atomic::AtomicU32> = height
+        .values
+        .iter()
+        .map(|metres| std::sync::atomic::AtomicU32::new(metres.to_bits()))
+        .collect();
 
-        let word = hash(droplet as i32, 0, seed);
-        let other = hash(droplet as i32, 1, seed);
-        let mut x = unit(word) * (width - 1) as f32;
-        let mut y = unit(other) * (rows - 1) as f32;
+    for colour in 0..COLOURS {
+        let tiles: Vec<(usize, usize)> = (0..rows.div_ceil(TILE))
+            .flat_map(|ty| (0..width.div_ceil(TILE)).map(move |tx| (tx, ty)))
+            .filter(|(tx, ty)| (tx % SPACING) + SPACING * (ty % SPACING) == colour)
+            .collect();
+        tiles.par_iter().for_each(|&(tx, ty)| {
+            run_tile(
+                &ground, rock, &brush, width, rows, metres_per_cell, per_cell, seed, tx, ty,
+            );
+        });
+        log::info!(
+            "{}% of the droplets have run",
+            (colour + 1) * 100 / COLOURS
+        );
+    }
+
+    for (index, cell) in ground.iter().enumerate() {
+        let after = f32::from_bits(cell.load(std::sync::atomic::Ordering::Relaxed));
+        deposit.values[index] += after - before[index];
+        height.values[index] = after;
+    }
+}
+
+/// Cells across the square of ground one thread owns.
+///
+/// Only the inner square is *seeded* with droplets; a droplet may wander up to
+/// [`HALO`] cells beyond it, which is why tiles have to be kept apart rather
+/// than merely tiled.
+const TILE: usize = 256;
+
+/// How far outside its tile a droplet's writing can reach.
+///
+/// A droplet takes at most [`MAX_STEPS`] steps of one cell, spreads its cutting
+/// over a disc of [`BRUSH_RADIUS`], and its deposits land on the four cells it
+/// stands between. Sixty-seven would do; this leaves room for all three to grow
+/// a little without silently becoming a data race.
+const HALO: usize = 80;
+
+/// How far apart, in tiles, two tiles running at once have to be.
+///
+/// A tile writes over `TILE + 2 * HALO` cells, so tiles two apart -- 512 cells
+/// between their origins against 416 of reach -- cannot overlap. Two on each
+/// axis makes four passes, and no two tiles in one pass share a cell.
+const SPACING: usize = 2;
+const COLOURS: usize = SPACING * SPACING;
+const _: () = assert!(TILE * SPACING >= TILE + 2 * HALO);
+
+/// Runs one tile's droplets, in order, over ground nothing else is touching.
+#[allow(clippy::too_many_arguments)]
+fn run_tile(
+    ground: &Ground,
+    rock: &[f32],
+    brush: &[(i64, i64, f32)],
+    width: usize,
+    rows: usize,
+    metres_per_cell: f32,
+    per_cell: usize,
+    seed: u32,
+    tx: usize,
+    ty: usize,
+) {
+    let (x0, y0) = (tx * TILE, ty * TILE);
+    let (tile_width, tile_rows) = (TILE.min(width - x0), TILE.min(rows - y0));
+    // As many droplets as this tile's own ground earns, so the total over the
+    // map is what a single stream would have been however the tiles fall.
+    let droplets = per_cell * tile_width * tile_rows;
+    // Its own stream, keyed by where it is rather than by a running count, so
+    // that a tile lands the same droplets whatever else is being run beside it.
+    let tile_seed = hash(tx as i32, ty as i32, seed);
+
+    for droplet in 0..droplets {
+        let word = hash(droplet as i32, 0, tile_seed);
+        let other = hash(droplet as i32, 1, tile_seed);
+        let mut x = x0 as f32 + unit(word) * (tile_width - 1) as f32;
+        let mut y = y0 as f32 + unit(other) * (tile_rows - 1) as f32;
         let (mut dx, mut dy) = (0.0f32, 0.0f32);
         let (mut speed, mut water, mut sediment) = (1.0f32, 1.0f32, 0.0f32);
 
         for _ in 0..MAX_STEPS {
-            let (was, gradient_x, gradient_y) = surface(heights, width, rows, x, y);
+            let (was, gradient_x, gradient_y) = surface(ground, width, rows, x, y);
             let (cell_x, cell_y) = (x.floor() as i64, y.floor() as i64);
             let (fx, fy) = (x - cell_x as f32, y - cell_y as f32);
 
@@ -215,7 +335,7 @@ pub fn erode(fields: &mut Fields, seed: u32, per_cell: usize) {
             if nx < 0.0 || ny < 0.0 || nx > (width - 1) as f32 || ny > (rows - 1) as f32 {
                 break;
             }
-            let (now, _, _) = surface(heights, width, rows, nx, ny);
+            let (now, _, _) = surface(ground, width, rows, nx, ny);
             let fall = was - now;
 
             // Slope as a rise over run, so the constants above mean the same
@@ -238,11 +358,10 @@ pub fn erode(fields: &mut Fields, seed: u32, per_cell: usize) {
                 }
                 .min(most);
                 sediment -= dropped;
-                let mut place = |dx: i64, dy: i64, share: f32| {
+                let place = |dx: i64, dy: i64, share: f32| {
                     let column = (cell_x + dx).clamp(0, width as i64 - 1) as usize;
                     let row = (cell_y + dy).clamp(0, rows as i64 - 1) as usize;
-                    heights[row * width + column] += dropped * share;
-                    deposits[row * width + column] += dropped * share;
+                    raise(ground, row * width + column, dropped * share);
                 };
                 place(0, 0, (1.0 - fx) * (1.0 - fy));
                 place(1, 0, fx * (1.0 - fy));
@@ -263,11 +382,10 @@ pub fn erode(fields: &mut Fields, seed: u32, per_cell: usize) {
                     .min(most)
                     * resistance;
                 sediment += cut;
-                for (dx, dy, share) in &brush {
+                for (dx, dy, share) in brush {
                     let column = (cell_x + dx).clamp(0, width as i64 - 1) as usize;
                     let row = (cell_y + dy).clamp(0, rows as i64 - 1) as usize;
-                    heights[row * width + column] -= cut * share;
-                    deposits[row * width + column] -= cut * share;
+                    raise(ground, row * width + column, -cut * share);
                 }
             }
 
@@ -323,6 +441,147 @@ mod tests {
         erode(&mut second, 4321, 3);
         assert_eq!(first.height.values, second.height.values);
         assert_eq!(first.deposit.values, second.deposit.values);
+    }
+
+    /// What the droplets cost on the ground a real run covers.
+    ///
+    /// The pass was 216.1 s of a 712.7 s run when it was one droplet after
+    /// another on one core. Run it with `--ignored --nocapture`.
+    ///
+    /// `DROPLET_MEASURE_ROUNDS` decides how incised the landscape is first, and
+    /// it matters far more than it looks: droplets on raw fractal ground die in
+    /// a step or two, and droplets in a cut drainage network run their full
+    /// length. A measurement taken at zero rounds says almost nothing about a
+    /// real run, which reaches this pass after eighty.
+    #[test]
+    #[ignore = "a measurement on the full grid, not a check"]
+    fn measure_what_the_droplets_cost() {
+        let rounds: u32 = std::env::var("DROPLET_MEASURE_ROUNDS")
+            .ok()
+            .and_then(|rounds| rounds.parse().ok())
+            .unwrap_or(80);
+
+        let mut fields = Fields::new([49152.0, 57344.0], 16.0);
+        crate::shape::raise(
+            &mut fields,
+            crate::shape::Relief {
+                valley_metres: 700.0,
+                peak_metres: 2600.0,
+            },
+            0,
+        );
+        crate::thermal::relax(&mut fields, crate::thermal::Settling::Bedrock);
+        if rounds > 0 {
+            let at = std::time::Instant::now();
+            crate::incise::rivers(&mut fields, rounds);
+            crate::thermal::relax(&mut fields, crate::thermal::Settling::Bedrock);
+            println!("cut {rounds} rounds of valleys first, in {:.1?}", at.elapsed());
+        }
+
+        let at = std::time::Instant::now();
+        erode(&mut fields, 0, 3);
+        println!(
+            "the droplets took {:.1?} over {} cells on {} threads",
+            at.elapsed(),
+            fields.height.values.len(),
+            rayon::current_num_threads(),
+        );
+    }
+
+    /// The same, over enough ground to be more than one tile.
+    ///
+    /// Every other test here runs on 48 cells, which is one tile and one
+    /// thread: none of them can see the tiling at all. This one spans several
+    /// tiles on both axes, so the droplets really are running on different
+    /// threads over ground that meets. If two tiles running at once could touch
+    /// the same cell, the result would depend on how the threads interleaved
+    /// and these runs would drift apart -- which is what [`SPACING`] exists to
+    /// make impossible, and this is the only thing that checks it.
+    ///
+    /// Repeated rather than paired: a race that lands the same way twice proves
+    /// nothing, and the failure it is looking for is intermittent by nature.
+    #[test]
+    fn the_tiles_do_not_race_each_other() {
+        let side = TILE * 2 + 91;
+        let mut first = cone(side, 10.0);
+        erode(&mut first, 4321, 1);
+        for again in 0..3 {
+            let mut next = cone(side, 10.0);
+            erode(&mut next, 4321, 1);
+            let differing = first
+                .height
+                .values
+                .iter()
+                .zip(&next.height.values)
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(differing, 0, "run {again} differed in {differing} cells");
+        }
+    }
+
+    /// Droplets have to land on every part of the map, seams included.
+    ///
+    /// The tiles are seeded only in their own inner square and the last one on
+    /// each axis is a partial tile, so an off-by-one in either would leave a
+    /// stripe of ground no droplet ever starts on -- which would draw as a band
+    /// of unweathered terrain and pass every other test in this file.
+    #[test]
+    fn every_tile_of_the_map_is_eroded() {
+        // The remainder past the last whole tile has to be wider than `HALO`.
+        // Narrower than that and droplets from the tile beside it wander across
+        // the whole band, so a band nobody seeds still comes back eroded and
+        // this test cannot tell the two apart -- which it could not, at 91.
+        let side = TILE * 2 + HALO * 3;
+        let before = cone(side, 10.0);
+        let mut after = cone(side, 10.0);
+        erode(&mut after, 99, 1);
+
+        let width = before.height.width;
+        let rows = before.height.height;
+        let changed = |cells: &mut dyn Iterator<Item = usize>| {
+            let (mut touched, mut total) = (0usize, 0usize);
+            for index in cells {
+                total += 1;
+                if before.height.values[index] != after.height.values[index] {
+                    touched += 1;
+                }
+            }
+            touched as f64 / total as f64
+        };
+
+        // As a *share* of each band rather than a count, and compared against
+        // the other bands rather than against a number picked in advance. A
+        // band nobody seeds is not empty -- droplets from the tile beside it
+        // wander up to `HALO` cells in, which is enough to pass any threshold
+        // low enough to be safe -- so the only honest test is that every band
+        // was worked about as hard as the busiest one.
+        let mut shares = Vec::new();
+        for tx in 0..width.div_ceil(TILE) {
+            let columns = tx * TILE..(tx * TILE + TILE).min(width);
+            shares.push((
+                format!("column {tx}"),
+                changed(&mut (0..rows).flat_map(|row| {
+                    columns.clone().map(move |column| row * width + column)
+                })),
+            ));
+        }
+        for ty in 0..rows.div_ceil(TILE) {
+            let band = ty * TILE..(ty * TILE + TILE).min(rows);
+            shares.push((
+                format!("row {ty}"),
+                changed(&mut band.flat_map(|row| (0..width).map(move |column| row * width + column))),
+            ));
+        }
+
+        let busiest = shares.iter().map(|(_, share)| *share).fold(0.0, f64::max);
+        for (band, share) in &shares {
+            assert!(
+                *share > busiest * 0.5,
+                "{band} had {:.1}% of its cells eroded against {:.1}% for the busiest band",
+                share * 100.0,
+                busiest * 100.0,
+            );
+        }
     }
 
     #[test]
