@@ -401,7 +401,10 @@ mod measure {
             let cover = at.elapsed();
 
             let _ = std::fs::remove_dir_all(&root);
-            println!("{level:5}  {:5} m  {dtm:>9.2?}  {cover:>9.2?}", 1u32 << level);
+            println!(
+                "{level:5}  {:5} m  {dtm:>9.2?}  {cover:>9.2?}",
+                1u32 << level
+            );
         }
     }
 }

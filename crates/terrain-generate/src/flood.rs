@@ -106,12 +106,10 @@ impl Flood {
             ty,
             count: None,
         };
-        let storage = |read_only| {
-            wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            }
+        let storage = |read_only| wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
         };
         let layout = gpu
             .device
@@ -132,13 +130,13 @@ impl Flood {
                     entry(4, storage(false)),
                 ],
             });
-        let pipeline_layout =
-            gpu.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("flood pipeline layout"),
-                    bind_group_layouts: &[Some(&layout)],
-                    immediate_size: 0,
-                });
+        let pipeline_layout = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("flood pipeline layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
         let pipeline = |label, entry_point| {
             gpu.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -302,7 +300,8 @@ impl Flood {
 
         let mut iterations = 0;
         loop {
-            gpu.queue.write_buffer(&self.changed, 0, &0u32.to_le_bytes());
+            gpu.queue
+                .write_buffer(&self.changed, 0, &0u32.to_le_bytes());
             let mut encoder = gpu
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -362,7 +361,11 @@ mod tests {
                 // A plain tilted east, so there is somewhere for the water to
                 // leave, and a pit every seventh cell so the fill has many
                 // small basins to settle as well as one large one.
-                let pit = if column % 7 == 3 && row % 7 == 5 { 12.0 } else { 0.0 };
+                let pit = if column % 7 == 3 && row % 7 == 5 {
+                    12.0
+                } else {
+                    0.0
+                };
                 fields.height.values[index] = 100.0 - column as f32 * 0.5 - bowl - pit;
             }
         }
@@ -488,7 +491,10 @@ mod tests {
             .zip(&raised)
             .filter(|(after, before)| after < before)
             .count();
-        assert!(drained > 100, "only {drained} cells drained after the breach");
+        assert!(
+            drained > 100,
+            "only {drained} cells drained after the breach"
+        );
     }
 
     /// How far an iteration should look, measured rather than guessed.
@@ -551,9 +557,7 @@ mod tests {
             .as_ref()
             .map(|first| filled.iter().zip(first).filter(|(a, b)| a != b).count())
             .unwrap_or(0);
-        println!(
-            "tiled:      {iterations:5} iterations in {elapsed:.1?}, {differs} cells differ"
-        );
+        println!("tiled:      {iterations:5} iterations in {elapsed:.1?}, {differs} cells differ");
         assert_eq!(differs, 0, "the tiled fill settled on a different surface");
     }
 

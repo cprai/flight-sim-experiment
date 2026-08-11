@@ -50,12 +50,15 @@ impl Gpu {
     pub fn new() -> Result<Self> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::from_env()
-                .unwrap_or(wgpu::PowerPreference::HighPerformance),
-            ..Default::default()
-        }))
-        .context("no wgpu adapter available")?;
+        let adapter =
+            pollster::block_on(
+                instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::from_env()
+                        .unwrap_or(wgpu::PowerPreference::HighPerformance),
+                    ..Default::default()
+                }),
+            )
+            .context("no wgpu adapter available")?;
         // Which device this ran on decides what the timings mean and whether a
         // landscape that came out different is the change or the driver, so say
         // it rather than leave it to be assumed.
@@ -115,7 +118,8 @@ impl Gpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(&buffer, 0, bytemuck::bytes_of(value));
+        self.queue
+            .write_buffer(&buffer, 0, bytemuck::bytes_of(value));
         buffer
     }
 

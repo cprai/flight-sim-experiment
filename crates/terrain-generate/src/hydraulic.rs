@@ -247,13 +247,19 @@ pub fn erode(fields: &mut Fields, seed: u32, per_cell: usize) {
             .collect();
         tiles.par_iter().for_each(|&(tx, ty)| {
             run_tile(
-                &ground, rock, &brush, width, rows, metres_per_cell, per_cell, seed, tx, ty,
+                &ground,
+                rock,
+                &brush,
+                width,
+                rows,
+                metres_per_cell,
+                per_cell,
+                seed,
+                tx,
+                ty,
             );
         });
-        log::info!(
-            "{}% of the droplets have run",
-            (colour + 1) * 100 / COLOURS
-        );
+        log::info!("{}% of the droplets have run", (colour + 1) * 100 / COLOURS);
     }
 
     for (index, cell) in ground.iter().enumerate() {
@@ -475,7 +481,10 @@ mod tests {
             let at = std::time::Instant::now();
             crate::incise::rivers(&mut fields, rounds);
             crate::thermal::relax(&mut fields, crate::thermal::Settling::Bedrock);
-            println!("cut {rounds} rounds of valleys first, in {:.1?}", at.elapsed());
+            println!(
+                "cut {rounds} rounds of valleys first, in {:.1?}",
+                at.elapsed()
+            );
         }
 
         let at = std::time::Instant::now();
@@ -560,16 +569,19 @@ mod tests {
             let columns = tx * TILE..(tx * TILE + TILE).min(width);
             shares.push((
                 format!("column {tx}"),
-                changed(&mut (0..rows).flat_map(|row| {
-                    columns.clone().map(move |column| row * width + column)
-                })),
+                changed(
+                    &mut (0..rows)
+                        .flat_map(|row| columns.clone().map(move |column| row * width + column)),
+                ),
             ));
         }
         for ty in 0..rows.div_ceil(TILE) {
             let band = ty * TILE..(ty * TILE + TILE).min(rows);
             shares.push((
                 format!("row {ty}"),
-                changed(&mut band.flat_map(|row| (0..width).map(move |column| row * width + column))),
+                changed(
+                    &mut band.flat_map(|row| (0..width).map(move |column| row * width + column)),
+                ),
             ));
         }
 
