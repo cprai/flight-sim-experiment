@@ -348,6 +348,10 @@ impl Scene {
             self.camera.z_near,
             self.camera.position.distance(self.was_eye),
         );
+        // Once, on the first update: the scattering tables are functions of the
+        // medium alone, so nothing about a frame can change them. Here rather
+        // than in the constructor because filling them needs a queue.
+        self.sky.ensure_built(device, queue);
         // Uploaded every frame rather than only when it changes. Nothing moves
         // the sun yet, so this rewrites the same sixteen bytes each time --
         // which is cheaper than the branch that would avoid it, and is what
