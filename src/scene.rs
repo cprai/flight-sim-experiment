@@ -787,10 +787,10 @@ mod tests {
     /// sixteen bits of the material word, the rest being the sub-pixel offset.
     const MATERIAL_MASK: u32 = 0xffff;
 
-    const GRASS: MaterialId = MaterialId(Material::Grass.id());
-    const SAND: MaterialId = MaterialId(Material::Sand.id());
-    const LAKE: MaterialId = MaterialId(Material::Lake.id());
-    const ROCK: MaterialId = MaterialId(Material::BareRock.id());
+    const GRASS: MaterialId = MaterialId(Material::Grass.id() as u16);
+    const SAND: MaterialId = MaterialId(Material::Sand.id() as u16);
+    const LAKE: MaterialId = MaterialId(Material::Lake.id() as u16);
+    const ROCK: MaterialId = MaterialId(Material::BareRock.id() as u16);
     /// An id inside the water block that no version of the enum has assigned.
     const UNASSIGNED: MaterialId = MaterialId(0x0109);
 
@@ -1105,7 +1105,7 @@ mod tests {
                 return None;
             }
             let packed = self.materials[(y * SIZE + x) as usize];
-            Some(MaterialId(packed & MATERIAL_MASK))
+            Some(MaterialId((packed & MATERIAL_MASK) as u16))
         }
 
         /// How many pixels of the frame are sky.
@@ -1394,7 +1394,7 @@ mod tests {
             .map(|index| {
                 let (col, row) = (index % RASTER, index / RASTER);
                 let block = (row / BLOCK) * across + col / BLOCK;
-                MaterialId(Material::ALL[block as usize % Material::ALL.len()].id())
+                MaterialId(Material::ALL[block as usize % Material::ALL.len()].id() as u16)
             })
             .collect();
 
@@ -1437,7 +1437,7 @@ mod tests {
         let uniform = |material: Material| {
             render(
                 vec![0.0; (RASTER * RASTER) as usize],
-                vec![MaterialId(material.id()); (RASTER * RASTER) as usize],
+                vec![MaterialId(material.id() as u16); (RASTER * RASTER) as usize],
                 over_the_checkerboard,
             )
         };
@@ -1474,7 +1474,7 @@ mod tests {
                 let gain = (shown(first.pixel(x, y)) - shown(second.pixel(x, y)))
                     / (first_albedo - second_albedo);
                 let haze = shown(first.pixel(x, y)) - first_albedo * gain;
-                let want = crate::sky::tonemap(albedo(id.0) * gain + haze)
+                let want = crate::sky::tonemap(albedo(u32::from(id.0)) * gain + haze)
                     .to_array()
                     .map(terrain_tiles::linear_to_srgb);
                 let got = frame.pixel(x, y);
@@ -2976,7 +2976,7 @@ mod tests {
         // Every material in the book, tiled: any misregistered window shows
         // as one id where another belongs, and ids compare exactly.
         let materials: Vec<MaterialId> = (0..RASTER * RASTER)
-            .map(|i| MaterialId(Material::ALL[i as usize % Material::ALL.len()].id()))
+            .map(|i| MaterialId(Material::ALL[i as usize % Material::ALL.len()].id() as u16))
             .collect();
 
         let aim = |camera: &mut Camera| {

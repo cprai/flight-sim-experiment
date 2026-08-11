@@ -90,12 +90,21 @@ pub fn read_height_tile(path: &Path) -> Result<Option<Vec<f32>>> {
 
 /// Reads a single-band tile back as material ids, or `None` if it was never
 /// written.
+///
+/// Both widths, and that is not transitional. Tiles are written sixteen bits
+/// wide, which is what the renderer holds them in, but the survey tree already
+/// installed on this machine is a hundred and seventeen gigabytes of 32-bit
+/// ones and is not going to be rebuilt to suit a format change. Widening on the
+/// way in costs a pass over a tile and lets one reader open both.
 pub fn read_material_tile(path: &Path) -> Result<Option<Vec<u32>>> {
     match read_tile(path, 1)? {
         None => Ok(None),
+        Some(DecodingResult::U16(values)) => {
+            Ok(Some(values.into_iter().map(u32::from).collect()))
+        }
         Some(DecodingResult::U32(values)) => Ok(Some(values)),
         Some(_) => bail!(
-            "{} holds something other than 32-bit unsigned ids",
+            "{} holds something other than 16- or 32-bit unsigned ids",
             path.display()
         ),
     }

@@ -1651,22 +1651,11 @@ impl Terrain {
                     .materials
                     .read_rect(level, origin, block, &mut staging);
                 read += clock.elapsed();
-                let clock = crate::profile::Clock::start(timed);
-                // Narrowed in place, forwards, so the sixteen bit id is written
-                // over bytes the thirty-two bit one has already been read out
-                // of. Two bytes never overtake four. An id that did not fit
-                // becomes `Null`, which draws as the magenta that means nothing
-                // is known -- visible, rather than silently some other material.
-                for cell in 0..count {
-                    let wide = u32::from_le_bytes(
-                        staging[cell * 4..cell * 4 + 4]
-                            .try_into()
-                            .expect("four bytes"),
-                    );
-                    let narrow = u16::try_from(wide).unwrap_or(0);
-                    staging[cell * 2..cell * 2 + 2].copy_from_slice(&narrow.to_le_bytes());
-                }
-                convert += clock.elapsed();
+                // Nothing to convert: `MaterialId` is the sixteen bits the
+                // texture holds, so the bytes the reader filled are the bytes
+                // the upload wants. Whatever width the tile on disk was is the
+                // reader's problem, and it settles it a decoded row at a time
+                // rather than by a pass over the whole raster here.
                 let clock = crate::profile::Clock::start(timed);
                 Self::write_rows(
                     queue,
@@ -2354,7 +2343,7 @@ mod tests {
             resident_base,
             relief,
             metres,
-            vec![MaterialId(cover); (RASTER * RASTER) as usize],
+            vec![MaterialId(cover as u16); (RASTER * RASTER) as usize],
         )
     }
 
@@ -3018,7 +3007,7 @@ mod tests {
         let cover = (0..RASTER * RASTER)
             .map(|i| {
                 let at = IVec2::new((i % RASTER) as i32, (i / RASTER) as i32) >> BASE;
-                MaterialId(if square(at) { WOODED } else { MARSH })
+                MaterialId(if square(at) { WOODED } else { MARSH } as u16)
             })
             .collect();
 
@@ -3191,7 +3180,7 @@ mod tests {
         let cover = (0..RASTER * RASTER)
             .map(|i| {
                 let at = IVec2::new((i % RASTER) as i32, (i / RASTER) as i32) >> BASE;
-                MaterialId(if square(at) { WOODED } else { FARMLAND })
+                MaterialId(if square(at) { WOODED } else { FARMLAND } as u16)
             })
             .collect();
 

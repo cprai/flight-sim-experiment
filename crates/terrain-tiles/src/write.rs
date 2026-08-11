@@ -21,7 +21,7 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tiff::encoder::colortype::{Gray32, Gray32Float, RGB8};
+use tiff::encoder::colortype::{Gray16, Gray32Float, RGB8};
 use tiff::encoder::{Compression, TiffEncoder};
 use tiff::tags::Tag;
 
@@ -217,12 +217,19 @@ pub fn write_colour_tile(path: &Path, placement: TilePlacement, samples: &[u8]) 
     Ok(())
 }
 
-/// Writes one material tile: a single band of 32-bit unsigned ids.
+/// Writes one material tile: a single band of 16-bit unsigned ids.
 ///
 /// The ids are `terrain-materials` discriminants, but the writer takes plain
 /// numbers: by the time a tile is being written the classification already
 /// happened, and refusing an id here could only turn a finished raster into
 /// an error after the expensive part is done.
+///
+/// Sixteen bits on disk, `u32` at the call site. The renderer holds ground
+/// cover in an `R16Uint` texture and the assigned ids reach 0x080c, so the
+/// upper half of a 32-bit sample was always zero -- a quarter of a gigabyte of
+/// it across a generated tree, and a narrowing loop over every texel on the way
+/// in. Narrowing here instead keeps every caller working in the width the
+/// classifiers use and puts the one place it can go wrong under a check.
 pub fn write_material_tile(path: &Path, placement: TilePlacement, samples: &[u32]) -> Result<()> {
     let expected = expected_samples(1);
     anyhow::ensure!(
@@ -230,6 +237,19 @@ pub fn write_material_tile(path: &Path, placement: TilePlacement, samples: &[u32
         "expected {expected} samples for a {TILE_SIZE} x {TILE_SIZE} tile, got {}",
         samples.len()
     );
+    // Loudly, rather than by truncation. An id that lost its top bits would
+    // still be a perfectly readable tile holding some other material, drawn
+    // somewhere in the far field, with nothing to trace it back to.
+    let narrowed: Vec<u16> = samples
+        .iter()
+        .map(|&id| {
+            u16::try_from(id).map_err(|_| {
+                anyhow::anyhow!(
+                    "material id {id:#x} does not fit in the sixteen bits a tile stores"
+                )
+            })
+        })
+        .collect::<Result<_>>()?;
     prepare(path)?;
 
     let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
@@ -238,7 +258,7 @@ pub fn write_material_tile(path: &Path, placement: TilePlacement, samples: &[u32
         .with_compression(Compression::Uncompressed);
 
     let mut image = encoder
-        .new_image::<Gray32>(TILE_SIZE, TILE_SIZE)
+        .new_image::<Gray16>(TILE_SIZE, TILE_SIZE)
         .context("starting the image")?;
     image
         .rows_per_strip(ROWS_PER_STRIP)
@@ -248,7 +268,7 @@ pub fn write_material_tile(path: &Path, placement: TilePlacement, samples: &[u32
     write_placement(&mut image, placement, Some(0.0))?;
 
     image
-        .write_data(samples)
+        .write_data(&narrowed)
         .with_context(|| format!("writing texels to {}", path.display()))?;
     Ok(())
 }
@@ -393,7 +413,13 @@ mod tests {
 
     #[test]
     fn a_material_tile_round_trips() {
-        let samples: Vec<u32> = (0..expected_samples(1)).map(|i| (i as u32) * 7).collect();
+        // Spread across the sixteen bits a tile stores, rather than counting
+        // upwards: the ids that actually occur are a scattered handful in the
+        // low twelve, and a test that only ever wrote small ones would not
+        // notice a writer that dropped the top byte.
+        let samples: Vec<u32> = (0..expected_samples(1))
+            .map(|i| ((i as u32) * 7919) % 0x1_0000)
+            .collect();
         let path = temp_path("material-round-trip");
         write_material_tile(&path, placement(), &samples).expect("failed to write");
         let bytes = std::fs::read(&path).expect("failed to read back");
@@ -402,14 +428,36 @@ mod tests {
         let mut decoder = Decoder::new(Cursor::new(bytes)).expect("failed to decode");
         assert_eq!(
             decoder.colortype().expect("no colour type"),
-            tiff::ColorType::Gray(32)
+            tiff::ColorType::Gray(16)
         );
-        let tiff::decoder::DecodingResult::U32(read) =
+        let tiff::decoder::DecodingResult::U16(read) =
             decoder.read_image().expect("failed to read the image")
         else {
-            panic!("expected 32-bit unsigned ids");
+            panic!("expected 16-bit unsigned ids");
         };
-        assert_eq!(read, samples);
+        assert_eq!(
+            read,
+            samples.iter().map(|&id| id as u16).collect::<Vec<u16>>()
+        );
+    }
+
+    /// An id too wide to store has to stop the write, not lose its top bits.
+    ///
+    /// Truncation here would produce a perfectly valid tile holding some other
+    /// material, drawn somewhere in the far field, with nothing about it to
+    /// trace back to the classifier that emitted the id.
+    #[test]
+    fn a_material_id_too_wide_to_store_is_refused() {
+        let mut samples = vec![1u32; expected_samples(1)];
+        samples[expected_samples(1) / 2] = 0x1_0000;
+        let path = temp_path("material-too-wide");
+        let error = write_material_tile(&path, placement(), &samples)
+            .expect_err("an id past sixteen bits should not be written");
+        let _ = std::fs::remove_dir_all(path.parent().and_then(|p| p.parent()).expect("no root"));
+        assert!(
+            error.to_string().contains("0x10000"),
+            "the error should name the id that did not fit: {error}"
+        );
     }
 
     #[test]

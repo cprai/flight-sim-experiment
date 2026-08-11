@@ -63,9 +63,17 @@ impl TileSample for f32 {
 /// does not depend on the enum: to the reader an id is an opaque label, and
 /// a tile holding ids the enum has not heard of is still a readable tile --
 /// what to *show* for such an id is the palette's problem, not the reader's.
+/// Sixteen bits wide, matching the `R16Uint` texture the chain holds cover in.
+///
+/// The assigned ids reach 0x080c, so the other sixteen bits were never carrying
+/// anything. Holding them at the width the GPU wants means a tile's bytes are
+/// staged and uploaded as they are read, rather than read as `u32` and narrowed
+/// texel by texel on the way past -- which is a loop over the whole raster at
+/// every startup, and one that quietly turned an id it could not fit into
+/// `Null`.
 #[repr(transparent)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct MaterialId(pub u32);
+pub struct MaterialId(pub u16);
 
 impl Texel for MaterialId {
     /// The commonest id among the children; ties go to the lowest id.
@@ -110,13 +118,25 @@ impl TileSample for MaterialId {
         Self::NODATA
     }
 
+    /// Either width on disk. Tiles are written sixteen bits wide, and the
+    /// installed survey tree is 32-bit ones that are not being rebuilt; an id
+    /// too wide to hold reads as `Null`, which draws as the magenta that means
+    /// nothing is known rather than as some other material.
     fn read_span(row: &DecodingResult, first: usize, out: &mut [Self]) -> Result<()> {
-        let DecodingResult::U32(values) = row else {
-            bail!("a material tile decoded to something other than 32-bit integers");
-        };
-        let span = &values[first..first + out.len()];
-        for (texel, &value) in out.iter_mut().zip(span) {
-            *texel = MaterialId(value);
+        match row {
+            DecodingResult::U16(values) => {
+                let span = &values[first..first + out.len()];
+                for (texel, &value) in out.iter_mut().zip(span) {
+                    *texel = MaterialId(value);
+                }
+            }
+            DecodingResult::U32(values) => {
+                let span = &values[first..first + out.len()];
+                for (texel, &value) in out.iter_mut().zip(span) {
+                    *texel = MaterialId(u16::try_from(value).unwrap_or(0));
+                }
+            }
+            _ => bail!("a material tile decoded to something other than 16- or 32-bit integers"),
         }
         Ok(())
     }
@@ -719,7 +739,7 @@ mod tests {
             let stored_column = (index / magnified) as u32;
             assert_eq!(
                 *texel,
-                MaterialId(stored_column + 1),
+                MaterialId((stored_column + 1) as u16),
                 "level-0 texel {index} should come from stored column {stored_column}"
             );
         }
