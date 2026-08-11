@@ -35,7 +35,12 @@ pub struct Texels {
     gpu_extent: Extent,
     params: wgpu::Buffer,
     layout: wgpu::BindGroupLayout,
+    /// The two lower layers, dispatched only by the tests that check them
+    /// against the crate they were transcribed from. A run wants the whole
+    /// texel and calls `texel`.
+    #[allow(dead_code)]
     bare: wgpu::ComputePipeline,
+    #[allow(dead_code)]
     cover: wgpu::ComputePipeline,
     texel: wgpu::ComputePipeline,
     /// The five erosion channels, uploaded once and never read back.
@@ -163,6 +168,7 @@ impl Texels {
     /// `emit::texel_metres` hands the CPU functions -- half a texel in, because
     /// the format's rasters are `PixelIsArea` and a texel is a square of ground
     /// rather than a point.
+    #[allow(dead_code)]
     pub fn bare_tile(&self, gpu: &Gpu, origin: [f32; 2], texel_metres: f32) -> Vec<f32> {
         self.run(gpu, &self.bare, origin, texel_metres);
         gpu.download(&self.out_height, (self.tile_size * self.tile_size) as usize)
@@ -170,6 +176,7 @@ impl Texels {
 
     /// The classifier's three answers over one tile: the ground cover, and the
     /// five shares that say what grows and what lies on it.
+    #[allow(dead_code)]
     pub fn cover_tile(
         &self,
         gpu: &Gpu,
@@ -480,6 +487,26 @@ mod tests {
     /// `PAINTED` and `BOULDERED` are thresholds on that same approximated
     /// statistic, so a texel sitting on one can fall either way. A rule
     /// transcribed wrongly moves regions, not speckles.
+    ///
+    /// # What the bound below is, and is not
+    ///
+    /// One metre is what this fixture's windows come to, not a bound on the
+    /// raster. Emitting the shipped extent from the same seed both ways and
+    /// comparing 17 of the 168 level-3 tiles -- 4.46 M texels -- puts 14 of
+    /// them over two metres, the worst 18.9 m, which is far more than a bucket
+    /// could account for. Every one is a cluster of exactly one texel, and the
+    /// id moves with the height: `Rubble` becomes `Canopy` and rises 13.9 m,
+    /// `Canopy` becomes `Meadow` and drops 18.9 m. That is a whole crown
+    /// existing on one side and not the other, which is what the hard test for
+    /// whether a cell holds a tree does to a density differing in its last bits
+    /// -- the same class as the id thresholds above, showing in the height
+    /// because the two come off one walk by design.
+    ///
+    /// Three per million is under a tenth of a texel expected across this
+    /// fixture, so it has never been seen here and the assertion is not
+    /// loosened for it. What would be worth chasing is a cluster, and there is
+    /// not one: no group larger than a single texel differs by over two metres
+    /// anywhere in that sample.
     #[test]
     fn the_shader_and_the_crate_agree_about_what_stands() {
         const TILE: u32 = 64;

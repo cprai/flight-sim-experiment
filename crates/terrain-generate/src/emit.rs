@@ -6,18 +6,27 @@
 //! its own texels -- see `detail` for why that is the better of the two ways to
 //! build a pyramid.
 //!
-//! The work is one tile per task. A tile is a quarter of a megabyte of samples
-//! and about a megabyte of file, so a worker's whole state is one buffer and
-//! there is nothing to share, which is what lets this run on every core the
-//! machine has, one tile at a time.
+//! The work is one tile per dispatch. The per-texel functions run on the GPU --
+//! see `texels` for the driver and `emit.wgsl` for the transcription -- and
+//! what is left on the CPU is the half a GPU is no use for: masking the
+//! overhang, encoding a TIFF and writing it. Those run across every core while
+//! the next tile is being computed, which is why the tiles are pulled through
+//! `par_bridge` rather than collected first: a worker takes one tile, and the
+//! dispatch that fills it happens under the bridge's own lock, so the shared
+//! output buffers are never written by two tiles at once and nothing queues up
+//! in memory ahead of the writers.
 //!
 //! A tile may hang off the edge of the raster: the grid is anchored at the
 //! projection's origin, so a coarse tile's span does not divide the download's
 //! extent. The part with nothing behind it is written as nodata, exactly as
 //! `terrain-download` writes it, rather than as a repeat of the last real
-//! texel.
+//! texel. The shader computes it anyway -- a branch per texel to skip ground
+//! that is about to be overwritten costs more than the texel does -- so the
+//! overhang is punched out after the readback instead, over the rectangle that
+//! actually has raster behind it.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,20 +37,66 @@ use terrain_materials::Material;
 use terrain_tiles::write::{TilePlacement, write_height_tile, write_material_tile};
 use terrain_tiles::{Manifest, TILE_SIZE, Tile};
 
-use crate::classify::material;
-use crate::detail::{self, OUTSIDE};
-use crate::fields::Fields;
-use crate::shape::Relief;
+use crate::detail::OUTSIDE;
+use crate::gpu::Gpu;
+use crate::texels::Texels;
 use crate::tiles::tile_range;
 
 /// How many tiles to build between progress lines.
 const REPORT_EVERY: u64 = 500;
 
+/// Which columns and rows of a tile have raster behind them, or `None` if none
+/// of it does.
+///
+/// A rectangle rather than a per-texel test, because that is what it always is:
+/// the raster is an axis-aligned block and so is a tile, so the part of one
+/// inside the other is a block too. Punching the overhang out of a finished
+/// tile is then two `fill`s and a short loop rather than a quarter of a million
+/// bounds checks.
+fn inside(manifest: &Manifest, level: u32, tile: Tile) -> Option<(Range<usize>, Range<usize>)> {
+    let (origin_column, origin_row) = manifest.origin_texels(level);
+    let (width, height) = manifest.size_texels(level);
+    let side = i64::from(TILE_SIZE);
+    let span = |first: i64, extent: u32| -> Range<usize> {
+        let low = (-first).clamp(0, side);
+        let high = (i64::from(extent) - first).clamp(low, side);
+        low as usize..high as usize
+    };
+    let columns = span(i64::from(tile.x) * side - origin_column, width);
+    let rows = span(i64::from(tile.y) * side - origin_row, height);
+    if columns.is_empty() || rows.is_empty() {
+        return None;
+    }
+    Some((columns, rows))
+}
+
+/// Where a tile's first texel sits, in raster metres -- east from the western
+/// edge of the raster, south from the northern one.
+///
+/// That is the coordinate system every per-texel function is written in, and
+/// the shader walks a tile from here by adding whole texels, so this is the
+/// only place the tile's position on the ground is worked out.
+///
+/// Half a texel in, because the format's rasters are `PixelIsArea`: a texel is
+/// a square of ground and its sample is the middle of that square. It may be
+/// negative, for a tile that hangs off the western or northern edge.
+fn tile_origin_metres(manifest: &Manifest, level: u32, tile: Tile) -> [f32; 2] {
+    let (origin_column, origin_row) = manifest.origin_texels(level);
+    let metres = manifest.metres_per_texel(level) as f32;
+    let at = |index: i32, origin: i64| {
+        ((i64::from(index) * i64::from(TILE_SIZE) - origin) as f32 + 0.5) * metres
+    };
+    [at(tile.x, origin_column), at(tile.y, origin_row)]
+}
+
 /// Where one texel of a tile sits, or that it sits outside the raster.
 ///
-/// Returned as raster metres -- east from the western edge, south from the
-/// northern one -- because that is the coordinate system both per-texel
-/// functions are written in.
+/// The two halves of what a tile's position means, put back together: which
+/// texels count, and where the first one is. Nothing in a run needs this -- the
+/// shader walks a tile from its origin, and the overhang is punched out
+/// afterwards -- but it is what the walk has to agree with, so it stays as the
+/// thing the tests state that agreement against.
+#[cfg(test)]
 fn texel_metres(
     manifest: &Manifest,
     level: u32,
@@ -49,34 +104,50 @@ fn texel_metres(
     column: usize,
     row: usize,
 ) -> Option<[f32; 2]> {
-    let (origin_column, origin_row) = manifest.origin_texels(level);
-    let (width, height) = manifest.size_texels(level);
-    let raster_column = i64::from(tile.x) * i64::from(TILE_SIZE) + column as i64 - origin_column;
-    let raster_row = i64::from(tile.y) * i64::from(TILE_SIZE) + row as i64 - origin_row;
-    if raster_column < 0
-        || raster_row < 0
-        || raster_column >= i64::from(width)
-        || raster_row >= i64::from(height)
-    {
+    let (columns, rows) = inside(manifest, level, tile)?;
+    if !columns.contains(&column) || !rows.contains(&row) {
         return None;
     }
-    // Half a texel in, because the format's rasters are `PixelIsArea`: a texel
-    // is a square of ground and its sample is the middle of that square.
+    let origin = tile_origin_metres(manifest, level, tile);
     let metres = manifest.metres_per_texel(level) as f32;
     Some([
-        (raster_column as f32 + 0.5) * metres,
-        (raster_row as f32 + 0.5) * metres,
+        origin[0] + column as f32 * metres,
+        origin[1] + row as f32 * metres,
     ])
 }
 
-/// Runs `build` over every tile of every stored level of a product.
+/// Replaces every texel of a finished tile that has no raster behind it.
+fn punch_out<T: Copy>(manifest: &Manifest, level: u32, tile: Tile, samples: &mut [T], hole: T) {
+    let side = TILE_SIZE as usize;
+    let Some((columns, rows)) = inside(manifest, level, tile) else {
+        samples.fill(hole);
+        return;
+    };
+    if columns.len() == side && rows.len() == side {
+        return;
+    }
+    for row in 0..side {
+        let line = &mut samples[row * side..(row + 1) * side];
+        if rows.contains(&row) {
+            line[..columns.start].fill(hole);
+            line[columns.end..].fill(hole);
+        } else {
+            line.fill(hole);
+        }
+    }
+}
+
+/// Builds every tile of every stored level of a product and writes it.
 ///
-/// The closure is handed a level, a tile and the level's texel size, and
-/// returns how many tiles it wrote -- one, or none if the tile turned out to
-/// hold nothing.
-fn over_tiles<F>(manifest: &Manifest, name: &str, build: F) -> Result<u64>
+/// `sample` is handed a level, a tile and the level's texel size and returns
+/// the tile's samples, or nothing if the tile has no raster behind it at all.
+/// It runs one tile at a time, because it drives the device. `write` runs on
+/// every core.
+fn over_tiles<T, S, W>(manifest: &Manifest, name: &str, mut sample: S, write: W) -> Result<u64>
 where
-    F: Fn(u32, Tile, f32) -> Result<u64> + Sync,
+    T: Send,
+    S: FnMut(u32, Tile, f32) -> Option<T> + Send,
+    W: Fn(u32, Tile, T) -> Result<()> + Sync,
 {
     let started = std::time::Instant::now();
     let mut written = 0;
@@ -93,16 +164,23 @@ where
 
         let texel = manifest.metres_per_texel(level) as f32;
         let done = AtomicU64::new(0);
+        // Progress is counted here rather than beside the write because this is
+        // the stage that runs in order; the bridge lets the writers fall at most
+        // a core's worth of tiles behind, so it is still a report of the run
+        // rather than of a queue filling up.
+        let sample = &mut sample;
         let level_written: u64 = tiles
-            .into_par_iter()
-            .map(|tile| {
-                let built = build(level, tile, texel);
+            .into_iter()
+            .filter_map(|tile| {
+                let built = sample(level, tile, texel);
                 let at = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if at.is_multiple_of(REPORT_EVERY) || at == total {
                     log::info!("{name} level {level}: {at} of {total} tiles");
                 }
-                built
+                built.map(|samples| (tile, samples))
             })
+            .par_bridge()
+            .map(|(tile, samples)| write(level, tile, samples).map(|()| 1u64))
             .collect::<Result<Vec<u64>>>()?
             .iter()
             .sum();
@@ -132,90 +210,33 @@ fn placement(manifest: &Manifest, level: u32, tile: Tile) -> TilePlacement {
 /// Baked at each level's own texel size, which is what `terrain_canopy::baked`
 /// takes it for -- a texel narrower than a crown is asking about one point of one
 /// tree, and a texel many crowns wide has to stand for the lot.
-pub fn heights(
-    root: &Path,
-    manifest: &Manifest,
-    fields: &Fields,
-    seed: u32,
-    relief: Relief,
-) -> Result<u64> {
+pub fn heights(root: &Path, manifest: &Manifest, gpu: &Gpu, texels: &Texels) -> Result<u64> {
     let product = root.join(&manifest.product);
-    let cell = fields.metres_per_cell;
-    let written = over_tiles(manifest, &manifest.product, |level, tile, texel| {
-        let side = TILE_SIZE as usize;
-        let mut samples = vec![OUTSIDE; side * side];
-        let mut any = false;
-        for row in 0..side {
-            for column in 0..side {
-                let Some([x, y]) = texel_metres(manifest, level, tile, column, row) else {
-                    continue;
-                };
-                let sample = fields.sample(x, y);
-                let ground = detail::ground(&sample, texel, cell);
-                let bare = detail::height(&sample, &ground, x, y, texel, seed);
-                let grown = crate::classify::trees(&sample, &ground, x, y, texel, seed, relief);
-                let strewn = crate::classify::rocks(&sample, &ground, x, y, texel, seed, relief);
-                let crowns = terrain_canopy::baked(x, y, &standing(&grown, x, y), texel).height;
-                let stones = terrain_rocks::baked(x, y, &scattered(&strewn, x, y), texel).height;
-                // The higher of the two rather than the sum. Both are surfaces
-                // standing on the same ground and a ray meets whichever is
-                // above the other; adding them would raise a boulder by the
-                // height of the trees beside it. The classifier never grows
-                // both on one texel, so today this only ever picks the one that
-                // is not zero -- which is exactly why it is worth writing the
-                // rule down rather than relying on that.
-                samples[row * side + column] = bare + crowns.max(stones);
-                any = true;
-            }
-        }
-        if !any {
-            return Ok(0);
-        }
-        let path = manifest.grid().tile_path(&product, level, tile);
-        write_height_tile(
-            &path,
-            placement(manifest, level, tile),
-            &samples,
-            manifest.nodata,
-        )
-        .with_context(|| format!("writing level {level} tile {tile:?}"))?;
-        Ok(1)
-    })?;
+    let written = over_tiles(
+        manifest,
+        &manifest.product,
+        |level, tile, texel| {
+            inside(manifest, level, tile)?;
+            let origin = tile_origin_metres(manifest, level, tile);
+            Some(texels.tile(gpu, origin, texel).0)
+        },
+        |level, tile, mut samples| {
+            punch_out(manifest, level, tile, &mut samples, OUTSIDE);
+            let path = manifest.grid().tile_path(&product, level, tile);
+            write_height_tile(
+                &path,
+                placement(manifest, level, tile),
+                &samples,
+                manifest.nodata,
+            )
+            .with_context(|| format!("writing level {level} tile {tile:?}"))
+        },
+    )?;
 
     // Last, so a killed run leaves a directory the renderer refuses rather than
     // one it opens and reads holes out of.
     manifest.write(&product)?;
     Ok(written)
-}
-
-/// The cover a point stands under, from what the classifier grew there.
-///
-/// One place, because both products ask the same question and an answer that
-/// differed between them would draw a tree and paint a meadow. The clumping is
-/// applied here rather than in the classifier because it is a *look*, not a fact
-/// about the landscape: it thins and thickens a stand inside itself so that a
-/// classifier writing one density per texel does not draw as one flat density.
-fn standing(grown: &crate::classify::Trees, x: f32, y: f32) -> terrain_canopy::Cover {
-    terrain_canopy::Cover {
-        density: grown.density * terrain_canopy::clump(x, y),
-        health: grown.health,
-    }
-}
-
-/// The stones lying on a point, from what the classifier scattered there.
-///
-/// The same bargain as [`standing`], and the two noise fields are applied here
-/// for the same reason: where the stone *is* comes out of the landscape, but how
-/// it bunches is a look. The boulder field's is a gate rather than a multiplier,
-/// so most of the ground a classifier calls strewn has no blocks on it at all
-/// and the ground inside a patch has them everywhere -- which is the difference
-/// between a boulder field and an even sprinkle of stones over a mountainside.
-fn scattered(strewn: &crate::classify::Rocks, x: f32, y: f32) -> terrain_rocks::Scatter {
-    terrain_rocks::Scatter {
-        boulders: strewn.boulders * terrain_rocks::field(x, y),
-        rubble: strewn.rubble * terrain_rocks::strew(x, y),
-        stature: strewn.stature,
-    }
 }
 
 /// Writes the ground-cover product: every level, classified from the fields.
@@ -226,78 +247,39 @@ fn scattered(strewn: &crate::classify::Rocks, x: f32, y: f32) -> terrain_rocks::
 /// are baked into the heights, a hit on one is indistinguishable from a hit on a
 /// hillock, and the march has nothing left to ask.
 ///
-/// The share comes out of the same `terrain_canopy::baked` call the elevation
-/// used, over the same block of ground, so a texel cannot be raised as a tree
-/// here and painted as open ground there.
-pub fn materials(
-    root: &Path,
-    manifest: &Manifest,
-    fields: &Fields,
-    seed: u32,
-    relief: Relief,
-) -> Result<u64> {
+/// The id comes out of the same `cs_texel` dispatch the elevation does, over the
+/// same block of ground, so a texel cannot be raised as a tree here and painted
+/// as open ground there. Each product still runs its own dispatch, since either
+/// can be asked for without the other, and the walk is cheap enough on the
+/// device that computing both twice is not worth a shared cache of tiles.
+pub fn materials(root: &Path, manifest: &Manifest, gpu: &Gpu, texels: &Texels) -> Result<u64> {
     let product = root.join(&manifest.product);
-    let cell = fields.metres_per_cell;
     // Counted at the finest stored level, which is the one the classifier's
     // thresholds were chosen against.
     let counted: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
-    let written = over_tiles(manifest, &manifest.product, |level, tile, texel| {
-        let side = TILE_SIZE as usize;
-        // Null, which is both the format's nodata and what ground outside the
-        // raster means.
-        let mut ids = vec![Material::Null.id(); side * side];
-        let mut any = false;
-        for row in 0..side {
-            for column in 0..side {
-                let Some([x, y]) = texel_metres(manifest, level, tile, column, row) else {
-                    continue;
-                };
-                let sample = fields.sample(x, y);
-                let ground = detail::ground(&sample, texel, cell);
-                let floor = material(&sample, &ground, x, y, texel, seed, relief);
-                let grown = crate::classify::trees(&sample, &ground, x, y, texel, seed, relief);
-                let strewn = crate::classify::rocks(&sample, &ground, x, y, texel, seed, relief);
-                let share = terrain_canopy::baked(x, y, &standing(&grown, x, y), texel).share;
-                let stone = terrain_rocks::baked(x, y, &scattered(&strewn, x, y), texel);
-                // One rule at every level, and it means two different things
-                // without needing to be told which: close up the block is inside
-                // a single crown or the gap beside it, so this asks "is this
-                // texel a treetop"; far out it spans a stand, so it asks "is this
-                // mostly wood". Both are the question the pixel wants answered,
-                // and the two stone rules under it read the same way at both
-                // ends.
-                //
-                // The order is what a viewer would say. Crowns first, because a
-                // closed stand hides whatever is under it from above. Then
-                // boulders before rubble, so a block lying in talus paints as
-                // the block: it is the coarser of the two answers and the only
-                // one a texel at any distance can actually resolve.
-                ids[row * side + column] = if share >= terrain_canopy::PAINTED {
-                    Material::Canopy.id()
-                } else if stone.boulders >= terrain_rocks::BOULDERED {
-                    Material::Boulder.id()
-                } else if stone.covered >= terrain_rocks::STREWN {
-                    Material::Rubble.id()
-                } else {
-                    floor.id()
-                };
-                any = true;
+    let written = over_tiles(
+        manifest,
+        &manifest.product,
+        |level, tile, texel| {
+            inside(manifest, level, tile)?;
+            let origin = tile_origin_metres(manifest, level, tile);
+            Some(texels.tile(gpu, origin, texel).1)
+        },
+        |level, tile, mut ids| {
+            // Null, which is both the format's nodata and what ground outside
+            // the raster means.
+            punch_out(manifest, level, tile, &mut ids, Material::Null.id());
+            if level == manifest.base_level {
+                let mut counts = counted.lock().expect("a tile panicked while counting");
+                for id in &ids {
+                    *counts.entry(*id).or_insert(0u64) += 1;
+                }
             }
-        }
-        if !any {
-            return Ok(0);
-        }
-        if level == manifest.base_level {
-            let mut counts = counted.lock().expect("a tile panicked while counting");
-            for id in &ids {
-                *counts.entry(*id).or_insert(0u64) += 1;
-            }
-        }
-        let path = manifest.grid().tile_path(&product, level, tile);
-        write_material_tile(&path, placement(manifest, level, tile), &ids)
-            .with_context(|| format!("writing level {level} tile {tile:?}"))?;
-        Ok(1)
-    })?;
+            let path = manifest.grid().tile_path(&product, level, tile);
+            write_material_tile(&path, placement(manifest, level, tile), &ids)
+                .with_context(|| format!("writing level {level} tile {tile:?}"))
+        },
+    )?;
 
     report(
         &counted
@@ -340,33 +322,36 @@ mod measure {
 
     use crate::fields::Fields;
 
-    /// What one texel of each product costs, level by level.
+    /// What one tile of each product costs, level by level.
     ///
-    /// Emitting is 283 s of a 457 s run and the largest thing left, so what a
-    /// port of it has to beat is worth knowing precisely rather than as one
-    /// total. Level matters because the crowns and stones are sampled over the
-    /// ground a texel covers: a texel at level 3 spans 8 m and one at level 8
-    /// spans 256 m, and if the cost per texel grows with that span then the
-    /// coarse levels are far more expensive than their tile counts suggest.
+    /// The same measurement that said porting was worth doing, kept so the
+    /// before and after are the same number rather than two different ones.
+    /// Level matters because the crowns and stones are sampled over the ground
+    /// a texel covers: a texel at level 3 spans 8 m and one at level 8 spans
+    /// 256 m, and on the CPU that made the coarse levels far more expensive
+    /// than their tile counts suggested.
+    ///
+    /// What it now includes on top of the walk is a dispatch, a blocking
+    /// readback, the overhang punched out, and a TIFF encoded and written --
+    /// everything a real tile costs. Against the CPU column that is a
+    /// comparison in the tile's favour rather than the shader's, which is the
+    /// direction a speed claim should be biased.
     ///
     /// Run with `--ignored --nocapture`.
     #[test]
     #[ignore = "a measurement, not a check"]
     fn measure_what_a_texel_costs_by_level() {
         let mut fields = Fields::new([49152.0, 57344.0], 16.0);
-        crate::shape::raise(
-            &mut fields,
-            crate::shape::Relief {
-                valley_metres: 700.0,
-                peak_metres: 2600.0,
-            },
-            0,
-        );
-        crate::flow::route(&mut fields);
         let relief = crate::shape::Relief {
             valley_metres: 700.0,
             peak_metres: 2600.0,
         };
+        crate::shape::raise(&mut fields, relief, 0);
+        crate::flow::route(&mut fields);
+
+        let gpu = crate::gpu::test_gpu();
+        let texels = Texels::new(&gpu, &fields, TILE_SIZE, 0, relief);
+        drop(fields);
 
         // The real emitters over a one-tile raster, rather than the loops
         // rewritten here. Reimplementing them is how a measurement quietly
@@ -392,12 +377,11 @@ mod measure {
             };
 
             let at = std::time::Instant::now();
-            heights(&root, &manifest("dtm", -32767.0), &fields, 0, relief).expect("heights");
+            heights(&root, &manifest("dtm", -32767.0), &gpu, &texels).expect("heights");
             let dtm = at.elapsed();
 
             let at = std::time::Instant::now();
-            materials(&root, &manifest(MATERIAL_PRODUCT, 0.0), &fields, 0, relief)
-                .expect("materials");
+            materials(&root, &manifest(MATERIAL_PRODUCT, 0.0), &gpu, &texels).expect("materials");
             let cover = at.elapsed();
 
             let _ = std::fs::remove_dir_all(&root);
@@ -413,6 +397,9 @@ mod measure {
 mod tests {
     use super::*;
     use terrain_tiles::read::{read_height_tile, read_material_tile};
+
+    use crate::fields::Fields;
+    use crate::shape::Relief;
 
     fn manifest(product: &str, base_level: u32, nodata: f32) -> Manifest {
         Manifest {
@@ -454,6 +441,14 @@ mod tests {
         fields
     }
 
+    /// A device with that landscape on it, which is what both emitters take
+    /// now. Seed 3 rather than 0 so a test would notice the seed being ignored.
+    fn driver() -> (crate::gpu::Gpu, Texels) {
+        let gpu = crate::gpu::test_gpu();
+        let texels = Texels::new(&gpu, &fields(), TILE_SIZE, 3, relief());
+        (gpu, texels)
+    }
+
     fn temp(name: &str) -> std::path::PathBuf {
         let root =
             std::env::temp_dir().join(format!("terrain-generate-{}-{name}", std::process::id()));
@@ -470,7 +465,8 @@ mod tests {
     fn an_elevation_product_round_trips_through_the_readers() {
         let root = temp("heights-round-trip");
         let manifest = manifest("dtm", 0, -32767.0);
-        let written = heights(&root, &manifest, &fields(), 3, relief()).expect("failed to write");
+        let (gpu, texels) = driver();
+        let written = heights(&root, &manifest, &gpu, &texels).expect("failed to write");
         assert!(written > 0);
 
         let read = Manifest::read(&root.join("dtm")).expect("the manifest must validate");
@@ -492,13 +488,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A tile has to hold the ground its grid position names.
+    ///
+    /// This is what the wiring to the device could get wrong without anything
+    /// else noticing. The shader is handed one origin per tile and walks the
+    /// rest by adding whole texels, so an origin off by a texel, by half a
+    /// texel, or by a whole tile produces a landscape that is perfectly
+    /// plausible, passes every range check, and is in the wrong place -- and
+    /// the seam only shows where two tiles meet.
+    ///
+    /// So the expected origin is worked out here from the raster indices
+    /// directly, the way `terrain-download` names ground, rather than from the
+    /// function under test. A tile away from the corner, because an index
+    /// scaled wrongly still lands on zero at the first one.
+    ///
+    /// Exact equality, not a tolerance: both sides are the same dispatch of the
+    /// same shader, so anything but a bit-for-bit match is a different origin.
+    #[test]
+    fn a_written_tile_holds_the_ground_its_grid_position_names() {
+        let root = temp("heights-placement");
+        let manifest = manifest("dtm", 0, -32767.0);
+        let (gpu, texels) = driver();
+        heights(&root, &manifest, &gpu, &texels).expect("failed to write");
+
+        let (first, across, down) = tile_range(&manifest, 0);
+        let tile = Tile::new(first.x + across as i32 - 1, first.y + down as i32 - 1);
+        assert!(
+            inside(&manifest, 0, tile).is_some_and(|(columns, rows)| {
+                columns.len() == TILE_SIZE as usize && rows.len() == TILE_SIZE as usize
+            }),
+            "the tile under test must be full, or the overhang explains a difference"
+        );
+
+        let path = manifest.grid().tile_path(&root.join("dtm"), 0, tile);
+        let written = read_height_tile(&path)
+            .expect("failed to read")
+            .expect("the tile must exist");
+
+        let (origin_column, origin_row) = manifest.origin_texels(0);
+        let metres = manifest.metres_per_texel(0) as f32;
+        let corner = |index: i32, origin: i64| {
+            ((i64::from(index) * i64::from(TILE_SIZE) - origin) as f32 + 0.5) * metres
+        };
+        let wanted = texels
+            .tile(
+                &gpu,
+                [corner(tile.x, origin_column), corner(tile.y, origin_row)],
+                metres,
+            )
+            .0;
+        assert_eq!(
+            written,
+            wanted,
+            "the tile on disk is not the ground at {:?}",
+            (tile.x, tile.y)
+        );
+        // ... and it is ground, rather than two identical buffers of nothing.
+        assert!(
+            written.iter().any(|height| *height > 500.0),
+            "the tile under test holds nothing to compare"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Every level has to be there, or the renderer's clipmap has a ring with
     /// nothing behind it.
     #[test]
     fn every_stored_level_is_written() {
         let root = temp("every-level");
         let manifest = manifest("dtm", 0, -32767.0);
-        heights(&root, &manifest, &fields(), 3, relief()).expect("failed to write");
+        let (gpu, texels) = driver();
+        heights(&root, &manifest, &gpu, &texels).expect("failed to write");
         for level in manifest.base_level..=manifest.max_level() {
             let directory = root.join("dtm").join(format!("{level:02}"));
             let count = std::fs::read_dir(&directory)
@@ -518,17 +578,8 @@ mod tests {
     fn every_material_written_is_one_the_shared_enum_knows() {
         let root = temp("materials-round-trip");
         let manifest = manifest("materials", 2, 0.0);
-        let written = materials(
-            &root,
-            &manifest,
-            &fields(),
-            3,
-            Relief {
-                valley_metres: 700.0,
-                peak_metres: 2600.0,
-            },
-        )
-        .expect("failed to write");
+        let (gpu, texels) = driver();
+        let written = materials(&root, &manifest, &gpu, &texels).expect("failed to write");
         assert!(written > 0);
 
         let (first, _, _) = tile_range(&manifest, 2);

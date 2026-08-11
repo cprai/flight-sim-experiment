@@ -32,6 +32,7 @@
 /// which is what makes the pieces meet with a matching gradient. The four
 /// weights always add to one, so a flat field stays flat and a lake stays
 /// exactly at its own level.
+#[allow(dead_code)]
 fn catmull_rom_weights(t: f32) -> [f32; 4] {
     let (t2, t3) = (t * t, t * t * t);
     [
@@ -119,6 +120,7 @@ impl Grid {
     ///
     /// It can overshoot by design, which is what a cubic through four points
     /// does; callers that need a bounded channel clamp it.
+    #[allow(dead_code)]
     pub fn sample_smooth(&self, column: f32, row: f32) -> f32 {
         let (c0, r0) = (column.floor(), row.floor());
         let (fc, fr) = (column - c0, row - r0);
@@ -186,6 +188,7 @@ pub struct Sample {
 
 impl Sample {
     /// How deep the standing water is here, in metres. Zero on dry ground.
+    #[allow(dead_code)]
     pub fn water_depth(&self) -> f32 {
         (self.filled - self.height).max(0.0)
     }
@@ -243,6 +246,7 @@ impl Fields {
     /// the detail pass is about to add on top. That is the right scale for
     /// deciding what grows here: a metre of talus does not turn a meadow into
     /// a cliff.
+    #[allow(dead_code)]
     pub fn sample(&self, x: f32, y: f32) -> Sample {
         let column = x / self.metres_per_cell;
         let row = y / self.metres_per_cell;

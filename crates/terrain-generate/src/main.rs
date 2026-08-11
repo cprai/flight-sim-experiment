@@ -52,8 +52,18 @@
 //! that would stay offline, and its channels are what such a shader would
 //! upload.
 
+// `classify` and `detail` are no longer part of a run. `emit` dispatches
+// `emit.wgsl`, which is a transcription of both, and the three agreement tests
+// in `texels` compare the shader against them texel for texel -- so they are
+// the oracle rather than dead weight, and an oracle is only worth anything
+// while both implementations exist. `detail` still has two constants a run
+// reads and `classify` is now reachable only from tests, but both carry a lint
+// rather than `#[cfg(test)]` so that an ordinary build still compiles them: an
+// oracle that only builds under `cargo test` is one you find broken later.
+#[allow(dead_code)]
 mod classify;
 mod creep;
+#[allow(dead_code)]
 mod detail;
 mod emit;
 mod fields;
@@ -347,24 +357,21 @@ fn main() -> Result<()> {
     let fields = simulate(&arguments);
     log::info!("simulated the landscape in {:.1?}", started.elapsed());
 
+    // The channels move to the device once and stay there for the whole of the
+    // emit, which is the shape the eventual startup path wants: nothing crosses
+    // the bus per tile, and the host copy is not needed again. Dropping it hands
+    // back 220 MB at the default grid, which is worth having while the writers
+    // are holding a tile each.
+    let gpu = gpu::Gpu::new()?;
+    let texels = texels::Texels::new(&gpu, &fields, TILE_SIZE, arguments.seed, arguments.relief());
+    drop(fields);
+
     let mut written = 0;
     if arguments.wants(&elevation.product) {
-        written += emit::heights(
-            &arguments.output,
-            &elevation,
-            &fields,
-            arguments.seed,
-            arguments.relief(),
-        )?;
+        written += emit::heights(&arguments.output, &elevation, &gpu, &texels)?;
     }
     if arguments.wants(&materials.product) {
-        written += emit::materials(
-            &arguments.output,
-            &materials,
-            &fields,
-            arguments.seed,
-            arguments.relief(),
-        )?;
+        written += emit::materials(&arguments.output, &materials, &gpu, &texels)?;
     }
 
     println!(

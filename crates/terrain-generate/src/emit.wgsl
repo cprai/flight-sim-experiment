@@ -1034,6 +1034,12 @@ fn canopy_baked(centre: vec2<f32>, texel: f32, trees: Trees) -> Standing {
 
     var out: Standing;
     out.lift = tallest_mean(counts, sums, samples, CANOPY_SILHOUETTE);
+    // One rule at every level, and it means two different things without
+    // needing to be told which: close up the block is inside a single crown or
+    // the gap beside it, so this asks "is this texel a treetop"; far out it
+    // spans a stand, so it asks "is this mostly wood". Both are the question the
+    // pixel wants answered, and the two stone rules read the same way at both
+    // ends.
     out.id = select(0u, MAT_CANOPY, under / samples >= CANOPY_PAINTED);
     return out;
 }
