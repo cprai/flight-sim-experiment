@@ -64,6 +64,7 @@ mod hydraulic;
 mod incise;
 mod noise;
 mod shape;
+mod texels;
 mod thermal;
 mod tiles;
 
