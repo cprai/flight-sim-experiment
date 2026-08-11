@@ -63,6 +63,12 @@ impl CameraUniform {
 /// The terrain plus the camera looking at it, and the GPU state to draw them.
 pub struct Scene {
     pub camera: Camera,
+    /// Where the sun is. Public because it is a property of the scene the way
+    /// the camera is, set by whoever set the camera up -- see `--sun` in
+    /// `src/main.rs`. Nothing moves it with the clock yet.
+    pub sun: crate::sky::Sun,
+    /// What the world is lit by, on the GPU: [`Scene::sun`] as a uniform.
+    sky: crate::sky::Sky,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     terrain: Terrain,
@@ -258,9 +264,12 @@ impl Scene {
         let reach_bind_group = crate::reproject::bind_reach(device, &reach_layout, &carried);
         let reproject =
             crate::reproject::Reprojection::new(device, camera_layout, &gbuffer, &carried);
-        let shading = Shading::new(device, format, &gbuffer);
+        let sky = crate::sky::Sky::new(device);
+        let shading = Shading::new(device, format, &gbuffer, sky.layout());
         Self {
             camera,
+            sun: crate::sky::Sun::default(),
+            sky,
             camera_buffer,
             camera_bind_group,
             terrain,
@@ -339,6 +348,11 @@ impl Scene {
             self.camera.z_near,
             self.camera.position.distance(self.was_eye),
         );
+        // Uploaded every frame rather than only when it changes. Nothing moves
+        // the sun yet, so this rewrites the same sixteen bytes each time --
+        // which is cheaper than the branch that would avoid it, and is what
+        // will already be right the day something does move it.
+        self.sky.set_frame(queue, self.sun);
         // What this frame draws becomes the next one's history, so the basis it
         // is drawn with is the basis that history will have to be read back
         // through.
@@ -565,7 +579,7 @@ impl Scene {
                 multiview_mask: None,
             },
         );
-        self.shading.draw(&mut pass);
+        self.shading.draw(&mut pass, &self.sky);
     }
 }
 
@@ -1648,14 +1662,26 @@ mod tests {
         };
 
         let (heights, materials) = ridges(false);
-        let alone = count_far(&render_config(test_residency(), heights, materials, aim, &[]));
+        let alone = count_far(&render_config(
+            test_residency(),
+            heights,
+            materials,
+            aim,
+            &[],
+        ));
         assert!(
             alone > 500,
             "the far plateau should be plainly in shot on its own, got {alone} pixels"
         );
 
         let (heights, materials) = ridges(true);
-        let occluded = count_far(&render_config(test_residency(), heights, materials, aim, &[]));
+        let occluded = count_far(&render_config(
+            test_residency(),
+            heights,
+            materials,
+            aim,
+            &[],
+        ));
         assert_eq!(
             occluded, 0,
             "every ray should have stopped at the near ridge"
@@ -3358,7 +3384,8 @@ mod tests {
         // not how many there are.
         let speckles: usize = carried_rows[(edge + 2).min(SIZE as usize)..].iter().sum();
         assert_eq!(
-            speckles, 0,
+            speckles,
+            0,
             "flying {} m left {speckles} pixels of far ridge below row {edge}, \
              where the near ridge is the nearest thing along every ray",
             step_metres * steps as f32

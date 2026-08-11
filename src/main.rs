@@ -9,6 +9,7 @@ mod profile;
 mod renderer;
 mod reproject;
 mod scene;
+mod sky;
 mod terrain;
 
 use std::path::PathBuf;
@@ -25,7 +26,7 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use crate::controls::FlyController;
-use crate::headless::Placement;
+use crate::headless::{Placement, SunAngles};
 use crate::renderer::Renderer;
 
 /// Size of the window, and of a screenshot that does not ask for another.
@@ -139,6 +140,15 @@ struct View {
     /// view for the first time.
     #[arg(long, default_value_t = 0.0, value_name = "M/S")]
     motion: f32,
+
+    /// Where the sun is, as `ELEVATION,AZIMUTH` in degrees.
+    ///
+    /// Elevation is measured from the horizon and may be negative, which puts
+    /// the sun below it; azimuth is a compass bearing, zero north and ninety
+    /// east. Without it the sun sits where it always has, 45 degrees up in the
+    /// south-east, so every existing invocation draws the frame it drew before.
+    #[arg(long, value_name = "ELEVATION,AZIMUTH")]
+    sun: Option<SunAngles>,
 }
 
 /// Reads `WIDTHxHEIGHT` for [`View::size`].
@@ -312,6 +322,7 @@ fn main() -> anyhow::Result<()> {
                 &terrain.terrain,
                 view.size.unwrap_or(DEFAULT_SIZE),
                 view.camera,
+                view.sun,
                 headless::Flight {
                     frames,
                     speed: view.motion,
@@ -328,6 +339,7 @@ fn main() -> anyhow::Result<()> {
                 &terrain.terrain,
                 view.size.unwrap_or(DEFAULT_SIZE),
                 view.camera,
+                view.sun,
                 headless::Flight {
                     frames,
                     speed: view.motion,

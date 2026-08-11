@@ -20,17 +20,6 @@ const SKY: vec4<f32> = vec4<f32>(0.30, 0.55, 0.85, 1.0);
 // tile -- in-range unassigned ids are magenta in the table itself.
 const MAGENTA: vec4<f32> = vec4<f32>(1.0, 0.0, 1.0, 1.0);
 
-// Where the sun is, as the unit vector pointing at it from the ground.
-//
-// World space is Y-up with +X east and +Z south, so this is a mid-morning sun
-// in the south-east, 45 degrees above the horizon: azimuth and elevation both
-// at 45 gives the exact halves and the exact root-half below. High enough that
-// nothing faces away from it outright, off-axis enough in both the horizontal
-// axes that no slope facing a cardinal direction comes out the same as its
-// neighbours. One constant rather than a uniform because there is no time of
-// day yet to drive it from; when there is, this becomes the thing it writes.
-const SUN: vec3<f32> = vec3<f32>(0.5, 0.70710678, 0.5);
-
 // How the light splits between the sun and everything else.
 //
 // The stand-in for a sky: no shadows are traced, so ground facing away from
@@ -51,13 +40,28 @@ struct Palette {
     colours: array<vec4<f32>, 2304>,
 };
 
-@group(0) @binding(0) var<uniform> palette: Palette;
+// What the world is lit by. Mirrors `SkyUniform` in `src/sky.rs`.
+//
+// `sun` is the unit vector pointing at the sun from the ground; `w` is unused
+// padding.
+struct Sky {
+    sun: vec4<f32>,
+};
+
+// Group 1, because group 0 is the camera for every pipeline in this program
+// and this pass will want it as soon as the shading needs a world position.
+// Group 2 is left for the scattering tables and group 3 is this pass's own,
+// which is the arrangement the atmosphere is being built into rather than one
+// this commit needs on its own.
+@group(1) @binding(0) var<uniform> sky: Sky;
+
+@group(3) @binding(0) var<uniform> palette: Palette;
 // A material id in the low sixteen bits and where inside its pixel the ground
 // sits in the rest; only the id is wanted here. See `MATERIAL_MASK` in
 // `src/terrain.wgsl` for what the other half is for.
-@group(0) @binding(1) var material: texture_2d<u32>;
-@group(0) @binding(3) var depth: texture_2d<f32>;
-@group(0) @binding(4) var normal: texture_2d<f32>;
+@group(3) @binding(1) var material: texture_2d<u32>;
+@group(3) @binding(3) var depth: texture_2d<f32>;
+@group(3) @binding(4) var normal: texture_2d<f32>;
 
 @vertex
 fn vs_shade(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
@@ -89,7 +93,7 @@ fn fs_shade(@builtin(position) clip: vec4<f32>) -> @location(0) vec4<f32> {
     // and the sun -- the relief this brings out is local, and a mountain does
     // not yet darken the valley behind it.
     let surface = textureLoad(normal, pixel, 0).xyz;
-    let light = AMBIENT + SUNLIGHT * max(dot(surface, SUN), 0.0);
+    let light = AMBIENT + SUNLIGHT * max(dot(surface, sky.sun.xyz), 0.0);
 
     // The palette is stored linearised and the target re-encodes on write, so
     // the light scales the colour in the space where scaling light is what it

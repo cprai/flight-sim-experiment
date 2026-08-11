@@ -245,7 +245,17 @@ pub struct Shading {
 impl Shading {
     /// Builds the shading pipeline against the target `format` and the
     /// buffers it will read.
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, gbuffer: &GBuffer) -> Self {
+    ///
+    /// `sky_layout` is [`crate::sky::Sky`]'s, and it is passed in rather than
+    /// built here for the reason [`storage_layout`] is built here rather than
+    /// in the terrain: one description of what a group holds, held in one
+    /// place, so neither side can drift from the other.
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        gbuffer: &GBuffer,
+        sky_layout: &wgpu::BindGroupLayout,
+    ) -> Self {
         // Uploaded once: the table is a pure function of the material enum,
         // so nothing ever rewrites it.
         let palette = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -295,9 +305,18 @@ impl Shading {
             label: Some("shading shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shading.wgsl").into()),
         });
+        // Four slots, two of them empty. Group 0 is the camera for every other
+        // pipeline in the program and group 2 is where the scattering tables
+        // will be read from; neither is bound here yet, and leaving the holes
+        // rather than packing this pass's own bindings down to group 0 is what
+        // stops every group in `src/shading.wgsl` being renumbered again when
+        // they arrive. `max_bind_groups` is four by default, so this is the
+        // whole budget: anything else the shading comes to want has to share a
+        // group, and the palette is the natural one to move -- it is uploaded
+        // once and never rewritten, exactly like the sky's own constants.
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shading pipeline layout"),
-            bind_group_layouts: &[Some(&layout)],
+            bind_group_layouts: &[None, Some(sky_layout), None, Some(&layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -361,9 +380,10 @@ impl Shading {
     }
 
     /// Records the shading into an already-started render pass.
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, sky: &crate::sky::Sky) {
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_bind_group(1, sky.bind_group(), &[]);
+        pass.set_bind_group(3, &self.bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
 }

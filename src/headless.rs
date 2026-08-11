@@ -78,6 +78,48 @@ impl FromStr for Placement {
     }
 }
 
+/// Where to put the sun, as `ELEVATION,AZIMUTH` in degrees.
+///
+/// Its own type beside [`Placement`] and for the same reason: clap parses an
+/// argument by asking a type to read it, and the reading is where the error
+/// message that tells someone what they typed wrong lives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SunAngles {
+    pub elevation_degrees: f32,
+    pub azimuth_degrees: f32,
+}
+
+impl SunAngles {
+    pub fn sun(self) -> crate::sky::Sun {
+        crate::sky::Sun::from_angles(self.elevation_degrees, self.azimuth_degrees)
+    }
+}
+
+impl FromStr for SunAngles {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let numbers: Vec<f32> = text
+            .split(',')
+            .map(|part| {
+                part.trim()
+                    .parse()
+                    .with_context(|| format!("{part:?} is not a number"))
+            })
+            .collect::<Result<_>>()?;
+        let [elevation, azimuth] = numbers[..] else {
+            bail!(
+                "expected elevation,azimuth -- two numbers, got {}",
+                numbers.len()
+            );
+        };
+        Ok(Self {
+            elevation_degrees: elevation,
+            azimuth_degrees: azimuth,
+        })
+    }
+}
+
 /// A GPU device and queue with no surface behind them.
 ///
 /// Requests exactly what [`crate::renderer::Renderer`] does, minus the
@@ -293,6 +335,7 @@ fn settled(
     terrain_root: &Path,
     size: UVec2,
     placement: Option<Placement>,
+    sun: Option<SunAngles>,
 ) -> Result<Scene> {
     let started = std::time::Instant::now();
     let mut scene = Scene::new(device, CAPTURE_FORMAT, size, terrain_root)?;
@@ -301,11 +344,18 @@ fn settled(
     if let Some(placement) = placement {
         placement.apply(&mut scene.camera);
     }
+    if let Some(sun) = sun {
+        scene.sun = sun.sun();
+    }
     log::info!(
         "camera at {} facing {:?}",
         scene.camera.position,
         scene.camera.orientation
     );
+    // Said out loud for the same reason the camera is: two runs that differ
+    // only in where the sun was would otherwise be indistinguishable in the
+    // log, and the sun is about to decide the colour of every pixel.
+    log::info!("sun towards {}", scene.sun.direction);
 
     let started = std::time::Instant::now();
     scene.settle(device, queue);
@@ -330,11 +380,12 @@ pub fn render(
     terrain_root: &Path,
     size: UVec2,
     placement: Option<Placement>,
+    sun: Option<SunAngles>,
     flight: Flight,
     output: &Path,
 ) -> Result<()> {
     let (device, queue) = device()?;
-    let mut scene = settled(&device, &queue, terrain_root, size, placement)?;
+    let mut scene = settled(&device, &queue, terrain_root, size, placement, sun)?;
 
     let pixels = capture(&device, &queue, &mut scene, size, flight)?;
     write_png(output, size, &pixels)?;
@@ -365,11 +416,12 @@ pub fn profile(
     terrain_root: &Path,
     size: UVec2,
     placement: Option<Placement>,
+    sun: Option<SunAngles>,
     flight: Flight,
 ) -> Result<()> {
     let frames = flight.frames;
     let (adapter, device, queue) = device_and_adapter()?;
-    let mut scene = settled(&device, &queue, terrain_root, size, placement)?;
+    let mut scene = settled(&device, &queue, terrain_root, size, placement, sun)?;
     // After settling, so the chain is already read in and the load's own
     // dispatches are not measured as if they were a frame's.
     scene.profile(&device, true);
