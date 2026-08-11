@@ -333,6 +333,80 @@ fn report(counts: &BTreeMap<u32, u64>) {
 }
 
 #[cfg(test)]
+mod measure {
+    use super::*;
+
+    use terrain_tiles::MATERIAL_PRODUCT;
+
+    use crate::fields::Fields;
+
+    /// What one texel of each product costs, level by level.
+    ///
+    /// Emitting is 283 s of a 457 s run and the largest thing left, so what a
+    /// port of it has to beat is worth knowing precisely rather than as one
+    /// total. Level matters because the crowns and stones are sampled over the
+    /// ground a texel covers: a texel at level 3 spans 8 m and one at level 8
+    /// spans 256 m, and if the cost per texel grows with that span then the
+    /// coarse levels are far more expensive than their tile counts suggest.
+    ///
+    /// Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn measure_what_a_texel_costs_by_level() {
+        let mut fields = Fields::new([49152.0, 57344.0], 16.0);
+        crate::shape::raise(
+            &mut fields,
+            crate::shape::Relief {
+                valley_metres: 700.0,
+                peak_metres: 2600.0,
+            },
+            0,
+        );
+        crate::flow::route(&mut fields);
+        let relief = crate::shape::Relief {
+            valley_metres: 700.0,
+            peak_metres: 2600.0,
+        };
+
+        // The real emitters over a one-tile raster, rather than the loops
+        // rewritten here. Reimplementing them is how a measurement quietly
+        // stops measuring the thing it is named after: written that way, the
+        // materials column left out the canopy walk that `materials` does and
+        // read a hundredth of the truth.
+        let root = std::env::temp_dir().join("terrain-generate-texel-cost");
+        println!("level  texel      heights   materials");
+        for level in 3..=8u32 {
+            let span = TILE_SIZE << level;
+            let manifest = |product: &str, nodata: f32| Manifest {
+                version: Manifest::VERSION,
+                product: product.into(),
+                epsg: 3979,
+                tile_size: TILE_SIZE,
+                base_level: level,
+                level_count: 1,
+                base_metres_per_texel: 1.0,
+                origin_metres: [-1_990_656.0, 536_576.0],
+                extent_texels: [span, span],
+                bands: 1,
+                nodata,
+            };
+
+            let at = std::time::Instant::now();
+            heights(&root, &manifest("dtm", -32767.0), &fields, 0, relief).expect("heights");
+            let dtm = at.elapsed();
+
+            let at = std::time::Instant::now();
+            materials(&root, &manifest(MATERIAL_PRODUCT, 0.0), &fields, 0, relief)
+                .expect("materials");
+            let cover = at.elapsed();
+
+            let _ = std::fs::remove_dir_all(&root);
+            println!("{level:5}  {:5} m  {dtm:>9.2?}  {cover:>9.2?}", 1u32 << level);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use terrain_tiles::read::{read_height_tile, read_material_tile};
