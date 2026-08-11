@@ -37,6 +37,7 @@ pub struct Texels {
     layout: wgpu::BindGroupLayout,
     bare: wgpu::ComputePipeline,
     cover: wgpu::ComputePipeline,
+    texel: wgpu::ComputePipeline,
     /// The five erosion channels, uploaded once and never read back.
     channels: Vec<wgpu::Buffer>,
     /// Wide enough for the five per-texel shares `cs_cover` writes as well as
@@ -145,6 +146,7 @@ impl Texels {
             layout,
             bare: pipeline("emit bare", "cs_bare"),
             cover: pipeline("emit cover", "cs_cover"),
+            texel: pipeline("emit texel", "cs_texel"),
             channels,
             out_height,
             out_cover,
@@ -179,6 +181,17 @@ impl Texels {
         (
             gpu.download(&self.out_cover, texels),
             gpu.download(&self.out_height, texels * 5),
+        )
+    }
+
+    /// A whole tile of both products: the height a ray meets and the id a
+    /// pixel is painted with, which is what `emit` writes.
+    pub fn tile(&self, gpu: &Gpu, origin: [f32; 2], texel_metres: f32) -> (Vec<f32>, Vec<u32>) {
+        self.run(gpu, &self.texel, origin, texel_metres);
+        let texels = (self.tile_size * self.tile_size) as usize;
+        (
+            gpu.download(&self.out_height, texels),
+            gpu.download(&self.out_cover, texels),
         )
     }
 
@@ -431,8 +444,6 @@ mod tests {
                 worst_share < 0.001,
                 "level {level}: a tree or stone share differs by {worst_share:.5}",
             );
-            // A landscape that came back as one material would agree with
-            // itself perfectly and prove nothing about any of the branches.
         }
         // A landscape that came back as one material would agree with itself
         // perfectly and prove nothing about any of the branches. Ten is what
@@ -445,5 +456,110 @@ mod tests {
                 .map(|id| format!("{id:#06x}"))
                 .collect::<Vec<_>>(),
         );
+    }
+
+    /// What a whole texel comes to: the height a ray meets and the id a pixel
+    /// is painted with, against what `emit` writes today.
+    ///
+    /// # Why this one cannot demand agreement
+    ///
+    /// The crowns and the stones are an order statistic -- the mean of the
+    /// tallest fifteenth of a block of up to a thousand samples -- and the
+    /// crates get it by sorting. A shader cannot sort a thousand samples, so
+    /// the tallest mean comes off sixteen cumulative buckets instead, which is
+    /// the renderer's own approach and approximates the exact answer by at most
+    /// the spread within one bucket.
+    ///
+    /// So this is the one layer where the two implementations genuinely compute
+    /// different things, and pretending otherwise with a tight tolerance would
+    /// only mean choosing a number until it passed. What this does instead is
+    /// hold the gap to something the bucketing explains, and the number below
+    /// was measured rather than guessed.
+    ///
+    /// The ids are held to a share rather than to equality for the same reason:
+    /// `PAINTED` and `BOULDERED` are thresholds on that same approximated
+    /// statistic, so a texel sitting on one can fall either way. A rule
+    /// transcribed wrongly moves regions, not speckles.
+    #[test]
+    fn the_shader_and_the_crate_agree_about_what_stands() {
+        const TILE: u32 = 64;
+
+        let fields = landscape(8192.0);
+        let gpu = test_gpu();
+        let texels = Texels::new(&gpu, &fields, TILE, 0, relief());
+        let cell = fields.metres_per_cell;
+
+        for level in 3..=8u32 {
+            let texel = (1u32 << level) as f32;
+            let origin = [2048.0 + 0.5 * texel, 2048.0 + 0.5 * texel];
+            let (heights, ids) = texels.tile(&gpu, origin, texel);
+
+            let (mut worst, mut differing) = (0.0f32, 0usize);
+            for row in 0..TILE {
+                for column in 0..TILE {
+                    let at = (row * TILE + column) as usize;
+                    let x = origin[0] + column as f32 * texel;
+                    let y = origin[1] + row as f32 * texel;
+
+                    // Exactly what `emit::heights` and `emit::materials` do.
+                    let sample = fields.sample(x, y);
+                    let ground = detail::ground(&sample, texel, cell);
+                    let bare = detail::height(&sample, &ground, x, y, texel, 0);
+                    let grown = crate::classify::trees(&sample, &ground, x, y, texel, 0, relief());
+                    let strewn = crate::classify::rocks(&sample, &ground, x, y, texel, 0, relief());
+                    let crowns = terrain_canopy::baked(
+                        x,
+                        y,
+                        &terrain_canopy::Cover {
+                            density: grown.density * terrain_canopy::clump(x, y),
+                            health: grown.health,
+                        },
+                        texel,
+                    );
+                    let stones = terrain_rocks::baked(
+                        x,
+                        y,
+                        &terrain_rocks::Scatter {
+                            boulders: strewn.boulders * terrain_rocks::field(x, y),
+                            rubble: strewn.rubble * terrain_rocks::strew(x, y),
+                            stature: strewn.stature,
+                        },
+                        texel,
+                    );
+                    worst =
+                        worst.max((bare + crowns.height.max(stones.height) - heights[at]).abs());
+
+                    let floor =
+                        crate::classify::material(&sample, &ground, x, y, texel, 0, relief());
+                    let want_id = if crowns.share >= terrain_canopy::PAINTED {
+                        terrain_materials::Material::Canopy.id()
+                    } else if stones.boulders >= terrain_rocks::BOULDERED {
+                        terrain_materials::Material::Boulder.id()
+                    } else if stones.covered >= terrain_rocks::STREWN {
+                        terrain_materials::Material::Rubble.id()
+                    } else {
+                        floor.id()
+                    };
+                    if want_id != ids[at] {
+                        differing += 1;
+                    }
+                }
+            }
+
+            // Measured at 0.463 m across the six levels, against a canopy
+            // bucket of 1.75 m. Held at one metre: comfortably above what the
+            // bucketing does and comfortably below a crown.
+            assert!(
+                worst < 1.0,
+                "level {level}: a texel stands {worst:.3} m from what the crate bakes",
+            );
+            let share = differing as f64 / (TILE * TILE) as f64;
+            // Measured at 0.24%, and zero at the three finest levels.
+            assert!(
+                share < 0.01,
+                "level {level}: {differing} texels were painted differently ({:.2}%)",
+                share * 100.0,
+            );
+        }
     }
 }
