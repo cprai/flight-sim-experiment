@@ -28,6 +28,8 @@ const TRANSMITTANCE_WIDTH: u32 = 256u;
 const TRANSMITTANCE_HEIGHT: u32 = 64u;
 const MULTISCATTER_SIZE: u32 = 32u;
 const SKYVIEW_HEIGHT: u32 = 108u;
+const AERIAL_SLICES: u32 = 64u;
+const AERIAL_FAR: f32 = 100000.0;
 
 const PI: f32 = 3.14159265358979;
 
@@ -87,6 +89,10 @@ struct Sky {
 // Wrapping in `u`; see `skyview_u` in `src/sky.wgsl`.
 @group(2) @binding(3) var skyview_sampler: sampler;
 @group(2) @binding(4) var skyview_lut: texture_2d<f32>;
+// The air in front of every part of the frame, sliced by distance: the
+// in-scattered light and, separately, what survives of what was behind it.
+@group(2) @binding(5) var aerial_scatter_lut: texture_3d<f32>;
+@group(2) @binding(6) var aerial_transmit_lut: texture_3d<f32>;
 
 @group(3) @binding(0) var<uniform> palette: Palette;
 // A material id in the low sixteen bits and where inside its pixel the ground
@@ -195,6 +201,13 @@ fn sample_skyview(direction: vec3<f32>) -> vec3<f32> {
     let zenith = acos(clamp(dot(up, direction), -1.0, 1.0));
     let v = to_texture(skyview_v(sky.eye.w, zenith), f32(SKYVIEW_HEIGHT));
     return textureSampleLevel(skyview_lut, skyview_sampler, vec2<f32>(u, v), 0.0).rgb;
+}
+
+// Where a view-axis distance sits down the aerial-perspective volume. Must
+// match `aerial_w` and `aerial_z` in `src/sky.wgsl`.
+fn aerial_depth(along: f32) -> f32 {
+    let w = sqrt(clamp(along, 0.0, AERIAL_FAR) / AERIAL_FAR);
+    return w - 0.5 / f32(AERIAL_SLICES);
 }
 
 // Half the sun's apparent width, in radians: 0.5334 degrees across, which is
@@ -333,6 +346,23 @@ fn fs_shade(@builtin(position) clip: vec4<f32>) -> @location(0) vec4<f32> {
     // is the `1 / pi`. The palette is stored linearised and is an albedo now
     // rather than a finished colour -- what fraction of each wavelength the
     // ground sends back -- and everything above is in units of the sun's own
-    // irradiance, so this line is the only place radiance is made.
-    return vec4<f32>(tonemap(albedo * (direct + ambient) / PI), 1.0);
+    // irradiance, so this line is where radiance is made.
+    let leaving = albedo * (direct + ambient) / PI;
+
+    // ... and this is what the air between here and there does to it: takes
+    // some of it out, and puts its own scattered light in front. Addressed by
+    // the same view-axis distance the depth already encodes, at this pixel's
+    // own place in the frame, so there is no normalise and no length -- the
+    // froxel column standing over this pixel marched the very ray the march
+    // did.
+    //
+    // The viewport comes from the depth buffer's dimensions, which is the same
+    // number the froxel volume's own basis was built from.
+    let uvw = vec3<f32>(
+        clip.xy / vec2<f32>(textureDimensions(depth)),
+        aerial_depth(distance_at(textureLoad(depth, pixel, 0).r)),
+    );
+    let haze = textureSampleLevel(aerial_scatter_lut, lut_sampler, uvw, 0.0).rgb;
+    let through = textureSampleLevel(aerial_transmit_lut, lut_sampler, uvw, 0.0).rgb;
+    return vec4<f32>(tonemap(leaving * through + haze), 1.0);
 }

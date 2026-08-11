@@ -270,7 +270,7 @@ impl Scene {
         let reach_bind_group = crate::reproject::bind_reach(device, &reach_layout, &carried);
         let reproject =
             crate::reproject::Reprojection::new(device, camera_layout, &gbuffer, &carried);
-        let sky = crate::sky::Sky::new(device);
+        let sky = crate::sky::Sky::new(device, camera_layout);
         let shading = Shading::new(
             device,
             format,
@@ -517,8 +517,18 @@ impl Scene {
             // *reading* them is the growth in `shading`, which cannot be
             // separated out without a toggle to turn the sky off.
             let mut atmosphere = gpu.scope(crate::profile::ATMOSPHERE);
-            let mut pass = atmosphere.scoped_compute_pass("sky-view");
-            self.sky.draw(&mut pass);
+            {
+                let mut pass = atmosphere.scoped_compute_pass("sky-view");
+                self.sky.draw_sky_view(&mut pass);
+            }
+            {
+                // Its own pass so it gets its own row, and because it is the
+                // only one of the two that wants the camera: the volume it
+                // fills is the frustum itself.
+                let mut pass = atmosphere.scoped_compute_pass("aerial");
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                self.sky.draw_aerial(&mut pass);
+            }
         }
 
         {
@@ -691,6 +701,28 @@ pub fn test_camera_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     camera_binding(device).1
 }
 
+/// The camera binding with `camera` already uploaded into it.
+///
+/// For tests that need a pass to see a particular camera without a whole scene
+/// to hold it -- the aerial-perspective volume is the frustum, so its readback
+/// has to say which frustum. The real `CameraUniform`, written the way
+/// [`Scene::update`] writes it, so a test cannot be looking at a layout the
+/// application never uses.
+#[cfg(test)]
+pub fn test_camera(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    camera: &Camera,
+) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+    let (buffer, layout, bind_group) = camera_binding(device);
+    queue.write_buffer(
+        &buffer,
+        0,
+        bytemuck::bytes_of(&CameraUniform::new(camera, camera.view_projection())),
+    );
+    (layout, bind_group)
+}
+
 /// Where a world point lands on screen, in pixels, with (0, 0) at the top left.
 ///
 /// Only used by tests, but it belongs next to the projection it inverts.
@@ -840,6 +872,21 @@ mod tests {
         heights: Vec<f32>,
         materials: Vec<MaterialId>,
     ) -> Scene {
+        test_scene_over(device, format, residency, heights, materials, placement())
+    }
+
+    /// The same, over a georeferencing of the caller's choosing.
+    ///
+    /// Only the aerial-perspective test wants one: a hundred kilometres of air
+    /// cannot be measured on a raster four across.
+    fn test_scene_over(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        residency: Residency,
+        heights: Vec<f32>,
+        materials: Vec<MaterialId>,
+        placement: Georeferencing,
+    ) -> Scene {
         Scene::from_terrain(
             device,
             format,
@@ -855,7 +902,7 @@ mod tests {
                     reach_layout,
                     residency,
                     UVec2::splat(SIZE),
-                    placement(),
+                    placement,
                     Sources {
                         heights: Box::new(Pyramid::build(Level::new(
                             RASTER,
@@ -901,6 +948,21 @@ mod tests {
         path: &[Vec3],
         sun: crate::sky::Sun,
     ) -> Frame {
+        render_over(residency, heights, materials, aim, path, sun, placement())
+    }
+
+    /// The same, over a georeferencing of the caller's choosing. See
+    /// [`test_scene_over`].
+    #[allow(clippy::too_many_arguments, reason = "one test wants every knob")]
+    fn render_over(
+        residency: Residency,
+        heights: Vec<f32>,
+        materials: Vec<MaterialId>,
+        aim: impl FnOnce(&mut Camera),
+        path: &[Vec3],
+        sun: crate::sky::Sun,
+        placement: Georeferencing,
+    ) -> Frame {
         let (device, queue) = test_device();
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -920,7 +982,7 @@ mod tests {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut scene = test_scene(&device, format, residency, heights, materials);
+        let mut scene = test_scene_over(&device, format, residency, heights, materials, placement);
         scene.sun = sun;
         aim(&mut scene.camera);
 
@@ -1340,6 +1402,16 @@ mod tests {
     /// level intact. The frame is flat and seen from straight above, so every
     /// normal is straight up and the light is the same everywhere -- which is
     /// what lets one expected colour per material stand for the whole block.
+    /// High enough that the whole raster is in shot, so every block is on
+    /// screen rather than only the middle ones. The raster is 3840 m across and
+    /// a 60-degree frame spans 4157 m from here, which fits it with a margin of
+    /// sky at the corners. From 2200 m -- where the frame spans 2540 m -- only
+    /// 60 of the 80 materials made it in.
+    fn over_the_checkerboard(camera: &mut Camera) {
+        camera.position = Vec3::new(0.0, 3600.0, 0.0);
+        camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+    }
+
     #[test]
     fn every_material_reaches_the_frame_as_its_own_colour() {
         const BLOCK: u32 = 8;
@@ -1352,15 +1424,11 @@ mod tests {
             })
             .collect();
 
-        let frame = render(vec![0.0; (RASTER * RASTER) as usize], materials, |camera| {
-            // High enough that the whole raster is in shot, so every block is
-            // on screen rather than only the middle ones. The raster is 3840 m
-            // across and a 60-degree frame spans 4157 m from here, which fits
-            // it with a margin of sky at the corners. From 2200 m -- where the
-            // frame spans 2540 m -- only 60 of the 80 materials made it in.
-            camera.position = Vec3::new(0.0, 3600.0, 0.0);
-            camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
-        });
+        let frame = render(
+            vec![0.0; (RASTER * RASTER) as usize],
+            materials,
+            over_the_checkerboard,
+        );
 
         // What the palette holds for an id, linearised: an albedo, which is
         // the fraction of each wavelength the ground sends back.
@@ -1369,32 +1437,53 @@ mod tests {
                 .map_or(crate::palette::MAGENTA, crate::palette::flat_colour);
             Vec3::from(bytes.map(terrain_tiles::srgb_to_linear))
         };
-
-        // The light falling on the ground, measured from the frame rather than
-        // recomputed here.
-        //
-        // It is one vector for the whole picture: the ground is a plane so
-        // every normal points straight up, and four kilometres of a planet six
-        // thousand across bends neither the radius nor the local up enough to
-        // see. So one material's pixel fixes it for all of them -- and reading
-        // it off the frame is the point. Restating the scattering in Rust
-        // would make this a test of a second copy of the shader rather than a
-        // test that an id becomes its own colour. Inverting the tonemap is
-        // exact, which is why that curve was chosen; see `src/sky.rs`.
-        let reference = MaterialId(Material::Grass.id());
-        let (rx, ry) = (0..SIZE)
-            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
-            .find(|&(x, y)| frame.material(x, y) == Some(reference))
-            .expect("the reference material is somewhere in the frame");
         let shown = |pixel: [u8; 4]| {
-            Vec3::new(
+            crate::sky::untonemap(Vec3::new(
                 terrain_tiles::srgb_to_linear(pixel[0]),
                 terrain_tiles::srgb_to_linear(pixel[1]),
                 terrain_tiles::srgb_to_linear(pixel[2]),
+            ))
+        };
+
+        // What the air does between the ground and the eye, solved for rather
+        // than recomputed here.
+        //
+        // Every pixel of this frame is `albedo * gain + haze`, where the gain
+        // carries the light on the ground and what survived the air, and the
+        // haze is what the air put in front. Both vary across the frame -- the
+        // path to a corner is longer than to the middle and points a different
+        // way at the sun -- so one reference pixel can no longer stand for the
+        // whole picture the way it could before there was any haze.
+        //
+        // Two unknowns per channel, so two knowns: the same camera over ground
+        // painted entirely one material and then entirely another. That gives
+        // an exact solve at every pixel, and leaves this test measuring what it
+        // is named for -- that an id becomes its own colour -- rather than
+        // measuring a second copy of the scattering.
+        let uniform = |material: Material| {
+            render(
+                vec![0.0; (RASTER * RASTER) as usize],
+                vec![MaterialId(material.id()); (RASTER * RASTER) as usize],
+                over_the_checkerboard,
             )
         };
-        let light = crate::sky::untonemap(shown(frame.pixel(rx, ry))) * std::f32::consts::PI
-            / albedo(reference.0);
+        // The palette's two extremes, and chosen for that: the solve divides by
+        // the gap between them, so a narrow gap multiplies up the eighth bit of
+        // the reference pixels. Grass against Ocean was the first attempt and
+        // its blue channels differ by only 0.034 in linear terms, which turned
+        // a rounding in the reference into four counts of error in the answer.
+        // Glacier against Canopy differ by more than 0.8 in every channel.
+        let (first, second) = (uniform(Material::Glacier), uniform(Material::Canopy));
+        let (first_albedo, second_albedo) = (
+            albedo(Material::Glacier.id()),
+            albedo(Material::Canopy.id()),
+        );
+        let spread = (first_albedo - second_albedo).abs();
+        assert!(
+            spread.min_element() > 0.5,
+            "the two reference materials are {first_albedo} and {second_albedo}, \
+             too close in some channel to solve the air from"
+        );
 
         let mut seen = std::collections::BTreeSet::new();
         for y in 0..SIZE {
@@ -1402,8 +1491,16 @@ mod tests {
                 let Some(id) = frame.material(x, y) else {
                     continue;
                 };
+                // The references have to be showing ground at this pixel too,
+                // or there is nothing to solve from.
+                if first.material(x, y).is_none() || second.material(x, y).is_none() {
+                    continue;
+                }
                 seen.insert(id.0);
-                let want = crate::sky::tonemap(albedo(id.0) * light / std::f32::consts::PI)
+                let gain = (shown(first.pixel(x, y)) - shown(second.pixel(x, y)))
+                    / (first_albedo - second_albedo);
+                let haze = shown(first.pixel(x, y)) - first_albedo * gain;
+                let want = crate::sky::tonemap(albedo(id.0) * gain + haze)
                     .to_array()
                     .map(terrain_tiles::linear_to_srgb);
                 let got = frame.pixel(x, y);
@@ -1583,11 +1680,17 @@ mod tests {
         // of a few percent and says nothing about the coin. So a pixel counts
         // only where both frames are flat around it -- which is most of every
         // square, and all of what a coin thrown per texel decides.
+        // Compared by material id rather than by colour. The dissolve decides
+        // which level's ids a texel reads, so the id is what it changes and the
+        // id is exact; the colour also carries the aerial perspective, which is
+        // a screen-space cache 32 froxels wide and so genuinely does move when
+        // the camera slides. That is honest behaviour of the haze and nothing
+        // to do with the dissolve, and comparing ids keeps the two apart.
         let flat = |frame: &Frame, x: u32, y: u32| {
-            let here = frame.pixel(x, y);
+            let here = frame.material(x, y);
             (-1..=1).all(|dy: i32| {
                 (-1..=1).all(|dx: i32| {
-                    frame.pixel(x.wrapping_add_signed(dx), y.wrapping_add_signed(dy)) == here
+                    frame.material(x.wrapping_add_signed(dx), y.wrapping_add_signed(dy)) == here
                 })
             })
         };
@@ -1599,7 +1702,7 @@ mod tests {
                 if !flat(&still, x + across, y) || !flat(&slid, x, y) {
                     continue;
                 }
-                if still.pixel(x + across, y) == slid.pixel(x, y) {
+                if still.material(x + across, y) == slid.material(x, y) {
                     same += 1;
                 } else {
                     differ += 1;
@@ -2403,8 +2506,13 @@ mod tests {
         let (toward, away) = (brightness(-1.0), brightness(1.0));
         println!("square-on {toward:.4}, turned away {away:.4}");
 
+        // Half again, measured rather than guessed, and lower than it once was
+        // on purpose: the haze in front of both slopes adds the same floor to
+        // each and so compresses the ratio. Square-on against turned-away is
+        // 0.521 to 0.299, a factor of 1.74; dropping the direct sun altogether
+        // leaves 0.310 to 0.299, a factor of 1.04. The threshold sits between.
         assert!(
-            toward > 2.0 * away,
+            toward > 1.4 * away,
             "square-on to the sun gives {toward:.4} against {away:.4} turned \
              away, which is not the difference a sun makes"
         );
@@ -2418,6 +2526,114 @@ mod tests {
             "sunlit ground came out at {toward:.4}, which has clipped: the \
              exposure is too high for the light the model produces"
         );
+    }
+
+    /// Distant ground fades into the air in front of it.
+    ///
+    /// The frame-level test for the aerial perspective, and it needs a fixture
+    /// of its own: the raster every other test here uses is 3.8 km corner to
+    /// corner, over which a hundred kilometres of air is a two percent effect
+    /// and nothing about it can be measured. The same 128 texels at 900 m
+    /// apiece span 115 km, which is what the installed survey actually covers.
+    ///
+    /// One flat plane of one material, seen obliquely, so that near ground and
+    /// far ground differ in nothing whatever except how much air stands in
+    /// front of them -- same albedo, same normal, same sun. Anything that
+    /// separates the two bands is the air and can be nothing else.
+    #[test]
+    fn distant_ground_fades_into_the_air_in_front_of_it() {
+        let wide = Georeferencing::square(RASTER, RASTER, 900.0);
+        let frame = render_over(
+            test_residency(),
+            vec![0.0; (RASTER * RASTER) as usize],
+            flat_ground(),
+            |camera| {
+                // Low and looking out, so the bottom of the frame is a few
+                // kilometres away and the top is tens.
+                camera.position = Vec3::new(0.0, 3000.0, 50_000.0);
+                camera.orientation = Camera::from_yaw_pitch_roll(0.0, -6f32.to_radians(), 0.0);
+            },
+            &[],
+            crate::sky::Sun::default(),
+            wide,
+        );
+
+        // Two bands of ground, near the bottom of the frame and just under the
+        // skyline, with their distances read out of the depth buffer rather
+        // than assumed.
+        let band = |row: u32| {
+            let mut colour = Vec3::ZERO;
+            let mut count = 0.0;
+            for x in 0..SIZE {
+                if frame.sky(x, row) {
+                    continue;
+                }
+                let pixel = frame.pixel(x, row);
+                colour += Vec3::new(
+                    f32::from(pixel[0]),
+                    f32::from(pixel[1]),
+                    f32::from(pixel[2]),
+                );
+                count += 1.0;
+            }
+            assert!(
+                count > 100.0,
+                "row {row} holds only {count} pixels of ground"
+            );
+            colour / count
+        };
+        // The skyline: the lowest row that is still entirely sky. Found rather
+        // than worked out, because where the horizon lands depends on the
+        // pitch, the altitude and the planet's own curvature together.
+        let skyline = (0..SIZE)
+            .rev()
+            .find(|&y| (0..SIZE).all(|x| frame.sky(x, y)))
+            .expect("some row of the frame is all sky");
+        let (near, far) = (band(SIZE - 8), band(skyline + 6));
+        let horizon = {
+            let pixel = frame.pixel(SIZE / 2, skyline.saturating_sub(2));
+            Vec3::new(
+                f32::from(pixel[0]),
+                f32::from(pixel[1]),
+                f32::from(pixel[2]),
+            )
+        };
+        println!("near {near}, far {far}, sky above {horizon}");
+
+        // The far band is bluer, which is the light the air put in front of it.
+        // Measured: far against near is 1.31 as it stands and 0.52 with the
+        // in-scattering dropped -- the distance then goes dark and drab instead
+        // of pale and blue -- so the threshold has room on both sides.
+        let blueness = |colour: Vec3| colour.z / colour.x.max(1.0);
+        assert!(
+            blueness(far) > 1.2 * blueness(near),
+            "near ground is {:.2} blue-to-red and far ground {:.2}, which is \
+             not the air scattering blue in front of the distance",
+            blueness(near),
+            blueness(far)
+        );
+
+        // ... and it has moved towards the sky it stands against.
+        assert!(
+            (far - horizon).length() < 0.6 * (near - horizon).length(),
+            "far ground is {far} against a sky of {horizon}, no closer to it \
+             than the near ground at {near}"
+        );
+
+        // ... without overshooting it, which is the transmittance's own half of
+        // the job and the one the two checks above cannot see. Ground darker
+        // than the sky can only ever approach the sky as the air thickens:
+        // what the haze adds, the extinction has already taken out. Drop the
+        // transmittance and keep the in-scattering and the far band comes out
+        // at 170 green against a sky of 157 -- brighter than the air it is
+        // seen through, which nothing real does.
+        for channel in 0..3 {
+            assert!(
+                far[channel] <= horizon[channel] + 2.0,
+                "far ground is {far} against a sky of {horizon}, which it has \
+                 no business being brighter than"
+            );
+        }
     }
 
     /// The sky is a gradient, and it turns over as the sun sets.
@@ -2560,10 +2776,9 @@ mod tests {
             SIZE,
             SIZE,
         );
-        let centroid = burnt
-            .iter()
-            .fold(Vec2::ZERO, |sum, &(x, y)| sum + Vec2::new(x as f32, y as f32))
-            / burnt.len() as f32;
+        let centroid = burnt.iter().fold(Vec2::ZERO, |sum, &(x, y)| {
+            sum + Vec2::new(x as f32, y as f32)
+        }) / burnt.len() as f32;
         let off = (centroid - Vec2::new(want_x - 0.5, want_y - 0.5)).length();
         println!(
             "{} pixels of sun, centroid ({:.1}, {:.1}) against ({want_x:.1}, {want_y:.1})",
@@ -2681,22 +2896,20 @@ mod tests {
                 .collect()
         };
         let burnt = |raised: bool| {
-            let frame = render_sunlit(
-                test_residency(),
-                wall(raised),
-                flat_ground(),
-                aim,
-                &[],
-                sun,
-            );
+            let frame = render_sunlit(test_residency(), wall(raised), flat_ground(), aim, &[], sun);
             (0..SIZE)
                 .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
-                .filter(|&(x, y)| frame.sky(x, y) && frame.pixel(x, y)[..3].iter().all(|&c| c >= 250))
+                .filter(|&(x, y)| {
+                    frame.sky(x, y) && frame.pixel(x, y)[..3].iter().all(|&c| c >= 250)
+                })
                 .count()
         };
 
         let open = burnt(false);
-        assert!(open > 0, "the sun has to be in shot for this to mean anything");
+        assert!(
+            open > 0,
+            "the sun has to be in shot for this to mean anything"
+        );
         assert_eq!(
             burnt(true),
             0,
@@ -2724,7 +2937,10 @@ mod tests {
                 test_residency(),
                 vec![0.0; (RASTER * RASTER) as usize],
                 flat_ground(),
-                straight_down,
+                |c: &mut Camera| {
+                    c.position = Vec3::new(0.0, 500.0, 0.0);
+                    c.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+                },
                 &[],
                 crate::sky::Sun::from_angles(elevation, crate::sky::Sun::DEFAULT_AZIMUTH),
             );
@@ -2753,15 +2969,14 @@ mod tests {
             "the ground should dim as the sun sets: {high:.4} at 60 degrees, \
              {low:.4} at 6, {dusk:.4} at -4"
         );
-        // Half again, and the figure is measured rather than guessed. Reading
-        // the transmittance table takes red against blue from 1.39 to 2.67 as
-        // the sun drops, a factor of 1.92; replacing that table lookup with the
-        // constant it averages leaves the sky's own ambient as the only thing
-        // that reddens, and the same measurement gives 1.30 to 1.42, a factor
-        // of 1.10. The threshold sits between the two with room either side, so
-        // this fails if the sun stops arriving through the air.
+        // Measured rather than guessed. Reading the transmittance table takes
+        // red against blue from 1.34 to 2.21 as the sun drops, a factor of
+        // 1.65; replacing that lookup with the constant it averages leaves the
+        // sky and the haze as the only things that redden, and the same
+        // measurement gives 1.24 to 1.40, a factor of 1.13. The threshold sits
+        // between, so this fails if the sun stops arriving through the air.
         assert!(
-            low_warmth > 1.5 * high_warmth,
+            low_warmth > 1.4 * high_warmth,
             "dropping the sun from 60 degrees to 6 moved red against blue only \
              from {high_warmth:.3} to {low_warmth:.3}, which is a cosine \
              dimming the light rather than the air reddening it"

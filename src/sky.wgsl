@@ -70,6 +70,20 @@ const TRANSMITTANCE_HEIGHT: u32 = 64u;
 const MULTISCATTER_SIZE: u32 = 32u;
 const SKYVIEW_WIDTH: u32 = 192u;
 const SKYVIEW_HEIGHT: u32 = 108u;
+const AERIAL_WIDTH: u32 = 32u;
+const AERIAL_HEIGHT: u32 = 32u;
+const AERIAL_SLICES: u32 = 64u;
+
+// How far the aerial perspective volume reaches, in metres along the view axis.
+//
+// Hillaire's is 32 km, which is right for a world you stand in and far too
+// short for one seen from a cockpit: this survey is 115 km across and a ridge
+// at eighty of them is exactly the thing the haze exists to place. Clamped
+// beyond, where the integral has all but saturated anyway.
+const AERIAL_FAR: f32 = 100000.0;
+// Samples per slice. Four, because the segment integral below is exact for a
+// constant medium and only has to follow the density's curve.
+const AERIAL_SUBSTEPS: u32 = 4u;
 
 // Steps along a ray when building each table.
 //
@@ -108,6 +122,20 @@ struct Sky {
     sun_tangent: vec4<f32>,
 };
 
+// Mirrors `CameraUniform` in `src/scene.rs`. Read only by `cs_aerial`, whose
+// volume is the camera's own frustum; the other three entry points here are
+// functions of the atmosphere and the sun alone and bind nothing at group 0.
+struct Camera {
+    view_proj: mat4x4<f32>,
+    was_view_proj: mat4x4<f32>,
+    position: vec4<f32>,
+    ray_right: vec4<f32>,
+    ray_up: vec4<f32>,
+    ray_forward: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> camera: Camera;
+
 @group(1) @binding(0) var<uniform> sky: Sky;
 
 // Linear and clamped. The repository's first sampler: everything else reads
@@ -126,6 +154,36 @@ struct Sky {
 @group(3) @binding(0) var out_transmittance: texture_storage_2d<rgba16float, write>;
 @group(3) @binding(1) var out_multiscatter: texture_storage_2d<rgba16float, write>;
 @group(3) @binding(2) var out_skyview: texture_storage_2d<rgba16float, write>;
+@group(3) @binding(3) var out_aerial_scatter: texture_storage_3d<rgba16float, write>;
+@group(3) @binding(4) var out_aerial_transmit: texture_storage_3d<rgba16float, write>;
+
+// Where a slice boundary sits, and its inverse.
+//
+// Quadratic rather than Hillaire's uniform slices, because a hundred kilometres
+// split evenly into 64 gives 1.6 km steps and puts the coarsest sampling
+// exactly where the gradient is steepest -- the first few kilometres, which is
+// most of what a frame contains. Equal steps in the square root of distance put
+// roughly equal *visible* change in each slice, because optical depth grows
+// about linearly with distance while what the eye notices grows with its
+// logarithm. Slice 0 ends at 24 m, slice 15 at 6.25 km, slice 31 at 25 km,
+// slice 63 at 100.
+//
+// Rejected: exponential slicing, which is better still and needs a bias tuned
+// to the near plane, and cannot start its first slice at zero.
+fn aerial_distance(w: f32) -> f32 {
+    return AERIAL_FAR * w * w;
+}
+
+fn aerial_w(t: f32) -> f32 {
+    return sqrt(clamp(t, 0.0, AERIAL_FAR) / AERIAL_FAR);
+}
+
+// Slice `i` holds the integral out to `w = (i+1)/n` but its texel centre is at
+// `(i+0.5)/n`, so the depth coordinate is half a slice behind the distance it
+// stands for. Clamped at both ends by the sampler.
+fn aerial_z(w: f32) -> f32 {
+    return w - 0.5 / f32(AERIAL_SLICES);
+}
 
 // The half-texel correction, both ways.
 //
@@ -470,6 +528,84 @@ fn cs_skyview(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     textureStore(out_skyview, vec2<i32>(id.xy), vec4<f32>(scattered, 1.0));
+}
+
+// The air in front of every part of the frame, sliced by distance.
+//
+// The second table that cannot be precomputed, and the one that could not be
+// precomputed even in principle: its two horizontal axes *are* the camera's own
+// frustum. It is less a lookup table than a cache of this frame at a thirtieth
+// of the resolution -- 32 x 32 x 64 marches standing in for a per-pixel
+// raymarch at 1280 x 720, which is the whole reason the shading pass can ask
+// what a hundred kilometres of air did with two filtered fetches.
+//
+// Two volumes rather than Hillaire's one, and this is forced by the range. He
+// stores a single mean transmittance in the alpha of the scattering volume; over
+// a hundred kilometres the Rayleigh split between red and blue is enormous, and
+// one number for all three channels turns a distant mountain grey where it
+// should go blue -- which is precisely the effect being added.
+//
+// One thread per froxel column, marching all sixty-four slices and storing the
+// running integral at each boundary. A thread per froxel would redo the whole
+// march from the eye for every slice.
+@compute @workgroup_size(8, 8, 1)
+fn cs_aerial(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= AERIAL_WIDTH || id.y >= AERIAL_HEIGHT) {
+        return;
+    }
+    let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(f32(AERIAL_WIDTH), f32(AERIAL_HEIGHT));
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    // The same basis the march walks and the shading rebuilds from, so a froxel
+    // column stands over the pixels that will read it. Unnormalised, with its
+    // component along the view axis exactly one -- which is what makes `t` here
+    // the very quantity `distance_at` recovers from a depth, with no normalise
+    // at either end.
+    let raw = camera.ray_right.xyz * ndc.x + camera.ray_up.xyz * ndc.y + camera.ray_forward.xyz;
+    // ... and the metres a unit of `t` covers, which is more than one away from
+    // the middle of the frame.
+    let per_step = length(raw);
+    let direction = raw / per_step;
+
+    // Constant along a straight ray.
+    let cos_theta = dot(direction, sky.sun.xyz);
+    let phase = vec2<f32>(rayleigh_phase(cos_theta), mie_phase(cos_theta));
+
+    var scattered = vec3<f32>(0.0);
+    var transmitted = vec3<f32>(1.0);
+    var t = 0.0;
+    for (var slice = 0u; slice < AERIAL_SLICES; slice = slice + 1u) {
+        let ends = aerial_distance(f32(slice + 1u) / f32(AERIAL_SLICES));
+        let stride = (ends - t) / f32(AERIAL_SUBSTEPS);
+        for (var k = 0u; k < AERIAL_SUBSTEPS; k = k + 1u) {
+            let along = t + stride * (f32(k) + 0.5);
+            let position = sky.eye.xyz + raw * along;
+            let radius = length(position);
+            let up = position / radius;
+            let air = medium(radius - GROUND_RADIUS);
+
+            let sun_mu = dot(up, sky.sun.xyz);
+            var sunlight = sample_transmittance(radius, sun_mu);
+            // Shadowed by the planet, not by the terrain: there is no terrain
+            // in this volume and putting it there would need a shadow map.
+            if (ground_distance(radius, sun_mu) >= 0.0) {
+                sunlight = vec3<f32>(0.0);
+            }
+            let multiple = sample_multiscatter(radius, sun_mu);
+            let single = (air.rayleigh * phase.x + vec3<f32>(air.mie) * phase.y) * sunlight;
+            let bounced = (air.rayleigh + vec3<f32>(air.mie)) * multiple;
+
+            let metres = stride * per_step;
+            let extinction = max(air.extinction, vec3<f32>(1e-12));
+            let survived = exp(-extinction * metres);
+            scattered = scattered
+                + transmitted * (single + bounced) * (vec3<f32>(1.0) - survived) / extinction;
+            transmitted = transmitted * survived;
+        }
+        t = ends;
+        let at = vec3<i32>(i32(id.x), i32(id.y), i32(slice));
+        textureStore(out_aerial_scatter, at, vec4<f32>(scattered, 1.0));
+        textureStore(out_aerial_transmit, at, vec4<f32>(transmitted, 1.0));
+    }
 }
 
 // One thread per direction, sixty-four directions per texel.

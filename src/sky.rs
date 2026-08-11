@@ -198,6 +198,27 @@ pub const MULTISCATTER_SIZE: glam::UVec2 = glam::UVec2::new(32, 32);
 /// as the window, which is not required but keeps the two comparable.
 pub const SKYVIEW_SIZE: glam::UVec2 = glam::UVec2::new(192, 108);
 
+/// Size of the aerial-perspective volume: the air in front of every part of the
+/// frame, sliced by distance.
+///
+/// Two horizontal axes that *are* the camera's frustum, so this one could not
+/// be precomputed even in principle. It is less a lookup table than a cache of
+/// this frame at a fraction of its resolution: 32 x 32 x 64 marches standing in
+/// for a per-pixel raymarch at 1280 x 720, which is a hundredfold saving and
+/// the reason the shading pass can ask what a hundred kilometres of air did
+/// with two filtered fetches.
+pub const AERIAL_SIZE: glam::UVec3 = glam::UVec3::new(32, 32, 64);
+
+/// How far that volume reaches along the view axis, in metres.
+///
+/// Hillaire's is 32 km. This survey is 115 km across and a ridge at eighty of
+/// them is exactly what the haze is for, so the volume has to reach past it.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
+pub const AERIAL_FAR: f32 = 100_000.0;
+
 /// Half the sun's apparent width, in radians: 0.5334 degrees across, which is
 /// what it is from this planet. Must match `src/shading.wgsl`.
 #[allow(
@@ -332,6 +353,12 @@ pub struct Sky {
     multiscatter: wgpu::Texture,
     #[allow(dead_code, reason = "read only by the table readback tests")]
     skyview: wgpu::Texture,
+    #[allow(dead_code, reason = "read only by the table readback tests")]
+    aerial_scatter: wgpu::Texture,
+    #[allow(dead_code, reason = "read only by the table readback tests")]
+    aerial_transmit: wgpu::Texture,
+    aerial_build: wgpu::ComputePipeline,
+    write_aerial: wgpu::BindGroup,
     /// The per-frame build: rebuilt every frame, so it is kept rather than
     /// dropped the way the two one-off builds are.
     skyview_build: wgpu::ComputePipeline,
@@ -368,7 +395,10 @@ struct Build {
 }
 
 impl Sky {
-    pub fn new(device: &wgpu::Device) -> Self {
+    /// `camera_layout` is the scene's, and only the aerial-perspective build
+    /// wants it: its volume is the camera's own frustum. Every other pass here
+    /// leaves group 0 empty.
+    pub fn new(device: &wgpu::Device, camera_layout: &wgpu::BindGroupLayout) -> Self {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sky uniform"),
             size: std::mem::size_of::<SkyUniform>() as u64,
@@ -427,6 +457,29 @@ impl Sky {
         let multiscatter_view = multiscatter.create_view(&Default::default());
         let skyview_view = skyview.create_view(&Default::default());
 
+        let volume = |label| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: AERIAL_SIZE.x,
+                    height: AERIAL_SIZE.y,
+                    depth_or_array_layers: AERIAL_SIZE.z,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: LUT_FORMAT,
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let aerial_scatter = volume("aerial scattering volume");
+        let aerial_transmit = volume("aerial transmittance volume");
+        let aerial_scatter_view = aerial_scatter.create_view(&Default::default());
+        let aerial_transmit_view = aerial_transmit.create_view(&Default::default());
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("scattering table sampler"),
             // Clamped in both axes: a table runs to the ends of its range and
@@ -476,6 +529,16 @@ impl Sky {
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
         };
+        let volume_at = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D3,
+                multisampled: false,
+            },
+            count: None,
+        };
         let tables_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scattering tables layout"),
             entries: &[
@@ -484,6 +547,8 @@ impl Sky {
                 sampled(2),
                 sampler_at(3),
                 sampled(4),
+                volume_at(5),
+                volume_at(6),
             ],
         });
         let sampler_binding = wgpu::BindGroupEntry {
@@ -512,6 +577,14 @@ impl Sky {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&skyview_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&aerial_scatter_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&aerial_transmit_view),
                 },
             ],
         });
@@ -569,6 +642,35 @@ impl Sky {
         let write_transmittance_layout = write_layout("transmittance write layout", 0);
         let write_multiscatter_layout = write_layout("multiscatter write layout", 1);
         let write_skyview_layout = write_layout("sky view write layout", 2);
+        let write_volume = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::StorageTexture {
+                access: wgpu::StorageTextureAccess::WriteOnly,
+                format: LUT_FORMAT,
+                view_dimension: wgpu::TextureViewDimension::D3,
+            },
+            count: None,
+        };
+        let write_aerial_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("aerial write layout"),
+                entries: &[write_volume(3), write_volume(4)],
+            });
+        let write_aerial = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aerial write bind group"),
+            layout: &write_aerial_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&aerial_scatter_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&aerial_transmit_view),
+                },
+            ],
+        });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky shader"),
@@ -592,6 +694,16 @@ impl Sky {
 
         // Built before the struct literal, because the literal moves
         // `sky_layout` into the `layout` field and this borrows it.
+        let aerial_build = stage(
+            "aerial perspective build",
+            "cs_aerial",
+            &[
+                Some(camera_layout),
+                Some(&sky_layout),
+                Some(&read_tables_layout),
+                Some(&write_aerial_layout),
+            ],
+        );
         let skyview_build = stage(
             "sky view build",
             "cs_skyview",
@@ -610,6 +722,8 @@ impl Sky {
             tables_layout,
             tables_bind_group,
             skyview_build,
+            aerial_build,
+            write_aerial,
             read_tables,
             write_skyview: write_bind(
                 "sky view write bind group",
@@ -653,6 +767,8 @@ impl Sky {
             transmittance,
             multiscatter,
             skyview,
+            aerial_scatter,
+            aerial_transmit,
         }
     }
 
@@ -730,12 +846,25 @@ impl Sky {
     /// The sky-view table depends on this frame's eye altitude and sun and on
     /// nothing the frame produces, so it is built before anything else in
     /// `Scene::draw` rather than fitted around the march.
-    pub fn draw(&self, pass: &mut wgpu::ComputePass<'_>) {
+    pub fn draw_sky_view(&self, pass: &mut wgpu::ComputePass<'_>) {
         pass.set_pipeline(&self.skyview_build);
         pass.set_bind_group(1, &self.bind_group, &[]);
         pass.set_bind_group(2, &self.read_tables, &[]);
         pass.set_bind_group(3, &self.write_skyview, &[]);
         pass.dispatch_workgroups(SKYVIEW_SIZE.x.div_ceil(8), SKYVIEW_SIZE.y.div_ceil(8), 1);
+    }
+
+    /// The aerial-perspective volume. The caller has set group 0 to the camera,
+    /// which this one needs and the sky-view build does not.
+    ///
+    /// One thread per froxel column rather than per froxel: a thread per froxel
+    /// would march from the eye again for every slice.
+    pub fn draw_aerial(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.aerial_build);
+        pass.set_bind_group(1, &self.bind_group, &[]);
+        pass.set_bind_group(2, &self.read_tables, &[]);
+        pass.set_bind_group(3, &self.write_aerial, &[]);
+        pass.dispatch_workgroups(AERIAL_SIZE.x.div_ceil(8), AERIAL_SIZE.y.div_ceil(8), 1);
     }
 
     pub fn layout(&self) -> &wgpu::BindGroupLayout {
@@ -931,7 +1060,7 @@ mod tests {
     /// what this measures is what the application would have produced.
     fn built_tables() -> (Vec<Vec3>, Vec<Vec3>) {
         let (device, queue) = crate::headless::device().expect("no headless device");
-        let mut sky = Sky::new(&device);
+        let mut sky = Sky::new(&device, &crate::scene::test_camera_layout(&device));
         sky.ensure_built(&device, &queue);
         let (transmittance, multiscatter) = sky.tables();
         (
@@ -1520,7 +1649,7 @@ mod tests {
     /// is which radius it was built for.
     fn built_sky_view(altitude: f32) -> (f32, f32, Vec<Vec3>) {
         let (device, queue) = crate::headless::device().expect("no headless device");
-        let mut sky = Sky::new(&device);
+        let mut sky = Sky::new(&device, &crate::scene::test_camera_layout(&device));
         sky.ensure_built(&device, &queue);
         let eye = Vec3::new(0.0, altitude, 0.0);
         sky.set_frame(
@@ -1536,7 +1665,7 @@ mod tests {
                 label: Some("sky view"),
                 timestamp_writes: None,
             });
-            sky.draw(&mut pass);
+            sky.draw_sky_view(&mut pass);
         }
         queue.submit(std::iter::once(encoder.finish()));
         let radius = f64::from(altitude) + f64::from(GROUND_RADIUS);
@@ -1545,6 +1674,226 @@ mod tests {
             altitude,
             read_table(&device, &queue, sky.sky_view(), SKYVIEW_SIZE),
         )
+    }
+
+    /// The aerial-perspective volume really does reach a hundred kilometres.
+    ///
+    /// The test for the one place this departs from the paper on range rather
+    /// than on method. Left at Hillaire's 32 km the last slice would hold three
+    /// times less air, and the blue channel -- which is what the distance does
+    /// most to -- would come out several times too bright. So the figures here
+    /// are absolute, not merely ordered.
+    #[test]
+    fn the_aerial_volume_reaches_a_hundred_kilometres() {
+        let volume = built_aerial();
+        // The middle column of the volume, which is the middle of the frame:
+        // the camera below looks level, so this is a horizontal ray through the
+        // thickest air the model has.
+        let at = |slice: u32| {
+            let (x, y) = (AERIAL_SIZE.x / 2, AERIAL_SIZE.y / 2);
+            volume[((slice * AERIAL_SIZE.y + y) * AERIAL_SIZE.x + x) as usize]
+        };
+
+        // Nothing has happened in the first slice: it ends 24 m out.
+        let first = at(0);
+        assert!(
+            (first.transmittance - Vec3::ONE).abs().max_element() < 1e-2,
+            "the first slice already passes only {}, and it is 24 m deep",
+            first.transmittance
+        );
+        assert!(
+            first.scattered.max_element() < 1e-3,
+            "the first slice has already scattered {}",
+            first.scattered
+        );
+
+        // Transmittance only ever falls, and in-scattering only ever rises: the
+        // volume stores a running integral, so anything else is a bug in the
+        // accumulation rather than in the physics.
+        for slice in 1..AERIAL_SIZE.z {
+            let (before, now) = (at(slice - 1), at(slice));
+            assert!(
+                now.transmittance.max_element() <= before.transmittance.max_element() + 1e-3,
+                "slice {slice} passes more light than slice {}: {} then {}",
+                slice - 1,
+                before.transmittance,
+                now.transmittance
+            );
+            assert!(
+                now.scattered.length() >= before.scattered.length() - 1e-3,
+                "slice {slice} scattered less than slice {}",
+                slice - 1
+            );
+        }
+
+        // And at the far end, a hundred kilometres of air has taken the blue
+        // out far harder than the red. Both figures matter: the ratio says the
+        // colour is right, and the absolute says the distance is.
+        let far = at(AERIAL_SIZE.z - 1);
+        println!(
+            "100 km: transmittance {}, scattered {}",
+            far.transmittance, far.scattered
+        );
+        // Both bounds are set from measurement rather than guessed, and both
+        // separate this volume from the paper's 32 km one. Along the same
+        // level ray from 2000 m the last slice passes
+        //
+        //   100 km: red 0.529, blue 0.053 -- a ratio of 10.0
+        //    32 km: red 0.833, blue 0.412 -- a ratio of  2.0
+        //
+        // so either check alone fails if the range is cut back, and the pair
+        // says the colour and the distance are both right.
+        assert!(
+            far.transmittance.x > 4.0 * far.transmittance.z,
+            "over a hundred kilometres the air passes {}, a red-to-blue ratio \
+             of {:.1} where the distance should give ten",
+            far.transmittance,
+            far.transmittance.x / far.transmittance.z
+        );
+        assert!(
+            far.transmittance.z < 0.15,
+            "a hundred kilometres of air still passes {} of the blue, where it \
+             should pass a twentieth; 32 km would pass 0.41",
+            far.transmittance.z
+        );
+    }
+
+    /// One froxel: the light the air put in, and what it let through.
+    #[derive(Clone, Copy)]
+    struct Froxel {
+        scattered: Vec3,
+        transmittance: Vec3,
+    }
+
+    /// Builds the aerial volume for a level camera at 2 km and reads it back.
+    fn built_aerial() -> Vec<Froxel> {
+        let (device, queue) = crate::headless::device().expect("no headless device");
+        let mut sky = Sky::new(&device, &crate::scene::test_camera_layout(&device));
+        sky.ensure_built(&device, &queue);
+
+        // A camera looking level, so the volume's middle column is the longest
+        // path through the atmosphere the model holds.
+        let camera = crate::camera::Camera::new(
+            Vec3::new(0.0, 2000.0, 0.0),
+            crate::camera::Camera::from_yaw_pitch_roll(0.0, 0.0, 0.0),
+            16.0 / 9.0,
+        );
+        let (_, group) = crate::scene::test_camera(&device, &queue, &camera);
+        sky.set_frame(
+            &queue,
+            Sun::default(),
+            camera.position,
+            pixel_angle(camera.fov_y, 720),
+        );
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("aerial"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, &group, &[]);
+            sky.draw_aerial(&mut pass);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let scattered = read_volume(&device, &queue, &sky.aerial_scatter);
+        let transmittance = read_volume(&device, &queue, &sky.aerial_transmit);
+        scattered
+            .into_iter()
+            .zip(transmittance)
+            .map(|(scattered, transmittance)| Froxel {
+                scattered,
+                transmittance,
+            })
+            .collect()
+    }
+
+    /// Copies a 3D table off the GPU as RGB triples, slice by slice.
+    fn read_volume(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+    ) -> Vec<Vec3> {
+        let bytes_per_row = AERIAL_SIZE.x * 8;
+        assert_eq!(bytes_per_row % 256, 0, "a row of the volume needs padding");
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("volume readback"),
+            size: u64::from(bytes_per_row * AERIAL_SIZE.y * AERIAL_SIZE.z),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(AERIAL_SIZE.y),
+                },
+            },
+            wgpu::Extent3d {
+                width: AERIAL_SIZE.x,
+                height: AERIAL_SIZE.y,
+                depth_or_array_layers: AERIAL_SIZE.z,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll failed");
+        let halves: Vec<u16> =
+            bytemuck::cast_slice::<u8, u16>(&readback.get_mapped_range(..).expect("mapped"))
+                .to_vec();
+        readback.unmap();
+        halves
+            .chunks_exact(4)
+            .map(|texel| {
+                Vec3::new(
+                    from_half(texel[0]),
+                    from_half(texel[1]),
+                    from_half(texel[2]),
+                )
+            })
+            .collect()
+    }
+
+    /// The slice distances are the ones the comments claim.
+    ///
+    /// Cheap, and it is what says the quadratic distribution is a distribution
+    /// rather than a formula that happens to end in the right place: uniform
+    /// slices over the same range would put slice 15 at 25 km, not 6.25.
+    #[test]
+    fn the_aerial_slices_crowd_towards_the_eye() {
+        let ends = |slice: u32| {
+            AERIAL_FAR * {
+                let w = (slice + 1) as f32 / AERIAL_SIZE.z as f32;
+                w * w
+            }
+        };
+        for (slice, want) in [
+            (0u32, 24.4f32),
+            (15, 6250.0),
+            (31, 25_000.0),
+            (63, 100_000.0),
+        ] {
+            let got = ends(slice);
+            assert!(
+                (got - want).abs() < want * 0.01,
+                "slice {slice} ends at {got} m, not {want}"
+            );
+        }
+        // The near slices are far finer than uniform slicing would give, which
+        // is the whole reason for the mapping.
+        let uniform = AERIAL_FAR / AERIAL_SIZE.z as f32;
+        assert!(
+            ends(0) < uniform / 50.0,
+            "the first slice is {} m against {uniform} m if they were even",
+            ends(0)
+        );
     }
 
     /// The raster never reaches the planet's horizon.
