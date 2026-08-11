@@ -108,8 +108,16 @@ impl SkyUniform {
 /// It is simpler and it destroys the curved horizon, which is the feature the
 /// sky-view table's whole parameterisation is built around, and it never lets
 /// the sun set properly.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
 pub const GROUND_RADIUS: f32 = 6_360_000.0;
 /// The top of the atmosphere, a hundred kilometres up.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
 pub const TOP_RADIUS: f32 = 6_460_000.0;
 
 /// Format of every scattering table.
@@ -135,7 +143,88 @@ pub const TRANSMITTANCE_SIZE: glam::UVec2 = glam::UVec2::new(256, 64);
 pub const MULTISCATTER_SIZE: glam::UVec2 = glam::UVec2::new(32, 32);
 
 /// Steps the shader integrates the optical depth in. Must match `src/sky.wgsl`.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
 const TRANSMITTANCE_STEPS: u32 = 40;
+
+/// How much display brightness a unit of radiance is worth.
+///
+/// Everything the tables hold is in units of the sun's irradiance at the top of
+/// the atmosphere, taken as one per channel. That fixes the scale of the model
+/// but says nothing about the screen, and this is the number that connects the
+/// two. Must match `EXPOSURE` in `src/shading.wgsl`.
+///
+/// Derived rather than dialled in. Level ground of albedo `a` under the
+/// reference 45-degree sun at sea level comes out at
+///
+///   `L = a/pi * (T(45) * cos 45 + pi * psi_ms) ~= a/pi * (0.76 * 0.707 + 0.12)`
+///
+/// which is about `0.209 a`. The light this replaces was `0.35 + 0.65 cos 45`,
+/// or `0.81 a`, and solving `tonemap(E * 0.209 a) = 0.81 a` gives five. So the
+/// change of lighting model is a change of *behaviour* -- where the light comes
+/// from and what colour it is -- rather than a change of overall brightness,
+/// which is what makes the two frames comparable at all.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
+pub const EXPOSURE: f32 = 5.0;
+
+/// The radiance that maps to white. Must match `WHITE` in `src/shading.wgsl`.
+///
+/// 1.6 in unexposed units. Sunlit snow reaches about 0.3 and the sun's own disc
+/// is four orders of magnitude above that, so the disc clips to white and
+/// nothing else in the frame does -- which is the only thing a white point has
+/// to get right.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
+pub const WHITE: f32 = 8.0;
+
+/// The shader's tonemap, in Rust.
+///
+/// Extended Reinhard, per channel. Not used by the shader -- there is no
+/// preprocessor -- but pinned to it by a test, and here so that a test can
+/// predict a byte from a radiance instead of restating the shader's arithmetic
+/// as its own expectation. That is why the curve is this one and not a fitted
+/// ACES: it inverts in closed form.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
+pub fn tonemap(radiance: Vec3) -> Vec3 {
+    let x = radiance * EXPOSURE;
+    (x * (Vec3::ONE + x / (WHITE * WHITE)) / (Vec3::ONE + x)).clamp(Vec3::ZERO, Vec3::ONE)
+}
+
+/// [`tonemap`] backwards: the radiance a displayed value came from.
+///
+/// This is what the closed form buys, and it is what a test uses to measure the
+/// light in a rendered frame rather than assume it. Solving
+/// `y = x (1 + x/W^2) / (1 + x)` for `x` is one quadratic:
+///
+///   `x^2 / W^2 + x (1 - y) - y = 0`
+///
+/// whose positive root is the line below. Exact at both ends -- `y = 1` gives
+/// `W`, and near zero it is the identity, which is what makes the curve usable
+/// for dark ground in the first place.
+///
+/// Undefined above one, where the curve has clipped and the radiance that made
+/// a pixel is no longer recoverable from it.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
+pub fn untonemap(displayed: Vec3) -> Vec3 {
+    let white = WHITE * WHITE;
+    let root = ((Vec3::ONE - displayed) * (Vec3::ONE - displayed) + displayed * (4.0 / white))
+        .max(Vec3::ZERO);
+    let exposed = (displayed - Vec3::ONE + root.powf(0.5)) * (white * 0.5);
+    exposed / EXPOSURE
+}
 
 /// The sky uniform, the scattering tables, and everything that fills them.
 ///
@@ -145,8 +234,15 @@ pub struct Sky {
     buffer: wgpu::Buffer,
     layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
-    /// The two tables themselves, kept for the readback tests.
+    /// The two tables themselves, rather than views of them.
+    ///
+    /// A frame says almost nothing about what is in a table -- the shading
+    /// reduces both to a single colour -- so the only way to check either is to
+    /// copy it back and read the values, and a copy needs the texture. The same
+    /// reasoning as `Targets` on the G-buffer.
+    #[allow(dead_code, reason = "read only by the table readback tests")]
     transmittance: wgpu::Texture,
+    #[allow(dead_code, reason = "read only by the table readback tests")]
     multiscatter: wgpu::Texture,
     /// Group 2 in full: the sampler and both tables.
     tables_layout: wgpu::BindGroupLayout,
@@ -495,21 +591,37 @@ impl Sky {
 /// that span. Skipping it is the classic failure of this technique and it fails
 /// quietly -- the picture looks nearly right, with the horizon about a degree
 /// out. Written here as well as in the shader so a test can round-trip it.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
 pub fn to_texture(x: f32, n: f32) -> f32 {
     0.5 / n + x * (1.0 - 1.0 / n)
 }
 
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
 pub fn to_unit(u: f32, n: f32) -> f32 {
     (u - 0.5 / n) / (1.0 - 1.0 / n)
 }
 
 /// Distance to the top of the atmosphere. Mirrors `top_distance` in the shader.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
 pub fn top_distance(r: f32, mu: f32) -> f32 {
     let discriminant = r * r * (mu * mu - 1.0) + TOP_RADIUS * TOP_RADIUS;
     (-r * mu + discriminant.max(0.0).sqrt()).max(0.0)
 }
 
 /// Where `(r, mu)` sits in the transmittance table. Mirrors the shader.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
 pub fn transmittance_uv(r: f32, mu: f32) -> glam::Vec2 {
     let horizon = (r * r - GROUND_RADIUS * GROUND_RADIUS).max(0.0).sqrt();
     let atmosphere = (TOP_RADIUS * TOP_RADIUS - GROUND_RADIUS * GROUND_RADIUS)
@@ -532,6 +644,10 @@ pub fn transmittance_uv(r: f32, mu: f32) -> glam::Vec2 {
 }
 
 /// The same mapping backwards, giving `(r, mu)`. Mirrors the shader.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
 pub fn transmittance_params(uv: glam::Vec2) -> (f32, f32) {
     let atmosphere = (TOP_RADIUS * TOP_RADIUS - GROUND_RADIUS * GROUND_RADIUS)
         .max(0.0)
@@ -554,6 +670,10 @@ pub fn transmittance_params(uv: glam::Vec2) -> (f32, f32) {
 
 /// What the air at height `h` takes out of a beam, per metre. Mirrors the
 /// shader's `medium().extinction`.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
 pub fn extinction(height: f32) -> Vec3 {
     let h = height.max(0.0);
     let rayleigh = Vec3::new(5.802e-6, 13.558e-6, 33.100e-6) * (-h / 8000.0).exp();
@@ -571,6 +691,10 @@ pub fn extinction(height: f32) -> Vec3 {
 /// integral at four times the step count is the cheapest independent answer
 /// there is. If the two agree, the shader's forty steps are converged and its
 /// parameterisation inverts to the place the forward mapping would have put it.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
 pub fn optical_depth(r: f32, mu: f32, steps: u32) -> Vec3 {
     let end = top_distance(r, mu);
     let step = end / steps as f32;
@@ -1031,6 +1155,47 @@ mod tests {
                 x - 1
             );
         }
+    }
+
+    /// The tonemap and its inverse are inverses.
+    ///
+    /// Worth pinning because a test measures the light in a rendered frame by
+    /// running the curve backwards, and a wrong root would make that
+    /// measurement quietly plausible rather than obviously broken.
+    #[test]
+    fn the_tonemap_inverts() {
+        for radiance in [0.0f32, 1e-4, 0.01, 0.1, 0.209, 0.5, 1.0, 1.5] {
+            let there = tonemap(Vec3::splat(radiance));
+            let back = untonemap(there);
+            assert!(
+                (back.x - radiance).abs() < 1e-3 * radiance.max(1e-3),
+                "{radiance} tonemaps to {there} and back to {back}"
+            );
+        }
+        // The white point is the number it claims to be, and nothing below it
+        // has clipped.
+        assert!((tonemap(Vec3::splat(WHITE / EXPOSURE)).x - 1.0).abs() < 1e-5);
+        assert!(tonemap(Vec3::splat(WHITE / EXPOSURE * 0.99)).x < 1.0);
+    }
+
+    /// The shader tonemaps the way Rust says it does.
+    ///
+    /// Two copies of one curve, and a test measures a frame through the Rust
+    /// one. If they parted the measurement would be of the wrong curve.
+    #[test]
+    fn the_shading_shader_tonemaps_the_way_rust_does() {
+        let source = include_str!("shading.wgsl");
+        for (name, value) in [("EXPOSURE", EXPOSURE), ("WHITE", WHITE)] {
+            let declaration = format!("const {name}: f32 = {value:.1};");
+            assert!(
+                source.contains(&declaration),
+                "src/shading.wgsl does not declare {declaration}"
+            );
+        }
+        assert!(
+            source.contains("saturate(x * (1.0 + x / (WHITE * WHITE)) / (1.0 + x))"),
+            "src/shading.wgsl's tonemap is not the curve src/sky.rs mirrors"
+        );
     }
 
     /// The raster never reaches the planet's horizon.

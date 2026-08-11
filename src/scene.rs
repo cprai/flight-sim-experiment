@@ -265,7 +265,14 @@ impl Scene {
         let reproject =
             crate::reproject::Reprojection::new(device, camera_layout, &gbuffer, &carried);
         let sky = crate::sky::Sky::new(device);
-        let shading = Shading::new(device, format, &gbuffer, sky.layout());
+        let shading = Shading::new(
+            device,
+            format,
+            &gbuffer,
+            camera_layout,
+            sky.layout(),
+            sky.tables_layout(),
+        );
         Self {
             camera,
             sun: crate::sky::Sun::default(),
@@ -583,6 +590,7 @@ impl Scene {
                 multiview_mask: None,
             },
         );
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
         self.shading.draw(&mut pass, &self.sky);
     }
 }
@@ -611,8 +619,12 @@ fn camera_binding(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::BindGroupLayout
             binding: 0,
             // The march reads it in compute; the reprojection reads it in the
             // vertex stage, where it decides which pixel a carried point lands
-            // on.
-            visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX,
+            // on; and the shading reads it in the fragment stage, where it
+            // rebuilds the world position behind a pixel to ask how much air
+            // stands in front of it.
+            visibility: wgpu::ShaderStages::COMPUTE
+                | wgpu::ShaderStages::VERTEX
+                | wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -838,6 +850,30 @@ mod tests {
         aim: impl FnOnce(&mut Camera),
         path: &[Vec3],
     ) -> Frame {
+        render_sunlit(
+            residency,
+            heights,
+            materials,
+            aim,
+            path,
+            crate::sky::Sun::default(),
+        )
+    }
+
+    /// The same, under a sun of the caller's choosing.
+    ///
+    /// Separate rather than a sixth argument on every call site, because only
+    /// the tests that are *about* the sun have any business naming one. The
+    /// rest want the default, which is the sun every frame in this file has
+    /// always been lit by.
+    fn render_sunlit(
+        residency: Residency,
+        heights: Vec<f32>,
+        materials: Vec<MaterialId>,
+        aim: impl FnOnce(&mut Camera),
+        path: &[Vec3],
+        sun: crate::sky::Sun,
+    ) -> Frame {
         let (device, queue) = test_device();
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -858,6 +894,7 @@ mod tests {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut scene = test_scene(&device, format, residency, heights, materials);
+        scene.sun = sun;
         aim(&mut scene.camera);
 
         // Walk the requested path first, so the windows arrive at the captured
@@ -1298,6 +1335,40 @@ mod tests {
             camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
         });
 
+        // What the palette holds for an id, linearised: an albedo, which is
+        // the fraction of each wavelength the ground sends back.
+        let albedo = |id: u32| {
+            let bytes = Material::try_from_u32(id)
+                .map_or(crate::palette::MAGENTA, crate::palette::flat_colour);
+            Vec3::from(bytes.map(terrain_tiles::srgb_to_linear))
+        };
+
+        // The light falling on the ground, measured from the frame rather than
+        // recomputed here.
+        //
+        // It is one vector for the whole picture: the ground is a plane so
+        // every normal points straight up, and four kilometres of a planet six
+        // thousand across bends neither the radius nor the local up enough to
+        // see. So one material's pixel fixes it for all of them -- and reading
+        // it off the frame is the point. Restating the scattering in Rust
+        // would make this a test of a second copy of the shader rather than a
+        // test that an id becomes its own colour. Inverting the tonemap is
+        // exact, which is why that curve was chosen; see `src/sky.rs`.
+        let reference = MaterialId(Material::Grass.id());
+        let (rx, ry) = (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .find(|&(x, y)| frame.material(x, y) == Some(reference))
+            .expect("the reference material is somewhere in the frame");
+        let shown = |pixel: [u8; 4]| {
+            Vec3::new(
+                terrain_tiles::srgb_to_linear(pixel[0]),
+                terrain_tiles::srgb_to_linear(pixel[1]),
+                terrain_tiles::srgb_to_linear(pixel[2]),
+            )
+        };
+        let light = crate::sky::untonemap(shown(frame.pixel(rx, ry))) * std::f32::consts::PI
+            / albedo(reference.0);
+
         let mut seen = std::collections::BTreeSet::new();
         for y in 0..SIZE {
             for x in 0..SIZE {
@@ -1305,11 +1376,9 @@ mod tests {
                     continue;
                 };
                 seen.insert(id.0);
-                // An id the enum does not assign is missing data, and the
-                // table holds magenta for it -- the same answer the shader
-                // reaches by a different route.
-                let want = lit(Material::try_from_u32(id.0)
-                    .map_or(crate::palette::MAGENTA, crate::palette::flat_colour));
+                let want = crate::sky::tonemap(albedo(id.0) * light / std::f32::consts::PI)
+                    .to_array()
+                    .map(terrain_tiles::linear_to_srgb);
                 let got = frame.pixel(x, y);
                 assert!(
                     got[..3]
@@ -1778,13 +1847,15 @@ mod tests {
         let flat = vec![0.0f32; (RASTER * RASTER) as usize];
         let frame = render(flat.clone(), null.clone(), straight_down);
         let centre = frame.pixel(SIZE / 2, SIZE / 2);
-        let [r, g, b] = lit(crate::palette::MAGENTA);
-        assert_eq!(
-            centre,
-            [r, g, b, 255],
-            "unmapped ground should be magenta, lit like the level ground it is"
+        // The hue rather than the bytes. What magenta shades to is a fact about
+        // the light on it, which the atmosphere decides and
+        // `every_material_reaches_the_frame_as_its_own_colour` is the test for;
+        // what this one is about is that ground with no material is drawn at
+        // all, in the colour of missing data, rather than left as sky.
+        assert!(
+            is_magenta(centre),
+            "unmapped ground should be magenta, got {centre:?}"
         );
-        assert!(is_magenta(centre));
         assert!(
             !frame.sky(SIZE / 2, SIZE / 2),
             "a ray that met unmapped ground still met ground"
@@ -1815,8 +1886,14 @@ mod tests {
             straight_down,
         );
         let centre = frame.pixel(SIZE / 2, SIZE / 2);
-        let [r, g, b] = lit(crate::palette::MAGENTA);
-        assert_eq!(centre, [r, g, b, 255], "unassigned ids are magenta");
+        assert!(
+            is_magenta(centre),
+            "unassigned ids should be magenta, got {centre:?}"
+        );
+        assert!(
+            !frame.sky(SIZE / 2, SIZE / 2),
+            "an unassigned id is still ground"
+        );
     }
 
     /// Renders one frame and reads the depth buffer back.
@@ -2226,72 +2303,163 @@ mod tests {
         );
     }
 
-    /// Both ends of the light, on the two slopes that produce them exactly.
+    /// A plane through the middle of the raster, tilted south-east.
     ///
-    /// The sun sits 45 degrees above the horizon in the south-east, so ground
-    /// falling away to the south-east at 45 degrees has the sun's own
-    /// direction for its normal and takes the whole of it, and the same slope
-    /// the other way misses it entirely. The first pins the light down at its
-    /// brightest -- the palette's colour and no more, which is what makes a
-    /// material's entry mean something -- and the second at its darkest, which
-    /// is the case worth having a test for: with no shadows to fall back on,
-    /// a slope facing away is lit by the ambient constant alone and would be
-    /// black if that constant were ever dropped.
-    #[test]
-    fn a_slope_facing_the_sun_takes_it_all_and_one_facing_away_keeps_the_ambient() {
-        // A plane through the middle of the raster, so it stays under the
-        // camera whichever way it tilts. The march differences these very
-        // heights, so the normal the shading dots against the sun is the
-        // gradient of the ground written here.
-        let plane = |fall: f32| -> Vec<f32> {
-            let metres = METRES_PER_TEXEL as f32;
-            (0..RASTER * RASTER)
-                .map(|index| {
-                    let (x, y) = ((index % RASTER) as f32, (index / RASTER) as f32);
-                    let across = x + y - (RASTER - 1) as f32;
-                    fall * std::f32::consts::FRAC_1_SQRT_2 * across * metres
-                })
-                .collect()
-        };
-        // High enough to clear the corner of a plane that reaches 2.7 km, and
-        // still close enough that the finest level is the one drawn.
-        let aim = |camera: &mut Camera| {
-            camera.position = Vec3::new(0.0, 9000.0, 0.0);
-            camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
-        };
+    /// `fall` of -1 puts the plane square-on to the reference sun, which sits
+    /// 45 degrees above the horizon in the south-east; +1 turns it as far away
+    /// as a plane can be turned. The march differences these very heights, so
+    /// the normal the shading dots against the sun is the gradient written
+    /// here. Through the middle so it stays under the camera whichever way it
+    /// tilts.
+    fn tilted_plane(fall: f32) -> Vec<f32> {
+        let metres = METRES_PER_TEXEL as f32;
+        (0..RASTER * RASTER)
+            .map(|index| {
+                let (x, y) = ((index % RASTER) as f32, (index / RASTER) as f32);
+                let across = x + y - (RASTER - 1) as f32;
+                fall * std::f32::consts::FRAC_1_SQRT_2 * across * metres
+            })
+            .collect()
+    }
 
-        let check = |fall: f32, light: f32, slope: &str| {
-            let frame = render_config(test_residency(), plane(fall), flat_ground(), aim, &[]);
-            let want = shade(crate::palette::flat_colour(Material::Grass), light);
-            let mut ground = 0;
+    /// High enough to clear the corner of a plane that reaches 2.7 km, and
+    /// still close enough that the finest level is the one drawn.
+    fn over_the_plane(camera: &mut Camera) {
+        camera.position = Vec3::new(0.0, 9000.0, 0.0);
+        camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+    }
+
+    /// Mean brightness of the ground in a frame, on a scale of zero to one.
+    fn ground_brightness(frame: &Frame) -> f32 {
+        let mut total = 0.0f64;
+        let mut count = 0u32;
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                if frame.sky(x, y) {
+                    continue;
+                }
+                let pixel = frame.pixel(x, y);
+                total += f64::from(pixel[0]) + f64::from(pixel[1]) + f64::from(pixel[2]);
+                count += 3;
+            }
+        }
+        assert!(count > 3000, "only {} channels of ground to average", count);
+        (total / f64::from(count) / 255.0) as f32
+    }
+
+    /// A slope facing the sun is far brighter than one turned away, and the
+    /// one turned away is still lit.
+    ///
+    /// Both halves used to be pinned to exact bytes, because the light was two
+    /// constants and a dot product and the answer could be written down. It
+    /// cannot now: the sun arrives through a transmittance table and the shade
+    /// is the sky's own multiple scattering, and a test that restated either
+    /// would be asserting the shader against a second copy of itself.
+    ///
+    /// What survives is the pair of facts that made the test worth writing --
+    /// the sun does most of the lighting, and ground turned away from it is not
+    /// black -- plus a third the old one could not make, because it had no
+    /// exposure to get wrong: the sunlit slope does not clip. That last is what
+    /// says the whole chain from irradiance to byte is in range, and it is the
+    /// thing a wrong `EXPOSURE` would break while every ratio stayed perfect.
+    #[test]
+    fn a_slope_facing_the_sun_is_far_brighter_than_one_facing_away() {
+        let brightness = |fall: f32| {
+            ground_brightness(&render_config(
+                test_residency(),
+                tilted_plane(fall),
+                flat_ground(),
+                over_the_plane,
+                &[],
+            ))
+        };
+        let (toward, away) = (brightness(-1.0), brightness(1.0));
+        println!("square-on {toward:.4}, turned away {away:.4}");
+
+        assert!(
+            toward > 2.0 * away,
+            "square-on to the sun gives {toward:.4} against {away:.4} turned \
+             away, which is not the difference a sun makes"
+        );
+        assert!(
+            away > 0.05,
+            "ground turned away from the sun came out at {away:.4}, which is \
+             black -- the sky is supposed to light it"
+        );
+        assert!(
+            toward < 0.98,
+            "sunlit ground came out at {toward:.4}, which has clipped: the \
+             exposure is too high for the light the model produces"
+        );
+    }
+
+    /// Lowering the sun dims the ground and reddens it.
+    ///
+    /// Nothing else in this file would notice if the sun uniform were ignored
+    /// and the shader had quietly kept a constant, because every other test
+    /// renders under the default sun -- which was chosen to reproduce that
+    /// constant. This is the test that says the sun is a value.
+    ///
+    /// It is also the one that says the *transmittance table* is being read
+    /// rather than a plain cosine: a Lambert term alone would dim the ground
+    /// without changing its colour at all, and what makes a low sun orange is
+    /// the air taking the blue out of it on the way in.
+    #[test]
+    fn lowering_the_sun_dims_the_ground_and_reddens_it() {
+        // Level ground, so the only thing changing between the three frames is
+        // where the sun is. A slope would confound the dimming with a cosine.
+        let warmth = |elevation: f32| {
+            let frame = render_sunlit(
+                test_residency(),
+                vec![0.0; (RASTER * RASTER) as usize],
+                flat_ground(),
+                straight_down,
+                &[],
+                crate::sky::Sun::from_angles(elevation, crate::sky::Sun::DEFAULT_AZIMUTH),
+            );
+            let mut warm = 0.0f64;
+            let mut cool = 0.0f64;
             for y in 0..SIZE {
                 for x in 0..SIZE {
-                    if frame.sky(x, y) {
-                        continue;
-                    }
-                    let got = frame.pixel(x, y);
-                    ground += 1;
-                    assert!(
-                        got[..3]
-                            .iter()
-                            .zip(want)
-                            .all(|(&got, want)| got.abs_diff(want) <= 8),
-                        "{slope}: pixel ({x}, {y}) shades as {got:?}, not {want:?}"
-                    );
+                    let pixel = frame.pixel(x, y);
+                    warm += f64::from(pixel[0]);
+                    cool += f64::from(pixel[2]);
                 }
             }
-            assert!(
-                ground > 1000,
-                "{slope}: only {ground} pixels of ground drawn"
-            );
+            (ground_brightness(&frame), (warm / cool.max(1.0)) as f32)
         };
 
-        check(
-            -1.0,
-            AMBIENT + SUNLIGHT,
-            "falling south-east, square-on to the sun",
+        let (high, high_warmth) = warmth(60.0);
+        let (low, low_warmth) = warmth(6.0);
+        let (dusk, _) = warmth(-4.0);
+        println!(
+            "60 deg: {high:.4} at {high_warmth:.3} red:blue; \
+             6 deg: {low:.4} at {low_warmth:.3}; -4 deg: {dusk:.4}"
         );
-        check(1.0, AMBIENT, "rising south-east, turned away from the sun");
+
+        assert!(
+            high > low && low > dusk,
+            "the ground should dim as the sun sets: {high:.4} at 60 degrees, \
+             {low:.4} at 6, {dusk:.4} at -4"
+        );
+        // Half again, and the figure is measured rather than guessed. Reading
+        // the transmittance table takes red against blue from 1.39 to 2.67 as
+        // the sun drops, a factor of 1.92; replacing that table lookup with the
+        // constant it averages leaves the sky's own ambient as the only thing
+        // that reddens, and the same measurement gives 1.30 to 1.42, a factor
+        // of 1.10. The threshold sits between the two with room either side, so
+        // this fails if the sun stops arriving through the air.
+        assert!(
+            low_warmth > 1.5 * high_warmth,
+            "dropping the sun from 60 degrees to 6 moved red against blue only \
+             from {high_warmth:.3} to {low_warmth:.3}, which is a cosine \
+             dimming the light rather than the air reddening it"
+        );
+        assert!(
+            dusk < 0.25 * low,
+            "with the sun below the horizon the ground is still at {dusk:.4} \
+             against {low:.4} with it up"
+        );
     }
 
     #[test]
