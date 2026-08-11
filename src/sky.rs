@@ -80,7 +80,11 @@ struct SkyUniform {
     /// of a six-million-metre vector is worth doing once, on the CPU, in double
     /// precision -- an `f32` holding 6.36e6 has metre-scale steps left.
     eye: [f32; 4],
-    /// The local up at the eye. `w` is unused.
+    /// The local up at the eye, with the angle one pixel subtends in `w`.
+    ///
+    /// That angle is what feathers the sun's edge. It belongs here rather than
+    /// being derived in the shader because it needs the field of view and the
+    /// viewport height, and the fragment stage has neither.
     up: [f32; 4],
     /// The sun projected into the eye's tangent plane, normalised: where the
     /// sky-view table's azimuth is measured from.
@@ -93,7 +97,7 @@ struct SkyUniform {
 }
 
 impl SkyUniform {
-    fn new(sun: Sun, eye: Vec3) -> Self {
+    fn new(sun: Sun, eye: Vec3, pixel_angle: f32) -> Self {
         // Doubles for the one subtraction that needs them: the eye is metres
         // from a centre six thousand kilometres away, and an `f32` there has
         // steps of about half a metre.
@@ -116,7 +120,7 @@ impl SkyUniform {
         Self {
             sun: sun.direction.extend(0.0).to_array(),
             eye: centred.as_vec3().extend(radius as f32).to_array(),
-            up: up.extend(0.0).to_array(),
+            up: up.extend(pixel_angle).to_array(),
             sun_tangent: tangent.extend(0.0).to_array(),
         }
     }
@@ -193,6 +197,36 @@ pub const MULTISCATTER_SIZE: glam::UVec2 = glam::UVec2::new(32, 32);
 /// 192 across is 1.875 degrees a texel of azimuth; 108 down is the same aspect
 /// as the window, which is not required but keeps the two comparable.
 pub const SKYVIEW_SIZE: glam::UVec2 = glam::UVec2::new(192, 108);
+
+/// Half the sun's apparent width, in radians: 0.5334 degrees across, which is
+/// what it is from this planet. Must match `src/shading.wgsl`.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
+pub const SUN_ANGULAR_RADIUS: f32 = 0.004654;
+
+/// One over the disc's solid angle, `2 pi (1 - cos r)`.
+///
+/// The sun is given as an irradiance and everything else here is a radiance, so
+/// this is what turns one into the other: the whole of its light spread over
+/// the small patch of sky it occupies. Must match `src/shading.wgsl`.
+#[allow(
+    dead_code,
+    reason = "the shader's mirror; the tests are the only Rust caller"
+)]
+pub const SUN_DISC_RADIANCE: f32 = 14696.0;
+
+/// The angle one pixel subtends at the centre of the frame, in radians.
+///
+/// What feathers the sun's edge, and the same quantity the clipmap sizes its
+/// windows by -- see `pixel_angle` in `crate::terrain::residency`, which is the
+/// small-angle form of this. The tangent is used here because the sun is
+/// measured in fractions of a degree and the two forms differ by a tenth at
+/// sixty degrees of field.
+pub fn pixel_angle(fov_y: f32, height: u32) -> f32 {
+    2.0 * (fov_y * 0.5).tan() / height.max(1) as f32
+}
 
 /// Steps the shader integrates the optical depth in. Must match `src/sky.wgsl`.
 #[allow(
@@ -683,11 +717,11 @@ impl Sky {
     }
 
     /// Uploads where the sun and the eye are, for the frame about to be drawn.
-    pub fn set_frame(&self, queue: &wgpu::Queue, sun: Sun, eye: Vec3) {
+    pub fn set_frame(&self, queue: &wgpu::Queue, sun: Sun, eye: Vec3, pixel_angle: f32) {
         queue.write_buffer(
             &self.buffer,
             0,
-            bytemuck::bytes_of(&SkyUniform::new(sun, eye)),
+            bytemuck::bytes_of(&SkyUniform::new(sun, eye, pixel_angle)),
         );
     }
 
@@ -1489,7 +1523,12 @@ mod tests {
         let mut sky = Sky::new(&device);
         sky.ensure_built(&device, &queue);
         let eye = Vec3::new(0.0, altitude, 0.0);
-        sky.set_frame(&queue, Sun::default(), eye);
+        sky.set_frame(
+            &queue,
+            Sun::default(),
+            eye,
+            pixel_angle(60f32.to_radians(), 720),
+        );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {

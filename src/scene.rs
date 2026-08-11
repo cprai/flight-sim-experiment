@@ -369,7 +369,12 @@ impl Scene {
         // the sun yet, so this rewrites the same sixteen bytes each time --
         // which is cheaper than the branch that would avoid it, and is what
         // will already be right the day something does move it.
-        self.sky.set_frame(queue, self.sun, self.camera.position);
+        self.sky.set_frame(
+            queue,
+            self.sun,
+            self.camera.position,
+            crate::sky::pixel_angle(self.camera.fov_y, self.gbuffer.size.y),
+        );
         // What this frame draws becomes the next one's history, so the basis it
         // is drawn with is the basis that history will have to be read back
         // through.
@@ -2502,6 +2507,200 @@ mod tests {
              the whole sky reddened together rather than the low sky alone",
             warmth(dusk_horizon),
             warmth(dusk_zenith)
+        );
+    }
+
+    /// The sun draws as a disc, where the sun is, about the size the sun is.
+    ///
+    /// Three claims, and it takes all three: a test that only asked whether
+    /// some pixel was bright would pass on a highlight stuck anywhere in the
+    /// frame, and one that only checked the position would pass on a sky
+    /// smeared white from edge to edge.
+    ///
+    /// Only sky pixels are counted, which is what makes "white" mean the sun:
+    /// snow is white too, and the depth buffer is what tells them apart.
+    #[test]
+    fn the_sun_draws_as_a_disc_where_the_sun_is() {
+        let sun = crate::sky::Sun::from_angles(25.0, crate::sky::Sun::DEFAULT_AZIMUTH);
+        // Aimed at the sun, so it lands near the middle of the frame where the
+        // projection is least distorted.
+        let mut camera = None;
+        let frame = render_sunlit(
+            test_residency(),
+            vec![0.0; (RASTER * RASTER) as usize],
+            flat_ground(),
+            |c| {
+                c.position = Vec3::new(0.0, 2000.0, 0.0);
+                c.orientation = Camera::from_yaw_pitch_roll(
+                    crate::sky::Sun::DEFAULT_AZIMUTH.to_radians(),
+                    25f32.to_radians(),
+                    0.0,
+                );
+                camera = Some(*c);
+            },
+            &[],
+            sun,
+        );
+        let camera = camera.expect("camera captured");
+
+        // Every sky pixel that has clipped to white in all three channels. The
+        // disc is thousands of times over the white point and nothing else in
+        // an empty sky comes close, so this is the disc and only the disc.
+        let burnt: Vec<(u32, u32)> = (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| frame.sky(x, y) && frame.pixel(x, y)[..3].iter().all(|&c| c >= 250))
+            .collect();
+        assert!(!burnt.is_empty(), "the sun is not in the frame at all");
+
+        // Where it should be: a point a long way along the sun's direction,
+        // projected. The infinite projection takes it without clipping.
+        let (want_x, want_y) = to_pixels(
+            camera.view_projection(),
+            camera.position + sun.direction * 1.0e6,
+            SIZE,
+            SIZE,
+        );
+        let centroid = burnt
+            .iter()
+            .fold(Vec2::ZERO, |sum, &(x, y)| sum + Vec2::new(x as f32, y as f32))
+            / burnt.len() as f32;
+        let off = (centroid - Vec2::new(want_x - 0.5, want_y - 0.5)).length();
+        println!(
+            "{} pixels of sun, centroid ({:.1}, {:.1}) against ({want_x:.1}, {want_y:.1})",
+            burnt.len(),
+            centroid.x,
+            centroid.y
+        );
+        assert!(
+            off < 2.0,
+            "the sun draws at ({:.1}, {:.1}) but points from ({want_x:.1}, \
+             {want_y:.1}), which is {off:.1} pixels out",
+            centroid.x,
+            centroid.y
+        );
+
+        // And about the right size, which at this resolution means the disc
+        // *plus its feather*. The sun is 0.53 degrees across, or 2.3 pixels of
+        // a 60-degree frame 256 wide, so the disc alone would be about four
+        // pixels -- but one pixel here subtends 0.0045 radians against the
+        // sun's own radius of 0.0047, so the one-pixel feather very nearly
+        // doubles the radius and twelve pixels is what actually comes out. At
+        // 1024 the feather is a quarter as wide and the disc dominates again.
+        //
+        // Bounded above all the same, which is the half that bites: a disc
+        // drawn at some convenient larger angle than the sun's own fails here
+        // however well it is centred.
+        assert!(
+            (4..=24).contains(&burnt.len()),
+            "the sun covers {} pixels, where the disc and its feather should \
+             cover about twelve at this size",
+            burnt.len()
+        );
+    }
+
+    /// The setting sun loses its blue.
+    ///
+    /// The disc is carried through the same transmittance table as the sky in
+    /// front of it, and this is the only test that can see that term at all.
+    /// While the sun is up it cannot: the disc is nine thousand times over the
+    /// white point, so anything short of the air removing all but a
+    /// ten-thousandth of it still clips to white, and removing the term
+    /// entirely changes no pixel. Taking the sun down to where the air really
+    /// does remove that much is what makes it measurable.
+    ///
+    /// A degree *below* level is still above the horizon here, which is the
+    /// point of choosing it: from 2000 m the horizon dips 1.44 degrees, so the
+    /// sun at -1 is genuinely in the sky and genuinely reddened -- not merely
+    /// clipped away by the geometry.
+    #[test]
+    fn the_setting_sun_loses_its_blue() {
+        let disc = |elevation: f32| {
+            let frame = render_sunlit(
+                test_residency(),
+                vec![0.0; (RASTER * RASTER) as usize],
+                flat_ground(),
+                |c| {
+                    c.position = Vec3::new(0.0, 2000.0, 0.0);
+                    c.orientation = Camera::from_yaw_pitch_roll(
+                        crate::sky::Sun::DEFAULT_AZIMUTH.to_radians(),
+                        elevation.to_radians(),
+                        0.0,
+                    );
+                },
+                &[],
+                crate::sky::Sun::from_angles(elevation, crate::sky::Sun::DEFAULT_AZIMUTH),
+            );
+            assert!(
+                frame.sky(SIZE / 2, SIZE / 2),
+                "the middle of the frame has to be sky for the sun to be in it"
+            );
+            frame.pixel(SIZE / 2, SIZE / 2)
+        };
+
+        let level = disc(0.0);
+        let setting = disc(-1.0);
+        println!("level {level:?}, setting {setting:?}");
+        assert_eq!(
+            &level[..3],
+            &[255, 255, 255],
+            "with the sun level the disc should still be white"
+        );
+        assert_eq!(
+            &setting[..3],
+            &[255, 255, 105],
+            "a degree lower the air should have taken most of the blue out of \
+             the disc and left the red alone"
+        );
+    }
+
+    /// ... and the ground stands in front of it.
+    ///
+    /// Free, and worth a test precisely because it is free: the disc is drawn
+    /// only where the march found no ground, so there is no visibility test to
+    /// get wrong. This is what says that remains true.
+    #[test]
+    fn a_ridge_between_the_eye_and_the_sun_hides_the_sun() {
+        let sun = crate::sky::Sun::from_angles(8.0, crate::sky::Sun::DEFAULT_AZIMUTH);
+        let aim = |camera: &mut Camera| {
+            camera.position = Vec3::new(0.0, 300.0, 0.0);
+            camera.orientation = Camera::from_yaw_pitch_roll(
+                crate::sky::Sun::DEFAULT_AZIMUTH.to_radians(),
+                8f32.to_radians(),
+                0.0,
+            );
+        };
+        // A wall across the south-east, high enough to stand over an eight
+        // degree sun from 300 m up.
+        let wall = |raised: bool| -> Vec<f32> {
+            (0..RASTER * RASTER)
+                .map(|index| {
+                    let (col, row) = (index % RASTER, index / RASTER);
+                    let towards = col > 88 && row > 88;
+                    if raised && towards { 4000.0 } else { 0.0 }
+                })
+                .collect()
+        };
+        let burnt = |raised: bool| {
+            let frame = render_sunlit(
+                test_residency(),
+                wall(raised),
+                flat_ground(),
+                aim,
+                &[],
+                sun,
+            );
+            (0..SIZE)
+                .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+                .filter(|&(x, y)| frame.sky(x, y) && frame.pixel(x, y)[..3].iter().all(|&c| c >= 250))
+                .count()
+        };
+
+        let open = burnt(false);
+        assert!(open > 0, "the sun has to be in shot for this to mean anything");
+        assert_eq!(
+            burnt(true),
+            0,
+            "a ridge in front of the sun left {open} pixels of it showing"
         );
     }
 

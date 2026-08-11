@@ -197,6 +197,54 @@ fn sample_skyview(direction: vec3<f32>) -> vec3<f32> {
     return textureSampleLevel(skyview_lut, skyview_sampler, vec2<f32>(u, v), 0.0).rgb;
 }
 
+// Half the sun's apparent width, in radians: 0.5334 degrees across, which is
+// what it is from this planet. Must match `SUN_ANGULAR_RADIUS` in `src/sky.rs`.
+const SUN_ANGULAR_RADIUS: f32 = 0.004654;
+
+// One over the disc's solid angle, `2 pi (1 - cos r)` = 6.805e-5 steradians.
+//
+// Everything else here is a radiance and the sun is given as an irradiance, so
+// this is what turns one into the other: spreading the whole of the sun's light
+// over the small patch of sky it actually occupies. Must match
+// `SUN_DISC_RADIANCE` in `src/sky.rs`.
+const SUN_DISC_RADIANCE: f32 = 14696.0;
+
+// The sun itself, where the ray points at it.
+//
+// Only ever called on a pixel whose ray found no ground, which is what makes
+// terrain occlude the disc: there is no separate visibility test and none is
+// wanted, because the march has already answered that question exactly.
+fn sun_disc(direction: vec3<f32>) -> vec3<f32> {
+    let angle = acos(clamp(dot(direction, sky.sun.xyz), -1.0, 1.0));
+    // One pixel of feather, so the edge is a curve rather than a staircase.
+    // The disc is about six pixels across at 720 rows and a 60-degree field,
+    // which is small enough that a hard cut is plainly stepped.
+    let feather = sky.up.w;
+    let edge = 1.0 - smoothstep(
+        SUN_ANGULAR_RADIUS - feather,
+        SUN_ANGULAR_RADIUS + feather,
+        angle,
+    );
+    if (edge <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+
+    // Limb darkening: the disc is a sphere of gas seen through more of its own
+    // atmosphere at the edges than at the middle, so it is not flat. Invisible
+    // while the sun is high -- everything here is thousands of times over the
+    // white point and clips alike -- and the whole of the shape of it once the
+    // air has taken the disc down near that point, which is the only time
+    // anyone looks straight at one.
+    let across = clamp(angle / SUN_ANGULAR_RADIUS, 0.0, 1.0);
+    let limb = 1.0 - 0.6 * (1.0 - sqrt(max(1.0 - across * across, 0.0)));
+
+    // Through the same air the sky in front of it went through, which is what
+    // reddens the disc as it sets and what makes it vanish on its own once it
+    // is down. No branch for "the sun has set": the table already answers that.
+    let mu = dot(sky.up.xyz, direction);
+    return vec3<f32>(SUN_DISC_RADIANCE * edge * limb) * sample_transmittance(sky.eye.w, mu);
+}
+
 // Radiance to a displayable colour: expose, then roll the top off.
 //
 // Extended Reinhard, per channel, and chosen over a fitted curve like ACES for
@@ -234,7 +282,8 @@ fn fs_shade(@builtin(position) clip: vec4<f32>) -> @location(0) vec4<f32> {
     // moving sun honest: the reprojection carries sky pixels between frames as
     // a fact about a *direction*, and a direction is all this needs.
     if (textureLoad(depth, pixel, 0).r == 0.0) {
-        return vec4<f32>(tonemap(sample_skyview(normalize(ray_raw_at(clip.xy)))), 1.0);
+        let towards = normalize(ray_raw_at(clip.xy));
+        return vec4<f32>(tonemap(sample_skyview(towards) + sun_disc(towards)), 1.0);
     }
 
     let id = textureLoad(material, pixel, 0).r & MATERIAL_MASK;
