@@ -694,6 +694,10 @@ mod tests {
         Georeferencing::square(RASTER, RASTER, METRES_PER_TEXEL)
     }
 
+    /// Must match `MATERIAL_MASK` in `src/terrain.wgsl`: the id is the low
+    /// sixteen bits of the material word, the rest being the sub-pixel offset.
+    const MATERIAL_MASK: u32 = 0xffff;
+
     const GRASS: MaterialId = MaterialId(Material::Grass.id());
     const SAND: MaterialId = MaterialId(Material::Sand.id());
     const LAKE: MaterialId = MaterialId(Material::Lake.id());
@@ -733,19 +737,6 @@ mod tests {
     /// hard-coded greens.
     fn lit(colour: [u8; 3]) -> [u8; 3] {
         shade(colour, AMBIENT + SUNLIGHT * std::f32::consts::FRAC_1_SQRT_2)
-    }
-
-    /// Whether a rendered pixel is the flat colour `material` shades as on
-    /// level ground.
-    ///
-    /// A small tolerance per channel, because the palette rides through a
-    /// linearise-and-re-encode round trip whose rounding is the driver's.
-    fn shows(material: Material, pixel: [u8; 4]) -> bool {
-        let want = lit(crate::palette::flat_colour(material));
-        pixel[..3]
-            .iter()
-            .zip(want)
-            .all(|(&got, want)| got.abs_diff(want) <= 8)
     }
 
     fn flat_ground() -> Vec<MaterialId> {
@@ -874,6 +865,7 @@ mod tests {
         };
         let readback = staging("readback");
         let depth_readback = staging("depth readback");
+        let material_readback = staging("material readback");
 
         let profiler = crate::profile::profiler(&device, false);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -901,9 +893,13 @@ mod tests {
         };
         copy(texture.as_image_copy(), &readback);
         copy(scene.gbuffer.targets.depth.as_image_copy(), &depth_readback);
+        copy(
+            scene.gbuffer.targets.material.as_image_copy(),
+            &material_readback,
+        );
         queue.submit(std::iter::once(encoder.finish()));
 
-        for buffer in [&readback, &depth_readback] {
+        for buffer in [&readback, &depth_readback, &material_readback] {
             buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
         }
         device
@@ -922,10 +918,18 @@ mod tests {
         )
         .to_vec();
         depth_readback.unmap();
+        let materials = bytemuck::cast_slice::<u8, u32>(
+            &material_readback
+                .get_mapped_range(..)
+                .expect("buffer not mapped"),
+        )
+        .to_vec();
+        material_readback.unmap();
 
         Frame {
             pixels,
             depths,
+            materials,
             base_level: scene.terrain.base_level(),
         }
     }
@@ -950,6 +954,10 @@ mod tests {
         pixels: Vec<u8>,
         /// Reversed-Z depth per pixel, straight from the G-buffer.
         depths: Vec<f32>,
+        /// The material word per pixel: the id in the low sixteen bits and
+        /// where inside the pixel the ground sits in the rest. See
+        /// `MATERIAL_MASK` in `src/terrain.wgsl`.
+        materials: Vec<u32>,
         /// How much detail the camera's height above the ground bought:
         /// everything below this level was dropped. A test that means to look
         /// at more than one level has to say so, because a camera high enough
@@ -965,6 +973,21 @@ mod tests {
         /// Whether the march found no ground at this pixel.
         fn sky(&self, x: u32, y: u32) -> bool {
             self.depths[(y * SIZE + x) as usize] == 0.0
+        }
+
+        /// Which material the march found here, or nothing where it found no
+        /// ground.
+        ///
+        /// The id the march wrote, not the colour the shading turned it into.
+        /// Two materials whose flat colours sit within a few counts of each
+        /// other -- and the palette has plenty, being hues by category -- are
+        /// the same pixel to a colour test and different ids to this one.
+        fn material(&self, x: u32, y: u32) -> Option<MaterialId> {
+            if self.sky(x, y) {
+                return None;
+            }
+            let packed = self.materials[(y * SIZE + x) as usize];
+            Some(MaterialId(packed & MATERIAL_MASK))
         }
 
         /// How many pixels of the frame are sky.
@@ -1143,13 +1166,13 @@ mod tests {
             let mut ground = 0u64;
             for y in 0..SIZE {
                 for x in 0..SIZE - 1 {
-                    let (here, next) = (frame.pixel(x, y), frame.pixel(x + 1, y));
-                    if frame.sky(x, y) || frame.sky(x + 1, y) {
+                    let (here, next) = (frame.material(x, y), frame.material(x + 1, y));
+                    if here.is_none() || next.is_none() {
                         continue;
                     }
                     ground += 1;
-                    let flipped = (shows(Material::Sand, here) && shows(Material::Grass, next))
-                        || (shows(Material::Grass, here) && shows(Material::Sand, next));
+                    let flipped = (here == Some(SAND) && next == Some(GRASS))
+                        || (here == Some(GRASS) && next == Some(SAND));
                     if flipped {
                         changes += 1;
                     }
@@ -1203,14 +1226,89 @@ mod tests {
         assert_eq!(sky[3], 255, "sky should be opaque");
         assert!(frame.sky(SIZE / 2, 4), "top of frame should be sky");
 
-        let ground = frame.pixel(SIZE / 2, SIZE - 4);
         assert!(
             !frame.sky(SIZE / 2, SIZE - 4),
             "bottom of frame should be ground"
         );
+        assert_eq!(
+            frame.material(SIZE / 2, SIZE - 4),
+            Some(GRASS),
+            "bottom of frame should be the material it is painted"
+        );
+    }
+
+    /// Every material reaches the frame as the colour the palette gives it.
+    ///
+    /// This used to be checked sideways, by the helper the tests above used to
+    /// find *where* a material was drawn: it compared a pixel against the
+    /// palette entry it expected, so it happened to prove the id-to-colour
+    /// mapping as a side effect of proving the registration. Those tests read
+    /// the id out of the G-buffer now, which is exact where a colour was
+    /// approximate -- and leaves nothing checking the mapping at all.
+    ///
+    /// So check it properly, which the old arrangement never did. It only ever
+    /// touched grass, sand and lake, and it accepted anything within eight
+    /// counts per channel -- a tolerance several pairs in the table fall
+    /// inside, the palette being hues by category. This paints every material
+    /// in the book at once and holds each pixel of ground to the entry for the
+    /// id the march actually wrote there, whichever level supplied it.
+    ///
+    /// Eight-texel blocks rather than a fine check because the levels fold ids
+    /// by mode: a block has to be wider than the fold to survive to a coarse
+    /// level intact. The frame is flat and seen from straight above, so every
+    /// normal is straight up and the light is the same everywhere -- which is
+    /// what lets one expected colour per material stand for the whole block.
+    #[test]
+    fn every_material_reaches_the_frame_as_its_own_colour() {
+        const BLOCK: u32 = 8;
+        let across = RASTER / BLOCK;
+        let materials: Vec<MaterialId> = (0..RASTER * RASTER)
+            .map(|index| {
+                let (col, row) = (index % RASTER, index / RASTER);
+                let block = (row / BLOCK) * across + col / BLOCK;
+                MaterialId(Material::ALL[block as usize % Material::ALL.len()].id())
+            })
+            .collect();
+
+        let frame = render(vec![0.0; (RASTER * RASTER) as usize], materials, |camera| {
+            // High enough that the whole raster is in shot, so every block is
+            // on screen rather than only the middle ones. The raster is 3840 m
+            // across and a 60-degree frame spans 4157 m from here, which fits
+            // it with a margin of sky at the corners. From 2200 m -- where the
+            // frame spans 2540 m -- only 60 of the 80 materials made it in.
+            camera.position = Vec3::new(0.0, 3600.0, 0.0);
+            camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+        });
+
+        let mut seen = std::collections::BTreeSet::new();
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let Some(id) = frame.material(x, y) else {
+                    continue;
+                };
+                seen.insert(id.0);
+                // An id the enum does not assign is missing data, and the
+                // table holds magenta for it -- the same answer the shader
+                // reaches by a different route.
+                let want = lit(Material::try_from_u32(id.0)
+                    .map_or(crate::palette::MAGENTA, crate::palette::flat_colour));
+                let got = frame.pixel(x, y);
+                assert!(
+                    got[..3]
+                        .iter()
+                        .zip(want)
+                        .all(|(&got, want)| got.abs_diff(want) <= 3),
+                    "material {:#06x} at ({x}, {y}) drew as {got:?}, not {want:?}",
+                    id.0
+                );
+            }
+        }
+        // Or the frame showed one block and the sweep proved nothing.
         assert!(
-            shows(Material::Grass, ground),
-            "ground should shade as the material it is painted, got {ground:?}"
+            seen.len() >= Material::ALL.len(),
+            "only {} of {} materials reached the frame",
+            seen.len(),
+            Material::ALL.len()
         );
     }
 
@@ -1255,21 +1353,23 @@ mod tests {
 
             let centre = world_of(f64::from(patch_col), f64::from(patch_row));
             let (x, y) = to_pixels(camera.view_projection(), centre, SIZE, SIZE);
-            let found = frame.pixel(x.round() as u32, y.round() as u32);
+            let found = frame.material(x.round() as u32, y.round() as u32);
 
-            assert!(
-                shows(Material::Sand, found),
-                "base {base}: expected the sand patch at ({x:.0}, {y:.0}), got {found:?}"
+            assert_eq!(
+                found,
+                Some(SAND),
+                "base {base}: expected the sand patch at ({x:.0}, {y:.0})"
             );
 
             // ... and the rest of the ground is still the background material,
             // so the patch has not simply been smeared over everything.
             let elsewhere = world_of(f64::from(patch_col), f64::from(RASTER - patch_row));
             let (x, y) = to_pixels(camera.view_projection(), elsewhere, SIZE, SIZE);
-            let found = frame.pixel(x.round() as u32, y.round() as u32);
-            assert!(
-                shows(Material::Grass, found),
-                "base {base}: expected background at ({x:.0}, {y:.0}), got {found:?}"
+            let found = frame.material(x.round() as u32, y.round() as u32);
+            assert_eq!(
+                found,
+                Some(GRASS),
+                "base {base}: expected background at ({x:.0}, {y:.0})"
             );
         }
     }
@@ -1543,7 +1643,7 @@ mod tests {
         let count_far = |frame: &Frame| {
             (0..SIZE)
                 .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
-                .filter(|&(x, y)| shows(Material::Lake, frame.pixel(x, y)))
+                .filter(|&(x, y)| frame.material(x, y) == Some(LAKE))
                 .count()
         };
 
@@ -2882,11 +2982,12 @@ mod tests {
         target: wgpu::Texture,
         view: wgpu::TextureView,
         readback: wgpu::Buffer,
-        /// The G-buffer's depth channel, alongside the picture.
+        /// The G-buffer's depth and material channels, alongside the picture.
         ///
-        /// Both flights below count sky, and sky is a fact about what the march
-        /// wrote rather than about what colour came out. See [`Frame`].
+        /// Both flights below count sky and one of them counts a material, and
+        /// neither is a fact about what colour came out. See [`Frame`].
         depth_readback: wgpu::Buffer,
+        material_readback: wgpu::Buffer,
         profiler: wgpu_profiler::GpuProfiler,
     }
 
@@ -2918,6 +3019,7 @@ mod tests {
             Self {
                 readback: staging("readback"),
                 depth_readback: staging("depth readback"),
+                material_readback: staging("material readback"),
                 profiler: crate::profile::profiler(device, false),
                 target,
                 view,
@@ -2973,12 +3075,20 @@ mod tests {
                     scene.gbuffer.targets.depth.as_image_copy(),
                     &self.depth_readback,
                 );
+                copy(
+                    scene.gbuffer.targets.material.as_image_copy(),
+                    &self.material_readback,
+                );
             }
             queue.submit(std::iter::once(encoder.finish()));
             if !read {
                 return None;
             }
-            for buffer in [&self.readback, &self.depth_readback] {
+            for buffer in [
+                &self.readback,
+                &self.depth_readback,
+                &self.material_readback,
+            ] {
                 buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
             }
             device
@@ -2998,9 +3108,18 @@ mod tests {
             )
             .to_vec();
             self.depth_readback.unmap();
+            let materials = bytemuck::cast_slice::<u8, u32>(
+                &self
+                    .material_readback
+                    .get_mapped_range(..)
+                    .expect("buffer not mapped"),
+            )
+            .to_vec();
+            self.material_readback.unmap();
             Some(Frame {
                 pixels,
                 depths,
+                materials,
                 base_level: scene.terrain.base_level(),
             })
         }
@@ -3129,13 +3248,13 @@ mod tests {
         (heights, materials)
     }
 
-    /// Whether a rendered pixel is showing the sandy far ridge.
+    /// Whether this pixel is showing the sandy far ridge.
     ///
-    /// Sand is warm and grass is green whatever the light does to them, so this
-    /// separates the two ridges without pinning either to a colour.
+    /// The id the march wrote. It used to be "warmer than it is green", which
+    /// separated sand from grass but would equally have found any of the dozen
+    /// other warm materials in the palette had one been in shot.
     fn is_sandy(frame: &Frame, x: u32, y: u32) -> bool {
-        let pixel = frame.pixel(x, y);
-        pixel[0] > pixel[1] && !frame.sky(x, y)
+        frame.material(x, y) == Some(SAND)
     }
 
     fn count_sandy(frame: &Frame) -> usize {
