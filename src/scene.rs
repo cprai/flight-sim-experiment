@@ -802,32 +802,6 @@ mod tests {
         r > 100 && b > 100 && g < 80
     }
 
-    /// The two halves of the light, kept in step by hand with `AMBIENT` and
-    /// `SUNLIGHT` in `src/shading.wgsl`.
-    const AMBIENT: f32 = 0.35;
-    const SUNLIGHT: f32 = 0.65;
-
-    /// A flat colour as the shading pass paints it under `light`: linearise,
-    /// scale, re-encode, which is what the shader and the sRGB target between
-    /// them do.
-    fn shade(colour: [u8; 3], light: f32) -> [u8; 3] {
-        colour.map(|channel| {
-            terrain_tiles::linear_to_srgb(terrain_tiles::srgb_to_linear(channel) * light)
-        })
-    }
-
-    /// The same, on ground facing straight up -- which every fixture below
-    /// that checks a colour is built out of. `SUN` in the shader sits 45
-    /// degrees above the horizon, so a level surface collects `cos 45` of it.
-    ///
-    /// Working the shade out here rather than writing the resulting bytes
-    /// down keeps these tests about which material was drawn where: moving the
-    /// sun should not send anyone hunting through the assertions for
-    /// hard-coded greens.
-    fn lit(colour: [u8; 3]) -> [u8; 3] {
-        shade(colour, AMBIENT + SUNLIGHT * std::f32::consts::FRAC_1_SQRT_2)
-    }
-
     fn flat_ground() -> Vec<MaterialId> {
         vec![GRASS; (RASTER * RASTER) as usize]
     }
