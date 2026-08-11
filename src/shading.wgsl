@@ -180,7 +180,7 @@ fn horizon_zenith(r: f32) -> f32 {
 // Must match `skyview_v` in `src/sky.wgsl`.
 fn skyview_v(r: f32, zenith: f32) -> f32 {
     let horizon = horizon_zenith(r);
-    if (zenith < horizon) {
+    if zenith < horizon {
         return 0.5 * (1.0 - sqrt(max(1.0 - zenith / horizon, 0.0)));
     }
     return 0.5 + 0.5 * sqrt(max((zenith - horizon) / (PI - horizon), 0.0));
@@ -238,7 +238,7 @@ fn sun_disc(direction: vec3<f32>) -> vec3<f32> {
         SUN_ANGULAR_RADIUS + feather,
         angle,
     );
-    if (edge <= 0.0) {
+    if edge <= 0.0 {
         return vec3<f32>(0.0);
     }
 
@@ -276,14 +276,14 @@ fn tonemap(radiance: vec3<f32>) -> vec3<f32> {
 }
 
 @vertex
-fn vs_shade(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+fn vs_shade(@builtin(vertex_index)index: u32) -> @builtin(position) vec4<f32> {
     // The same oversized triangle the geometry pass draws.
     let corner = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
     return vec4<f32>(corner * 2.0 - 1.0, 1.0, 1.0);
 }
 
 @fragment
-fn fs_shade(@builtin(position) clip: vec4<f32>) -> @location(0) vec4<f32> {
+fn fs_shade(@builtin(position)clip: vec4<f32>) -> @location(0) vec4<f32> {
     // The fragment coordinate is the pixel centre, so truncation is the index.
     let pixel = vec2<i32>(clip.xy);
 
@@ -294,14 +294,14 @@ fn fs_shade(@builtin(position) clip: vec4<f32>) -> @location(0) vec4<f32> {
     // Recomputed here every frame rather than stored, which is what keeps a
     // moving sun honest: the reprojection carries sky pixels between frames as
     // a fact about a *direction*, and a direction is all this needs.
-    if (textureLoad(depth, pixel, 0).r == 0.0) {
+    if textureLoad(depth, pixel, 0).r == 0.0 {
         let towards = normalize(ray_raw_at(clip.xy));
         return vec4<f32>(tonemap(sample_skyview(towards) + sun_disc(towards)), 1.0);
     }
 
     let id = textureLoad(material, pixel, 0).r & MATERIAL_MASK;
     var albedo = MAGENTA.rgb;
-    if (id < PALETTE_SIZE) {
+    if id < PALETTE_SIZE {
         albedo = palette.colours[id].rgb;
     }
 

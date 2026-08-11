@@ -216,11 +216,11 @@ fn top_distance(r: f32, mu: f32) -> f32 {
 // comes out, which is why `mu > 0` is rejected outright rather than left to the
 // discriminant: near the horizon the two roots are close and rounding decides.
 fn ground_distance(r: f32, mu: f32) -> f32 {
-    if (mu > 0.0) {
+    if mu > 0.0 {
         return -1.0;
     }
     let discriminant = r * r * (mu * mu - 1.0) + GROUND_RADIUS * GROUND_RADIUS;
-    if (discriminant < 0.0) {
+    if discriminant < 0.0 {
         return -1.0;
     }
     return -r * mu - sqrt(discriminant);
@@ -229,7 +229,7 @@ fn ground_distance(r: f32, mu: f32) -> f32 {
 // How far along a ray it takes to reach whatever it meets first.
 fn ray_end(r: f32, mu: f32) -> f32 {
     let ground = ground_distance(r, mu);
-    if (ground >= 0.0) {
+    if ground >= 0.0 {
         return ground;
     }
     return top_distance(r, mu);
@@ -308,7 +308,7 @@ fn transmittance_params(uv: vec2<f32>) -> vec2<f32> {
     let longest = horizon + atmosphere;
     let distance = shortest + to_unit(uv.x, f32(TRANSMITTANCE_WIDTH)) * (longest - shortest);
     var mu = 1.0;
-    if (distance > 0.0) {
+    if distance > 0.0 {
         mu = clamp(
             (atmosphere * atmosphere - horizon * horizon - distance * distance)
                 / (2.0 * r * distance),
@@ -362,8 +362,8 @@ fn optical_depth(r: f32, mu: f32) -> vec3<f32> {
 }
 
 @compute @workgroup_size(8, 8, 1)
-fn cs_transmittance(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= TRANSMITTANCE_WIDTH || id.y >= TRANSMITTANCE_HEIGHT) {
+fn cs_transmittance(@builtin(global_invocation_id)id: vec3<u32>) {
+    if id.x >= TRANSMITTANCE_WIDTH || id.y >= TRANSMITTANCE_HEIGHT {
         return;
     }
     let uv = (vec2<f32>(id.xy) + 0.5)
@@ -392,7 +392,7 @@ fn horizon_zenith(r: f32) -> f32 {
 // overhead.
 fn skyview_v(r: f32, zenith: f32) -> f32 {
     let horizon = horizon_zenith(r);
-    if (zenith < horizon) {
+    if zenith < horizon {
         return 0.5 * (1.0 - sqrt(max(1.0 - zenith / horizon, 0.0)));
     }
     return 0.5 + 0.5 * sqrt(max((zenith - horizon) / (PI - horizon), 0.0));
@@ -401,7 +401,7 @@ fn skyview_v(r: f32, zenith: f32) -> f32 {
 // The same backwards, which is what building the table needs.
 fn skyview_zenith(r: f32, v: f32) -> f32 {
     let horizon = horizon_zenith(r);
-    if (v < 0.5) {
+    if v < 0.5 {
         let away = 1.0 - 2.0 * v;
         return horizon * (1.0 - away * away);
     }
@@ -465,8 +465,8 @@ fn sample_skyview(direction: vec3<f32>) -> vec3<f32> {
 // would make a faithful table gigabytes, and a table small enough to ship would
 // throw away the horizon crowding above and band every sunset.
 @compute @workgroup_size(8, 8, 1)
-fn cs_skyview(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= SKYVIEW_WIDTH || id.y >= SKYVIEW_HEIGHT) {
+fn cs_skyview(@builtin(global_invocation_id)id: vec3<u32>) {
+    if id.x >= SKYVIEW_WIDTH || id.y >= SKYVIEW_HEIGHT {
         return;
     }
     // The azimuth axis wraps, so its coordinate is the parameter; the zenith
@@ -506,7 +506,7 @@ fn cs_skyview(@builtin(global_invocation_id) id: vec3<u32>) {
 
         let sun_mu = dot(local_up, sky.sun.xyz);
         var sunlight = sample_transmittance(radius, sun_mu);
-        if (ground_distance(radius, sun_mu) >= 0.0) {
+        if ground_distance(radius, sun_mu) >= 0.0 {
             sunlight = vec3<f32>(0.0);
         }
         let multiple = sample_multiscatter(radius, sun_mu);
@@ -549,8 +549,8 @@ fn cs_skyview(@builtin(global_invocation_id) id: vec3<u32>) {
 // running integral at each boundary. A thread per froxel would redo the whole
 // march from the eye for every slice.
 @compute @workgroup_size(8, 8, 1)
-fn cs_aerial(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= AERIAL_WIDTH || id.y >= AERIAL_HEIGHT) {
+fn cs_aerial(@builtin(global_invocation_id)id: vec3<u32>) {
+    if id.x >= AERIAL_WIDTH || id.y >= AERIAL_HEIGHT {
         return;
     }
     let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(f32(AERIAL_WIDTH), f32(AERIAL_HEIGHT));
@@ -587,7 +587,7 @@ fn cs_aerial(@builtin(global_invocation_id) id: vec3<u32>) {
             var sunlight = sample_transmittance(radius, sun_mu);
             // Shadowed by the planet, not by the terrain: there is no terrain
             // in this volume and putting it there would need a shadow map.
-            if (ground_distance(radius, sun_mu) >= 0.0) {
+            if ground_distance(radius, sun_mu) >= 0.0 {
                 sunlight = vec3<f32>(0.0);
             }
             let multiple = sample_multiscatter(radius, sun_mu);
@@ -626,7 +626,7 @@ var<workgroup> shared_returned: array<vec3<f32>, 64>;
 // light has forgotten which way it came from.
 @compute @workgroup_size(1, 1, 64)
 fn cs_multiscatter(
-    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(global_invocation_id)id: vec3<u32>,
     @builtin(local_invocation_index) thread: u32,
 ) {
     let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(f32(MULTISCATTER_SIZE));
@@ -675,7 +675,7 @@ fn cs_multiscatter(
         // there is none in this frame of reference and none in the table.
         let sun_mu = dot(up, sun);
         var sunlight = sample_transmittance(radius, sun_mu);
-        if (ground_distance(radius, sun_mu) >= 0.0) {
+        if ground_distance(radius, sun_mu) >= 0.0 {
             sunlight = vec3<f32>(0.0);
         }
 
@@ -695,7 +695,7 @@ fn cs_multiscatter(
     // Light that went down, hit the ground and came back up. The ground is a
     // Lambertian grey, so what leaves it is its albedo over pi times what
     // arrived.
-    if (ground_distance(r, mu) >= 0.0) {
+    if ground_distance(r, mu) >= 0.0 {
         let landed = start + direction * end;
         let up = normalize(landed);
         let facing = max(dot(up, sun), 0.0);
@@ -712,13 +712,13 @@ fn cs_multiscatter(
     // phase of `1 / 4 pi` cancels exactly -- so the average is the integral and
     // there is no stray factor to carry.
     for (var stride = MULTISCATTER_DIRECTIONS / 2u; stride > 0u; stride = stride / 2u) {
-        if (thread < stride) {
+        if thread < stride {
             shared_scattered[thread] = shared_scattered[thread] + shared_scattered[thread + stride];
             shared_returned[thread] = shared_returned[thread] + shared_returned[thread + stride];
         }
         workgroupBarrier();
     }
-    if (thread != 0u) {
+    if thread != 0u {
         return;
     }
 

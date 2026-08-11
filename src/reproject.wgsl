@@ -202,7 +202,7 @@ fn dropped(pixel: vec2<u32>) -> bool {
 // for this. Any translation at all can, and how much is what the reach already
 // says.
 fn swept(pixel: vec2<u32>, mine: f32) -> bool {
-    if (splatting.moved == 0.0) {
+    if splatting.moved == 0.0 {
         return false;
     }
     let intruder = textureLoad(reach, vec2<i32>(pixel / DITHER_BLOCK), 0).r;
@@ -210,19 +210,23 @@ fn swept(pixel: vec2<u32>, mine: f32) -> bool {
 }
 
 struct Splat {
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position)
+    clip: vec4<f32>,
     // Flat throughout: a point covers one pixel, so there is nothing between
     // two vertices to interpolate, and a material id could not be interpolated
     // in any case.
-    @location(0) @interpolate(flat) material: u32,
+    @location(0) @interpolate(flat)
+    material: u32,
     // Zero for sky and a unit vector for ground, which is how the compaction
     // tells the two apart once they have landed.
-    @location(1) @interpolate(flat) normal: vec4<f32>,
+    @location(1) @interpolate(flat)
+    normal: vec4<f32>,
     // Where the point landed, in whole screen pixels, so the fragment can
     // measure the sub-pixel offset against the pixel it is *actually* in. See
     // `pack_offset`, which is why this is carried across rather than the offset
     // itself.
-    @location(2) @interpolate(flat) landed: vec2<f32>,
+    @location(2) @interpolate(flat)
+    landed: vec2<f32>,
 };
 
 // Where a point goes to not be drawn: `z` outside the zero-to-one range wgpu
@@ -307,7 +311,7 @@ const SKY_DISTANCE: f32 = 1.0e9;
 const OCCLUDER_NEARER: f32 = 2.0;
 
 @vertex
-fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
+fn vs_reproject(@builtin(vertex_index)index: u32) -> Splat {
     var out: Splat;
     out.clip = CULLED;
     out.material = 0u;
@@ -319,14 +323,14 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
 
     // Tested before anything is read, so a dropped point pays for no memory it
     // will not use.
-    if (dropped(pixel)) {
+    if dropped(pixel) {
         return out;
     }
 
     let normal = textureLoad(history_normal, vec2<i32>(pixel), 0);
     let depth = textureLoad(history_depth, vec2<i32>(pixel), 0).r;
 
-    if (depth == 0.0) {
+    if depth == 0.0 {
         // No ground down this pixel's ray -- or nothing known about it at all.
         // The two are told apart by the normal's fourth channel, which is where
         // a marched sky pixel leaves a mark and an abandoned ray, like a buffer
@@ -334,13 +338,13 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
         // second case, so the point is dropped and the march does the pixel over
         // -- which on the first frame, and the first after a resize, is the
         // whole screen, exactly as it was before any of this existed.
-        if (normal.w == 0.0) {
+        if normal.w == 0.0 {
             return out;
         }
         // Sky the eye may since have moved behind something is not sky any
         // more, so hand the pixel back rather than answer it from a ray that
         // was cast from somewhere else.
-        if (swept(pixel, 0.0)) {
+        if swept(pixel, 0.0) {
             return out;
         }
         // Sky, which has no world position -- only the direction the old camera
@@ -358,7 +362,7 @@ fn vs_reproject(@builtin(vertex_index) index: u32) -> Splat {
 
     // Ground the carry is still entitled to place, but not necessarily still
     // entitled to show: something nearer may have swept in front of it.
-    if (swept(pixel, depth)) {
+    if swept(pixel, depth) {
         return out;
     }
 
@@ -423,8 +427,10 @@ fn pack_offset(id: u32, landed: vec2<f32>, base: vec2<f32>) -> u32 {
 }
 
 struct Carried {
-    @location(0) material: u32,
-    @location(1) normal: vec4<f32>,
+    @location(0)
+    material: u32,
+    @location(1)
+    normal: vec4<f32>,
 };
 
 // No `frag_depth`: the depth being written is the one the rasterizer already

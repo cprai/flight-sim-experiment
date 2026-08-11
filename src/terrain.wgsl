@@ -217,7 +217,7 @@ fn resident(level: u32, cell: vec2<i32>) -> bool {
 // less than that is none.
 fn slot(level: u32, cell: vec2<i32>) -> vec2<i32> {
     let info = terrain.levels[level];
-    if (level >= terrain.resident_base) {
+    if level >= terrain.resident_base {
         return clamp(cell, info.valid_low, info.valid_high - vec2<i32>(1));
     }
     // A window wraps and does not clamp. The cells being generated or derived
@@ -306,14 +306,14 @@ fn level_coin(cell: vec2<i32>, level: u32) -> f32 {
 // edge to dissolve and no ring to hide -- every seam this is for is under the
 // base.
 fn level_share(level: u32, t: f32) -> f32 {
-    if (level < terrain.base_level) {
+    if level < terrain.base_level {
         return 0.0;
     }
     var share = 1.0;
-    if (level == terrain.base_level) {
+    if level == terrain.base_level {
         share = 1.0 - terrain.base_fade;
     }
-    if (level < terrain.resident_base) {
+    if level < terrain.resident_base {
         let far = terrain.detail_reach * f32(1u << level);
         let near = terrain.detail_fade * far;
         share = min(share, clamp((far - t) / max(far - near, 1e-6), 0.0, 1.0));
@@ -333,7 +333,7 @@ fn resident_height_at(level: u32, cell: vec2<i32>) -> f32 {
 }
 
 fn height_at(level: u32, cell: vec2<i32>) -> f32 {
-    if (level >= terrain.resident_base) {
+    if level >= terrain.resident_base {
         return resident_height_at(level, cell);
     }
     return textureLoad(detail_heights, slot(level, cell), i32(level), 0).r;
@@ -341,7 +341,7 @@ fn height_at(level: u32, cell: vec2<i32>) -> f32 {
 
 // The ceiling one cell of one level carries, from whichever pyramid holds it.
 fn ceiling_at(level: u32, cell: vec2<i32>) -> f32 {
-    if (level >= terrain.resident_base) {
+    if level >= terrain.resident_base {
         return textureLoad(maxima, slot(level, cell), mip(level)).r;
     }
     return textureLoad(detail_maxima, slot(level, cell), i32(level), 0).r;
@@ -521,7 +521,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     var hole = false;
 
     for (var step = 0u; step < terrain.march_steps; step += 1u) {
-        if (t >= limit) {
+        if t >= limit {
             return out;
         }
         let p = p0 + d0 * t;
@@ -531,8 +531,8 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         // Off the end of this level: the ray has left the raster at this
         // resolution, so hand it out to the level beyond, which covers twice
         // the ground per texel and so reaches one texel further.
-        if (!resident(level, cell)) {
-            if (level >= coarsest) {
+        if !resident(level, cell) {
+            if level >= coarsest {
                 // Past the coarsest level is past the raster, and there is
                 // nothing out there to draw. This used to be reported as a ray
                 // that gave up, because it was genuinely ambiguous: a square
@@ -554,8 +554,8 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         // at. Worth asking on arrival: at any horizon view most of the frame is
         // sky, and every one of those rays would otherwise walk the length of
         // each square it passes through.
-        if (dir.y >= 0.0 && eye.y + dir.y * t > terrain.levels[level].ceiling) {
-            if (level >= coarsest) {
+        if dir.y >= 0.0 && eye.y + dir.y * t > terrain.levels[level].ceiling {
+            if level >= coarsest {
                 return out;
             }
             level += 1u;
@@ -576,7 +576,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         let ceiling = ceiling_at(level, cell);
         // The texel bounds its whole closed square, so a ray above that ceiling
         // at both ends of the segment is above it throughout.
-        if (min(eye.y + dir.y * t, eye.y + dir.y * exit) > ceiling) {
+        if min(eye.y + dir.y * t, eye.y + dir.y * exit) > ceiling {
             t = exit + nudge;
             moved = true;
             level = min(level + 1u, coarsest);
@@ -602,10 +602,10 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         // Refusing the descent is not a special case. The ray simply treats
         // this level as the leaf, which is exactly what it does at the edge of
         // a window today, so nothing below has to know.
-        if (level > finest) {
+        if level > finest {
             let finer = level - 1u;
-            if (resident(finer, vec2<i32>(floor(p / (size * 0.5))))
-                && level_coin(cell, level) < level_share(finer, t)) {
+            if resident(finer, vec2<i32>(floor(p / (size * 0.5))))
+                && level_coin(cell, level) < level_share(finer, t) {
                 level = finer;
                 continue;
             }
@@ -636,7 +636,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         // Ground nothing is known about is not ground. The sentinel is far below
         // anything a canopy could add to it, so ground with trees on it is still
         // ground and a hole is still a hole.
-        if (deepest < NODATA_BELOW) {
+        if deepest < NODATA_BELOW {
             hole = true;
             t = exit + nudge;
             moved = true;
@@ -645,8 +645,8 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
             continue;
         }
 
-        if (eye.y + dir.y * t <= enter) {
-            if (!moved || hole) {
+        if eye.y + dir.y * t <= enter {
+            if !moved || hole {
                 // Either the ray began below the surface -- where it went in is
                 // behind the eye and cannot be found from here -- or it has just
                 // dropped through a hole and this is the underside of the ground
@@ -674,7 +674,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         // behind it now and cannot be what a later descent is coming up under.
         hole = false;
 
-        if (eye.y + dir.y * exit > leave) {
+        if eye.y + dir.y * exit > leave {
             // The ceiling allowed a hit somewhere in the texel; the surface
             // itself does not reach the ray.
             t = exit + nudge;
@@ -705,7 +705,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
         for (var i = 0u; i < REFINE_STEPS; i += 1u) {
             let middle = 0.5 * (above + below);
             let ground = surface(corner, (p0 + d0 * middle) / size - base);
-            if (eye.y + dir.y * middle > ground) {
+            if eye.y + dir.y * middle > ground {
                 above = middle;
             } else {
                 below = middle;
@@ -732,7 +732,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     // However it ends, getting here at all means the budget ran out rather than
     // the ray settling anything, which is what `ray_spent` records.
     ray_spent = true;
-    if (moved && !hole) {
+    if moved && !hole {
         out.found = true;
         out.position = eye + dir * t;
         out.level = level;
@@ -880,7 +880,7 @@ var<private> ray_spent: bool = false;
 // the texel it is standing in, and the far one carries no weight at the edge,
 // whereas a central difference reaches two texels past the hit.
 fn sample_height(level: u32, cell: vec2<i32>, last: vec2<i32>) -> vec2<f32> {
-    if (any(cell < vec2<i32>(0)) || any(cell > last) || !resident(level, cell)) {
+    if any(cell < vec2<i32>(0)) || any(cell > last) || !resident(level, cell) {
         return vec2<f32>(0.0, 0.0);
     }
     let height = height_at(level, cell);
@@ -893,13 +893,13 @@ fn sample_height(level: u32, cell: vec2<i32>, last: vec2<i32>) -> vec2<f32> {
 // flat where the texel stands alone -- so the last row of a survey slopes the
 // way its two real samples do rather than the way a repeated edge would.
 fn axis_slope(here: f32, low: vec2<f32>, high: vec2<f32>, metres: f32) -> f32 {
-    if (low.y > 0.0 && high.y > 0.0) {
+    if low.y > 0.0 && high.y > 0.0 {
         return (high.x - low.x) / (2.0 * metres);
     }
-    if (low.y > 0.0) {
+    if low.y > 0.0 {
         return (here - low.x) / metres;
     }
-    if (high.y > 0.0) {
+    if high.y > 0.0 {
         return (high.x - here) / metres;
     }
     return 0.0;
@@ -951,7 +951,7 @@ fn normal_at(level: u32, w: vec2<f32>) -> vec3<f32> {
     for (var j = -1; j <= 2; j += 1) {
         for (var i = -1; i <= 2; i += 1) {
             let outside = (i < 0 || i > 1) && (j < 0 || j > 1);
-            if (!outside) {
+            if !outside {
                 nearby[(j + 1) * 4 + i + 1] = sample_height(level, base + vec2<i32>(i, j), last);
             }
         }
@@ -963,7 +963,7 @@ fn normal_at(level: u32, w: vec2<f32>) -> vec3<f32> {
         for (var i = 0; i <= 1; i += 1) {
             let at = (j + 1) * 4 + i + 1;
             let here = nearby[at];
-            if (here.y <= 0.0) {
+            if here.y <= 0.0 {
                 continue;
             }
             let weight = select(1.0 - f.x, f.x, i == 1) * select(1.0 - f.y, f.y, j == 1);
@@ -973,7 +973,7 @@ fn normal_at(level: u32, w: vec2<f32>) -> vec3<f32> {
             total += weight;
         }
     }
-    if (total <= 0.0) {
+    if total <= 0.0 {
         return vec3<f32>(0.0, 1.0, 0.0);
     }
     // A mean of directions, which is not itself one. Renormalising is what
@@ -1071,7 +1071,7 @@ fn unknown() -> Ground {
 // worth spending rays on" and is the safe way to be wrong.
 fn was_at(position: vec3<f32>) -> vec2<f32> {
     let clip = camera.was_view_proj * vec4<f32>(position, 1.0);
-    if (clip.w <= 0.0) {
+    if clip.w <= 0.0 {
         return vec2<f32>(0.0);
     }
     let ndc = clip.xy / clip.w;
@@ -1085,12 +1085,12 @@ fn was_at(position: vec3<f32>) -> vec2<f32> {
 // as sky being still -- it turns with the camera like everything else -- but
 // sky is not what the drop pattern is trying to find.
 fn motion_of(pixel: vec2<u32>, ground: Ground) -> vec2<f32> {
-    if (ground.depth == 0.0) {
+    if ground.depth == 0.0 {
         return vec2<f32>(0.0);
     }
     let now = vec2<f32>(pixel) + 0.5;
     let was = was_at(ground.position);
-    if (all(was == vec2<f32>(0.0))) {
+    if all(was == vec2<f32>(0.0)) {
         return vec2<f32>(0.0);
     }
     return now - was;
@@ -1107,15 +1107,15 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // A ray already above the highest ground anywhere resident, and still
     // climbing, is never coming back down. Worth one comparison: at any horizon
     // view most of the frame is sky.
-    if (dir.y >= 0.0 && eye.y >= terrain.ceiling) {
+    if dir.y >= 0.0 && eye.y >= terrain.ceiling {
         ray_abandoned = false;
         ray_spent = false;
         return nothing();
     }
 
     let hit = march(eye, dir);
-    if (!hit.found) {
-        if (hit.abandoned) {
+    if !hit.found {
+        if hit.abandoned {
             return unknown();
         }
         return nothing();
@@ -1125,7 +1125,7 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // shares their slot, so the ground beyond the last real sample is not
     // ground. A straight ray leaves the data once and never comes back, so
     // there is nothing further along worth carrying on for.
-    if (any(hit.position.xz < terrain.data_min) || any(hit.position.xz > terrain.data_max)) {
+    if any(hit.position.xz < terrain.data_min) || any(hit.position.xz > terrain.data_max) {
         return nothing();
     }
 
@@ -1154,7 +1154,7 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
     // the same answer while a generated level had nothing to say about the
     // ground itself; now it does, and the level that was descended to is the
     // level that answers.
-    if (hit.level < terrain.resident_base) {
+    if hit.level < terrain.resident_base {
         out.material = textureLoad(detail_materials, slot(hit.level, cell), i32(hit.level), 0).r;
     } else {
         out.material = textureLoad(materials, slot(hit.level, cell), mip(hit.level)).r;
@@ -1196,7 +1196,7 @@ fn ground_at(pixel: vec2<u32>) -> Ground {
 // ground and zeroes for sky, and no ground normal can be short.
 fn carried_at(pixel: vec2<u32>, depth: f32) -> Ground {
     let normal = textureLoad(carried_normal, vec2<i32>(pixel), 0);
-    if (dot(normal.xyz, normal.xyz) < 0.5) {
+    if dot(normal.xyz, normal.xyz) < 0.5 {
         return nothing();
     }
     var out: Ground;
@@ -1241,10 +1241,10 @@ fn store(pixel: vec2<u32>, ground: Ground) {
 // the G-buffer go uncleared: it is either written from what the reprojection
 // carried, written as sky, or handed to the march, which writes it.
 @compute @workgroup_size(8, 8)
-fn cs_compact(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_compact(@builtin(global_invocation_id)id: vec3<u32>) {
     // The dispatch is rounded up to whole workgroups, so the last row and
     // column of them run past the target.
-    if (any(id.xy >= terrain.viewport)) {
+    if any(id.xy >= terrain.viewport) {
         return;
     }
     let pixel = id.xy;
@@ -1252,7 +1252,7 @@ fn cs_compact(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // Already answered by a ray cast on an earlier frame.
     let depth = textureLoad(carried_depth, at, 0);
-    if (depth != 0.0) {
+    if depth != 0.0 {
         store(pixel, carried_at(pixel, depth));
         atomicAdd(&tally.carried, 1u);
         return;
@@ -1269,7 +1269,7 @@ fn cs_compact(@builtin(global_invocation_id) id: vec3<u32>) {
     // sky at all -- it rejects the whole test before the normalize behind
     // `ray_through` is ever run.
     let eye = camera.position.xyz;
-    if (eye.y >= terrain.ceiling && ray_through(pixel).y >= 0.0) {
+    if eye.y >= terrain.ceiling && ray_through(pixel).y >= 0.0 {
         store(pixel, nothing());
         atomicAdd(&tally.sky, 1u);
         return;
@@ -1328,14 +1328,14 @@ var<workgroup> worst: array<vec2<f32>, 64>;
 
 @compute @workgroup_size(8, 8)
 fn cs_risk(
-    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(global_invocation_id)id: vec3<u32>,
     @builtin(workgroup_id) cell: vec3<u32>,
     @builtin(local_invocation_index) slot: u32,
 ) {
     // Pixels past the edge take the identity of the reduction rather than
     // dropping out, so every lane has something defined to contribute.
     var here = vec2<f32>(0.0);
-    if (all(id.xy < terrain.viewport)) {
+    if all(id.xy < terrain.viewport) {
         let motion = unpack2x16float(textureLoad(motion, vec2<i32>(id.xy), 0).r);
         here = vec2<f32>(
             max(abs(motion.x), abs(motion.y)),
@@ -1346,13 +1346,13 @@ fn cs_risk(
     workgroupBarrier();
 
     for (var stride = 32u; stride > 0u; stride >>= 1u) {
-        if (slot < stride) {
+        if slot < stride {
             worst[slot] = max(worst[slot], worst[slot + stride]);
         }
         workgroupBarrier();
     }
 
-    if (slot == 0u) {
+    if slot == 0u {
         textureStore(out_risk, vec2<i32>(cell.xy), vec4<f32>(worst[0], 0.0, 0.0));
     }
 }
@@ -1393,10 +1393,10 @@ const REACH_CELLS: i32 = 8;
 // a cell needs its neighbours' finished risk. See `swept` in
 // `src/reproject.wgsl` for what reads it.
 @compute @workgroup_size(8, 8)
-fn cs_reach(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_reach(@builtin(global_invocation_id)id: vec3<u32>) {
     let cells = vec2<i32>((terrain.viewport + u32(RISK_CELL) - 1u) / u32(RISK_CELL));
     let cell = vec2<i32>(id.xy);
-    if (any(cell >= cells)) {
+    if any(cell >= cells) {
         return;
     }
     var nearest = 0.0;
@@ -1411,7 +1411,7 @@ fn cs_reach(@builtin(global_invocation_id) id: vec3<u32>) {
             // its own sky in doubt, and a neighbour's has to cross the space
             // between before it counts.
             let gap = RISK_CELL * f32(max(abs(dx), abs(dy)) - 1);
-            if (there.r > max(gap, 0.0)) {
+            if there.r > max(gap, 0.0) {
                 nearest = max(nearest, there.g);
             }
         }
@@ -1640,17 +1640,17 @@ fn fractal(p: vec2<f32>, wavelength: f32, octaves: u32, whole: u32, seed: u32) -
     var sum = 0.0;
     var total = 0.0;
     for (var octave = 0u; octave < DETAIL_OCTAVES; octave++) {
-        if (octave >= whole) {
+        if octave >= whole {
             break;
         }
         total += amplitude;
-        if (octave < octaves) {
+        if octave < octaves {
             sum += gradient_noise(p * frequency, seed ^ (octave * 0x51ed270bu)) * amplitude;
         }
         frequency *= 2.0;
         amplitude *= 0.5;
     }
-    if (total <= 0.0) {
+    if total <= 0.0 {
         return 0.0;
     }
     return sum / total;
@@ -1754,7 +1754,7 @@ fn cover_upscaled(cell: vec2<i32>, level: u32, octaves: u32) -> u32 {
     let node = vec2<i32>(floor((centre + warp) / metres));
     let there = textureLoad(materials, slot(base, node), mip(base)).r;
     let here = cover_at(cell, level);
-    if (there == here || !drawn_by_nature(there) || !drawn_by_nature(here)) {
+    if there == here || !drawn_by_nature(there) || !drawn_by_nature(here) {
         return here;
     }
     return there;
@@ -1843,7 +1843,7 @@ fn lift_at(level: u32, cell: vec2<i32>) -> f32 {
 fn bare_height_at(cell: vec2<i32>) -> f32 {
     let base = terrain.resident_base;
     let height = resident_height_at(base, cell);
-    if (height < NODATA_BELOW) {
+    if height < NODATA_BELOW {
         return height;
     }
     return height - lift_at(base, cell);
@@ -1872,7 +1872,7 @@ fn base_height(at: vec2<f32>) -> f32 {
     // cliff dropping eight kilometres rather than as a hole. Spreading the hole
     // by the width of the kernel instead draws slightly more of the survey's
     // edge as nothing, which is the safe direction.
-    if (deepest < NODATA_BELOW) {
+    if deepest < NODATA_BELOW {
         return deepest;
     }
     return total;
@@ -1880,8 +1880,8 @@ fn base_height(at: vec2<f32>) -> f32 {
 
 // One thread per texel of a generated tile.
 @compute @workgroup_size(8, 8)
-fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= detail.size.x || id.y >= detail.size.y) {
+fn cs_detail(@builtin(global_invocation_id)id: vec3<u32>) {
+    if id.x >= detail.size.x || id.y >= detail.size.y {
         return;
     }
     let level = detail.level;
@@ -1905,7 +1905,7 @@ fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
     // nothing here, and a hole with texture on it is ground. The cover still
     // stands: a hole is ground nobody measured the height of, not ground nobody
     // mapped, and the id is what the shading has to paint it with either way.
-    if (height >= NODATA_BELOW) {
+    if height >= NODATA_BELOW {
         // How steep the base is under this point, as a rise over run, from the
         // four samples around the node. The relief comes in with it: a box
         // filter throws away most on a hillside and nothing at all on a flat,
@@ -1922,7 +1922,7 @@ fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
         // A lake with waves in it is worse than a lake with none, and the
         // survey is right about water being flat. Asked of the upscaled cover,
         // so the flat ends exactly where the blue does.
-        if ((painted >> 8u) == WATER_COVER) {
+        if (painted >> 8u) == WATER_COVER {
             relief = 0.0;
         }
 
@@ -1940,7 +1940,7 @@ fn cs_detail(@builtin(global_invocation_id) id: vec3<u32>) {
         height += grown.lift;
         // Only where something stands: a crown hides the ground and takes the
         // texel's id with it, and everything else leaves the ground's own.
-        if (grown.id != 0u) {
+        if grown.id != 0u {
             painted = grown.id;
         }
     }
@@ -2105,7 +2105,7 @@ fn stone_strew(p: vec2<f32>) -> f32 {
 // reaches out of its own cell and has to be findable from the cells beside it.
 // Those nine hashes are the whole cost of this file.
 fn crown_at(p: vec2<f32>, density: f32, health: f32) -> f32 {
-    if (health <= 0.0 || density <= 0.0) {
+    if health <= 0.0 || density <= 0.0 {
         return 0.0;
     }
     // The understorey: a floor under the crowns for the ground between them,
@@ -2127,7 +2127,7 @@ fn crown_at(p: vec2<f32>, density: f32, health: f32) -> f32 {
             let wants = f32((bits >> 26u) & 0x3fu) * (1.0 / 64.0);
 
             let grow = cover_fade(clamp((density - wants) / COVER_EDGE, 0.0, 1.0));
-            if (grow <= 0.0) {
+            if grow <= 0.0 {
                 continue;
             }
             // Anywhere in its own cell, which is what stops the stand drawing
@@ -2138,7 +2138,7 @@ fn crown_at(p: vec2<f32>, density: f32, health: f32) -> f32 {
             let height = health * mix(CANOPY_SHORTEST, CANOPY_TALLEST, size) * grow;
 
             let u = length(p - trunk) / radius;
-            if (u < 1.0) {
+            if u < 1.0 {
                 let cone = 1.0 - u;
                 let dome = sqrt(max(1.0 - u * u, 0.0));
                 found = max(found, height * mix(cone, dome, CANOPY_ROUNDNESS));
@@ -2164,7 +2164,7 @@ fn stone_class(
     tallest: f32,
     seed: u32,
 ) -> f32 {
-    if (density <= 0.0 || stature <= 0.0) {
+    if density <= 0.0 || stature <= 0.0 {
         return 0.0;
     }
     var found = 0.0;
@@ -2179,7 +2179,7 @@ fn stone_class(
             let wants = f32((bits >> 26u) & 0x3fu) * (1.0 / 64.0);
 
             let grow = cover_fade(clamp((density - wants) / COVER_EDGE, 0.0, 1.0));
-            if (grow <= 0.0) {
+            if grow <= 0.0 {
                 continue;
             }
             let middle = (vec2<f32>(cell) + jitter) * spacing;
@@ -2188,7 +2188,7 @@ fn stone_class(
             let height = stature * mix(shortest, tallest, grade) * grow;
 
             let u = length(p - middle) / reach;
-            if (u < 1.0) {
+            if u < 1.0 {
                 let cone = 1.0 - u;
                 let dome = sqrt(max(1.0 - u * u, 0.0));
                 found = max(found, height * mix(cone, dome, STONE_ROUNDNESS));
@@ -2253,7 +2253,7 @@ fn tallest_mean(
     // that does. The seventeenth entry is never written and is therefore zero,
     // which is what makes `k + 1` safe at the top.
     for (var k = i32(COVER_BUCKETS) - 1; k >= 0; k--) {
-        if (!found && counts[k] >= taken) {
+        if !found && counts[k] >= taken {
             let above = counts[k + 1];
             let above_sum = sums[k + 1];
             let inside = max(counts[k] - above, 1e-6);
@@ -2345,7 +2345,7 @@ fn stone_baked(
                 BOULDER_SEED,
             );
             var here = block;
-            if (strewn) {
+            if strewn {
                 here = max(
                     here,
                     stone_class(
@@ -2442,7 +2442,7 @@ fn standing_on(cover: u32, centre: vec2<f32>, texel: f32, slope: f32) -> Standin
     // Krummholz: the same trees, beaten down to head height and scattered. Flat
     // numbers, because nothing about this belt varies in a way that reads from
     // the air -- what makes it look right is that it is sparse and short.
-    if (cover == SCRUB_ID || cover == SHRUBBERY_ID) {
+    if cover == SCRUB_ID || cover == SHRUBBERY_ID {
         return canopy_baked(centre, texel, 0.30 * clump, 0.17);
     }
 
@@ -2450,30 +2450,28 @@ fn standing_on(cover: u32, centre: vec2<f32>, texel: f32, slope: f32) -> Standin
     let field = stone_field(centre);
     let strew = stone_strew(centre);
     var scatter = vec3<f32>(0.0);
-    if (cover == SCREE_ID) {
+    if cover == SCREE_ID {
         // Talus: the rubble a cliff sheds, with the blocks that did not break up
         // lying in it.
         scatter = vec3<f32>(0.40, 0.72, 0.7);
-    } else if (cover == BARE_ROCK_ID) {
+    } else if cover == BARE_ROCK_ID {
         // A cliff: swept, with what the ledges managed to hold. A face steep
         // enough to read as bare rock has already sent anything loose to the
         // talus below it, so the rubble fades out with the steepness.
         scatter = vec3<f32>(0.22, 0.15 * (1.0 - steep), 0.9);
-    } else if (cover == FELL_ID || cover == HEATH_ID) {
+    } else if cover == FELL_ID || cover == HEATH_ID {
         // Felsenmeer: the alpine plateau, shattered in place. The blocks want
         // flat ground, because anything steep enough to shed them has.
         scatter = vec3<f32>(0.18 + 0.12 * (1.0 - steep), 0.50, 0.75);
-    } else if (cover == SHINGLE_ID) {
+    } else if cover == SHINGLE_ID {
         // A gravel bar: cobbles and not much else. The stature is what is low
         // rather than the densities -- a river that could roll a five-metre
         // block would not have left it here.
         scatter = vec3<f32>(0.05, 0.65, 0.35);
-    } else if (
-        cover == GRASSLAND_ID
+    } else if cover == GRASSLAND_ID
         || cover == MEADOW_ID
         || cover == SAND_ID
-        || cover == BARE_EARTH_ID
-    ) {
+        || cover == BARE_EARTH_ID {
         // Erratics: single blocks standing on ground that has none of their
         // kind. The sparsest and the most visible, which is not a contradiction
         // -- a valley floor is flat, open and looked at from low down, so one
@@ -2503,15 +2501,15 @@ fn cover_centre(cell: vec2<i32>, level: u32) -> vec2<f32> {
 // One thread per pair of cells across, as `cs_maxima` is and for the same
 // reason: the cells go out through a storage buffer as packed halves.
 @compute @workgroup_size(8, 8)
-fn cs_cover(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_cover(@builtin(global_invocation_id)id: vec3<u32>) {
     let pairs = (job.size.x + 1u) / 2u;
-    if (id.x >= pairs || id.y >= job.size.y) {
+    if id.x >= pairs || id.y >= job.size.y {
         return;
     }
     let at = job.origin + vec2<i32>(i32(id.x) * 2, i32(id.y));
     let low = level_lift(at);
     var high = low;
-    if (id.x * 2u + 1u < job.size.x) {
+    if id.x * 2u + 1u < job.size.x {
         high = level_lift(at + vec2<i32>(1, 0));
     }
     out_halves[id.y * job.stride + id.x] = ceiling_half(low) | (ceiling_half(high) << 16u);
@@ -2535,15 +2533,15 @@ fn cs_cover(@builtin(global_invocation_id) id: vec3<u32>) {
 // for is the slope, which is a question about the ground rather than about what
 // is standing on it.
 @compute @workgroup_size(8, 8)
-fn cs_raise(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_raise(@builtin(global_invocation_id)id: vec3<u32>) {
     let pairs = (job.size.x + 1u) / 2u;
-    if (id.x >= pairs || id.y >= job.size.y) {
+    if id.x >= pairs || id.y >= job.size.y {
         return;
     }
     let at = job.origin + vec2<i32>(i32(id.x) * 2, i32(id.y));
     let wide = id.y * job.wide_stride + id.x * 2u;
     out_surface[wide] = level_surface(at);
-    if (id.x * 2u + 1u < job.size.x) {
+    if id.x * 2u + 1u < job.size.x {
         out_surface[wide + 1u] = level_surface(at + vec2<i32>(1, 0));
     }
 }
@@ -2552,7 +2550,7 @@ fn level_surface(cell: vec2<i32>) -> f32 {
     let height = resident_height_at(job.level, cell);
     // Nothing stands on a hole. The sentinel is what says the survey measured
     // nothing here, and a hole with trees on it is ground.
-    if (height < NODATA_BELOW) {
+    if height < NODATA_BELOW {
         return height;
     }
     return height + lift_at(job.level, cell);
@@ -2578,10 +2576,10 @@ fn level_surface(cell: vec2<i32>) -> f32 {
 // honestly is three times the base pass again, and it buys a step at every ring
 // where averaging leaves none.
 fn level_lift(cell: vec2<i32>) -> f32 {
-    if (resident_height_at(job.level, cell) < NODATA_BELOW) {
+    if resident_height_at(job.level, cell) < NODATA_BELOW {
         return 0.0;
     }
-    if (job.level == terrain.resident_base) {
+    if job.level == terrain.resident_base {
         // The survey's own id, unwarped: this texel *is* the resolution the
         // cover was stored at, so there is nothing here to upscale.
         return standing_at(cover_at(cell, job.level), cell, job.level).lift;
@@ -2595,13 +2593,13 @@ fn level_lift(cell: vec2<i32>) -> f32 {
     for (var dy = 0; dy < 2; dy++) {
         for (var dx = 0; dx < 2; dx++) {
             let child = cell * 2 + vec2<i32>(dx, dy);
-            if (resident_height_at(job.level - 1u, child) >= NODATA_BELOW) {
+            if resident_height_at(job.level - 1u, child) >= NODATA_BELOW {
                 sum += lift_at(job.level - 1u, child);
                 found += 1.0;
             }
         }
     }
-    if (found <= 0.0) {
+    if found <= 0.0 {
         return 0.0;
     }
     return sum / found;
@@ -2669,13 +2667,13 @@ fn standing_at(cover: u32, cell: vec2<i32>, level: u32) -> Standing {
 // mode is out by more than one representable step, so one step always closes it.
 fn ceiling_half(height: f32) -> u32 {
     let bits = pack2x16float(vec2<f32>(height, 0.0)) & 0xffffu;
-    if (unpack2x16float(bits).x >= height) {
+    if unpack2x16float(bits).x >= height {
         return bits;
     }
     // One step away from zero within a sign, which is one step towards positive
     // infinity. Negative zero cannot arrive here: anything that rounds to it
     // came from a value at or below zero, which it is therefore not below.
-    if ((bits & 0x8000u) != 0u) {
+    if (bits & 0x8000u) != 0u {
         return bits - 1u;
     }
     return bits + 1u;
@@ -2693,7 +2691,7 @@ fn derived_ceiling(cell: vec2<i32>) -> f32 {
     top = max(top, height_at(level, cell + vec2<i32>(1, 0)));
     top = max(top, height_at(level, cell + vec2<i32>(0, 1)));
     top = max(top, height_at(level, cell + vec2<i32>(1, 1)));
-    if (job.carry == 0u) {
+    if job.carry == 0u {
         return top;
     }
 
@@ -2707,7 +2705,7 @@ fn derived_ceiling(cell: vec2<i32>) -> f32 {
     for (var dy = 0; dy < 2; dy++) {
         for (var dx = 0; dx < 2; dx++) {
             let child = cell * 2 + vec2<i32>(dx, dy);
-            if (all(child >= job.below_low) && all(child < job.below_high)) {
+            if all(child >= job.below_low) && all(child < job.below_high) {
                 top = max(top, ceiling_at(level - 1u, child));
             }
         }
@@ -2718,9 +2716,9 @@ fn derived_ceiling(cell: vec2<i32>) -> f32 {
 // One thread per pair of cells across, because the smallest thing a storage
 // buffer can be written in is four bytes and a cell is two.
 @compute @workgroup_size(8, 8)
-fn cs_maxima(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_maxima(@builtin(global_invocation_id)id: vec3<u32>) {
     let pairs = (job.size.x + 1u) / 2u;
-    if (id.x >= pairs || id.y >= job.size.y) {
+    if id.x >= pairs || id.y >= job.size.y {
         return;
     }
     let at = job.origin + vec2<i32>(i32(id.x) * 2, i32(id.y));
@@ -2729,7 +2727,7 @@ fn cs_maxima(@builtin(global_invocation_id) id: vec3<u32>) {
     // are in the buffer but not in the copy out of it, so they are filled by
     // repeating rather than by reading a cell the rectangle does not cover.
     var high = low;
-    if (id.x * 2u + 1u < job.size.x) {
+    if id.x * 2u + 1u < job.size.x {
         high = ceiling_half(derived_ceiling(at + vec2<i32>(1, 0)));
     }
     out_halves[id.y * job.stride + id.x] = low | (high << 16u);
@@ -2737,14 +2735,14 @@ fn cs_maxima(@builtin(global_invocation_id) id: vec3<u32>) {
 
 // One thread per pixel the reprojection could not answer.
 @compute @workgroup_size(64)
-fn cs_march(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_march(@builtin(global_invocation_id)id: vec3<u32>) {
     // The list is laid out in rows of `MARCH_ROW` workgroups; see the constant
     // for why it is not one long line. A grid one row deep has `y` of zero
     // throughout and this is `id.x`, so the short case costs nothing.
     let at = id.y * MARCH_ROW * MARCH_GROUP + id.x;
     // The dispatch is whole workgroups and whole rows, so the end runs past the
     // list.
-    if (at >= atomicLoad(&tally.holes)) {
+    if at >= atomicLoad(&tally.holes) {
         return;
     }
     let packed = holes[at];
@@ -2752,10 +2750,10 @@ fn cs_march(@builtin(global_invocation_id) id: vec3<u32>) {
     store(pixel, ground_at(pixel));
     // Diagnostics, and only paid for by the rays that failed: on a healthy
     // frame almost nothing reaches either of these.
-    if (ray_abandoned) {
+    if ray_abandoned {
         atomicAdd(&tally.abandoned, 1u);
     }
-    if (ray_spent) {
+    if ray_spent {
         atomicAdd(&tally.spent, 1u);
     }
     atomicAdd(&tally.wrote, 1u);
