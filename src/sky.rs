@@ -364,7 +364,13 @@ pub struct Sky {
     skyview_build: wgpu::ComputePipeline,
     /// Group 2 for that build: the sampler and the two finished tables, and
     /// deliberately not the sky-view table it is writing. See [`Build`].
+    ///
+    /// Handed out as well as used here -- see [`Sky::sun_tables_bind_group`] --
+    /// because a pass that wants the sun and not the sky wants exactly this.
     read_tables: wgpu::BindGroup,
+    /// The layout that group was built against, kept so a pipeline elsewhere can
+    /// be compiled with it.
+    read_tables_layout: wgpu::BindGroupLayout,
     write_skyview: wgpu::BindGroup,
     /// Group 2 in full: the sampler and both tables.
     tables_layout: wgpu::BindGroupLayout,
@@ -725,6 +731,7 @@ impl Sky {
             aerial_build,
             write_aerial,
             read_tables,
+            read_tables_layout,
             write_skyview: write_bind(
                 "sky view write bind group",
                 &write_skyview_layout,
@@ -884,6 +891,27 @@ impl Sky {
     #[allow(dead_code, reason = "bound by the shading pass from the next commit")]
     pub fn tables_bind_group(&self) -> &wgpu::BindGroup {
         &self.tables_bind_group
+    }
+
+    /// Group 2 with only what is true of the sun: the sampler, the
+    /// transmittance table and the multiple-scattering table.
+    ///
+    /// The same group the two per-frame builds here read, handed out because a
+    /// pass that wants to know how much sun reaches a point and how bright the
+    /// sky around it is wants exactly these two and none of the rest. What is
+    /// left out is what is true of a *view*: the sky-view table and the two
+    /// aerial-perspective volumes, which describe the air between the eye and
+    /// something, and which the cloud march has no use for -- the haze in front
+    /// of a cloud is applied where the cloud is composited into the frame.
+    ///
+    /// That is not only tidiness. Sampled textures per shader stage are limited,
+    /// and three of them is the difference between the march fitting and not.
+    pub fn sun_tables_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.read_tables_layout
+    }
+
+    pub fn sun_tables_bind_group(&self) -> &wgpu::BindGroup {
+        &self.read_tables
     }
 
     /// The tables themselves, for the readback tests.

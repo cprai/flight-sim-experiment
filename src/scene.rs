@@ -102,6 +102,9 @@ pub struct Scene {
     pub weather: crate::cloud::Preset,
     /// The noise a cloud is carved out of, and the weather over it.
     cloud: crate::cloud::Cloud,
+    /// The coarse bound on where that cloud can be, and the half-resolution
+    /// march that draws it. Screen-sized, so rebuilt by [`Scene::resize`].
+    march: crate::cloud::March,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     terrain: Terrain,
@@ -139,7 +142,6 @@ pub struct Scene {
     ///
     /// [`Scene::settle`] advances it by nothing, for the reason it puts the
     /// frame counter back: settling is not time passing.
-    #[allow(dead_code, reason = "read by the weather, which lands next")]
     elapsed: std::time::Duration,
     /// The ray basis of the camera that drew what is now the history.
     ///
@@ -319,6 +321,15 @@ impl Scene {
             sky.layout(),
             sky.tables_layout(),
         );
+        let cloud = crate::cloud::Cloud::new(device);
+        let march = crate::cloud::March::new(
+            device,
+            camera_layout,
+            sky.layout(),
+            sky.sun_tables_layout(),
+            &cloud,
+            &gbuffer,
+        );
         Self {
             camera,
             sun: crate::sky::Sun::default(),
@@ -326,7 +337,8 @@ impl Scene {
             sky,
             air: crate::air::Air::new(device),
             weather: crate::cloud::Preset::default(),
-            cloud: crate::cloud::Cloud::new(device),
+            cloud,
+            march,
             camera_buffer,
             camera_bind_group,
             terrain,
@@ -375,6 +387,9 @@ impl Scene {
             crate::reproject::bind_reach(device, &self.reach_layout, &self.carried);
         self.reproject.rebind(device, &self.gbuffer, &self.carried);
         self.shading.rebind(device, &self.gbuffer);
+        // The half-resolution cloud buffers follow the frame, and the march
+        // reads the depth of the G-buffer just rebuilt above.
+        self.march.resize(device, &self.cloud, &self.gbuffer);
         self.terrain.resize(viewport);
         self.camera.aspect = viewport.x as f32 / viewport.y.max(1) as f32;
     }
@@ -393,7 +408,7 @@ impl Scene {
     /// the caller is the only one who knows what a frame is worth: a window
     /// hands over the wall-clock gap since the last redraw, where a headless
     /// flight hands over a nominal step so that two runs of it are the same
-    /// run. Nothing reads the total yet -- see [`Scene::elapsed`].
+    /// run. What reads the total is the weather; see [`Scene::elapsed`].
     ///
     /// [`Scene::elapsed`]: Scene#structfield.elapsed
     pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: std::time::Duration) {
@@ -613,15 +628,6 @@ impl Scene {
         }
 
         {
-            // Beside the atmosphere and for the same reason: it depends on
-            // nothing this frame produces -- only on the clock -- and
-            // everything after it may read what it writes.
-            let mut cloud = gpu.scope(crate::profile::CLOUD);
-            let mut pass = cloud.scoped_compute_pass("weather");
-            self.cloud.draw_weather(&mut pass);
-        }
-
-        {
             // Reads the G-buffer -- still holding last frame, because nothing
             // has written this one yet -- and scatters it into buffers of its
             // own. The two sets swap roles rather than contents, so there is no
@@ -702,6 +708,33 @@ impl Scene {
             let mut pass = gpu.scoped_compute_pass("reach");
             pass.set_bind_group(3, &self.reach_bind_group, &[]);
             self.terrain.reach(&mut pass);
+        }
+
+        {
+            // After the march, because the last of these needs the depth it
+            // wrote: the ground is what stops a cloud ray, and reading the
+            // G-buffer is what makes that occlusion exact rather than a guess.
+            // The first two depend on nothing this frame produces and could sit
+            // anywhere; they are here so the readout shows what a sky costs as
+            // one row with its parts under it.
+            //
+            // Three passes rather than one dispatch after another, because each
+            // reads what the one before it wrote and a pass boundary is what
+            // makes those writes visible.
+            let mut cloud = gpu.scope(crate::profile::CLOUD);
+            {
+                let mut pass = cloud.scoped_compute_pass("weather");
+                self.cloud.draw_weather(&mut pass);
+            }
+            {
+                let mut pass = cloud.scoped_compute_pass("cloud-ceiling");
+                self.march.draw_ceiling(&mut pass);
+            }
+            {
+                let mut pass = cloud.scoped_compute_pass("cloud-march");
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                self.march.draw(&mut pass, &self.sky);
+            }
         }
 
         // The clear never survives -- the shading pass writes every pixel --
@@ -1054,7 +1087,39 @@ mod tests {
         path: &[Vec3],
         sun: crate::sky::Sun,
     ) -> Frame {
-        render_over(residency, heights, materials, aim, path, sun, placement())
+        render_over(
+            residency,
+            heights,
+            materials,
+            aim,
+            path,
+            sun,
+            placement(),
+            crate::cloud::Preset::default(),
+        )
+    }
+
+    /// As [`render_sunlit`], but under weather of the caller's choosing.
+    ///
+    /// Separate for the reason the sun is separate: only a test that is *about*
+    /// the cloud has any business naming a preset, and the rest want the sky
+    /// every frame in this file has been drawn under since the weather arrived.
+    fn render_under(
+        heights: Vec<f32>,
+        materials: Vec<MaterialId>,
+        aim: impl FnOnce(&mut Camera),
+        weather: crate::cloud::Preset,
+    ) -> Frame {
+        render_over(
+            test_residency(),
+            heights,
+            materials,
+            aim,
+            &[],
+            crate::sky::Sun::default(),
+            placement(),
+            weather,
+        )
     }
 
     /// The same, over a georeferencing of the caller's choosing. See
@@ -1068,6 +1133,7 @@ mod tests {
         path: &[Vec3],
         sun: crate::sky::Sun,
         placement: Georeferencing,
+        weather: crate::cloud::Preset,
     ) -> Frame {
         let (device, queue) = test_device();
 
@@ -1090,6 +1156,7 @@ mod tests {
 
         let mut scene = test_scene_over(&device, format, residency, heights, materials, placement);
         scene.sun = sun;
+        scene.weather = weather;
         aim(&mut scene.camera);
 
         // Walk the requested path first, so the windows arrive at the captured
@@ -1147,9 +1214,46 @@ mod tests {
             scene.gbuffer.targets.material.as_image_copy(),
             &material_readback,
         );
+
+        // The cloud buffer is half the frame and four half floats a texel, so
+        // it takes a copy of its own rather than riding on the one above. At
+        // this viewport its rows are 1024 bytes, already a multiple of the copy
+        // alignment, and the assertion says so rather than the reader having to
+        // work it out.
+        let (cloud_colour, _, _) = scene.march.buffers_for_test();
+        let cloud_size = scene.march.size();
+        let cloud_row = cloud_size.x * 8;
+        assert_eq!(cloud_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
+        let cloud_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cloud readback"),
+            size: u64::from(cloud_row * cloud_size.y),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            cloud_colour.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &cloud_readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(cloud_row),
+                    rows_per_image: Some(cloud_size.y),
+                },
+            },
+            wgpu::Extent3d {
+                width: cloud_size.x,
+                height: cloud_size.y,
+                depth_or_array_layers: 1,
+            },
+        );
         queue.submit(std::iter::once(encoder.finish()));
 
-        for buffer in [&readback, &depth_readback, &material_readback] {
+        for buffer in [
+            &readback,
+            &depth_readback,
+            &material_readback,
+            &cloud_readback,
+        ] {
             buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
         }
         device
@@ -1175,11 +1279,23 @@ mod tests {
         )
         .to_vec();
         material_readback.unmap();
+        // Only the transmittance: what the cloud scattered is a matter for the
+        // composite, but whether a ray met cloud at all is what the depth clip
+        // decides, and that is one number.
+        let clouds = cloud_readback
+            .get_mapped_range(..)
+            .expect("buffer not mapped")
+            .chunks_exact(8)
+            .map(|texel| half::f16::from_le_bytes([texel[6], texel[7]]).to_f32())
+            .collect();
+        cloud_readback.unmap();
 
         Frame {
             pixels,
             depths,
             materials,
+            clouds,
+            cloud_size,
             base_level: scene.terrain.base_level(),
         }
     }
@@ -1208,6 +1324,10 @@ mod tests {
         /// where inside the pixel the ground sits in the rest. See
         /// `MATERIAL_MASK` in `src/terrain.wgsl`.
         materials: Vec<u32>,
+        /// How much of the background survives the cloud, per half-resolution
+        /// texel. One is a ray that met no cloud at all.
+        clouds: Vec<f32>,
+        cloud_size: UVec2,
         /// How much detail the camera's height above the ground bought:
         /// everything below this level was dropped. A test that means to look
         /// at more than one level has to say so, because a camera high enough
@@ -1252,6 +1372,15 @@ mod tests {
         ///
         /// Sky above a ridge is honest; sky enclosed by ground is a ray that
         /// should have found something and did not.
+        /// How much cloud the ray through this pixel met, from none to all.
+        ///
+        /// One number per two-by-two block of pixels, because that is what the
+        /// march produces; a pixel is told what its block found.
+        fn cloud(&self, x: u32, y: u32) -> f32 {
+            let at = (y / 2) * self.cloud_size.x + x / 2;
+            1.0 - self.clouds[at as usize]
+        }
+
         fn holes(&self) -> Vec<(u32, u32)> {
             (0..SIZE)
                 .flat_map(|x| {
@@ -2662,6 +2791,7 @@ mod tests {
             &[],
             crate::sky::Sun::default(),
             wide,
+            crate::cloud::Preset::default(),
         );
 
         // Two bands of ground, near the bottom of the frame and just under the
@@ -3382,6 +3512,103 @@ mod tests {
         eprintln!("wrote {}", path.display());
     }
 
+    /// A flat shelf rising out of flat ground, east of the middle.
+    ///
+    /// Deliberately lower than any cloud base: a ray that stops on it has not
+    /// climbed into the deck, so what it met is nothing at all rather than a
+    /// little. That is what makes the comparison below a clean one.
+    fn shelf(height: f32) -> (Vec<f32>, Vec<MaterialId>) {
+        let heights = (0..RASTER * RASTER)
+            .map(|i| if i % RASTER >= 96 { height } else { 0.0 })
+            .collect();
+        (heights, flat_ground())
+    }
+
+    /// Ground in front of cloud hides it, exactly.
+    ///
+    /// The march clips its ray at the G-buffer's own depth, which is the whole
+    /// of how terrain occludes cloud: there is no cloud shadow volume, no depth
+    /// test in the composite, and no second traversal -- the ray simply stops
+    /// where the ground the geometry pass already found is. That makes the
+    /// occlusion exact, and it makes it free, and this is what says it happens.
+    ///
+    /// A shelf 600 m high, which is under the lowest a deck's base can sag,
+    /// against an overcast sky that covers nearly all of it. A ray that meets
+    /// the shelf has climbed nowhere near the cloud, so it must come back with
+    /// none; a ray that clears the skyline runs for tens of kilometres inside a
+    /// solid deck and must come back with almost nothing else.
+    ///
+    /// Measured over whole two-by-two blocks, because that is the unit the march
+    /// works in: a block straddling the skyline takes the reach of its farthest
+    /// pixel, which is the ray running on past the ridge, and it is *meant* to
+    /// -- erring the other way would cut a notch of missing cloud along every
+    /// silhouette in the frame.
+    #[test]
+    fn ground_in_front_of_cloud_hides_the_cloud_behind_it() {
+        let (heights, materials) = shelf(600.0);
+        let frame = render_under(
+            heights,
+            materials,
+            |camera| {
+                // West of the shelf, below its top, looking east along the flat.
+                camera.position = Vec3::new(world_of(4.0, 64.0).x, 200.0, world_of(4.0, 64.0).z);
+                // Rolled, so the shelf's edge runs diagonally across the frame.
+                // Level, it projects to an exactly horizontal line that lands
+                // between two rows of blocks, and no block straddles it at all
+                // -- which is the one case the last assertion below is about.
+                camera.orientation =
+                    Camera::from_yaw_pitch_roll(90f32.to_radians(), 0.0, 8f32.to_radians());
+            },
+            crate::cloud::Preset::Overcast,
+        );
+
+        let mut against = Vec::new();
+        let mut open = Vec::new();
+        let mut skyline = Vec::new();
+        for block_y in 0..SIZE / 2 {
+            for block_x in 0..SIZE / 2 {
+                let corners = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                    .map(|(i, j)| (block_x * 2 + i, block_y * 2 + j));
+                let cloud = frame.cloud(block_x * 2, block_y * 2);
+                if corners.iter().all(|&(x, y)| !frame.sky(x, y)) {
+                    against.push(cloud);
+                } else if corners.iter().all(|&(x, y)| frame.sky(x, y)) {
+                    open.push(cloud);
+                } else {
+                    skyline.push(cloud);
+                }
+            }
+        }
+        assert!(
+            against.len() > 1000 && open.len() > 1000,
+            "the shelf left {} blocks of ground and {} of sky, which is not a skyline",
+            against.len(),
+            open.len()
+        );
+
+        let worst = against.iter().copied().fold(0.0f32, f32::max);
+        assert_eq!(
+            worst, 0.0,
+            "a ray stopped by ground 600 m up still found {worst} of cloud"
+        );
+        let least = open.iter().copied().fold(1.0f32, f32::min);
+        assert!(
+            least > 0.9,
+            "a ray over the skyline under an overcast sky found only {least} of cloud"
+        );
+        // And the blocks the skyline runs through go with the sky rather than
+        // with the ground, which is the other half of taking the farthest of a
+        // block's four depths. Taking the nearest instead would leave these
+        // empty, and a row of empty blocks along a ridge is a notch bitten out
+        // of the cloud behind it.
+        let straddling = skyline.iter().copied().fold(1.0f32, f32::min);
+        assert!(
+            !skyline.is_empty() && straddling > 0.9,
+            "{} blocks straddle the skyline and the emptiest found {straddling} of cloud",
+            skyline.len()
+        );
+    }
+
     /// Rough terrain, so that neighbouring clipmap levels genuinely disagree
     /// about where the surface is and any seam between them would show.
     fn rugged() -> (Vec<f32>, Vec<MaterialId>) {
@@ -4075,6 +4302,12 @@ mod tests {
                 pixels,
                 depths,
                 materials,
+                // Not read back here. This harness exists to fly a camera and
+                // compare the pictures it draws, and nothing along that path
+                // asks about cloud; a fourth buffer copied every frame of every
+                // flight would be paid for by every one of them.
+                clouds: Vec::new(),
+                cloud_size: UVec2::ZERO,
                 base_level: scene.terrain.base_level(),
             })
         }

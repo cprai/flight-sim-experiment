@@ -49,6 +49,88 @@ pub const WEATHER_SIZE: u32 = 256;
 /// and an index.
 pub const DECKS: usize = 3;
 
+/// Cells across the ceiling cache, in X and Z. Must match `CEILING_ACROSS` in
+/// `src/cloud_march.wgsl`.
+///
+/// Exactly two weather texels to a cell, so the cache tiles with the map it is
+/// built from and one fold serves both. A cell is 469 m across, which is coarse
+/// against a cloud and about right for a thing whose only job is to say whether
+/// a ray may skip the next half kilometre without looking.
+pub const CEILING_ACROSS: u32 = 128;
+
+/// Cells up the ceiling cache. Must match `CEILING_SLICES` in
+/// `src/cloud_march.wgsl`.
+///
+/// Twenty-four over [`CEILING_TOP`] is a cell every 500 m, which is a fifth of
+/// the low deck's thickness -- enough for a ray to skip the air between the
+/// decks and the air under them, which is most of what there is to skip.
+pub const CEILING_SLICES: u32 = 24;
+
+/// How high the ceiling cache reaches, in metres. Must match `CEILING_TOP` in
+/// `src/cloud_march.wgsl`.
+///
+/// Above the highest deck, so a ray that climbs out of the grid has left every
+/// cloud behind rather than merely left the table.
+const CEILING_TOP: f32 = 12000.0;
+
+/// How much world one tile of the weather map covers, in metres. Must match
+/// `WEATHER_TILE` in `src/cloud_march.wgsl`.
+///
+/// Sixty kilometres, which is the scale weather systems come at and far enough
+/// that no flight crosses the seam twice in a way anyone would notice.
+///
+/// Nothing on this side addresses the map -- the march does, in world metres --
+/// so Rust holds this only so a test can check that the shader still says the
+/// same number. See `the_shader_and_rust_agree_on_the_cloud_grid`.
+#[allow(
+    dead_code,
+    reason = "mirrored from the shader for the test comparing them"
+)]
+const WEATHER_TILE: f32 = 60_000.0;
+
+/// Where each deck sits: base, top, how far its base may lift, and how dense.
+///
+/// Three heights cloud actually forms at, and they deliberately do not overlap
+/// -- a height belongs to at most one deck, including after the base has lifted
+/// by its whole swing, which is what lets a sample in the march cost one weather
+/// fetch rather than three. The low deck runs from 700 m, which is below the
+/// tops of the mountains this flies over: that is the point, and it is what the
+/// terrain coupling later has to survive.
+///
+/// The densities fall with height because the cloud does: cirrus is ice crystals
+/// where cumulus is water, and what it takes out of a beam is a quarter of what
+/// the same thickness of cumulus would.
+const DECK_SLABS: [[f32; 4]; DECKS] = [
+    [700.0, 3000.0, 400.0, 1.0],
+    [3500.0, 6000.0, 500.0, 0.65],
+    [8500.0, 10000.0, 300.0, 0.25],
+];
+
+/// The format the half-resolution cloud buffer is held in.
+///
+/// Three channels of scattered radiance and one of transmittance, which is more
+/// than eight bits a channel can hold: sunlit cloud and cloud in its own shadow
+/// are two orders of magnitude apart, and the transmittance is multiplied
+/// through everything behind it, so a step in it is a step in the whole
+/// background. The same format and the same reasoning as `LUT_FORMAT` in
+/// `src/sky.rs`.
+const CLOUD_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// The format of the ceiling cache and of the cloud's own depth.
+///
+/// Both hold one number in metres over a range of a hundred kilometres, and
+/// `R32Float` is the one single-channel float format that is storage-writable in
+/// core WebGPU. See the note on [`FORMAT`].
+const DISTANCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+
+/// Threads per workgroup for the ceiling build, in each axis. Must match
+/// `@workgroup_size` on `cs_cloud_ceiling`.
+const CEILING_GROUP: u32 = 4;
+
+/// The same for the march, which is a flat image and takes a flat group. Must
+/// match `@workgroup_size` on `cs_cloud_march`.
+const MARCH_GROUP: u32 = 8;
+
 /// How long the weather takes to come back round to where it was, in seconds.
 ///
 /// Ten minutes. Long enough that a front does not visibly cycle within a
@@ -106,15 +188,29 @@ struct DeckUniform {
     look: [f32; 4],
     /// Where this deck's fields are drawn from, and three spare.
     seed: [u32; 4],
+    /// This deck's entry from [`DECK_SLABS`].
+    ///
+    /// A constant of the world rather than of the preset -- what a name like
+    /// `storm` changes is how much cloud there is and how dense, not what
+    /// altitude cumulus forms at. It rides in the uniform anyway because the
+    /// march wants it beside the rest, and one buffer beats two.
+    slab: [f32; 4],
 }
 
-/// Mirrors the `Weather` uniform block in `src/cloud.wgsl`.
+/// Mirrors the `Weather` uniform block in `src/cloud.wgsl` and in
+/// `src/cloud_march.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct WeatherUniform {
     decks: [DeckUniform; DECKS],
     /// Seconds since the world started, then [`WEATHER_PERIOD`].
     clock: [f32; 4],
+    /// The lowest and highest metres any deck can put cloud at, then two spare.
+    ///
+    /// What the march clips its ray against before it steps at all: everything
+    /// outside this is sky, and for a camera looking down at the ground it is
+    /// most of the ray.
+    span: [f32; 4],
 }
 
 /// Where each deck's fields are drawn from.
@@ -161,17 +257,33 @@ impl Preset {
             decks: std::array::from_fn(|deck| DeckUniform {
                 look: looks[deck],
                 seed: [DECK_SEEDS[deck], 0, 0, 0],
+                slab: DECK_SLABS[deck],
             }),
             clock: [elapsed.as_secs_f32(), WEATHER_PERIOD, 0.0, 0.0],
+            span: [cloud_span().0, cloud_span().1, 0.0, 0.0],
         }
     }
 }
 
+/// The lowest and highest a cloud can be, over every deck.
+///
+/// Derived from [`DECK_SLABS`] rather than written down beside it, because a
+/// second copy of a bound is a bound that can disagree with what it bounds. A
+/// deck's top lifts with its base, so the highest it reaches is its top plus its
+/// whole swing.
+fn cloud_span() -> (f32, f32) {
+    DECK_SLABS
+        .iter()
+        .fold((f32::MAX, 0.0f32), |(low, high), s| {
+            (low.min(s[0]), high.max(s[1] + s[2]))
+        })
+}
+
 /// The two volumes, the weather over them, and the pipelines that fill them.
 pub struct Cloud {
-    #[allow(dead_code, reason = "read by the cloud march, which lands later")]
+    #[allow(dead_code, reason = "read only by the noise readback tests")]
     shape: wgpu::Texture,
-    #[allow(dead_code, reason = "read by the cloud march, which lands later")]
+    #[allow(dead_code, reason = "read only by the noise readback tests")]
     detail: wgpu::Texture,
     /// One texel per patch of sky per deck: how much cloud it may hold, which
     /// way that cloud leans, how dense it is and where its base sits.
@@ -180,7 +292,7 @@ pub struct Cloud {
     /// the cheapest thing in the frame by a wide margin -- see the `weather`
     /// row -- and evolving it is what stops a sky being the same sky for the
     /// length of a flight.
-    #[allow(dead_code, reason = "read by the cloud march, which lands later")]
+    #[allow(dead_code, reason = "read only by the weather readback tests")]
     weather: wgpu::Texture,
     shape_view: wgpu::TextureView,
     detail_view: wgpu::TextureView,
@@ -442,8 +554,7 @@ impl Cloud {
         pass.dispatch_workgroups(across, across, DECKS as u32);
     }
 
-    /// The two volumes and the weather over them.
-    #[allow(dead_code, reason = "read by the cloud march, which lands later")]
+    /// The two volumes and the weather over them, for the march to bind.
     pub fn views(&self) -> (&wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView) {
         (&self.shape_view, &self.detail_view, &self.weather_view)
     }
@@ -453,6 +564,404 @@ impl Cloud {
 fn bytes() -> u64 {
     let cube = |size: u64| size * size * size * 4;
     cube(u64::from(SHAPE_SIZE)) + cube(u64::from(DETAIL_SIZE))
+}
+
+/// The coarse bound on where cloud can be, and the march that reads it.
+///
+/// Separate from [`Cloud`] because the two answer different questions and are
+/// built at different times. `Cloud` holds fields: what the sky is made of and
+/// what kind of day it is, neither of which knows anything about a camera. This
+/// holds a view of them: screen-sized buffers that follow a resize, bound
+/// against a G-buffer and a set of scattering tables that belong to other
+/// modules. A resize throws all of this away and none of that.
+pub struct March {
+    /// An upper bound on the extinction anywhere in each cell of a coarse world
+    /// grid, rebuilt every frame from the weather.
+    #[allow(dead_code, reason = "read through its view")]
+    ceiling: wgpu::Texture,
+    /// Scattered radiance and transmittance, at half the frame's resolution.
+    ///
+    /// Nothing reads it yet; the composite lands next. `COPY_SRC` for the reason
+    /// the G-buffer's targets carry it -- a frame this does not appear in says
+    /// nothing about what is in it.
+    colour: wgpu::Texture,
+    /// How far along each of those rays the cloud it found actually was.
+    depth: wgpu::Texture,
+    colour_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    ceiling_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    ceiling_group: wgpu::BindGroup,
+    march_layout: wgpu::BindGroupLayout,
+    march_group: wgpu::BindGroup,
+    ceiling_pipeline: wgpu::ComputePipeline,
+    march_pipeline: wgpu::ComputePipeline,
+    /// The half-resolution size every buffer above was built at.
+    size: glam::UVec2,
+}
+
+impl March {
+    /// Builds the two passes against the fields, tables and G-buffer they read.
+    ///
+    /// Every layout but its own comes from whoever owns it -- the camera from
+    /// the scene, the sun and its tables from [`crate::sky::Sky`] -- for the
+    /// reason `Shading::new` takes the same three: one description of what a
+    /// group holds, held in one place.
+    pub fn new(
+        device: &wgpu::Device,
+        camera_layout: &wgpu::BindGroupLayout,
+        sky_layout: &wgpu::BindGroupLayout,
+        sun_tables_layout: &wgpu::BindGroupLayout,
+        cloud: &Cloud,
+        gbuffer: &crate::deferred::GBuffer,
+    ) -> Self {
+        // A deck reaching above the cache is a deck the march never finds: the
+        // ceiling reads as empty above its own top, and the ray skips straight
+        // past. Checked rather than trusted because the failure is silent -- the
+        // cloud is simply not drawn, and nothing says why.
+        let (_, highest) = cloud_span();
+        assert!(
+            highest <= CEILING_TOP,
+            "a deck reaches {highest} m, above the {CEILING_TOP} m the ceiling cache covers"
+        );
+        let ceiling = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cloud ceiling"),
+            size: wgpu::Extent3d {
+                width: CEILING_ACROSS,
+                height: CEILING_SLICES,
+                depth_or_array_layers: CEILING_ACROSS,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: DISTANCE_FORMAT,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let ceiling_view = ceiling.create_view(&Default::default());
+
+        // Repeating in every axis. All three fields the march reads tile, and
+        // reading them wrapped is the whole reason eight megabytes of noise
+        // covers a hundred kilometres of sky. Its own sampler rather than the
+        // sky's, which clamps: a table runs to the ends of its range and stops,
+        // where these come back round.
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("cloud field sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let uniform = wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let sampled = |binding, dimension, filterable| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable },
+                view_dimension: dimension,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let written = |binding, format, dimension| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::StorageTexture {
+                access: wgpu::StorageTextureAccess::WriteOnly,
+                format,
+                view_dimension: dimension,
+            },
+            count: None,
+        };
+
+        // The ceiling build reads the weather and writes the cache, and holds
+        // nothing else: it is a function of the forecast and of the constants
+        // the decks are described by. Deliberately *not* the layout below with
+        // the extra entries left unbound -- the cache is bound writable here and
+        // sampled there, and wgpu tracks that across a whole pass. See the note
+        // on `Build` in `src/sky.rs`.
+        let ceiling_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cloud ceiling layout"),
+            entries: &[
+                uniform,
+                sampled(1, wgpu::TextureViewDimension::D2Array, true),
+                written(9, DISTANCE_FORMAT, wgpu::TextureViewDimension::D3),
+            ],
+        });
+        let (_, _, weather_view) = cloud.views();
+        let ceiling_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cloud ceiling group"),
+            layout: &ceiling_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: cloud.uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(weather_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&ceiling_view),
+                },
+            ],
+        });
+
+        let march_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cloud march layout"),
+            entries: &[
+                uniform,
+                sampled(1, wgpu::TextureViewDimension::D2Array, true),
+                sampled(2, wgpu::TextureViewDimension::D3, true),
+                sampled(3, wgpu::TextureViewDimension::D3, true),
+                // Never filtered, and the layout says so: interpolating between
+                // maxima returns less than the true maximum of the cell a sample
+                // is in, which is a hole in a cloud.
+                sampled(4, wgpu::TextureViewDimension::D3, false),
+                sampled(5, wgpu::TextureViewDimension::D2, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                written(7, CLOUD_FORMAT, wgpu::TextureViewDimension::D2),
+                written(8, DISTANCE_FORMAT, wgpu::TextureViewDimension::D2),
+            ],
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cloud march shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("cloud_march.wgsl").into()),
+        });
+        let pipeline = |label, entry, layouts: &[Option<&wgpu::BindGroupLayout>]| {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: layouts,
+                immediate_size: 0,
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        // The ceiling build needs no camera, no sun and no tables: what it says
+        // is true of the world rather than of a view of it.
+        let ceiling_pipeline = pipeline(
+            "cloud ceiling",
+            "cs_cloud_ceiling",
+            &[None, None, None, Some(&ceiling_layout)],
+        );
+        // The march needs all four. Group 2 is the reduced read of the two
+        // build-once tables rather than the whole set: the sky-view table and
+        // the two aerial volumes are what the *composite* wants, and leaving
+        // them out here is what keeps this inside the sampled-texture budget.
+        let march_pipeline = pipeline(
+            "cloud march",
+            "cs_cloud_march",
+            &[
+                Some(camera_layout),
+                Some(sky_layout),
+                Some(sun_tables_layout),
+                Some(&march_layout),
+            ],
+        );
+
+        let size = half_of(gbuffer.size);
+        let (colour, depth) = Self::buffers(device, size);
+        let colour_view = colour.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+        let march_group = Self::bind(
+            device,
+            &march_layout,
+            cloud,
+            gbuffer,
+            &ceiling_view,
+            &sampler,
+            &colour_view,
+            &depth_view,
+        );
+
+        Self {
+            ceiling,
+            colour,
+            depth,
+            colour_view,
+            depth_view,
+            ceiling_view,
+            sampler,
+            ceiling_group,
+            march_layout,
+            march_group,
+            ceiling_pipeline,
+            march_pipeline,
+            size,
+        }
+    }
+
+    /// Follows the render target to a new size.
+    ///
+    /// The cache does not move -- it is a fact about the world, at a resolution
+    /// of its own -- so only the two screen-sized buffers and the group naming
+    /// them are rebuilt. Called from [`crate::scene::Scene::resize`], which also
+    /// hands over the rebuilt G-buffer this reads the depth of.
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        cloud: &Cloud,
+        gbuffer: &crate::deferred::GBuffer,
+    ) {
+        self.size = half_of(gbuffer.size);
+        let (colour, depth) = Self::buffers(device, self.size);
+        self.colour_view = colour.create_view(&Default::default());
+        self.depth_view = depth.create_view(&Default::default());
+        self.colour = colour;
+        self.depth = depth;
+        self.march_group = Self::bind(
+            device,
+            &self.march_layout,
+            cloud,
+            gbuffer,
+            &self.ceiling_view,
+            &self.sampler,
+            &self.colour_view,
+            &self.depth_view,
+        );
+    }
+
+    fn buffers(device: &wgpu::Device, size: glam::UVec2) -> (wgpu::Texture, wgpu::Texture) {
+        let buffer = |label, format| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size.x,
+                    height: size.y,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        (
+            buffer("cloud colour", CLOUD_FORMAT),
+            buffer("cloud depth", DISTANCE_FORMAT),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "one group, one entry apiece")]
+    fn bind(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        cloud: &Cloud,
+        gbuffer: &crate::deferred::GBuffer,
+        ceiling: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+        colour: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        let (shape, detail, weather) = cloud.views();
+        let texture = |binding, view| wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::TextureView(view),
+        };
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cloud march group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: cloud.uniform.as_entire_binding(),
+                },
+                texture(1, weather),
+                texture(2, shape),
+                texture(3, detail),
+                texture(4, ceiling),
+                texture(5, &gbuffer.depth),
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                texture(7, colour),
+                texture(8, depth),
+            ],
+        })
+    }
+
+    /// Records the ceiling build into an already-started compute pass.
+    ///
+    /// Every frame, after the weather it is built from and before the march that
+    /// reads it -- and in a pass of its own on both counts, because a pass
+    /// boundary is what makes one dispatch's writes visible to the next.
+    pub fn draw_ceiling(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.ceiling_pipeline);
+        pass.set_bind_group(3, &self.ceiling_group, &[]);
+        let across = CEILING_ACROSS.div_ceil(CEILING_GROUP);
+        pass.dispatch_workgroups(across, CEILING_SLICES.div_ceil(CEILING_GROUP), across);
+    }
+
+    /// Records the march. The caller has set group 0 to the camera.
+    pub fn draw(&self, pass: &mut wgpu::ComputePass<'_>, sky: &crate::sky::Sky) {
+        pass.set_pipeline(&self.march_pipeline);
+        pass.set_bind_group(1, sky.bind_group(), &[]);
+        pass.set_bind_group(2, sky.sun_tables_bind_group(), &[]);
+        pass.set_bind_group(3, &self.march_group, &[]);
+        pass.dispatch_workgroups(
+            self.size.x.div_ceil(MARCH_GROUP),
+            self.size.y.div_ceil(MARCH_GROUP),
+            1,
+        );
+    }
+
+    /// What the buffers hold, for the readback tests and for the composite.
+    #[allow(dead_code, reason = "read by the composite, which lands next")]
+    pub fn views(&self) -> (&wgpu::TextureView, &wgpu::TextureView) {
+        (&self.colour_view, &self.depth_view)
+    }
+
+    /// The textures themselves, for the tests that read them back.
+    #[cfg(test)]
+    pub fn buffers_for_test(&self) -> (&wgpu::Texture, &wgpu::Texture, &wgpu::Texture) {
+        (&self.colour, &self.depth, &self.ceiling)
+    }
+
+    /// The half-resolution size the buffers were last built at.
+    #[cfg(test)]
+    pub fn size(&self) -> glam::UVec2 {
+        self.size
+    }
+}
+
+/// The half-resolution size a viewport marches at.
+///
+/// Rounded up, so a viewport with an odd side still has a half-resolution texel
+/// standing over its last column rather than one short of it.
+fn half_of(viewport: glam::UVec2) -> glam::UVec2 {
+    ((viewport + glam::UVec2::ONE) / 2).max(glam::UVec2::ONE)
 }
 
 #[cfg(test)]
@@ -711,11 +1220,13 @@ mod tests {
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let at = |q: f64| sorted[((n - 1.0) * q) as usize];
                 eprintln!(
-                    "{name}[{channel}] mean={mean:.3} sd={:.3} p05={:.3} p50={:.3} p95={:.3}",
+                    "{name}[{channel}] mean={mean:.3} sd={:.3} p05={:.3} p50={:.3} \
+                     p95={:.3} max={:.3}",
                     variance.sqrt(),
                     at(0.05),
                     at(0.50),
-                    at(0.95)
+                    at(0.95),
+                    at(1.00)
                 );
             }
         }
@@ -956,6 +1467,507 @@ mod tests {
         }
     }
 
+    /// One frame of the march, and the cache it was walked over.
+    struct Marched {
+        /// Half-resolution scattered radiance and transmittance.
+        colour: Vec<[f32; 4]>,
+        /// Where along each of those rays the cloud was, in metres.
+        depth: Vec<f32>,
+        size: glam::UVec2,
+        /// The ceiling cache, indexed `(x, slice, z)`.
+        ceiling: Vec<f32>,
+        /// The weather the cache was built from, one layer per deck.
+        weather: Vec<Volume>,
+    }
+
+    impl Marched {
+        fn cell(&self, x: u32, slice: u32, z: u32) -> f32 {
+            let across = CEILING_ACROSS;
+            self.ceiling[((z * CEILING_SLICES + slice) * across + x) as usize]
+        }
+
+        /// The weather over a world point, sampled the way the march samples it.
+        ///
+        /// Bilinear over a map that wraps, with a texel standing for its own
+        /// middle: the Rust twin of the `textureSampleLevel` the shader makes,
+        /// which is what the oracle below needs and what a `textureLoad` would
+        /// not give.
+        fn forecast_at(&self, deck: usize, x: f32, z: f32) -> [f32; 4] {
+            let size = WEATHER_SIZE as f32;
+            let at = glam::Vec2::new(x, z) / WEATHER_TILE * size - 0.5;
+            let corner = at.floor();
+            let f = at - corner;
+            let layer = &self.weather[deck];
+            let tap = |dx: i32, dy: i32| {
+                let texel = layer.wrapped(corner.x as i32 + dx, corner.y as i32 + dy, 0);
+                std::array::from_fn::<f32, 4, _>(|c| f32::from(texel[c]) / 255.0)
+            };
+            let mix = |a: [f32; 4], b: [f32; 4], t: f32| {
+                std::array::from_fn::<f32, 4, _>(|c| a[c] + (b[c] - a[c]) * t)
+            };
+            mix(
+                mix(tap(0, 0), tap(1, 0), f.x),
+                mix(tap(0, 1), tap(1, 1), f.x),
+                f.y,
+            )
+        }
+
+        /// How much of the frame the cloud covers, from nothing to all of it.
+        fn opacity(&self) -> f64 {
+            self.colour
+                .iter()
+                .map(|texel| 1.0 - f64::from(texel[3]))
+                .sum::<f64>()
+                / self.colour.len() as f64
+        }
+    }
+
+    /// Marches one frame of one preset, from a camera of the caller's choosing.
+    ///
+    /// No terrain: the G-buffer is left as it was made, which is zeroes, and
+    /// zero depth is exactly what the march reads as "this ray found no ground".
+    /// So every ray runs its full length, which is the case worth measuring and
+    /// the only one where what the march did can be read off the buffer without
+    /// a mountain in the way. What the depth clip does with real ground is a
+    /// question for a real frame; `src/scene.rs` asks it there.
+    fn marched(preset: Preset, camera: &crate::camera::Camera, size: glam::UVec2) -> Marched {
+        let (device, queue) = crate::headless::device().expect("no headless device");
+        let (camera_layout, camera_group) = crate::scene::test_camera(&device, &queue, camera);
+
+        let mut sky = crate::sky::Sky::new(&device, &camera_layout);
+        sky.ensure_built(&device, &queue);
+        sky.set_frame(
+            &queue,
+            crate::sky::Sun::default(),
+            camera.position,
+            crate::sky::pixel_angle(camera.fov_y, size.y),
+        );
+
+        let mut cloud = Cloud::new(&device);
+        cloud.ensure_built(&device, &queue);
+        cloud.set_frame(&queue, preset, std::time::Duration::ZERO);
+
+        let gbuffer = crate::deferred::GBuffer::new(&device, size);
+        let march = March::new(
+            &device,
+            &camera_layout,
+            sky.layout(),
+            sky.sun_tables_layout(),
+            &cloud,
+            &gbuffer,
+        );
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        // Three passes, as `Scene::draw` records them, and for the reason it
+        // does: each reads what the one before it wrote.
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            cloud.draw_weather(&mut pass);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            march.draw_ceiling(&mut pass);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_bind_group(0, &camera_group, &[]);
+            march.draw(&mut pass, &sky);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let (colour, depth, ceiling) = march.buffers_for_test();
+        let half = march.size();
+        Marched {
+            colour: read_texels(&device, &queue, colour, half.x, half.y, 1, 8)
+                .chunks_exact(8)
+                .map(|texel| {
+                    std::array::from_fn(|c| {
+                        half::f16::from_le_bytes([texel[c * 2], texel[c * 2 + 1]]).to_f32()
+                    })
+                })
+                .collect(),
+            depth: read_texels(&device, &queue, depth, half.x, half.y, 1, 4)
+                .chunks_exact(4)
+                .map(|texel| f32::from_le_bytes(texel.try_into().unwrap()))
+                .collect(),
+            size: half,
+            ceiling: read_texels(
+                &device,
+                &queue,
+                ceiling,
+                CEILING_ACROSS,
+                CEILING_SLICES,
+                CEILING_ACROSS,
+                4,
+            )
+            .chunks_exact(4)
+            .map(|texel| f32::from_le_bytes(texel.try_into().unwrap()))
+            .collect(),
+            // Read back from this very run rather than rebuilt beside it: the
+            // field is deterministic, so a second build would give the same
+            // bytes -- but then the oracle would be checking the cache against a
+            // forecast it was not made from, and the day that stopped being true
+            // the test would be measuring nothing.
+            weather: (0..DECKS)
+                .map(|deck| read_layer(&device, &queue, &cloud.weather, deck as u32))
+                .collect(),
+        }
+    }
+
+    /// A texture read back into tightly packed bytes, whatever its row stride.
+    ///
+    /// The copy wants rows on a 256-byte stride and none of these buffers has
+    /// one naturally, so the slack is dropped on the way out -- the same
+    /// arrangement [`read_volume`] makes and for the same reason.
+    fn read_texels(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        depth: u32,
+        stride: u32,
+    ) -> Vec<u8> {
+        let packed = width * stride;
+        let bytes_per_row = packed.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cloud march readback"),
+            size: u64::from(bytes_per_row * height * depth),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: depth,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        readback.map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = sender.send(result);
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
+        let mapped = readback.get_mapped_range(..).unwrap();
+        let mut out = Vec::with_capacity((packed * height * depth) as usize);
+        for row in 0..height * depth {
+            let start = (row * bytes_per_row) as usize;
+            out.extend_from_slice(&mapped[start..start + packed as usize]);
+        }
+        drop(mapped);
+        readback.unmap();
+        out
+    }
+
+    /// Three whole weather tiles from the origin, and negative.
+    ///
+    /// Every camera below flies from here rather than from nothing, so that
+    /// every ray they cast is at world coordinates the fields have to be folded
+    /// to reach. Both folds are on that path -- the cache's cell index and the
+    /// repeating sampler the three noise fields are read through -- and either
+    /// one missing puts the whole march outside its data. At the origin that is
+    /// invisible: an unfolded index into the first tile is the right index.
+    const AWAY: f32 = -3.0 * WEATHER_TILE;
+
+    /// A camera out at [`AWAY`], at a height and a pitch.
+    fn looking(height: f32, pitch_degrees: f32) -> crate::camera::Camera {
+        crate::camera::Camera::new(
+            glam::Vec3::new(AWAY, height, AWAY),
+            crate::camera::Camera::from_yaw_pitch_roll(0.0, pitch_degrees.to_radians(), 0.0),
+            1.0,
+        )
+    }
+
+    /// A clear sky marches to no cloud at any pixel, and marches every pixel.
+    ///
+    /// Two claims in one readback, and the second is why the first is worth
+    /// making at all. Transmittance one and no scattered light is what a ray
+    /// that met nothing leaves behind -- and a texel the dispatch never reached
+    /// reads as zero, which is *opaque black cloud*. So the exact ones here say
+    /// the march covered the buffer as well as that it found nothing in it.
+    ///
+    /// This is the setting every later test reaches for to say "and this changes
+    /// nothing", so it has to be exact rather than nearly so.
+    #[test]
+    fn a_clear_sky_marches_to_nothing_at_every_pixel() {
+        let frame = marched(
+            Preset::Clear,
+            &looking(1500.0, 0.0),
+            glam::UVec2::splat(128),
+        );
+        assert_eq!(frame.colour.len(), (frame.size.x * frame.size.y) as usize);
+        for (index, texel) in frame.colour.iter().enumerate() {
+            assert_eq!(
+                *texel,
+                [0.0, 0.0, 0.0, 1.0],
+                "texel {index} of a clear sky reads {texel:?}"
+            );
+        }
+        // ... and the cache agrees, which is the other half of "clear is clear":
+        // a cell that bounded something would have the march sampling inside it.
+        let worst = frame.ceiling.iter().copied().fold(0.0f32, f32::max);
+        assert_eq!(worst, 0.0, "a clear sky bounded {worst} of extinction");
+    }
+
+    /// A sky with cloud in it draws cloud, at a distance the ray reached.
+    ///
+    /// The counterpart to the test above, and the one that says the march does
+    /// anything at all: every assertion there is satisfied by a dispatch that
+    /// returns immediately. A level view under a broken sky should be most cloud
+    /// and some gap, and where there is cloud the recorded distance has to be a
+    /// distance the ray actually walked -- in front of the eye and no further
+    /// than the march is allowed to look.
+    #[test]
+    fn a_broken_sky_draws_cloud_at_the_distance_it_was_found() {
+        let frame = marched(
+            Preset::Broken,
+            &looking(1500.0, 0.0),
+            glam::UVec2::splat(128),
+        );
+        let opacity = frame.opacity();
+        assert!(
+            (0.2..0.98).contains(&opacity),
+            "a broken sky came out {opacity:.3} opaque, which is not broken"
+        );
+        for (index, texel) in frame.colour.iter().enumerate() {
+            assert!(
+                texel.iter().all(|v| v.is_finite()),
+                "texel {index} holds {texel:?}"
+            );
+            assert!(
+                (0.0..=1.0).contains(&texel[3]),
+                "texel {index} has transmittance {}",
+                texel[3]
+            );
+            // Cloud is lit by a sun and by a sky, so anything it stopped it also
+            // put something back. Scattering nothing while stopping light is
+            // what a bug in the source term looks like.
+            if texel[3] < 0.5 {
+                assert!(
+                    texel[0] > 0.0 && texel[1] > 0.0 && texel[2] > 0.0,
+                    "texel {index} stopped light and scattered {texel:?}"
+                );
+                let at = frame.depth[index];
+                assert!(
+                    at > 0.0 && at <= 100_000.0,
+                    "texel {index} put its cloud {at} m away"
+                );
+            }
+        }
+    }
+
+    /// How much of a deck's slab is filled, at a height fraction through it.
+    ///
+    /// The Rust twin of `vertical` in `src/cloud_march.wgsl`. A second copy of
+    /// the arithmetic rather than a text comparison of it, because what is being
+    /// checked here is not that the two agree -- it is that the *cache* bounds
+    /// what the march would find, and an oracle that cannot be wrong in the same
+    /// way the shader is wrong is the whole point of writing one.
+    fn vertical(h: f32, lean: f32) -> f32 {
+        let smoothstep = |edge0: f32, edge1: f32, x: f32| {
+            let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let rise = mix(0.10, 0.35, lean);
+        let fall = mix(0.88, 0.60, lean);
+        smoothstep(0.0, rise, h) * (1.0 - smoothstep(fall, 1.0, h))
+    }
+
+    /// What the march would find at a point, at its very largest.
+    ///
+    /// The extinction the march computes is this with the shape field in place
+    /// of the one the carve is evaluated at, and the field cannot exceed one --
+    /// so this is the number the cell containing the point has to bound. Must
+    /// stay in step with `cloud_extinction` and `cell_bound` in
+    /// `src/cloud_march.wgsl`; `EXTINCTION` and `EDGE` are read out of the
+    /// shader rather than restated, so a change to either fails the test that
+    /// compares them rather than quietly moving both sides at once.
+    fn most_at(frame: &Marched, p: glam::Vec3) -> f32 {
+        let extinction = shader_constant("EXTINCTION");
+        let edge = shader_constant("EDGE");
+        let mut most: f32 = 0.0;
+        for (deck, slab) in DECK_SLABS.iter().enumerate() {
+            if p.y < slab[0] || p.y > slab[1] + slab[2] {
+                continue;
+            }
+            let w = frame.forecast_at(deck, p.x, p.z);
+            let base = slab[0] + w[3] * slab[2];
+            let coverage = w[0] * vertical((p.y - base) / (slab[1] - slab[0]), w[1]);
+            most = most.max(extinction * w[2] * slab[3] * (coverage / edge).clamp(0.0, 1.0));
+        }
+        most
+    }
+
+    /// What the march shader gives as the value of a named constant.
+    fn shader_says(name: &str) -> String {
+        let source = include_str!("cloud_march.wgsl");
+        let declaration = format!("const {name}: ");
+        let line = source
+            .lines()
+            .find(|line| line.starts_with(&declaration))
+            .unwrap_or_else(|| panic!("src/cloud_march.wgsl declares no {name}"));
+        let (_, value) = line
+            .split_once(" = ")
+            .unwrap_or_else(|| panic!("src/cloud_march.wgsl says {line:?}"));
+        value.trim_end_matches(';').to_owned()
+    }
+
+    /// The same, as the number it is.
+    fn shader_constant(name: &str) -> f32 {
+        let value = shader_says(name);
+        value
+            .parse()
+            .unwrap_or_else(|_| panic!("src/cloud_march.wgsl says {name} is {value:?}"))
+    }
+
+    /// No cell of the cache ever claims less cloud than is inside it.
+    ///
+    /// The one property the empty-space skipping rests on, and the one that
+    /// fails invisibly: a cell whose bound is too low is a cell the march walks
+    /// straight through, and what that leaves is a bite out of a cloud that
+    /// looks like a gap in the cloud. There is no frame in which it reads as a
+    /// bug.
+    ///
+    /// So it is measured against an oracle instead. A grid of world points is
+    /// walked -- deliberately not on the cache's own lattice, because the
+    /// interesting points are the ones near a cell's corners, where the march's
+    /// bilinear reach into the neighbouring weather texels is what the build's
+    /// margin has to have covered. Points are taken well outside the tile too,
+    /// where the fold is what has to be right.
+    #[test]
+    fn no_cell_of_the_ceiling_claims_less_cloud_than_it_holds() {
+        let frame = marched(
+            Preset::Broken,
+            &looking(1500.0, 0.0),
+            glam::UVec2::splat(32),
+        );
+        // A stride that shares no factor with the cell size, so the points walk
+        // across cells rather than landing at the same place in each.
+        let step = 61.0;
+        let mut worst: f32 = 0.0;
+        let mut checked = 0u32;
+        for iz in -40..40 {
+            for ix in -40..40 {
+                for slice in 0..CEILING_SLICES {
+                    let p = glam::Vec3::new(
+                        AWAY + ix as f32 * step,
+                        (f32::from(slice as u16) + 0.37) * (CEILING_TOP / CEILING_SLICES as f32),
+                        AWAY + iz as f32 * step,
+                    );
+                    let across = CEILING_ACROSS as i32;
+                    let cell = |v: f32| {
+                        let raw = (v / (WEATHER_TILE / CEILING_ACROSS as f32)).floor() as i32;
+                        ((raw % across) + across) % across
+                    };
+                    let bound = frame.cell(cell(p.x) as u32, slice, cell(p.z) as u32);
+                    let most = most_at(&frame, p);
+                    worst = worst.max(most - bound);
+                    checked += 1;
+                }
+            }
+        }
+        // The tolerance is for the two bilinears, not for the bound: the shader
+        // filters an eight-bit map in hardware and the oracle does it in `f32`,
+        // and the two disagree by about a seventh of a texel's last bit. That
+        // measures 1.1e-4 here. Dropping the margin measures 2.4e-3, so the
+        // bound below sits between them with four times' room on each side.
+        assert!(
+            worst < 5e-4,
+            "the cache fell {worst:.5} short of the cloud in it, over {checked} points"
+        );
+    }
+
+    /// Writes what the march drew, and the cache it walked, out to look at.
+    ///
+    /// Ignored, like `dump_noise` and `dump_weather`, and for the reason those
+    /// are: the tests above say the buffer is covered, that a clear sky is clear
+    /// and that a broken one is neither -- and a field satisfying all three
+    /// could still look like fog, or like static, or like nothing at all. Run
+    /// with `cargo test --release -- --ignored dump_cloud --nocapture`.
+    ///
+    /// Transmittance on the left and the scattered light on the right, tonemapped
+    /// the way the frame will shortly tonemap it, so what is written here is what
+    /// the composite is about to put on the screen.
+    #[test]
+    #[ignore = "writes an image to look at rather than asserting anything"]
+    fn dump_cloud() {
+        let out = std::env::temp_dir();
+        for (name, camera) in [
+            ("level", looking(1500.0, 0.0)),
+            ("down", looking(6000.0, -35.0)),
+            ("up", looking(500.0, 25.0)),
+        ] {
+            for preset in [
+                Preset::Fair,
+                Preset::Broken,
+                Preset::Overcast,
+                Preset::Storm,
+            ] {
+                let frame = marched(preset, &camera, glam::UVec2::splat(512));
+                let (w, h) = (frame.size.x, frame.size.y);
+                let mut pixels = vec![0u8; (w * 2 * h * 4) as usize];
+                for y in 0..h {
+                    for x in 0..w {
+                        let texel = frame.colour[(y * w + x) as usize];
+                        let lit =
+                            crate::sky::tonemap(glam::Vec3::new(texel[0], texel[1], texel[2]));
+                        let alpha = ((1.0 - texel[3]) * 255.0) as u8;
+                        let put = |pixels: &mut Vec<u8>, column: u32, rgb: [u8; 3]| {
+                            let at = ((y * w * 2 + column) * 4) as usize;
+                            pixels[at] = rgb[0];
+                            pixels[at + 1] = rgb[1];
+                            pixels[at + 2] = rgb[2];
+                            pixels[at + 3] = 255;
+                        };
+                        put(&mut pixels, x, [alpha, alpha, alpha]);
+                        put(
+                            &mut pixels,
+                            w + x,
+                            [
+                                (lit.x * 255.0) as u8,
+                                (lit.y * 255.0) as u8,
+                                (lit.z * 255.0) as u8,
+                            ],
+                        );
+                    }
+                }
+                let path = out.join(format!("cloud-{name}-{preset:?}.png").to_lowercase());
+                crate::headless::write_png(&path, glam::UVec2::new(w * 2, h), &pixels)
+                    .expect("failed to write");
+                // What the cloud is worth in radiance, against what the ground
+                // under it is: a sunlit grass slope leaves about 0.07, and a
+                // sunlit cloud top should be several times that.
+                let mut lit: Vec<f32> = frame.colour.iter().map(|t| t[1]).collect();
+                lit.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let at = |q: f64| lit[((lit.len() - 1) as f64 * q) as usize];
+                eprintln!(
+                    "wrote {} ({:.3} opaque, {:.0} m mean, green p50={:.3} \
+                     p95={:.3} max={:.3})",
+                    path.display(),
+                    frame.opacity(),
+                    frame.depth.iter().sum::<f32>() / frame.depth.len() as f32,
+                    at(0.50),
+                    at(0.95),
+                    at(1.00),
+                );
+            }
+        }
+    }
+
     /// The two copies of the mixer are the same mixer.
     ///
     /// Nothing would break if they differed -- they seed different fields -- but
@@ -977,6 +1989,179 @@ mod tests {
             body(include_str!("terrain.wgsl")),
             "src/cloud.wgsl and src/terrain.wgsl spell `noise_mix` differently"
         );
+    }
+
+    /// Rust and the shader agree about the grid the march walks.
+    ///
+    /// Every one of these is a number Rust uses to shape a texture or size a
+    /// dispatch and the shader uses to address it. None of them would fail to
+    /// compile if they disagreed: the cache would be addressed at the wrong
+    /// scale, or two thirds of it would go unwritten, and the result would be a
+    /// sky with holes in it that looked like a sky with gaps in it.
+    #[test]
+    fn the_shader_and_rust_agree_on_the_cloud_grid() {
+        for (name, value) in [
+            ("WEATHER_SIZE", WEATHER_SIZE),
+            ("DECKS", DECKS as u32),
+            ("CEILING_ACROSS", CEILING_ACROSS),
+            ("CEILING_SLICES", CEILING_SLICES),
+        ] {
+            assert_eq!(shader_says(name), format!("{value}u"), "{name} differs");
+        }
+        for (name, value) in [("CEILING_TOP", CEILING_TOP), ("WEATHER_TILE", WEATHER_TILE)] {
+            assert_eq!(shader_constant(name), value, "{name} differs");
+        }
+        let source = include_str!("cloud_march.wgsl");
+        for (group, count) in [(CEILING_GROUP, 1), (MARCH_GROUP, 1)] {
+            let flat = if group == MARCH_GROUP { 1 } else { group };
+            assert_eq!(
+                source
+                    .matches(&format!(
+                        "@compute @workgroup_size({group}, {group}, {flat})"
+                    ))
+                    .count(),
+                count,
+                "src/cloud_march.wgsl has a kernel this module would dispatch wrongly"
+            );
+        }
+    }
+
+    /// The march reads the tables and rebuilds its rays the way the shading does.
+    ///
+    /// Seven functions copied into `src/cloud_march.wgsl` from
+    /// `src/shading.wgsl`, because there is no preprocessor here and no way to
+    /// share them. Two of them decide where a pixel's ray points, and a
+    /// last-bit difference there would put the cloud on a slightly different ray
+    /// from the ground it is drawn against -- still in a still frame, and
+    /// crawling in a moving one. The other five address the scattering tables,
+    /// where a difference is a cloud lit by a sun in a marginally different
+    /// place from the one lighting the mountain under it.
+    ///
+    /// Whitespace is normalised and the bodies are compared: a comment may
+    /// differ, since each copy says what its own caller wants, and the
+    /// arithmetic may not.
+    #[test]
+    fn the_march_reads_the_sky_the_way_the_shading_does() {
+        let body = |source: &str, name: &str| {
+            let start = source
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("no {name}"));
+            let end = source[start..].find("\n}").expect("unterminated");
+            source[start..start + end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let shade = include_str!("shading.wgsl");
+        let march = include_str!("cloud_march.wgsl");
+        for name in [
+            "ray_raw_at",
+            "distance_at",
+            "to_texture",
+            "top_distance",
+            "transmittance_uv",
+            "sample_transmittance",
+            "sample_multiscatter",
+        ] {
+            assert_eq!(
+                body(shade, name),
+                body(march, name),
+                "{name} differs between src/shading.wgsl and src/cloud_march.wgsl"
+            );
+        }
+        // ... and the constants those seven read.
+        for name in [
+            "GROUND_RADIUS",
+            "TOP_RADIUS",
+            "TRANSMITTANCE_WIDTH",
+            "TRANSMITTANCE_HEIGHT",
+            "MULTISCATTER_SIZE",
+            "PI",
+        ] {
+            let declared = |source: &'static str| {
+                source
+                    .lines()
+                    .find(|line| line.starts_with(&format!("const {name}: ")))
+                    .unwrap_or_else(|| panic!("no {name}"))
+            };
+            assert_eq!(
+                declared(shade),
+                declared(march),
+                "{name} differs between src/shading.wgsl and src/cloud_march.wgsl"
+            );
+        }
+    }
+
+    /// Both cloud shaders describe the uniform they share the same way.
+    ///
+    /// One buffer, written once by [`Preset::uniform`] and read by two shader
+    /// modules that cannot include each other. A field added to one and not the
+    /// other does not fail to compile -- it silently shifts every field after it
+    /// in the module that is short, so the march would read a deck's density out
+    /// of the bytes that hold its seed.
+    #[test]
+    fn both_cloud_shaders_describe_the_same_uniform() {
+        let block = |source: &str, name: &str| {
+            let start = source
+                .find(&format!("struct {name} {{"))
+                .unwrap_or_else(|| panic!("no struct {name}"));
+            let end = source[start..].find("\n};").expect("unterminated");
+            // Comments differ between the two on purpose -- each says what its
+            // own reader does with the fields -- so only the declarations are
+            // compared.
+            source[start..start + end]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let build = include_str!("cloud.wgsl");
+        let march = include_str!("cloud_march.wgsl");
+        for name in ["Deck", "Weather"] {
+            assert_eq!(
+                block(build, name),
+                block(march, name),
+                "{name} differs between src/cloud.wgsl and src/cloud_march.wgsl"
+            );
+        }
+        // ... and Rust writes exactly what both of them expect to read.
+        assert_eq!(
+            std::mem::size_of::<WeatherUniform>(),
+            DECKS * 3 * 16 + 2 * 16,
+            "the uniform is not the three decks and two vectors both shaders read"
+        );
+    }
+
+    /// No height belongs to two decks at once.
+    ///
+    /// What lets a sample in the march cost one weather fetch rather than three:
+    /// it finds the deck a height is in and stops looking. Overlapping slabs
+    /// would not fail -- the lower deck would simply win everywhere the two met,
+    /// and the upper one would be missing its underside for reasons nothing
+    /// records. The swing counts: a deck's base lifts and carries its top with
+    /// it, so what it can occupy runs to its top plus its whole swing.
+    #[test]
+    fn the_decks_never_reach_into_one_another() {
+        for pair in DECK_SLABS.windows(2) {
+            let [below, above] = pair else { unreachable!() };
+            assert!(
+                below[1] + below[2] < above[0],
+                "a deck reaching {} m sits under one starting at {} m",
+                below[1] + below[2],
+                above[0]
+            );
+        }
+        // ... and each is a slab with a thickness, rather than a plane or an
+        // inversion, which is what the height fraction divides by.
+        for slab in DECK_SLABS {
+            assert!(
+                slab[1] > slab[0],
+                "a deck runs from {} to {}",
+                slab[0],
+                slab[1]
+            );
+        }
     }
 
     /// Rust and the shader agree about how big the volumes are.

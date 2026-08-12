@@ -79,7 +79,8 @@ const WEATHER_CELLS: i32 = 3;
 const WEATHER_OCTAVES: u32 = 3u;
 const WEATHER_SLOW_OCTAVES: u32 = 1u;
 
-// What one deck of one preset looks like.
+// What one deck of one preset looks like. Must match `Deck` in
+// `src/cloud_march.wgsl`, which is the other view of the same uniform buffer.
 struct Deck {
     // The field values that map to no cloud and to solid cloud, then which way
     // the deck leans -- nothing for flat stratus, one for heaped cumulus -- and
@@ -87,13 +88,22 @@ struct Deck {
     look: vec4<f32>,
     // The seed this deck's field is drawn from, and three spare.
     seed: vec4<u32>,
+    // Where the deck sits: its base, its top, how far its base may lift, and how
+    // dense it is. Read by the march rather than here -- this pass says what the
+    // weather is, not where it hangs -- but it is part of the buffer and so has
+    // to be part of the struct.
+    slab: vec4<f32>,
 };
 
+// Must match `Weather` in `src/cloud_march.wgsl`, for the same reason.
 struct Weather {
     decks: array<Deck, 3>,
     // Seconds since the world started, then how long the weather takes to come
     // back round to where it was. The rest is spare.
     clock: vec4<f32>,
+    // The lowest and highest a cloud can be, over every deck. The march's own
+    // business; see above.
+    span: vec4<f32>,
 };
 
 @group(1) @binding(0) var<uniform> weather: Weather;
