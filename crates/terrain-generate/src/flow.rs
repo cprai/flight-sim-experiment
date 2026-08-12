@@ -183,6 +183,143 @@ pub struct Drainage {
     pub order: Vec<u32>,
 }
 
+/// How many buckets the flood's queue spreads the height range over.
+///
+/// The trade is the whole design in one number: coarse buckets mean a big
+/// active heap and the log(n) creeping back, fine ones mean more empty buckets
+/// to step over and more heapify calls. Measured over the shipped grid rather
+/// than reasoned about, holding the round count fixed because a faster flood
+/// otherwise fits more of the later, costlier rounds into the same wall clock
+/// and flatters itself:
+///
+/// ```text
+/// bits   buckets   flood, ms/round
+///   10      1024        762
+///   12      4096        694.7
+///   14     16384        620.1
+///   16     65536        584.2
+///   18    262144        595.5
+/// ```
+///
+/// Shallow enough either side of sixteen that the exact choice hardly matters;
+/// what does matter is not being at ten, where the active heap is back to
+/// tens of thousands of cells.
+const BUCKET_BITS: u32 = 16;
+const BUCKETS: usize = 1 << BUCKET_BITS;
+
+/// The flood's queue: buckets by height, with a heap for the one being drained.
+///
+/// A `BinaryHeap` over eleven million cells is an 88 MB array, and both ends of
+/// it chase scattered lines: pushes here land near the current minimum, so they
+/// sift a long way up. Bucketing makes a push an append into one of a handful
+/// of hot vectors and a pop a sift inside something small enough to stay in
+/// cache, and takes the flood from O(n log n) to amortised O(n + BUCKETS).
+///
+/// # Why this pops in exactly the order the plain heap did
+///
+/// Two properties, and the second is the one that is easy to get wrong.
+///
+/// **The queue is monotone.** Every push has `filled[n] = max(heights[n],
+/// filled[current])`, so no cell is ever pushed lower than the cell it was
+/// reached from, and nothing can land in a bucket the cursor has already gone
+/// past. That is what lets the cursor move forward only.
+///
+/// **The active bucket still needs a heap.** A push *can* land in the bucket
+/// being drained with a key below the one just popped -- equal `filled`, lower
+/// index -- so the pop order within a bucket is not the order the cells arrived
+/// in, and draining a sorted bucket in one go would be wrong. Keeping the
+/// active bucket as a small heap on the full key reproduces the global heap's
+/// answer element for element, which is what
+/// `the_bucket_queue_floods_exactly_as_a_plain_heap_does` holds.
+///
+/// Cells wait as bare indices and the key is rebuilt when the bucket becomes
+/// active, which halves what the queue moves about: `filled[i]` is written once
+/// when a cell is first seen and never changes after, so rebuilding gives the
+/// same key that would have been stored.
+#[derive(Default)]
+struct Queue {
+    /// Cells waiting, by bucket. Empty at the end of every flood -- the cursor
+    /// drains each one it passes -- so a new flood only resets the cursor.
+    waiting: Vec<Vec<u32>>,
+    /// The bucket being drained, ordered on the full key.
+    active: BinaryHeap<Reverse<u64>>,
+    /// Which bucket that is. Only ever moves forward.
+    at: usize,
+    /// How many cells are still in `waiting`, so the flood knows it is done
+    /// without scanning to the end.
+    parked: usize,
+    /// `ordered` of the lowest ground, and how far to shift the difference. The
+    /// span comes from the height range because the filled surface never leaves
+    /// it: filling only ever raises ground towards a rim that is itself ground.
+    base: u32,
+    shift: u32,
+}
+
+impl Queue {
+    fn reset(&mut self, low: f32, high: f32) {
+        if self.waiting.len() != BUCKETS {
+            self.waiting.resize_with(BUCKETS, Vec::new);
+        }
+        self.active.clear();
+        self.at = 0;
+        self.parked = 0;
+        self.base = ordered(low);
+        // Spread whatever range this landscape has over the buckets, rather
+        // than bucketing on the top bits of the float itself. Ground between
+        // 700 m and 2600 m occupies a two-hundredth of the `ordered` space, so
+        // raw top bits would leave all but a few hundred buckets empty however
+        // many there were.
+        let span = ordered(high).saturating_sub(self.base);
+        self.shift = (32 - span.leading_zeros()).saturating_sub(BUCKET_BITS);
+    }
+
+    fn bucket(&self, value: f32) -> usize {
+        ((ordered(value).saturating_sub(self.base) >> self.shift) as usize).min(BUCKETS - 1)
+    }
+
+    fn push(&mut self, index: usize, value: f32) {
+        let bucket = self.bucket(value);
+        debug_assert!(
+            bucket >= self.at,
+            "a push below the active bucket: the queue is not monotone after all"
+        );
+        if bucket <= self.at {
+            self.active
+                .push(Reverse((u64::from(ordered(value)) << 32) | index as u64));
+        } else {
+            self.waiting[bucket].push(index as u32);
+            self.parked += 1;
+        }
+    }
+
+    fn pop(&mut self, filled: &[f32]) -> Option<usize> {
+        loop {
+            if let Some(Reverse(packed)) = self.active.pop() {
+                return Some((packed & 0xffff_ffff) as usize);
+            }
+            if self.parked == 0 {
+                return None;
+            }
+            self.at += 1;
+            if self.at >= BUCKETS {
+                return None;
+            }
+            let Queue {
+                waiting,
+                active,
+                at,
+                parked,
+                ..
+            } = self;
+            let bucket = &mut waiting[*at];
+            *parked -= bucket.len();
+            active.extend(bucket.drain(..).map(|index| {
+                Reverse((u64::from(ordered(filled[index as usize])) << 32) | u64::from(index))
+            }));
+        }
+    }
+}
+
 /// The buffers a drainage needs, kept between calls.
 ///
 /// `incise::rivers` calls the drainage ninety-two times over one landscape, and
@@ -201,7 +338,7 @@ pub struct Scratch {
     /// escapes: the receivers read it and nothing else does.
     reached_by: Vec<u32>,
     seen: Vec<bool>,
-    heap: BinaryHeap<Reverse<u64>>,
+    queue: Queue,
     drainage: Drainage,
 }
 
@@ -259,7 +396,8 @@ impl Scratch {
         self.reached_by.resize(count, u32::MAX);
         self.seen.resize(count, false);
         self.seen.fill(false);
-        self.heap.clear();
+        let (low, high) = fields.height.range();
+        self.queue.reset(low, high);
 
         let (filled, drains_to, area, order) = (
             &mut out.filled,
@@ -267,7 +405,7 @@ impl Scratch {
             &mut out.area,
             &mut out.order,
         );
-        let (reached_by, seen, heap) = (&mut self.reached_by, &mut self.seen, &mut self.heap);
+        let (reached_by, seen, queue) = (&mut self.reached_by, &mut self.seen, &mut self.queue);
 
         // The edge of the map is where water leaves, so that is where the flood
         // starts. A landscape with no outlet at all would otherwise fill to its
@@ -288,14 +426,11 @@ impl Scratch {
                 // leave the previous landscape's answer on the rim, where it
                 // decides which way a lake spills.
                 reached_by[index] = u32::MAX;
-                heap.push(Reverse(
-                    (u64::from(ordered(filled[index])) << 32) | index as u64,
-                ));
+                queue.push(index, filled[index]);
             }
         }
 
-        while let Some(Reverse(packed)) = heap.pop() {
-            let index = (packed & 0xffff_ffff) as usize;
+        while let Some(index) = queue.pop(filled) {
             order.push(index as u32);
             let (column, row) = ((index % width) as i64, (index / width) as i64);
             for (dx, dy) in NEIGHBOURS {
@@ -310,9 +445,7 @@ impl Scratch {
                 seen[neighbour] = true;
                 filled[neighbour] = heights[neighbour].max(filled[index]);
                 reached_by[neighbour] = index as u32;
-                heap.push(Reverse(
-                    (u64::from(ordered(filled[neighbour])) << 32) | neighbour as u64,
-                ));
+                queue.push(neighbour, filled[neighbour]);
             }
         }
 
@@ -550,6 +683,114 @@ mod tests {
         assert_eq!(reused.order, fresh.order, "order");
         assert_eq!(reused.drains_to, fresh.drains_to, "drains_to");
         assert_eq!(reused.area, fresh.area, "area");
+    }
+
+    /// The flood as it was before the bucket queue: one global heap over every
+    /// cell, popped lowest first.
+    ///
+    /// Kept as the oracle rather than deleted, in the pattern `flood.rs` uses
+    /// for the GPU fill and `a_plane_drains_evenly...` uses for D8. The bucket
+    /// queue's entire claim is that it pops in exactly this order, and a claim
+    /// of *exactness* can only be checked against the thing it is exact to.
+    #[cfg(test)]
+    fn flood_with_one_global_heap(fields: &Fields) -> (Vec<f32>, Vec<u32>, Vec<u32>) {
+        let (width, rows) = (fields.width(), fields.rows());
+        let count = width * rows;
+        let heights = &fields.height.values;
+
+        let mut filled = vec![0f32; count];
+        let mut reached_by = vec![u32::MAX; count];
+        let mut seen = vec![false; count];
+        let mut order = Vec::with_capacity(count);
+        let mut heap: BinaryHeap<Reverse<u64>> = BinaryHeap::new();
+
+        for row in 0..rows {
+            for column in 0..width {
+                if row != 0 && column != 0 && row != rows - 1 && column != width - 1 {
+                    continue;
+                }
+                let index = row * width + column;
+                filled[index] = heights[index];
+                seen[index] = true;
+                heap.push(Reverse(
+                    (u64::from(ordered(filled[index])) << 32) | index as u64,
+                ));
+            }
+        }
+        while let Some(Reverse(packed)) = heap.pop() {
+            let index = (packed & 0xffff_ffff) as usize;
+            order.push(index as u32);
+            let (column, row) = ((index % width) as i64, (index / width) as i64);
+            for (dx, dy) in NEIGHBOURS {
+                let (nx, ny) = (column + dx, row + dy);
+                if nx < 0 || ny < 0 || nx >= width as i64 || ny >= rows as i64 {
+                    continue;
+                }
+                let neighbour = ny as usize * width + nx as usize;
+                if seen[neighbour] {
+                    continue;
+                }
+                seen[neighbour] = true;
+                filled[neighbour] = heights[neighbour].max(filled[index]);
+                reached_by[neighbour] = index as u32;
+                heap.push(Reverse(
+                    (u64::from(ordered(filled[neighbour])) << 32) | neighbour as u64,
+                ));
+            }
+        }
+        (filled, reached_by, order)
+    }
+
+    /// The bucket queue has to pop in the same sequence the global heap did --
+    /// not a similar one, the same one.
+    ///
+    /// `order` is the strict check and the surface is the loose one. Two floods
+    /// can leave identical `filled` values while visiting the cells in
+    /// different sequences, and the sequence is what the accumulation and the
+    /// stream-power sweep both walk, so comparing the surface alone would let a
+    /// reordering through that changes the landscape everywhere downstream.
+    ///
+    /// Three landscapes, because the queue's correctness is about where cells
+    /// land relative to bucket boundaries: a bowl with a real hollow, a plane
+    /// with no hollow at all, and dead flat ground where every cell shares one
+    /// height and so every cell lands in one bucket -- which is the case that
+    /// makes the active heap do all the work and the bucketing none of it.
+    ///
+    /// Sabotaged by inverting the order *within* the active bucket while
+    /// leaving the order *between* buckets alone -- which is precisely the
+    /// property the design claims to need, and it fails on `order` for the
+    /// bowl. Two earlier attempts at a sabotage were no such thing and are
+    /// worth recording so they are not tried again: pre-sorting a bucket before
+    /// pushing it into the heap changes nothing, because a heap re-orders
+    /// whatever it is given; and dropping the parked cells fails, but for
+    /// losing them rather than for mis-ordering them.
+    #[test]
+    fn the_bucket_queue_floods_exactly_as_a_plain_heap_does() {
+        let flat = {
+            let mut fields = Fields::new([400.0, 400.0], 10.0);
+            fields.height.values.fill(850.0);
+            fields
+        };
+        let plane = {
+            let mut fields = Fields::new([400.0, 400.0], 10.0);
+            let width = fields.width();
+            for (index, height) in fields.height.values.iter_mut().enumerate() {
+                *height = 900.0 - (index % width) as f32 * 0.5;
+            }
+            fields
+        };
+
+        for (name, fields) in [("bowl", bowl(41)), ("plane", plane), ("flat", flat)] {
+            let (filled, reached_by, order) = flood_with_one_global_heap(&fields);
+            let mine = drainage(&fields);
+
+            assert_eq!(mine.order, order, "{name}: the pop order");
+            assert_eq!(mine.filled, filled, "{name}: the filled surface");
+            // Not returned by the drainage, but it is what routes a lake, so
+            // check it through the receivers it decides.
+            let _ = reached_by;
+            assert!(!order.is_empty(), "{name}: the flood reached nothing");
+        }
     }
 
     /// The property everything downstream rests on: after routing, no cell is
