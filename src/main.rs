@@ -315,12 +315,18 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => self.controls.release_all(),
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = now.duration_since(self.last_frame).as_secs_f32();
+                let dt = now.duration_since(self.last_frame);
                 self.last_frame = now;
 
                 if let Some(renderer) = self.renderer.as_mut() {
-                    self.controls.update(renderer.camera_mut(), dt);
-                    renderer.render();
+                    // The one gap, spent twice: the camera flies over it and
+                    // the world ages by it. Each clamps it for itself -- see
+                    // `MAX_STEP` in `src/controls.rs` and the one of the same
+                    // name in `src/scene.rs` -- because a stalled frame must
+                    // neither fling the camera nor wind the sky on.
+                    self.controls
+                        .update(renderer.camera_mut(), dt.as_secs_f32());
+                    renderer.render(dt);
                     // Drive a continuous render loop rather than redrawing only on demand.
                     renderer.window().request_redraw();
                 }

@@ -175,7 +175,15 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn render(&mut self) {
+    /// Draws one frame, covering `dt` of the world's time.
+    ///
+    /// `dt` is the wall-clock gap since the last redraw, the same one the
+    /// controller flies the camera over, so what the window shows advances at
+    /// the rate a person watching it experiences. It is passed in rather than
+    /// measured from [`Self::last_frame`], which is deliberately timed from
+    /// after `get_current_texture` and so excludes the vsync wait -- a clock
+    /// that skipped the time spent blocked on the display would run slow.
+    pub fn render(&mut self, dt: std::time::Duration) {
         let (frame, stale) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             // Still drawable, but the swapchain no longer matches the surface. Draw
@@ -209,7 +217,7 @@ impl Renderer {
                 label: Some("frame"),
             });
 
-        self.scene.update(&self.device, &self.queue);
+        self.scene.update(&self.device, &self.queue, dt);
         self.scene.record(&mut self.frame);
         // What the coverage is a share of, the ceiling a climbing ray has to
         // clear before it can be settled as sky for free, and the viewpoint the

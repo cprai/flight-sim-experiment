@@ -173,14 +173,17 @@ pub fn device_and_adapter() -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue)
     Ok((adapter, device, queue))
 }
 
-/// How far the camera is taken to move between one frame and the next, per
-/// metre per second of [`Flight::speed`].
+/// How much time one headless frame is taken to cover.
 ///
 /// A nominal sixtieth of a second rather than the frame's own measured time.
 /// The path flown has to come out the same on a fast machine and a slow one, or
 /// two runs would be looking at two different flights and could not be
-/// compared -- which is the only reason either mode can fly at all.
-const STEP_SECONDS: f32 = 1.0 / 60.0;
+/// compared -- which is the only reason either mode can fly at all. The same
+/// number is what the world's clock is wound on by, so a run's weather is as
+/// reproducible as its camera; see [`Scene::update`].
+///
+/// [`Scene::update`]: crate::scene::Scene::update
+pub const STEP: std::time::Duration = std::time::Duration::from_nanos(1_000_000_000 / 60);
 
 /// A camera that moves, for the modes that draw more than one frame.
 ///
@@ -204,7 +207,7 @@ impl Flight {
     fn advance(self, scene: &mut Scene) {
         if self.speed != 0.0 {
             let forward = scene.camera.ray_basis()[2];
-            scene.camera.position += forward * self.speed * STEP_SECONDS;
+            scene.camera.position += forward * self.speed * STEP.as_secs_f32();
         }
     }
 }
@@ -263,7 +266,7 @@ pub fn capture(
         scene.draw(&mut encoder, &view);
         queue.submit(std::iter::once(encoder.finish()));
         flight.advance(scene);
-        scene.update(device, queue);
+        scene.update(device, queue, STEP);
     }
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -460,7 +463,7 @@ pub fn profile(
         if index > 0 {
             flight.advance(&mut scene);
         }
-        scene.update(&device, &queue);
+        scene.update(&device, &queue, STEP);
         scene.record(&mut frame);
 
         let clock = crate::profile::Clock::start(true);
@@ -585,7 +588,7 @@ fn coverage(
     });
 
     flight.advance(scene);
-    scene.update(device, queue);
+    scene.update(device, queue, STEP);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("coverage"),
     });

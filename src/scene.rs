@@ -25,6 +25,17 @@ pub const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+/// The longest step the world's clock takes in one frame.
+///
+/// The same guard, and for the same reason, as `MAX_STEP` in
+/// `src/controls.rs`: a stalled frame -- a resize, a shader compile, the window
+/// being dragged -- would otherwise hand its whole wall-clock gap to
+/// [`Scene::update`] at once, and the weather would jump. Kept here rather than
+/// shared with the controller's, because the two are answering different
+/// questions and would not have to move together: that one bounds how far the
+/// camera is flung, this one bounds how far the sky is wound on.
+const MAX_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Mirrors the `Camera` uniform block in `terrain.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -101,6 +112,19 @@ pub struct Scene {
     /// Which frame this is, which is all the dither needs to move its pattern
     /// on. Wraps freely: only the low six bits are ever read.
     frame: u32,
+    /// How long the world has been running, in the world's own time.
+    ///
+    /// Not wall-clock and not the process's age: it is the sum of the steps
+    /// [`Scene::update`] was handed, so a headless flight of sixty frames has
+    /// advanced exactly one nominal second whatever the machine took to draw
+    /// them. That is what makes two runs of the same flight the same flight --
+    /// the same reasoning that puts a nominal step in [`crate::headless`]
+    /// rather than a measured one.
+    ///
+    /// [`Scene::settle`] advances it by nothing, for the reason it puts the
+    /// frame counter back: settling is not time passing.
+    #[allow(dead_code, reason = "read by the weather, which lands next")]
+    elapsed: std::time::Duration,
     /// The ray basis of the camera that drew what is now the history.
     ///
     /// Only carried sky needs it -- ground reprojects from its own world
@@ -300,6 +324,7 @@ impl Scene {
             reach_bind_group,
             reproject,
             frame: 0,
+            elapsed: std::time::Duration::ZERO,
             was_basis: camera.ray_basis(),
             was_eye: camera.position,
             was_view_proj: camera.view_projection(),
@@ -342,8 +367,18 @@ impl Scene {
     /// its outer edge rather than wrongly. What that costs is the `detail` and
     /// `maxima` rows of the readout -- 0.72 ms and 0.18 ms of GPU on average
     /// at 4 km/s, against 0 on a frame that crossed nothing.
-    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    ///
+    /// `dt` is how much of the world's time this frame covers, clamped to
+    /// [`MAX_STEP`]. It is a parameter rather than a clock read here because
+    /// the caller is the only one who knows what a frame is worth: a window
+    /// hands over the wall-clock gap since the last redraw, where a headless
+    /// flight hands over a nominal step so that two runs of it are the same
+    /// run. Nothing reads the total yet -- see [`Scene::elapsed`].
+    ///
+    /// [`Scene::elapsed`]: Scene#structfield.elapsed
+    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: std::time::Duration) {
         let clock = crate::profile::Clock::start(self.terrain.spans().is_some());
+        self.elapsed += dt.min(MAX_STEP);
         queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -453,10 +488,15 @@ impl Scene {
         // phase belongs to frames that are actually drawn, so it is put back
         // afterwards. Without this the pattern at the first drawn frame would
         // depend on how much of the pyramid was on disk.
+        //
+        // The world's clock needs no putting back, because it is never wound
+        // on: a zero step is the same statement about time that restoring the
+        // counter is about the dither, made where it can be made directly.
         let frame = self.frame;
-        self.update(device, queue);
+        let still = std::time::Duration::ZERO;
+        self.update(device, queue, still);
         while self.terrain.pending() {
-            self.update(device, queue);
+            self.update(device, queue, still);
         }
         self.frame = frame;
         self.reproject.set_frame(
@@ -738,6 +778,8 @@ fn to_pixels(view_proj: glam::Mat4, point: glam::Vec3, width: u32, height: u32) 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use glam::{IVec2, UVec2, Vec2, Vec3};
     use terrain_materials::Material;
 
@@ -965,10 +1007,10 @@ mod tests {
         let destination = scene.camera.position;
         for step in path {
             scene.camera.position = *step;
-            scene.update(&device, &queue);
+            scene.update(&device, &queue, crate::headless::STEP);
         }
         scene.camera.position = destination;
-        scene.update(&device, &queue);
+        scene.update(&device, &queue, crate::headless::STEP);
 
         // `SIZE * 4` is already a multiple of the 256-byte copy alignment, and
         // the depth channel is four bytes wide too, so one figure serves both.
@@ -2025,7 +2067,7 @@ mod tests {
 
         let mut scene = test_scene(&device, format, test_residency(), heights, flat_ground());
         aim(&mut scene.camera);
-        scene.update(&device, &queue);
+        scene.update(&device, &queue, crate::headless::STEP);
 
         // One float a texel, and `SIZE * 4` is already a multiple of the
         // 256-byte copy alignment.
@@ -2156,7 +2198,7 @@ mod tests {
 
         let mut scene = test_scene(&device, format, residency, heights, flat_ground());
         aim(&mut scene.camera);
-        scene.update(&device, &queue);
+        scene.update(&device, &queue, crate::headless::STEP);
 
         // Four half floats a texel, and `SIZE * 8` is already a multiple of
         // the 256-byte copy alignment.
@@ -3007,6 +3049,88 @@ mod tests {
         );
     }
 
+    /// A scene over flat ground, for the tests that are about bookkeeping
+    /// rather than about pixels and never draw a frame at all.
+    fn clockwork_scene(device: &wgpu::Device) -> Scene {
+        test_scene(
+            device,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            test_residency(),
+            vec![0.0; (RASTER * RASTER) as usize],
+            flat_ground(),
+        )
+    }
+
+    #[test]
+    fn a_frame_winds_the_world_clock_on_by_the_step_it_was_handed() {
+        let (device, queue) = test_device();
+        let mut scene = clockwork_scene(&device);
+        assert_eq!(scene.elapsed, Duration::ZERO, "a new scene has no history");
+
+        for frames in 1..=5u32 {
+            scene.update(&device, &queue, crate::headless::STEP);
+            assert_eq!(
+                scene.elapsed,
+                crate::headless::STEP * frames,
+                "after {frames} nominal frames"
+            );
+        }
+    }
+
+    /// The clock is the sum of the steps it was handed, not of the ones it
+    /// might have wanted.
+    ///
+    /// Sixty nominal frames are one second exactly, whatever the machine took
+    /// to draw them -- which is the whole reason [`crate::headless::STEP`] is a
+    /// nominal figure. A run whose weather depended on how fast the GPU was
+    /// could not be compared with another run of the same flight.
+    #[test]
+    fn a_nominal_second_of_frames_is_a_second() {
+        let (device, queue) = test_device();
+        let mut scene = clockwork_scene(&device);
+        for _ in 0..60 {
+            scene.update(&device, &queue, crate::headless::STEP);
+        }
+        // Not `assert_eq!` against one second: the step is a whole number of
+        // nanoseconds and sixty of them are a nanosecond short of a second.
+        // That shortfall is the point being pinned -- it is fixed, and it does
+        // not accumulate differently on different machines.
+        assert_eq!(scene.elapsed, Duration::from_nanos(999_999_960));
+    }
+
+    /// Settling is not time passing -- the same statement the frame counter
+    /// makes by being put back, made where it can be made directly.
+    #[test]
+    fn settling_the_scene_does_not_wind_the_world_clock_on() {
+        let (device, queue) = test_device();
+        let mut scene = clockwork_scene(&device);
+
+        scene.update(&device, &queue, crate::headless::STEP);
+        let drawn = scene.elapsed;
+        scene.settle(&device, &queue);
+
+        assert_eq!(
+            scene.elapsed,
+            drawn,
+            "settling aged the world by {:?}",
+            scene.elapsed.saturating_sub(drawn),
+        );
+    }
+
+    /// A stalled frame ages the world by a frame's worth, not by the stall.
+    ///
+    /// The same guard the controller puts on how far the camera is flung; see
+    /// [`MAX_STEP`] and the one of that name in `src/controls.rs`. Without it a
+    /// shader compile or a dragged window would jump the weather forward by
+    /// however long it took.
+    #[test]
+    fn a_stalled_frame_does_not_wind_the_world_clock_past_the_limit() {
+        let (device, queue) = test_device();
+        let mut scene = clockwork_scene(&device);
+        scene.update(&device, &queue, Duration::from_secs(30));
+        assert_eq!(scene.elapsed, MAX_STEP);
+    }
+
     /// Renders a real tile pyramid and writes the frame out.
     ///
     /// Ignored because no pyramid is in version control -- one covering a few
@@ -3095,7 +3219,7 @@ mod tests {
             scene.camera.position = home - Vec3::new(steps as f32, 0.0, steps as f32);
             for _ in 0..steps {
                 scene.camera.position += Vec3::new(1.0, 0.0, 1.0);
-                scene.update(&device, &queue);
+                scene.update(&device, &queue, crate::headless::STEP);
             }
             scene.camera.position = home;
         }
@@ -3324,7 +3448,7 @@ mod tests {
         let mut read_levels = |at: Vec3| {
             reads.borrow_mut().clear();
             scene.camera.position = at;
-            scene.update(&device, &queue);
+            scene.update(&device, &queue, crate::headless::STEP);
             let seen: std::collections::HashSet<u32> = reads.borrow().iter().copied().collect();
             (seen, scene.terrain.base_level())
         };
@@ -3417,7 +3541,7 @@ mod tests {
             heights.clone(),
             flat_ground(),
         );
-        quiet.update(&device, &queue);
+        quiet.update(&device, &queue, crate::headless::STEP);
         quiet.record(&mut frame);
         assert_eq!(frame.cpu.terrain, crate::profile::Terrain::default());
 
@@ -3425,7 +3549,7 @@ mod tests {
         // has plenty to report.
         let mut watched = test_scene(&device, format, test_residency(), heights, flat_ground());
         watched.profile(&device, true);
-        watched.update(&device, &queue);
+        watched.update(&device, &queue, crate::headless::STEP);
         watched.record(&mut frame);
         let load = frame.cpu.terrain;
         assert!(load.read > Duration::ZERO, "{load:?}");
@@ -3435,7 +3559,7 @@ mod tests {
         // chain rather than streaming it -- and the reason these rows are worth
         // keeping is that they are how anyone would notice it had come back.
         watched.camera.position = Vec3::new(400.0, 900.0, -400.0);
-        watched.update(&device, &queue);
+        watched.update(&device, &queue, crate::headless::STEP);
         watched.record(&mut frame);
         let flying = frame.cpu.terrain;
         assert_eq!(flying.read, Duration::ZERO, "{flying:?}");
@@ -3541,7 +3665,7 @@ mod tests {
         assert_eq!(first.total(), pixels, "{first:?}");
         assert_eq!(first.reprojected, 0, "{first:?}");
 
-        scene.update(&device, &queue);
+        scene.update(&device, &queue, crate::headless::STEP);
 
         // The second is the first that can take all three paths.
         let second = settled_pixels(&device, &queue, &scene, &view);
@@ -3616,7 +3740,7 @@ mod tests {
         // run against their own cameras -- the same reason
         // `crate::headless::capture` loops that way.
         scene.camera.position.y = GROUND - 100.0;
-        scene.update(&device, &queue);
+        scene.update(&device, &queue, crate::headless::STEP);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut gpu = profiler.scope("gpu", &mut encoder);
@@ -3626,7 +3750,7 @@ mod tests {
 
         // Back out above it, where every ray meets the ground again.
         scene.camera.position.y = 3000.0;
-        scene.update(&device, &queue);
+        scene.update(&device, &queue, crate::headless::STEP);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut gpu = profiler.scope("gpu", &mut encoder);
@@ -3742,7 +3866,7 @@ mod tests {
             read: bool,
         ) -> Option<Frame> {
             scene.camera.position = at;
-            scene.update(device, queue);
+            scene.update(device, queue, crate::headless::STEP);
             let mut encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             {
@@ -4215,7 +4339,7 @@ mod tests {
             if arrived.is_some() {
                 break;
             }
-            scene.update(&device, &queue);
+            scene.update(&device, &queue, crate::headless::STEP);
         }
 
         let coverage = arrived.expect("the reader never delivered a coverage in 16 frames");
