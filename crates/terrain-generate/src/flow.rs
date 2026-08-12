@@ -1249,6 +1249,53 @@ mod measure {
         sweep::<32>("32", &fields, &drainage, Some(&control), rule);
     }
 
+    /// Whether a tiled, parallel flood is worth the rest of Barnes.
+    ///
+    /// The gate this exists to answer: the fill is the cheap half, and the pop
+    /// order and the lake-routing tree are the expensive half. If the cheap
+    /// half does not clear about three times, the expensive half is not worth
+    /// designing and the flood stays as it is.
+    ///
+    /// Exactness is checked first and is not negotiable -- the minimax surface
+    /// has one answer however it is reached, so a tiled flood that disagrees
+    /// with the heap is wrong rather than approximate.
+    ///
+    /// Run with `--release ... -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement on the full grid, not a check"]
+    fn measure_whether_a_tiled_flood_is_worth_it() {
+        let fields = crate::fields::shipped_grid();
+        println!(
+            "grid {} x {}, {} threads",
+            fields.width(),
+            fields.rows(),
+            rayon::current_num_threads()
+        );
+
+        // The phase timings inside `drainage` are logged rather than returned,
+        // and the comparison has to be against the flood phase alone: timing
+        // the whole `drainage` call would put the receivers and the
+        // accumulation on the serial side of the ratio and flatter the tiles by
+        // about three times.
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .is_test(false)
+            .try_init();
+        let heap = drainage(&fields).filled;
+
+        for tile in [64usize, 128, 256, 512] {
+            let at = std::time::Instant::now();
+            let (mine, sweeps) = super::tiled::fill(&fields, tile);
+            let elapsed = at.elapsed();
+            let differing = mine.iter().zip(&heap).filter(|(a, b)| a != b).count();
+            println!(
+                "  {tile:>4}-cell tiles, {sweeps:>2} sweeps   {elapsed:>9.1?}   \
+                 {differing} of {} cells differ",
+                mine.len(),
+            );
+        }
+    }
+
     /// How deep the drainage network is, and how wide each of its levels is.
     ///
     /// The evidence for or against parallelising the accumulation by depth.
@@ -1327,5 +1374,223 @@ mod measure {
             "working the depths out took {pre_pass:.1?}, which is what a level \
              decomposition pays before it parallelises anything"
         );
+    }
+}
+
+/// A prototype of the one thing left that could put every core on the flood.
+///
+/// The flood is the largest single item in a run and it is the only phase with
+/// no parallel form: a priority queue is a total order and a total order is one
+/// thread. Barnes' answer (Barnes 2016, "Parallel Priority-Flood depression
+/// filling for trillion cell digital elevation models") is to decompose the
+/// grid into tiles, flood each independently, and reconcile them.
+///
+/// This is the fill and nothing else, which is deliberate: a run needs the pop
+/// order and the lake-routing tree as much as it needs the surface, and neither
+/// falls out of a tiled flood. That is the expensive half of adopting Barnes
+/// and it is only worth designing if the cheap half wins first, so this exists
+/// to answer whether it does.
+///
+/// # What this is, and what it is not
+///
+/// It is the **iterative** tiled fill: sweep every tile, repeat until nothing
+/// moves. It is not Barnes' algorithm, which floods each tile once, solves a
+/// small graph over the tile borders, and floods once more -- two passes and a
+/// reconciliation rather than however many sweeps the geometry demands. The
+/// difference is the whole result below: information crosses one tile per
+/// sweep, so a grid twelve tiles across wants about eight sweeps, and doing
+/// eight times the work to get twenty-four times the parallelism leaves very
+/// little over.
+///
+/// Kept because the numbers it produces are the ones a real attempt at Barnes
+/// would need as its starting point, and because it establishes the part that
+/// was not obvious: a tiled fill can be *exact*, to the cell, against the heap.
+#[cfg(test)]
+mod tiled {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// The filled surface computed one tile at a time, across every core.
+    ///
+    /// The surface is a minimax: a cell's filled height is the lowest, over
+    /// every path out to the rim of the map, of the highest ground on that
+    /// path. That has a fixed point which does not care how it is reached --
+    /// which is what makes a tiled version able to agree with the heap exactly
+    /// rather than approximately.
+    ///
+    /// Each tile floods inwards from its own halo, lowering cells it can
+    /// improve and leaving the rest, and a sweep is done when no tile lowered
+    /// anything. Values only ever fall, from infinity towards the answer, so it
+    /// terminates.
+    ///
+    /// Tiles are coloured two apart on both axes, exactly as `hydraulic` does,
+    /// so that no two tiles running at once can touch the same cell: a tile
+    /// writes only its own interior and reads only one ring beyond it.
+    /// `AtomicU32` for the same reason it is used there -- the compiler's
+    /// permission, not synchronisation.
+    pub fn fill(fields: &Fields, tile: usize) -> (Vec<f32>, usize) {
+        let (width, rows) = (fields.width(), fields.rows());
+        let heights = &fields.height.values;
+
+        let filled: Vec<AtomicU32> = (0..width * rows)
+            .map(|index| {
+                let (column, row) = (index % width, index / width);
+                let rim = row == 0 || column == 0 || row == rows - 1 || column == width - 1;
+                AtomicU32::new(if rim { heights[index] } else { f32::INFINITY }.to_bits())
+            })
+            .collect();
+
+        let across = width.div_ceil(tile);
+        let down = rows.div_ceil(tile);
+        let mut sweeps = 0;
+        loop {
+            sweeps += 1;
+            let moved = AtomicBool::new(false);
+            for colour in 0..4 {
+                let tiles: Vec<(usize, usize)> = (0..down)
+                    .flat_map(|ty| (0..across).map(move |tx| (tx, ty)))
+                    .filter(|(tx, ty)| (tx % 2) + 2 * (ty % 2) == colour)
+                    .collect();
+                tiles.par_iter().for_each(|&(tx, ty)| {
+                    if one_tile(heights, &filled, width, rows, tile, tx, ty) {
+                        moved.store(true, Ordering::Relaxed);
+                    }
+                });
+            }
+            if !moved.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
+        let out = filled
+            .iter()
+            .map(|bits| f32::from_bits(bits.load(Ordering::Relaxed)))
+            .collect();
+        (out, sweeps)
+    }
+
+    /// One tile's flood: a minimax Dijkstra over the tile, seeded from whatever
+    /// its neighbours currently know, relaxing only cells inside it.
+    fn one_tile(
+        heights: &[f32],
+        filled: &[AtomicU32],
+        width: usize,
+        rows: usize,
+        tile: usize,
+        tx: usize,
+        ty: usize,
+    ) -> bool {
+        let (first_column, first_row) = (tx * tile, ty * tile);
+        let last_column = (first_column + tile).min(width);
+        let last_row = (first_row + tile).min(rows);
+        let (span, high) = (last_column - first_column, last_row - first_row);
+        if span == 0 || high == 0 {
+            return false;
+        }
+
+        let at = |column: usize, row: usize| row * width + column;
+        let read = |index: usize| f32::from_bits(filled[index].load(Ordering::Relaxed));
+        let local = |column: usize, row: usize| (row - first_row) * span + (column - first_column);
+
+        // The tile's own copy, so the inner loop is a walk over half a megabyte
+        // rather than over a quarter of a gigabyte. This is most of the point:
+        // the heap version's cost is that every neighbour it looks at is a
+        // cache miss somewhere in 220 MB.
+        let mut best: Vec<f32> = Vec::with_capacity(span * high);
+        for row in first_row..last_row {
+            for column in first_column..last_column {
+                best.push(read(at(column, row)));
+            }
+        }
+
+        let mut heap: BinaryHeap<Reverse<u64>> = BinaryHeap::new();
+        let push = |heap: &mut BinaryHeap<Reverse<u64>>, slot: usize, value: f32| {
+            heap.push(Reverse((u64::from(ordered(value)) << 32) | slot as u64));
+        };
+
+        // Seed from the halo: every way into this tile from outside it.
+        for row in first_row..last_row {
+            for column in first_column..last_column {
+                let edge = column == first_column
+                    || row == first_row
+                    || column + 1 == last_column
+                    || row + 1 == last_row;
+                if !edge {
+                    continue;
+                }
+                let slot = local(column, row);
+                for (dx, dy) in NEIGHBOURS {
+                    let (nx, ny) = (column as i64 + dx, row as i64 + dy);
+                    if nx < 0 || ny < 0 || nx >= width as i64 || ny >= rows as i64 {
+                        continue;
+                    }
+                    let (nx, ny) = (nx as usize, ny as usize);
+                    let outside =
+                        nx < first_column || ny < first_row || nx >= last_column || ny >= last_row;
+                    if !outside {
+                        continue;
+                    }
+                    let over = read(at(nx, ny));
+                    if !over.is_finite() {
+                        continue;
+                    }
+                    let candidate = heights[at(column, row)].max(over);
+                    if candidate < best[slot] {
+                        best[slot] = candidate;
+                        push(&mut heap, slot, candidate);
+                    }
+                }
+            }
+        }
+        // ... and from what the tile already knew, so a value that arrived last
+        // sweep can still travel inwards this one.
+        for (slot, value) in best.iter().enumerate() {
+            if value.is_finite() {
+                push(&mut heap, slot, *value);
+            }
+        }
+
+        let mut lowered = false;
+        while let Some(Reverse(packed)) = heap.pop() {
+            let slot = (packed & 0xffff_ffff) as usize;
+            // The key holds `ordered` bits, not float bits -- comparing them
+            // against `ordered(best[slot])` is the check for a stale entry, and
+            // the value itself has to come back from `best` rather than from
+            // the key.
+            if (packed >> 32) as u32 != ordered(best[slot]) {
+                continue;
+            }
+            let here = best[slot];
+            let (column, row) = (first_column + slot % span, first_row + slot / span);
+            for (dx, dy) in NEIGHBOURS {
+                let (nx, ny) = (column as i64 + dx, row as i64 + dy);
+                if nx < first_column as i64
+                    || ny < first_row as i64
+                    || nx >= last_column as i64
+                    || ny >= last_row as i64
+                {
+                    continue;
+                }
+                let (nx, ny) = (nx as usize, ny as usize);
+                let neighbour = local(nx, ny);
+                let candidate = heights[at(nx, ny)].max(here);
+                if candidate < best[neighbour] {
+                    best[neighbour] = candidate;
+                    push(&mut heap, neighbour, candidate);
+                }
+            }
+        }
+
+        for row in first_row..last_row {
+            for column in first_column..last_column {
+                let index = at(column, row);
+                let value = best[local(column, row)];
+                if ordered(value) < ordered(read(index)) {
+                    filled[index].store(value.to_bits(), Ordering::Relaxed);
+                    lowered = true;
+                }
+            }
+        }
+        lowered
     }
 }
