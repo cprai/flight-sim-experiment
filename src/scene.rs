@@ -313,15 +313,8 @@ impl Scene {
         let reproject =
             crate::reproject::Reprojection::new(device, camera_layout, &gbuffer, &carried);
         let sky = crate::sky::Sky::new(device, camera_layout);
-        let shading = Shading::new(
-            device,
-            format,
-            &gbuffer,
-            camera_layout,
-            sky.layout(),
-            sky.tables_layout(),
-        );
         let cloud = crate::cloud::Cloud::new(device);
+        // Before the shading, which now reads what it leaves.
         let march = crate::cloud::March::new(
             device,
             camera_layout,
@@ -329,6 +322,15 @@ impl Scene {
             sky.sun_tables_layout(),
             &cloud,
             &gbuffer,
+        );
+        let shading = Shading::new(
+            device,
+            format,
+            &gbuffer,
+            camera_layout,
+            sky.layout(),
+            sky.tables_layout(),
+            march.views(),
         );
         Self {
             camera,
@@ -386,10 +388,12 @@ impl Scene {
         self.reach_bind_group =
             crate::reproject::bind_reach(device, &self.reach_layout, &self.carried);
         self.reproject.rebind(device, &self.gbuffer, &self.carried);
-        self.shading.rebind(device, &self.gbuffer);
         // The half-resolution cloud buffers follow the frame, and the march
-        // reads the depth of the G-buffer just rebuilt above.
+        // reads the depth of the G-buffer just rebuilt above. Before the
+        // shading, which reads the buffers this throws away and remakes.
         self.march.resize(device, &self.cloud, &self.gbuffer);
+        self.shading
+            .rebind(device, &self.gbuffer, self.march.views());
         self.terrain.resize(viewport);
         self.camera.aspect = viewport.x as f32 / viewport.y.max(1) as f32;
     }
@@ -1021,6 +1025,11 @@ mod tests {
             },
         );
         scene.skip_the_wind();
+        // Under a clear sky unless the caller says otherwise, for the reason
+        // given on [`render_sunlit`]: none of these tests is about cloud, and
+        // cloud in front of what one of them is measuring is noise in the
+        // measurement. `render_over` sets this again from its own argument.
+        scene.weather = crate::cloud::Preset::Clear;
         scene
     }
 
@@ -1079,6 +1088,15 @@ mod tests {
     /// the tests that are *about* the sun have any business naming one. The
     /// rest want the default, which is the sun every frame in this file has
     /// always been lit by.
+    ///
+    /// Under a clear sky, and that is not the application's default. Cloud in
+    /// front of the thing a test is measuring is noise in the measurement, and
+    /// the day the composite landed it stopped being hypothetical: a
+    /// fair-weather cumulus over the setting sun took the disc from white to
+    /// [143, 69, 32], and the weather moving between two frames of a still
+    /// camera changed ninety-five pixels the reprojection was being held to
+    /// account for. Both are the renderer working. Neither is what those tests
+    /// are about.
     fn render_sunlit(
         residency: Residency,
         heights: Vec<f32>,
@@ -1095,15 +1113,15 @@ mod tests {
             path,
             sun,
             placement(),
-            crate::cloud::Preset::default(),
+            crate::cloud::Preset::Clear,
         )
     }
 
     /// As [`render_sunlit`], but under weather of the caller's choosing.
     ///
     /// Separate for the reason the sun is separate: only a test that is *about*
-    /// the cloud has any business naming a preset, and the rest want the sky
-    /// every frame in this file has been drawn under since the weather arrived.
+    /// the cloud has any business naming a preset, and the rest want the clear
+    /// sky every frame in this file has always been drawn under.
     fn render_under(
         heights: Vec<f32>,
         materials: Vec<MaterialId>,
@@ -2791,7 +2809,7 @@ mod tests {
             &[],
             crate::sky::Sun::default(),
             wide,
-            crate::cloud::Preset::default(),
+            crate::cloud::Preset::Clear,
         );
 
         // Two bands of ground, near the bottom of the frame and just under the
@@ -3524,6 +3542,18 @@ mod tests {
         (heights, flat_ground())
     }
 
+    /// West of the shelf, below its top, looking east along the flat.
+    ///
+    /// Rolled, so the shelf's edge runs diagonally across the frame. Level, it
+    /// projects to an exactly horizontal line that lands between two rows of
+    /// blocks, and no block straddles it at all -- which is the one case both
+    /// tests below are most about.
+    fn against_the_shelf(camera: &mut Camera) {
+        camera.position = Vec3::new(world_of(4.0, 64.0).x, 200.0, world_of(4.0, 64.0).z);
+        camera.orientation =
+            Camera::from_yaw_pitch_roll(90f32.to_radians(), 0.0, 8f32.to_radians());
+    }
+
     /// Ground in front of cloud hides it, exactly.
     ///
     /// The march clips its ray at the G-buffer's own depth, which is the whole
@@ -3549,16 +3579,7 @@ mod tests {
         let frame = render_under(
             heights,
             materials,
-            |camera| {
-                // West of the shelf, below its top, looking east along the flat.
-                camera.position = Vec3::new(world_of(4.0, 64.0).x, 200.0, world_of(4.0, 64.0).z);
-                // Rolled, so the shelf's edge runs diagonally across the frame.
-                // Level, it projects to an exactly horizontal line that lands
-                // between two rows of blocks, and no block straddles it at all
-                // -- which is the one case the last assertion below is about.
-                camera.orientation =
-                    Camera::from_yaw_pitch_roll(90f32.to_radians(), 0.0, 8f32.to_radians());
-            },
+            against_the_shelf,
             crate::cloud::Preset::Overcast,
         );
 
@@ -3606,6 +3627,183 @@ mod tests {
             !skyline.is_empty() && straddling > 0.9,
             "{} blocks straddle the skyline and the emptiest found {straddling} of cloud",
             skyline.len()
+        );
+    }
+
+    /// A cloud in front of the sun hides the sun.
+    ///
+    /// Nothing in the composite mentions the sun's disc. It is hidden because
+    /// the cloud's transmittance multiplies the *whole* of what was behind it,
+    /// and the disc is part of that -- which is the same line that makes a cloud
+    /// redden at sunset and that will make one dim a star. Getting this for
+    /// nothing is the argument for compositing over a finished background
+    /// rather than adding cloud into the sky as another term.
+    ///
+    /// The disc is the only thing in the frame that clips to white, so it can be
+    /// found rather than predicted: the brightest pixel of the clear frame is
+    /// it, and the assertion is about that same pixel under cloud.
+    #[test]
+    fn a_cloud_in_front_of_the_sun_hides_the_sun() {
+        // Flat, so the whole upper frame is sky and the sun has somewhere to
+        // be. Looking east at the sun's own bearing, tilted up to meet it.
+        let aim = |camera: &mut Camera| {
+            camera.position = Vec3::new(0.0, 300.0, 0.0);
+            camera.orientation =
+                Camera::from_yaw_pitch_roll(90f32.to_radians(), 25f32.to_radians(), 0.0);
+        };
+        let frame = |weather| {
+            render_over(
+                test_residency(),
+                vec![0.0; (RASTER * RASTER) as usize],
+                flat_ground(),
+                aim,
+                &[],
+                crate::sky::Sun::from_angles(25.0, 90.0),
+                placement(),
+                weather,
+            )
+        };
+        let clear = frame(crate::cloud::Preset::Clear);
+        let cloudy = frame(crate::cloud::Preset::Overcast);
+
+        let brightness = |pixels: &Frame, x, y| {
+            let p = pixels.pixel(x, y);
+            u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])
+        };
+        let (at, disc) = (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .map(|(x, y)| ((x, y), brightness(&clear, x, y)))
+            .max_by_key(|&(_, lit)| lit)
+            .expect("an empty frame");
+        assert!(
+            disc > 700,
+            "the brightest pixel of a clear sky is only {disc}, which is no sun"
+        );
+        assert!(
+            clear.sky(at.0, at.1),
+            "the brightest pixel of the frame is ground, not the sun"
+        );
+
+        // What says the sun is hidden is not that the pixel went dark -- a
+        // sunlit overcast deck is bright -- but that it stopped standing out
+        // from what is around it. The disc is a fraction of a degree across and
+        // the sky beside it is not, so the ratio between them is the measurement
+        // that survives the cloud being bright in its own right.
+        let ring = |frame: &Frame| {
+            let mut lit = 0u32;
+            let mut count = 0u32;
+            for step in 0..16i32 {
+                let angle = step as f32 * std::f32::consts::TAU / 16.0;
+                let x = at.0 as f32 + 40.0 * angle.cos();
+                let y = at.1 as f32 + 40.0 * angle.sin();
+                if (0.0..SIZE as f32).contains(&x) && (0.0..SIZE as f32).contains(&y) {
+                    lit += brightness(frame, x as u32, y as u32);
+                    count += 1;
+                }
+            }
+            f64::from(lit) / f64::from(count.max(1))
+        };
+        let stands_out =
+            |frame: &Frame| f64::from(brightness(frame, at.0, at.1)) / ring(frame).max(1.0);
+        // Measured: 2.26 against a clear sky, 1.06 against an overcast one --
+        // the disc goes from twice its surroundings to indistinguishable from
+        // them. It is worth saying what the second number is *not*: the pixel
+        // did not go dark, it went from 255 a channel to 114, because what is
+        // there now is a sunlit cloud and a sunlit cloud is bright.
+        let (open, hidden) = (stands_out(&clear), stands_out(&cloudy));
+        assert!(open > 1.8, "a clear sky's sun stands out by only {open:.2}");
+        assert!(
+            hidden < 1.25,
+            "an overcast sky left the sun standing out by {hidden:.2}"
+        );
+    }
+
+    /// Cloud behind a ridge does not leak across it into the ridge.
+    ///
+    /// The half-resolution march is one ray per two-by-two block, and a block
+    /// the skyline runs through marched *past* the shelf -- that is deliberate,
+    /// and it is what stops a notch of missing cloud appearing along every
+    /// silhouette. The price is that a plain bilinear upsample would then paint
+    /// that cloud onto the pixels the shelf covers, which is the halo every
+    /// half-resolution volumetric has to answer for.
+    ///
+    /// The answer is the bilateral weighting in `cloud_at`: a tap is worth the
+    /// reciprocal of how far its block reached from what this pixel is showing,
+    /// so a tap that ran to the horizon is worth a hundredth to a pixel two
+    /// kilometres away. This measures the leak.
+    ///
+    /// Two frames of one scene, differing only in the preset. Under a clear sky
+    /// the composite is the identity, so the clear frame *is* the frame this
+    /// pass drew before there were clouds in it -- which makes the comparison an
+    /// exact one rather than a judgement.
+    #[test]
+    fn cloud_behind_a_ridge_does_not_leak_onto_the_ridge() {
+        let (heights, materials) = shelf(600.0);
+        let clear = render_under(
+            heights.clone(),
+            materials.clone(),
+            against_the_shelf,
+            crate::cloud::Preset::Clear,
+        );
+        let cloudy = render_under(
+            heights,
+            materials,
+            against_the_shelf,
+            crate::cloud::Preset::Overcast,
+        );
+
+        let apart = |x, y| {
+            let (a, b) = (clear.pixel(x, y), cloudy.pixel(x, y));
+            (0..3).map(|c| a[c].abs_diff(b[c])).max().unwrap_or(0)
+        };
+        let mut ground = (0u8, 0usize, 0usize);
+        let mut sky = (255u8, 0usize);
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let difference = apart(x, y);
+                if clear.sky(x, y) {
+                    sky.0 = sky.0.min(difference);
+                    sky.1 += 1;
+                } else {
+                    ground.0 = ground.0.max(difference);
+                    ground.1 += usize::from(difference > 0);
+                    ground.2 += 1;
+                }
+            }
+        }
+
+        // Ground below the skyline is showing rock that no cloud stands in
+        // front of, so the two frames have to agree about it. They do not agree
+        // *exactly* everywhere: within a pixel or two of the silhouette a tap
+        // that marched past the shelf still carries the one per cent the
+        // weighting leaves it, which is a few counts of colour.
+        //
+        // Measured: 6 counts at worst. Dropping the weighting for a plain
+        // bilinear measures 60 -- a white fringe running the whole ridge -- so
+        // the bound sits well clear of both.
+        assert!(
+            ground.0 <= 15,
+            "cloud behind the shelf changed ground in front of it by {} counts",
+            ground.0
+        );
+        // How *far* the leak reaches is not what the weighting changes, and the
+        // number is here to say so rather than to discriminate: 0.91% of the
+        // ground moves at all with the weighting and 1.07% without it. Both are
+        // the same fringe, one pixel or two wide. What the weighting decides is
+        // how strong it is, which is the assertion above.
+        let leaked = ground.1 as f64 / ground.2 as f64;
+        assert!(
+            leaked < 0.03,
+            "{leaked:.3} of the ground changed when cloud was put behind it, \
+             which is a band and not a fringe"
+        );
+        // ... and the sky above the skyline changed everywhere, which is what
+        // says the frames differ at all and that the comparison has teeth.
+        assert!(
+            sky.1 > 1000 && sky.0 > 10,
+            "{} sky pixels, the least changed by {} counts",
+            sky.1,
+            sky.0
         );
     }
 

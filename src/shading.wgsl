@@ -101,6 +101,17 @@ struct Sky {
 @group(3) @binding(1) var material: texture_2d<u32>;
 @group(3) @binding(3) var depth: texture_2d<f32>;
 @group(3) @binding(4) var normal: texture_2d<f32>;
+// What the cloud march left, at half this pass's resolution: scattered light
+// and, in `w`, how much of what is behind it survives. Beside it, how far along
+// the ray that cloud was, in metres.
+//
+// Loaded rather than sampled, and declared unfilterable so that nothing can
+// quietly start sampling them: the upsample below is bilateral, and a hardware
+// bilinear across a mountain's silhouette blends cloud that was marched past the
+// mountain into pixels the mountain covers. That is the halo this pass exists to
+// avoid.
+@group(3) @binding(2) var cloud_colour: texture_2d<f32>;
+@group(3) @binding(5) var cloud_along: texture_2d<f32>;
 
 // The ray through a point on the screen, before it is normalised.
 //
@@ -275,6 +286,152 @@ fn tonemap(radiance: vec3<f32>) -> vec3<f32> {
     return saturate(x * (1.0 + x / (WHITE * WHITE)) / (1.0 + x));
 }
 
+// How much of the sky's own distance a block and a pixel may disagree by before
+// the block stops speaking for the pixel.
+//
+// A hundredth of `AERIAL_FAR`, so a kilometre of view-axis distance. Below that
+// two taps are treated as describing the same place, which is what keeps a
+// smooth slope from being upsampled through one tap at a time; above it a tap
+// falls away as the reciprocal of how far out it is. A sky tap beside a ground
+// pixel two kilometres off is down by a hundred, which is the case this is set
+// for.
+const BILATERAL_BIAS: f32 = 0.01;
+
+// The cloud in front of one pixel, and where it was.
+struct Cloud {
+    // Scattered light, and what survives of everything behind it.
+    lit: vec4<f32>,
+    // The view-axis distance to put that light at, or zero where there is none.
+    along: f32,
+};
+
+// How far the cloud march let a block of four pixels run, along the view axis.
+//
+// The same rule the march itself applies -- the farthest of the four, and
+// unbounded if any of them found no ground -- so this reproduces the reach that
+// produced the tap rather than guessing at it. In view-axis units where the
+// march works in metres, which costs nothing: this is only ever compared
+// against another number in the same units, never used to rebuild a position.
+fn block_reach(block: vec2<i32>) -> f32 {
+    let full = vec2<i32>(textureDimensions(depth));
+    var reach = 0.0;
+    for (var j = 0; j < 2; j += 1) {
+        for (var i = 0; i < 2; i += 1) {
+            let d = textureLoad(depth, min(block + vec2<i32>(i, j), full - 1), 0).r;
+            if d == 0.0 {
+                reach = AERIAL_FAR;
+            } else {
+                reach = max(reach, min(distance_at(d), AERIAL_FAR));
+            }
+        }
+    }
+    return reach;
+}
+
+// The half-resolution cloud buffer, read at a full-resolution pixel.
+//
+// A bilinear weight per tap, divided by how far that tap's block reached from
+// what this pixel is showing. Across the open sky and across a continuous slope
+// every tap agrees and this is an ordinary bilinear; at a silhouette the taps
+// that marched past the ridge fall away by two orders of magnitude and the pixel
+// is reconstructed from the ones that stopped where it did.
+//
+// The distance comes from the single best tap and is never blended, which is not
+// fussiness: a blended distance addresses the aerial-perspective volume at a
+// place no cloud is, and between a cloud at two kilometres and one at forty the
+// average is a haze belonging to neither.
+fn cloud_at(pixel: vec2<i32>, along: f32) -> Cloud {
+    // Half-resolution texel `h` stands for the point where its block's four
+    // pixels meet, which is full-resolution coordinate `2h + 1`; see
+    // `cs_cloud_march`. So a pixel centre at `p + 0.5` sits at `(p - 0.5) / 2`
+    // in the half-resolution grid.
+    let at = (vec2<f32>(pixel) - 0.5) * 0.5;
+    let corner = floor(at);
+    let f = at - corner;
+    let last = vec2<i32>(textureDimensions(cloud_colour)) - 1;
+
+    var lit = vec4<f32>(0.0);
+    var total = 0.0;
+    var best = -1.0;
+    var found = 0.0;
+    var empty = true;
+    for (var j = 0; j < 2; j += 1) {
+        for (var i = 0; i < 2; i += 1) {
+            let tap = clamp(vec2<i32>(corner) + vec2<i32>(i, j), vec2<i32>(0), last);
+            let share = mix(1.0 - f.x, f.x, f32(i)) * mix(1.0 - f.y, f.y, f32(j));
+            let apart = abs(block_reach(tap * 2) - along) / AERIAL_FAR;
+            let weight = share / (apart + BILATERAL_BIAS);
+            let marched = textureLoad(cloud_colour, tap, 0);
+            empty = empty && marched.w >= 1.0;
+            lit = lit + marched * weight;
+            total = total + weight;
+            if weight > best {
+                best = weight;
+                found = textureLoad(cloud_along, tap, 0).r;
+            }
+        }
+    }
+
+    var out: Cloud;
+    // Read off the taps rather than off the average of them. Four taps that all
+    // say "nothing here" average to a transmittance of one in exact
+    // arithmetic and to one and a hair either side of it in this one: the
+    // weights are summed twice, once into `total` and once through the alpha
+    // channel, and nothing obliges a compiler to associate the two sums the same
+    // way. Dividing then leaves a last-bit error, which is enough to take a
+    // pixel down the compositing path and shift its colour by a count. It shows
+    // as a fine magenta static over the whole frame when the two paths are
+    // painted apart -- which is how this was found, since the difference from a
+    // clear sky is otherwise a handful of counts nobody would see.
+    if empty {
+        out.lit = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    } else {
+        out.lit = lit / max(total, 1e-6);
+    }
+    // The buffer holds metres and the tables are addressed along the view axis,
+    // which is more than a metre per unit anywhere but the middle of the frame.
+    out.along = found / max(length(ray_raw_at(vec2<f32>(pixel) + 0.5)), 1e-6);
+    return out;
+}
+
+// The cloud put in front of what was already there.
+//
+// Everything the frame had is radiance measured at the eye, so it already
+// carries the air between the eye and it. Putting something halfway along that
+// path means undoing the near half of the air, inserting the cloud, and putting
+// the near half back:
+//
+//   beyond = (background - haze(t)) / through(t)
+//   final  = haze(t) + through(t) * (scattered + transmitted * beyond)
+//
+// which collapses to `background` exactly when the cloud is absent, and which
+// is why a cloud reddens at sunset and dims the sun's disc for nothing extra --
+// the transmittance multiplies the whole background, disc included.
+//
+// The clamp at zero is not decoration. The sky-view table and the aerial volume
+// are built by different marches over the same air and disagree by a hair near
+// the horizon, where `background` can come out a shade under the haze that is
+// supposed to be part of it.
+fn composite(background: vec3<f32>, screen: vec2<f32>, cloud: Cloud) -> vec3<f32> {
+    // A pixel with nothing in front of it takes the path it always took, to the
+    // last bit. That is what lets a clear sky be checked against the frames this
+    // pass drew before there were clouds in it.
+    if cloud.lit.w >= 1.0 {
+        return background;
+    }
+    let uvw = vec3<f32>(
+        screen / vec2<f32>(textureDimensions(depth)),
+        aerial_depth(cloud.along),
+    );
+    let haze = textureSampleLevel(aerial_scatter_lut, lut_sampler, uvw, 0.0).rgb;
+    let through = max(
+        textureSampleLevel(aerial_transmit_lut, lut_sampler, uvw, 0.0).rgb,
+        vec3<f32>(1e-4),
+    );
+    let beyond = max((background - haze) / through, vec3<f32>(0.0));
+    return haze + through * (cloud.lit.rgb + cloud.lit.w * beyond);
+}
+
 @vertex
 fn vs_shade(@builtin(vertex_index)index: u32) -> @builtin(position) vec4<f32> {
     // The same oversized triangle the geometry pass draws.
@@ -296,7 +453,11 @@ fn fs_shade(@builtin(position)clip: vec4<f32>) -> @location(0) vec4<f32> {
     // a fact about a *direction*, and a direction is all this needs.
     if textureLoad(depth, pixel, 0).r == 0.0 {
         let towards = normalize(ray_raw_at(clip.xy));
-        return vec4<f32>(tonemap(sample_skyview(towards) + sun_disc(towards)), 1.0);
+        let sky = sample_skyview(towards) + sun_disc(towards);
+        // A sky ray reaches nothing, so as far as the cloud upsample is
+        // concerned it is showing whatever is at the end of the table.
+        let cloud = cloud_at(pixel, AERIAL_FAR);
+        return vec4<f32>(tonemap(composite(sky, clip.xy, cloud)), 1.0);
     }
 
     let id = textureLoad(material, pixel, 0).r & MATERIAL_MASK;
@@ -358,11 +519,19 @@ fn fs_shade(@builtin(position)clip: vec4<f32>) -> @location(0) vec4<f32> {
     //
     // The viewport comes from the depth buffer's dimensions, which is the same
     // number the froxel volume's own basis was built from.
+    let along = distance_at(textureLoad(depth, pixel, 0).r);
     let uvw = vec3<f32>(
         clip.xy / vec2<f32>(textureDimensions(depth)),
-        aerial_depth(distance_at(textureLoad(depth, pixel, 0).r)),
+        aerial_depth(along),
     );
     let haze = textureSampleLevel(aerial_scatter_lut, lut_sampler, uvw, 0.0).rgb;
     let through = textureSampleLevel(aerial_transmit_lut, lut_sampler, uvw, 0.0).rgb;
-    return vec4<f32>(tonemap(leaving * through + haze), 1.0);
+    // ... and then whatever cloud stands between the eye and all of that. The
+    // ground, the air in front of it and the cloud in front of that are three
+    // layers of one integral, composited in that order.
+    let cloud = cloud_at(pixel, along);
+    return vec4<f32>(
+        tonemap(composite(leaving * through + haze, clip.xy, cloud)),
+        1.0,
+    );
 }

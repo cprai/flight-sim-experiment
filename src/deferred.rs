@@ -257,6 +257,7 @@ impl Shading {
         camera_layout: &wgpu::BindGroupLayout,
         sky_layout: &wgpu::BindGroupLayout,
         tables_layout: &wgpu::BindGroupLayout,
+        cloud: (&wgpu::TextureView, &wgpu::TextureView),
     ) -> Self {
         // Uploaded once: the table is a pure function of the material enum,
         // so nothing ever rewrites it.
@@ -277,6 +278,7 @@ impl Shading {
             ty,
             count: None,
         };
+        let unfiltered = texture(wgpu::TextureSampleType::Float { filterable: false });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shading layout"),
             entries: &[
@@ -289,19 +291,25 @@ impl Shading {
                     },
                 ),
                 entry(1, texture(wgpu::TextureSampleType::Uint)),
+                // The two halves of what the cloud march left. Unfilterable on
+                // purpose: the upsample in `fs_shade` is bilateral and reads
+                // them with `textureLoad`, and a layout that allowed filtering
+                // would let someone quietly reintroduce the halo at every
+                // mountain silhouette that avoids.
+                //
+                // They take the free bindings the group already had rather than
+                // a group of their own, because there is no fifth group to be
+                // had: `max_bind_groups` is four and this pipeline uses all of
+                // them.
+                entry(2, unfiltered),
                 // A plain float channel, not a depth texture: see
                 // [`DEPTH_FORMAT`].
-                entry(
-                    3,
-                    texture(wgpu::TextureSampleType::Float { filterable: false }),
-                ),
-                entry(
-                    4,
-                    texture(wgpu::TextureSampleType::Float { filterable: false }),
-                ),
+                entry(3, unfiltered),
+                entry(4, unfiltered),
+                entry(5, unfiltered),
             ],
         });
-        let bind_group = Self::bind(device, &layout, &palette, gbuffer);
+        let bind_group = Self::bind(device, &layout, &palette, gbuffer, cloud);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shading shader"),
@@ -357,9 +365,17 @@ impl Shading {
         }
     }
 
-    /// Points the pass at a rebuilt G-buffer, after a resize.
-    pub fn rebind(&mut self, device: &wgpu::Device, gbuffer: &GBuffer) {
-        self.bind_group = Self::bind(device, &self.layout, &self.palette, gbuffer);
+    /// Points the pass at a rebuilt G-buffer and cloud buffer, after a resize.
+    ///
+    /// Both follow the frame's size, so both are gone by the time this is
+    /// called and both have to be named again.
+    pub fn rebind(
+        &mut self,
+        device: &wgpu::Device,
+        gbuffer: &GBuffer,
+        cloud: (&wgpu::TextureView, &wgpu::TextureView),
+    ) {
+        self.bind_group = Self::bind(device, &self.layout, &self.palette, gbuffer, cloud);
     }
 
     fn bind(
@@ -367,16 +383,20 @@ impl Shading {
         layout: &wgpu::BindGroupLayout,
         palette: &wgpu::Buffer,
         gbuffer: &GBuffer,
+        cloud: (&wgpu::TextureView, &wgpu::TextureView),
     ) -> wgpu::BindGroup {
         let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
+        let (colour, along) = cloud;
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shading bind group"),
             layout,
             entries: &[
                 entry(0, palette.as_entire_binding()),
                 entry(1, wgpu::BindingResource::TextureView(&gbuffer.material)),
+                entry(2, wgpu::BindingResource::TextureView(colour)),
                 entry(3, wgpu::BindingResource::TextureView(&gbuffer.depth)),
                 entry(4, wgpu::BindingResource::TextureView(&gbuffer.normal)),
+                entry(5, wgpu::BindingResource::TextureView(along)),
             ],
         })
     }

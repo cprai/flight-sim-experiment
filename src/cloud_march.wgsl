@@ -18,8 +18,11 @@
 // approximation ("Oz: The Great and Volumetric", SIGGRAPH 2013 Talks) over a
 // dual-lobe Henyey-Greenstein phase.
 //
-// Nothing reads what this writes yet. It is landed on its own so that what it
-// costs can be measured against a frame that is otherwise unchanged.
+// What it writes is composited into the frame by `fs_shade`, which upsamples it
+// bilaterally against the G-buffer's depth. This pass never touches the air
+// between the eye and the cloud: the haze in front of a cloud is applied there,
+// at the cloud's own distance, out of the aerial-perspective volume the frame
+// already has.
 
 const PI: f32 = 3.14159265358979;
 
@@ -122,7 +125,21 @@ const MAX_STEPS: u32 = 256u;
 
 // Below this transmittance the ray has established that nothing behind it will
 // be seen, and stops.
-const CUTOFF: f32 = 0.01;
+//
+// A millionth, and it is the sun's own disc that sets it. Everything else in a
+// frame is of the order of the sky it stands against, so a hundredth would do
+// and did: what survives is a per cent of a background nobody is measuring. The
+// disc is `SUN_DISC_RADIANCE`, fifteen thousand times the sky, and a hundredth
+// of it still tonemaps to solid white -- so an overcast deck left the sun
+// shining through it as a clean white spot, which is exactly what an overcast
+// deck does not do. A millionth puts the residue below the sky it sits in.
+//
+// It costs three or four extra steps inside cloud that was already opaque:
+// going from a hundredth to a millionth is nine more of optical depth, which at
+// this extinction is a hundred and fifty metres. Measured at 0.60 ms against
+// 0.64 for an overcast sky, and unchanged for every other -- a thin cloud never
+// reaches either threshold and stops by running out of deck.
+const CUTOFF: f32 = 1e-6;
 
 // The extinction below which a cell of the cache is treated as empty.
 //

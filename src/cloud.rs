@@ -937,8 +937,7 @@ impl March {
         );
     }
 
-    /// What the buffers hold, for the readback tests and for the composite.
-    #[allow(dead_code, reason = "read by the composite, which lands next")]
+    /// The two buffers the composite reads.
     pub fn views(&self) -> (&wgpu::TextureView, &wgpu::TextureView) {
         (&self.colour_view, &self.depth_view)
     }
