@@ -81,6 +81,13 @@ pub const MAXIMA: &str = "maxima";
 /// without a switch to draw the frame without a sky.
 pub const ATMOSPHERE: &str = "atmosphere";
 
+/// The scope [`crate::scene::Scene::draw`] opens around the cloud's own passes.
+///
+/// Beside [`ATMOSPHERE`] and for the same reason: a group of passes that
+/// belong together, so the readout says both what the cloud costs altogether
+/// and which part of it went where.
+pub const CLOUD: &str = "cloud";
+
 /// The terrain's own submissions, in the order the GPU runs them.
 const TERRAIN_SCOPES: [&str; 2] = [DETAIL, MAXIMA];
 

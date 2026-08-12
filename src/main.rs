@@ -205,6 +205,25 @@ struct Weather {
     // needs one.
     #[arg(long, value_name = "SPEED,BEARING", allow_hyphen_values = true)]
     wind: Option<air::Wind>,
+
+    /// What kind of day it is: how much cloud, of what sort, at what heights.
+    ///
+    /// Without it the sky is `fair` -- scattered cumulus with a little cirrus
+    /// over them.
+    #[arg(long, value_enum, value_name = "PRESET")]
+    weather: Option<cloud::Preset>,
+}
+
+impl Weather {
+    /// The conditions these flags name, with the defaults where they were
+    /// left out.
+    fn world(&self) -> headless::World {
+        headless::World {
+            sun: self.sun,
+            wind: self.wind.unwrap_or_default(),
+            weather: self.weather.unwrap_or_default(),
+        }
+    }
 }
 
 /// Reads `WIDTHxHEIGHT` for [`View::size`].
@@ -231,12 +250,10 @@ struct App {
     terrain: PathBuf,
     /// Whether to instrument the frame and draw the breakdown over it.
     profiling: bool,
-    /// Where the sun goes once the renderer exists, since the window is built
-    /// on `resumed` rather than here and there is no scene to put it in yet.
-    sun: Option<SunAngles>,
-    /// Which way the wind blows, held for the same reason and handed over at
-    /// the same moment.
-    wind: air::Wind,
+    /// What the day is like, held until the renderer exists to put it on:
+    /// the window is built on `resumed` rather than here, so there is no scene
+    /// to apply it to yet.
+    world: headless::World,
     renderer: Option<Renderer>,
     controls: FlyController,
     /// When the last frame was drawn, for the timestep the controls integrate over.
@@ -248,15 +265,13 @@ impl App {
         display: OwnedDisplayHandle,
         terrain: PathBuf,
         profiling: bool,
-        sun: Option<SunAngles>,
-        wind: air::Wind,
+        world: headless::World,
     ) -> Self {
         Self {
             display,
             terrain,
             profiling,
-            sun,
-            wind,
+            world,
             renderer: None,
             controls: FlyController::default(),
             last_frame: Instant::now(),
@@ -288,8 +303,7 @@ impl ApplicationHandler for App {
             self.display.clone(),
             &self.terrain,
             self.profiling,
-            self.sun,
-            self.wind,
+            self.world,
         )) {
             Ok(renderer) => {
                 self.controls = FlyController::new(renderer.camera());
@@ -400,8 +414,7 @@ fn main() -> anyhow::Result<()> {
                 &terrain.terrain,
                 view.size.unwrap_or(DEFAULT_SIZE),
                 view.camera,
-                view.weather.sun,
-                view.weather.wind.unwrap_or_default(),
+                view.weather.world(),
                 headless::Flight {
                     frames,
                     speed: view.motion,
@@ -418,8 +431,7 @@ fn main() -> anyhow::Result<()> {
                 &terrain.terrain,
                 view.size.unwrap_or(DEFAULT_SIZE),
                 view.camera,
-                view.weather.sun,
-                view.weather.wind.unwrap_or_default(),
+                view.weather.world(),
                 headless::Flight {
                     frames,
                     speed: view.motion,
@@ -437,8 +449,7 @@ fn main() -> anyhow::Result<()> {
         event_loop.owned_display_handle(),
         terrain,
         profiling,
-        weather.sun,
-        weather.wind.unwrap_or_default(),
+        weather.world(),
     );
     event_loop.run_app(&mut app)?;
 
@@ -565,6 +576,40 @@ mod tests {
                 "{bad:?} was accepted as a wind"
             );
         }
+    }
+
+    /// The weather reaches all four modes, by name.
+    #[test]
+    fn every_mode_takes_the_weather() {
+        for argv in [
+            vec!["flight-sim", "fly", "-t", "x", "--weather", "storm"],
+            vec!["flight-sim", "fly-profile", "-t", "x", "--weather", "storm"],
+            vec![
+                "flight-sim",
+                "render",
+                "-t",
+                "x",
+                "-o",
+                "y",
+                "--weather",
+                "storm",
+            ],
+            vec!["flight-sim", "profile", "-t", "x", "--weather", "storm"],
+        ] {
+            assert_eq!(
+                weather_of(&argv).weather,
+                Some(cloud::Preset::Storm),
+                "{argv:?}"
+            );
+        }
+        // Left out, it is the fair day every run before the flag drew.
+        assert_eq!(weather_of(&["flight-sim", "fly", "-t", "x"]).weather, None);
+        assert_eq!(cloud::Preset::default(), cloud::Preset::Fair);
+        // And a name that is not a preset is refused rather than guessed at.
+        assert!(
+            Arguments::try_parse_from(["flight-sim", "fly", "-t", "x", "--weather", "drizzle"])
+                .is_err()
+        );
     }
 
     /// Left out, the sun stays wherever `Sun::default` puts it, so every

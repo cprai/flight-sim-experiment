@@ -51,8 +51,56 @@ const PERLIN_SEED: u32 = 0x50726c6eu;
 const WORLEY_SEED: u32 = 0x576f726cu;
 const DETAIL_SEED: u32 = 0x44746c73u;
 
+// Side of the weather map, in texels, and how many decks it describes. Must
+// match `WEATHER_SIZE` and `DECKS` in `src/cloud.rs`.
+//
+// Two hundred and fifty-six over sixty kilometres puts a texel at about two
+// hundred and thirty metres, which is far coarser than a cloud and exactly
+// right for what this holds: not cloud, but where cloud is *allowed* -- the
+// shape of the weather rather than the shape of a cumulus. The volumes above
+// supply everything finer.
+const WEATHER_SIZE: u32 = 256u;
+const DECKS: u32 = 3u;
+
+// Lattice cells across one tile of the weather map.
+//
+// Three, so a tile holds three or four weather systems across sixty kilometres
+// -- about the scale real cover varies on. It is also the period of the time
+// axis, in the sense that the field returns to itself after `clock.y` seconds.
+const WEATHER_CELLS: i32 = 3;
+
+// Octaves of the cover field, and of the three fields beside it.
+//
+// Three for cover: the first is the front, the second the breaks in it, the
+// third the ragged edges of those. One for the rest, because what they say --
+// which way a patch of cloud leans, how dense it is, how high its base sits --
+// varies over a whole weather system and not within one. Giving them three
+// apiece doubled what this pass cost and changed nothing anybody could see.
+const WEATHER_OCTAVES: u32 = 3u;
+const WEATHER_SLOW_OCTAVES: u32 = 1u;
+
+// What one deck of one preset looks like.
+struct Deck {
+    // The field values that map to no cloud and to solid cloud, then which way
+    // the deck leans -- nothing for flat stratus, one for heaped cumulus -- and
+    // how dense it is where it is solid.
+    look: vec4<f32>,
+    // The seed this deck's field is drawn from, and three spare.
+    seed: vec4<u32>,
+};
+
+struct Weather {
+    decks: array<Deck, 3>,
+    // Seconds since the world started, then how long the weather takes to come
+    // back round to where it was. The rest is spare.
+    clock: vec4<f32>,
+};
+
+@group(1) @binding(0) var<uniform> weather: Weather;
+
 @group(3) @binding(0) var out_shape: texture_storage_3d<rgba8unorm, write>;
 @group(3) @binding(1) var out_detail: texture_storage_3d<rgba8unorm, write>;
+@group(3) @binding(2) var out_weather: texture_storage_2d_array<rgba8unorm, write>;
 
 // Wellons' `lowbias32`. Must match `noise_mix` in `src/terrain.wgsl` character
 // for character; there is no preprocessor here and a test compares the two as
@@ -285,6 +333,72 @@ fn cs_cloud_shape(@builtin(global_invocation_id) id: vec3<u32>) {
             worley(p, SHAPE_CELLS * 2, WORLEY_SEED + 1u),
             worley(p, SHAPE_CELLS * 4, WORLEY_SEED + 2u),
         ),
+    );
+}
+
+// The weather field: a fractal over the map, with time as its third axis.
+//
+// Time being an axis of the *same* noise, rather than a second field blended
+// over the first, is what makes the weather evolve rather than cross-fade. A
+// front does not appear and disappear where it stands; it drifts in from
+// somewhere, because moving along the third axis of a solid noise slides the
+// features about in the other two. It costs nothing over a static field -- the
+// noise was already three-dimensional.
+//
+// Periodic in all three, so the map tiles over the world and the weather comes
+// back round after `clock.y` seconds. Nothing depends on the loop, but a field
+// that returned to itself was free and one that ran forever would eventually
+// walk out of the range `f32` holds a lattice index in exactly.
+fn weather_field(at: vec2<f32>, seed: u32, octaves: u32) -> f32 {
+    let t = weather.clock.x / max(weather.clock.y, 1.0);
+    let p = vec3<f32>(at, fract(t));
+    var sum = 0.0;
+    var weight = 0.0;
+    var cells = WEATHER_CELLS;
+    var amplitude = 1.0;
+    for (var octave = 0u; octave < octaves; octave += 1u) {
+        sum += perlin(p, cells, seed + octave * 0x9e3779b9u) * amplitude;
+        weight += amplitude;
+        cells *= 2;
+        amplitude *= 0.5;
+    }
+    return clamp(sum / weight * 0.5 + 0.5, 0.0, 1.0);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_cloud_weather(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= WEATHER_SIZE || id.y >= WEATHER_SIZE || id.z >= DECKS {
+        return;
+    }
+    let deck = weather.decks[id.z];
+    let at = (vec2<f32>(id.xy) + 0.5) / f32(WEATHER_SIZE);
+
+    // Cover: the field stretched between the two values the preset called the
+    // edges of its cloud. A preset that wants none of a deck puts both above
+    // anything the field can reach, which is what makes `clear` exactly clear
+    // rather than nearly clear -- and `clamp` of a negative is a hard zero, so
+    // no eight-bit rounding can leave a speck of cloud behind.
+    let field = weather_field(at, deck.seed.x, WEATHER_OCTAVES);
+    let cover = clamp((field - deck.look.x) / max(deck.look.y - deck.look.x, 1e-3), 0.0, 1.0);
+
+    // Which way this patch leans, and how dense it is. Both wander with fields
+    // of their own so that a deck is not one kind of cloud everywhere: the
+    // heaped part of a broken sky is heaped, and the part filling in behind it
+    // is flatter. Half the preset's figure, half the field.
+    let slow = WEATHER_SLOW_OCTAVES;
+    let kind = clamp(deck.look.z * (0.5 + weather_field(at, deck.seed.x + 1u, slow)), 0.0, 1.0);
+    let density = clamp(deck.look.w * (0.5 + weather_field(at, deck.seed.x + 2u, slow)), 0.0, 1.0);
+
+    // Where in its slab this deck's base sits, as a fraction. A deck whose base
+    // is flat everywhere reads as a ceiling; real cloud bases sag and lift by
+    // hundreds of metres across a sky, and this is the field that says so.
+    let base = weather_field(at, deck.seed.x + 3u, slow);
+
+    textureStore(
+        out_weather,
+        vec2<i32>(id.xy),
+        i32(id.z),
+        vec4<f32>(cover, kind, density, base),
     );
 }
 

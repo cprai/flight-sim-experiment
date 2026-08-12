@@ -130,6 +130,41 @@ impl FromStr for SunAngles {
     }
 }
 
+/// What the day is like: everything about the world that is not the camera.
+///
+/// One value rather than three parameters, because they always travel
+/// together, always come from the same flags, and are always applied at the
+/// same moment -- before the first update, which is the one that bakes the wind
+/// around the terrain it has just read in. Threading them separately had
+/// already pushed two functions here past what `clippy` will take, which was
+/// the argument's own way of making it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct World {
+    pub sun: Option<SunAngles>,
+    pub wind: crate::air::Wind,
+    pub weather: crate::cloud::Preset,
+}
+
+impl World {
+    /// Puts these conditions on a scene, and says what they were.
+    ///
+    /// Said out loud because two runs that differ only in the weather are
+    /// otherwise indistinguishable in the log, and between them these three
+    /// decide the colour of every pixel.
+    pub fn apply(self, scene: &mut Scene) {
+        scene.sun = SunAngles::or_default(self.sun);
+        scene.wind = self.wind;
+        scene.weather = self.weather;
+        log::info!("sun towards {}", scene.sun.direction);
+        log::info!(
+            "wind {} m/s from {} degrees",
+            scene.wind.speed,
+            scene.wind.from_degrees
+        );
+        log::info!("weather {:?}", scene.weather);
+    }
+}
+
 /// A GPU device and queue with no surface behind them.
 ///
 /// Requests exactly what [`crate::renderer::Renderer`] does, minus the
@@ -348,8 +383,7 @@ fn settled(
     terrain_root: &Path,
     size: UVec2,
     placement: Option<Placement>,
-    sun: Option<SunAngles>,
-    wind: crate::air::Wind,
+    world: World,
 ) -> Result<Scene> {
     let started = std::time::Instant::now();
     let mut scene = Scene::new(device, CAPTURE_FORMAT, size, terrain_root)?;
@@ -358,24 +392,14 @@ fn settled(
     if let Some(placement) = placement {
         placement.apply(&mut scene.camera);
     }
-    scene.sun = SunAngles::or_default(sun);
-    // Before the settle below, which is the update that reads the chain in and
-    // then bakes the wind around it.
-    scene.wind = wind;
     log::info!(
         "camera at {} facing {:?}",
         scene.camera.position,
         scene.camera.orientation
     );
-    // Said out loud for the same reason the camera is: two runs that differ
-    // only in where the sun was would otherwise be indistinguishable in the
-    // log, and the sun is about to decide the colour of every pixel.
-    log::info!("sun towards {}", scene.sun.direction);
-    log::info!(
-        "wind {} m/s from {} degrees",
-        scene.wind.speed,
-        scene.wind.from_degrees
-    );
+    // Before the settle below, which is the update that reads the chain in and
+    // then bakes the wind around it.
+    world.apply(&mut scene);
 
     let started = std::time::Instant::now();
     scene.settle(device, queue);
@@ -400,13 +424,12 @@ pub fn render(
     terrain_root: &Path,
     size: UVec2,
     placement: Option<Placement>,
-    sun: Option<SunAngles>,
-    wind: crate::air::Wind,
+    world: World,
     flight: Flight,
     output: &Path,
 ) -> Result<()> {
     let (device, queue) = device()?;
-    let mut scene = settled(&device, &queue, terrain_root, size, placement, sun, wind)?;
+    let mut scene = settled(&device, &queue, terrain_root, size, placement, world)?;
 
     let pixels = capture(&device, &queue, &mut scene, size, flight)?;
     write_png(output, size, &pixels)?;
@@ -437,13 +460,12 @@ pub fn profile(
     terrain_root: &Path,
     size: UVec2,
     placement: Option<Placement>,
-    sun: Option<SunAngles>,
-    wind: crate::air::Wind,
+    world: World,
     flight: Flight,
 ) -> Result<()> {
     let frames = flight.frames;
     let (adapter, device, queue) = device_and_adapter()?;
-    let mut scene = settled(&device, &queue, terrain_root, size, placement, sun, wind)?;
+    let mut scene = settled(&device, &queue, terrain_root, size, placement, world)?;
     // After settling, so the chain is already read in and the load's own
     // dispatches are not measured as if they were a frame's.
     scene.profile(&device, true);

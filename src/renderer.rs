@@ -36,8 +36,7 @@ impl Renderer {
         display: winit::event_loop::OwnedDisplayHandle,
         terrain_root: &std::path::Path,
         profiling: bool,
-        sun: Option<crate::headless::SunAngles>,
-        wind: crate::air::Wind,
+        world: crate::headless::World,
     ) -> anyhow::Result<Self> {
         let size = window.inner_size();
 
@@ -114,21 +113,10 @@ impl Renderer {
         // the sun later would cost nothing and need no invalidation -- but that
         // is a key binding and a HUD readout, and this is the flag that lets a
         // window be pointed at the same sky a `render` was.
-        scene.sun = crate::headless::SunAngles::or_default(sun);
         // Set before the first update, which is the one that bakes the wind
-        // around the terrain it has just read in. Setting it later would have
-        // no effect at all, which is the one sharp edge of baking.
-        scene.wind = wind;
-        // Said out loud for the same reason the headless modes say it: two runs
-        // that differ only in where the sun was are otherwise indistinguishable
-        // in the log, and the sun decides the colour of every pixel. The wind
-        // decides where the air goes, and shortly the cloud with it.
-        log::info!("sun towards {}", scene.sun.direction);
-        log::info!(
-            "wind {} m/s from {} degrees",
-            scene.wind.speed,
-            scene.wind.from_degrees
-        );
+        // around the terrain it has just read in. Setting the wind later would
+        // have no effect at all, which is the one sharp edge of baking.
+        world.apply(&mut scene);
 
         // No overlay at all on an unprofiled run: there is nothing to put in it.
         let hud =

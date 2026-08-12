@@ -95,7 +95,12 @@ pub struct Scene {
     sky: crate::sky::Sky,
     /// The wind solved around the mountains, once, at load.
     air: crate::air::Air,
-    /// The noise a cloud is carved out of, built once at load.
+    /// What kind of day it is. Public for the reason [`Scene::sun`] is.
+    ///
+    /// Unlike the wind, this is read every frame rather than once, so changing
+    /// it mid-flight would work -- there is simply nothing yet that would.
+    pub weather: crate::cloud::Preset,
+    /// The noise a cloud is carved out of, and the weather over it.
     cloud: crate::cloud::Cloud,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -320,6 +325,7 @@ impl Scene {
             wind: crate::air::Wind::default(),
             sky,
             air: crate::air::Air::new(device),
+            weather: crate::cloud::Preset::default(),
             cloud: crate::cloud::Cloud::new(device),
             camera_buffer,
             camera_bind_group,
@@ -417,6 +423,7 @@ impl Scene {
         // Beside the scattering tables and for the same reason: functions of
         // nothing a frame can change, so once is all they are ever built.
         self.cloud.ensure_built(device, queue);
+        self.cloud.set_frame(queue, self.weather, self.elapsed);
         // Uploaded every frame rather than only when it changes. Nothing moves
         // the sun yet, so this rewrites the same sixteen bytes each time --
         // which is cheaper than the branch that would avoid it, and is what
@@ -603,6 +610,15 @@ impl Scene {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 self.sky.draw_aerial(&mut pass);
             }
+        }
+
+        {
+            // Beside the atmosphere and for the same reason: it depends on
+            // nothing this frame produces -- only on the clock -- and
+            // everything after it may read what it writes.
+            let mut cloud = gpu.scope(crate::profile::CLOUD);
+            let mut pass = cloud.scoped_compute_pass("weather");
+            self.cloud.draw_weather(&mut pass);
         }
 
         {
