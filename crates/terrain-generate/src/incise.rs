@@ -146,7 +146,21 @@ fn cut(fields: &mut Fields) {
     // The surface the rivers would leave if there were no hollows, built
     // downstream first so that every cell's receiver is already final.
     let mut bed = drainage.filled.clone();
-    for index in &drainage.order {
+    for (position, index) in drainage.order.iter().enumerate() {
+        // The same lead the accumulation takes, in the other direction. This
+        // sweep has the milder version of the same problem: one scattered read
+        // of each of four grids rather than an eight-neighbour gather, so there
+        // is less to overlap and less to win.
+        if let Some(soon) = position.checked_add(flow::AHEAD)
+            && let Some(soon) = drainage.order.get(soon)
+        {
+            let soon = *soon as usize;
+            flow::prefetch(&bed, soon);
+            flow::prefetch(&drainage.area, soon);
+            flow::prefetch(&fields.hardness.values, soon);
+            flow::prefetch(&drainage.drains_to, soon);
+        }
+
         let index = *index as usize;
         let into = drainage.drains_to[index];
         if into == u32::MAX {

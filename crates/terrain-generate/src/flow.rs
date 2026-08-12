@@ -95,6 +95,56 @@ const NEIGHBOURS: [(i64, i64); 8] = [
 /// a rule that concentrates water on its own makes them wherever it likes.
 const SPREAD: f32 = 1.1;
 
+/// How far in front of itself the accumulation asks the hardware to fetch.
+///
+/// The sweep is a random walk over a 220 MB working set and f27c6a2 measured it
+/// three quarters memory rather than arithmetic, so what it is waiting for is
+/// main memory rather than any instruction. Because `order` is a finished list,
+/// the addresses it will want are known thousands of iterations early -- which
+/// is the case a prefetch exists for, and the reason this is worth more here
+/// than any amount of arithmetic.
+///
+/// Shared with `incise`, whose stream-power sweep walks the same order in the
+/// other direction over the same scattered grids and wants the same lead.
+///
+/// Measured rather than picked; see `measure_how_far_ahead_to_fetch`. Three is
+/// the middle of a flat 2-to-4 plateau, chosen over the single fastest sample
+/// because the three are within noise of each other and the plateau is the real
+/// finding.
+///
+/// **Three cells, not fifty**, and that is worth knowing rather than filing as
+/// a tuning constant. Hiding a main-memory round trip needs tens of iterations
+/// of lead, and out past eight the win shrinks steadily until by 256 it is
+/// almost gone. So this is not latency hiding: it is getting a couple of
+/// iterations' worth of gathers into flight at once, and further ahead only
+/// means the line is evicted before the sweep arrives. Prefetching only the
+/// cell's own line rather than the rows either side is worth 2% against 15%,
+/// which says the same thing from the other side -- what the sweep waits for is
+/// the eight-neighbour gather across three rows, not the cell it started from.
+pub const AHEAD: usize = 3;
+
+/// Asks for a cache line without waiting for it, if the index is real.
+///
+/// The only `unsafe` in this crate, and about as small as the keyword gets: a
+/// prefetch has no architectural effect whatever -- it cannot fault, cannot
+/// change a value, and a wrong address costs a wasted fetch rather than a bug.
+/// The bounds check above it is not for soundness but so that the address is
+/// one the walk will really want. Everything the sweep computes is identical
+/// with this compiled in or out, which the fingerprint gate is what proves.
+#[inline(always)]
+pub fn prefetch<T>(values: &[T], index: usize) {
+    if index >= values.len() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `index` is in bounds, so the pointer is inside the allocation.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+            values.as_ptr().add(index) as *const i8,
+        );
+    }
+}
+
 /// A total order on `f32` that matches the numeric one, as bits.
 ///
 /// The heap holds one `u64` per cell rather than a pair, so that it is a plain
@@ -243,7 +293,7 @@ pub fn drainage(fields: &Fields) -> Drainage {
     let at = std::time::Instant::now();
 
     let mut area = vec![1.0f32; count];
-    accumulate(
+    accumulate::<AHEAD>(
         width,
         rows,
         &filled,
@@ -278,7 +328,11 @@ pub fn drainage(fields: &Fields) -> Drainage {
 /// that reimplements its subject stops measuring it the moment either one moves
 /// -- see 581ddd0, where a rewritten emit loop reported a hundredth of the
 /// truth. Being generic, it monomorphises to the same code a direct call would.
-fn accumulate(
+///
+/// `AHEAD` is how many cells in front of itself the sweep asks the hardware to
+/// fetch; zero compiles the prefetching away entirely. See [`AHEAD`] for what it
+/// is set to and why that number was measured rather than picked.
+fn accumulate<const AHEAD: usize>(
     width: usize,
     rows: usize,
     filled: &[f32],
@@ -288,7 +342,21 @@ fn accumulate(
     mut share: impl FnMut(f32) -> f32,
 ) {
     let mut falls = [0.0f32; 8];
-    for index in order.iter().rev() {
+    for (position, index) in order.iter().enumerate().rev() {
+        // Where this sweep is going is known long before it gets there --
+        // `order` is a finished list -- which is the one thing a random-access
+        // walk needs to stop being latency-bound. The rows either side are
+        // asked for as well as the cell itself, because the eight neighbours it
+        // is about to touch straddle three rows and only the middle one shares
+        // a cache line with the cell.
+        if AHEAD > 0 && position >= AHEAD {
+            let soon = order[position - AHEAD] as usize;
+            for line in [soon.wrapping_sub(width), soon, soon + width] {
+                prefetch(filled, line);
+                prefetch(area, line);
+            }
+        }
+
         let index = *index as usize;
         let (column, row) = ((index % width) as i64, (index / width) as i64);
         let here = filled[index];
@@ -617,7 +685,7 @@ mod measure {
     /// compile to the same indirect call and they would all measure the same,
     /// which is exactly the shape of a measurement that quietly answers a
     /// different question than the one asked.
-    fn sweep(
+    fn sweep<const AHEAD: usize>(
         label: &str,
         fields: &Fields,
         drainage: &Drainage,
@@ -631,7 +699,7 @@ mod measure {
         for _ in 0..REPEATS {
             area = vec![1.0f32; width * rows];
             let at = std::time::Instant::now();
-            accumulate(
+            accumulate::<AHEAD>(
                 width,
                 rows,
                 &drainage.filled,
@@ -709,7 +777,7 @@ mod measure {
         // loop being measured.
         let mut calls = 0u64;
         let mut counted = vec![1.0f32; fields.width() * fields.rows()];
-        accumulate(
+        accumulate::<AHEAD>(
             fields.width(),
             fields.rows(),
             &drainage.filled,
@@ -727,30 +795,63 @@ mod measure {
         );
 
         println!("  rule                                       best   against the rule today");
-        let control = sweep("powf(1.1), the rule today", &fields, &drainage, None, |f| {
+        let control = sweep::<AHEAD>("powf(1.1), the rule today", &fields, &drainage, None, |f| {
             f.powf(SPREAD)
         });
-        sweep(
+        sweep::<AHEAD>(
             "f * f^(1/8), i.e. 1.125, three sqrts",
             &fields,
             &drainage,
             Some(&control),
             |f| f * f.sqrt().sqrt().sqrt(),
         );
-        sweep(
+        sweep::<AHEAD>(
             "f, i.e. 1.0, the cheapest exponent",
             &fields,
             &drainage,
             Some(&control),
             |f| f,
         );
-        sweep(
+        sweep::<AHEAD>(
             "1.0, no transcendental at all",
             &fields,
             &drainage,
             Some(&control),
             |_| 1.0,
         );
+    }
+
+    /// How far in front of itself the sweep should ask for its cache lines.
+    ///
+    /// f27c6a2 measured the accumulation three quarters memory and only a
+    /// quarter arithmetic, so this is where its time actually is. `order` is a
+    /// finished list, which means the addresses are knowable arbitrarily far
+    /// ahead -- the only question is how far ahead is useful, and that is a
+    /// property of this machine's memory system rather than of the code, so it
+    /// is measured rather than reasoned about.
+    ///
+    /// Zero is the control: the same function with the prefetching compiled
+    /// out.
+    ///
+    /// Run with `--release ... -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement on the full grid, not a check"]
+    fn measure_how_far_ahead_to_fetch() {
+        let fields = crate::fields::shipped_grid();
+        let drainage = drainage(&fields);
+        let rule = |f: f32| f.powf(SPREAD);
+
+        println!("  cells ahead                                best");
+        let control = sweep::<0>("0, no prefetch at all", &fields, &drainage, None, rule);
+        sweep::<1>("1", &fields, &drainage, Some(&control), rule);
+        sweep::<2>("2", &fields, &drainage, Some(&control), rule);
+        sweep::<3>("3", &fields, &drainage, Some(&control), rule);
+        sweep::<4>("4", &fields, &drainage, Some(&control), rule);
+        sweep::<6>("6", &fields, &drainage, Some(&control), rule);
+        sweep::<8>("8", &fields, &drainage, Some(&control), rule);
+        sweep::<12>("12", &fields, &drainage, Some(&control), rule);
+        sweep::<16>("16", &fields, &drainage, Some(&control), rule);
+        sweep::<32>("32", &fields, &drainage, Some(&control), rule);
     }
 
     /// How deep the drainage network is, and how wide each of its levels is.
