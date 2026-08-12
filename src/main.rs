@@ -1,3 +1,4 @@
+mod air;
 mod camera;
 mod controls;
 mod deferred;
@@ -63,7 +64,8 @@ struct Terrain {
 /// `--camera` means nothing to a window you can steer, and an output path means
 /// nothing to a run that measures. As flags those had to be bound together with
 /// clap `requires` attributes that said so only after the fact. The one thing
-/// all four do share, [`Sky`], is flattened into each rather than made a global:
+/// all four do share, [`Weather`], is flattened into each rather than made a
+/// global:
 /// clap cannot require a global, and a global would sit before the subcommand,
 /// which reads oddly for something this specific to the picture.
 #[derive(clap::Subcommand, Debug)]
@@ -74,7 +76,7 @@ enum Mode {
         terrain: Terrain,
 
         #[command(flatten)]
-        sky: Sky,
+        weather: Weather,
     },
 
     /// Open a window and fly, with the frame breakdown drawn in the corner.
@@ -83,7 +85,7 @@ enum Mode {
         terrain: Terrain,
 
         #[command(flatten)]
-        sky: Sky,
+        weather: Weather,
     },
 
     /// Render a single frame to a PNG and exit, without opening a window.
@@ -157,17 +159,21 @@ struct View {
     motion: f32,
 
     #[command(flatten)]
-    sky: Sky,
+    weather: Weather,
 }
 
-/// Where the sun is, which every mode needs and none can infer.
+/// What the world is like, which every mode needs and none can infer.
 ///
-/// Its own struct, flattened into all four modes, so the flag is declared once
-/// and cannot drift between them. The atmosphere is a pure function of the
-/// camera and this, so a `fly` run and the `render` that reproduces a frame from
-/// it have to be able to say the same thing.
+/// Its own struct, flattened into all four modes, so each flag is declared once
+/// and cannot drift between them. The frame is a pure function of the camera
+/// and this, so a `fly` run and the `render` that reproduces a frame from it
+/// have to be able to say the same thing.
+///
+/// Named for the weather rather than the sky because it is no longer only the
+/// sun: the wind decides what the air does around the mountains, which is a
+/// property of the day and not of the view.
 #[derive(clap::Args, Debug)]
-struct Sky {
+struct Weather {
     /// Where the sun is, as `ELEVATION,AZIMUTH` in degrees.
     ///
     /// Elevation is measured from the horizon and may be negative, which puts
@@ -184,6 +190,20 @@ struct Sky {
     // follows it, which `SunAngles` then rejects for not being two numbers.
     #[arg(long, value_name = "ELEVATION,AZIMUTH", allow_hyphen_values = true)]
     sun: Option<SunAngles>,
+
+    /// The wind aloft, as `SPEED,BEARING`: metres per second, then degrees.
+    ///
+    /// The bearing is where the wind blows *from*, as every forecast and
+    /// windsock gives it: `--wind 12,270` is a westerly of twelve metres a
+    /// second, blowing towards the east. Without it the wind is ten metres a
+    /// second from the west.
+    // Not a doc comment, for the reason `sun` above has one: this is for
+    // whoever edits the flag. Changing it re-solves the field at load, which
+    // costs about half a second and is the whole of what the flag does -- there
+    // is no way to change the wind once a run has started, and nothing yet
+    // needs one.
+    #[arg(long, value_name = "SPEED,BEARING", allow_hyphen_values = true)]
+    wind: Option<air::Wind>,
 }
 
 /// Reads `WIDTHxHEIGHT` for [`View::size`].
@@ -213,6 +233,9 @@ struct App {
     /// Where the sun goes once the renderer exists, since the window is built
     /// on `resumed` rather than here and there is no scene to put it in yet.
     sun: Option<SunAngles>,
+    /// Which way the wind blows, held for the same reason and handed over at
+    /// the same moment.
+    wind: air::Wind,
     renderer: Option<Renderer>,
     controls: FlyController,
     /// When the last frame was drawn, for the timestep the controls integrate over.
@@ -225,12 +248,14 @@ impl App {
         terrain: PathBuf,
         profiling: bool,
         sun: Option<SunAngles>,
+        wind: air::Wind,
     ) -> Self {
         Self {
             display,
             terrain,
             profiling,
             sun,
+            wind,
             renderer: None,
             controls: FlyController::default(),
             last_frame: Instant::now(),
@@ -263,6 +288,7 @@ impl ApplicationHandler for App {
             &self.terrain,
             self.profiling,
             self.sun,
+            self.wind,
         )) {
             Ok(renderer) => {
                 self.controls = FlyController::new(renderer.camera());
@@ -362,7 +388,7 @@ fn main() -> anyhow::Result<()> {
     // The headless modes run before the event loop is ever built, deliberately:
     // `EventLoop::new` fails outright on a machine with no display server, which
     // is exactly where those modes are for.
-    let (terrain, profiling, sun) = match arguments.mode {
+    let (terrain, profiling, weather) = match arguments.mode {
         Mode::Render {
             terrain,
             output,
@@ -373,7 +399,8 @@ fn main() -> anyhow::Result<()> {
                 &terrain.terrain,
                 view.size.unwrap_or(DEFAULT_SIZE),
                 view.camera,
-                view.sky.sun,
+                view.weather.sun,
+                view.weather.wind.unwrap_or_default(),
                 headless::Flight {
                     frames,
                     speed: view.motion,
@@ -390,21 +417,28 @@ fn main() -> anyhow::Result<()> {
                 &terrain.terrain,
                 view.size.unwrap_or(DEFAULT_SIZE),
                 view.camera,
-                view.sky.sun,
+                view.weather.sun,
+                view.weather.wind.unwrap_or_default(),
                 headless::Flight {
                     frames,
                     speed: view.motion,
                 },
             );
         }
-        Mode::Fly { terrain, sky } => (terrain.terrain, false, sky.sun),
-        Mode::FlyProfile { terrain, sky } => (terrain.terrain, true, sky.sun),
+        Mode::Fly { terrain, weather } => (terrain.terrain, false, weather),
+        Mode::FlyProfile { terrain, weather } => (terrain.terrain, true, weather),
     };
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(event_loop.owned_display_handle(), terrain, profiling, sun);
+    let mut app = App::new(
+        event_loop.owned_display_handle(),
+        terrain,
+        profiling,
+        weather.sun,
+        weather.wind.unwrap_or_default(),
+    );
     event_loop.run_app(&mut app)?;
 
     Ok(())
@@ -416,22 +450,29 @@ mod tests {
 
     use clap::CommandFactory;
 
-    /// Where a parsed command puts the sun, whichever mode it is.
+    /// What a parsed command says the day is like, whichever mode it is.
     ///
     /// Written as one function over all four so that a mode which quietly
-    /// stopped carrying `--sun` would fail here rather than be skipped.
-    fn sun_of(argv: &[&str]) -> Option<SunAngles> {
+    /// stopped carrying one of these flags would fail here rather than be
+    /// skipped -- the two windowed modes flatten [`Weather`] directly and the
+    /// two headless ones reach it through [`View`], which is exactly the kind
+    /// of asymmetry a flag gets dropped through.
+    fn weather_of(argv: &[&str]) -> Weather {
         let arguments = Arguments::try_parse_from(argv)
             .unwrap_or_else(|err| panic!("{argv:?} did not parse: {err}"));
         match arguments.mode {
-            Mode::Fly { sky, .. } | Mode::FlyProfile { sky, .. } => sky.sun,
-            Mode::Render { view, .. } | Mode::Profile { view, .. } => view.sky.sun,
+            Mode::Fly { weather, .. } | Mode::FlyProfile { weather, .. } => weather,
+            Mode::Render { view, .. } | Mode::Profile { view, .. } => view.weather,
         }
+    }
+
+    fn sun_of(argv: &[&str]) -> Option<SunAngles> {
+        weather_of(argv).sun
     }
 
     /// clap's own check that the derived command is well formed -- duplicate
     /// argument ids, a flattened struct colliding with its host, and the like.
-    /// Worth running because `Sky` is now flattened into four places, two of
+    /// Worth running because `Weather` is flattened into four places, two of
     /// them through `View`, and a collision would otherwise surface as a panic
     /// the first time somebody ran the binary.
     #[test]
@@ -470,6 +511,59 @@ mod tests {
             sun_of(&["flight-sim", "profile", "-t", "x", "--sun", "5,120"]),
             Some(angles)
         );
+    }
+
+    /// The wind reaches all four modes too, and reads as a forecast does.
+    #[test]
+    fn every_mode_takes_the_wind() {
+        let breeze = air::Wind {
+            speed: 12.0,
+            from_degrees: 270.0,
+        };
+        for argv in [
+            vec!["flight-sim", "fly", "-t", "x", "--wind", "12,270"],
+            vec!["flight-sim", "fly-profile", "-t", "x", "--wind", "12,270"],
+            vec![
+                "flight-sim",
+                "render",
+                "-t",
+                "x",
+                "-o",
+                "y",
+                "--wind",
+                "12,270",
+            ],
+            vec!["flight-sim", "profile", "-t", "x", "--wind", "12,270"],
+        ] {
+            assert_eq!(weather_of(&argv).wind, Some(breeze), "{argv:?}");
+        }
+        // Left out, it is the prevailing westerly every run before the flag
+        // was solved for.
+        assert_eq!(weather_of(&["flight-sim", "fly", "-t", "x"]).wind, None);
+    }
+
+    /// A wind that is not two numbers, or is blowing backwards, is refused
+    /// rather than quietly taken. `allow_hyphen_values` is on for the same
+    /// reason `--sun` has it -- a bearing is never negative but a swallowed
+    /// flag has to fail loudly rather than parse.
+    #[test]
+    fn the_wind_refuses_what_is_not_a_forecast() {
+        for bad in ["--motion", "12", "12,270,90", "brisk,west", "-5,270"] {
+            assert!(
+                Arguments::try_parse_from([
+                    "flight-sim",
+                    "render",
+                    "-t",
+                    "x",
+                    "-o",
+                    "y",
+                    "--wind",
+                    bad
+                ])
+                .is_err(),
+                "{bad:?} was accepted as a wind"
+            );
+        }
     }
 
     /// Left out, the sun stays wherever `Sun::default` puts it, so every

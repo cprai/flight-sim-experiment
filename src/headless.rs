@@ -349,6 +349,7 @@ fn settled(
     size: UVec2,
     placement: Option<Placement>,
     sun: Option<SunAngles>,
+    wind: crate::air::Wind,
 ) -> Result<Scene> {
     let started = std::time::Instant::now();
     let mut scene = Scene::new(device, CAPTURE_FORMAT, size, terrain_root)?;
@@ -358,6 +359,9 @@ fn settled(
         placement.apply(&mut scene.camera);
     }
     scene.sun = SunAngles::or_default(sun);
+    // Before the settle below, which is the update that reads the chain in and
+    // then bakes the wind around it.
+    scene.wind = wind;
     log::info!(
         "camera at {} facing {:?}",
         scene.camera.position,
@@ -367,6 +371,11 @@ fn settled(
     // only in where the sun was would otherwise be indistinguishable in the
     // log, and the sun is about to decide the colour of every pixel.
     log::info!("sun towards {}", scene.sun.direction);
+    log::info!(
+        "wind {} m/s from {} degrees",
+        scene.wind.speed,
+        scene.wind.from_degrees
+    );
 
     let started = std::time::Instant::now();
     scene.settle(device, queue);
@@ -392,11 +401,12 @@ pub fn render(
     size: UVec2,
     placement: Option<Placement>,
     sun: Option<SunAngles>,
+    wind: crate::air::Wind,
     flight: Flight,
     output: &Path,
 ) -> Result<()> {
     let (device, queue) = device()?;
-    let mut scene = settled(&device, &queue, terrain_root, size, placement, sun)?;
+    let mut scene = settled(&device, &queue, terrain_root, size, placement, sun, wind)?;
 
     let pixels = capture(&device, &queue, &mut scene, size, flight)?;
     write_png(output, size, &pixels)?;
@@ -428,11 +438,12 @@ pub fn profile(
     size: UVec2,
     placement: Option<Placement>,
     sun: Option<SunAngles>,
+    wind: crate::air::Wind,
     flight: Flight,
 ) -> Result<()> {
     let frames = flight.frames;
     let (adapter, device, queue) = device_and_adapter()?;
-    let mut scene = settled(&device, &queue, terrain_root, size, placement, sun)?;
+    let mut scene = settled(&device, &queue, terrain_root, size, placement, sun, wind)?;
     // After settling, so the chain is already read in and the load's own
     // dispatches are not measured as if they were a frame's.
     scene.profile(&device, true);

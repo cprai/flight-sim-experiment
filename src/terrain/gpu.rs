@@ -1586,6 +1586,61 @@ impl Terrain {
         }
     }
 
+    /// Whether the coarse height mirror has been read in yet.
+    ///
+    /// False until the first update, which is the one that loads the chain.
+    /// Anything that wants the shape of the land before then has to wait rather
+    /// than be told the world is flat.
+    pub fn has_ground(&self) -> bool {
+        !self.ground.is_empty()
+    }
+
+    /// The elevation of the ground at a world position, interpolated.
+    ///
+    /// The same mirror [`Terrain::ground_height`] reads and a different
+    /// question: that one is asked once a frame about the camera and wants the
+    /// ground averaged over kilometres, where this is asked across a whole grid
+    /// and wants a surface without steps in it. A nearest lookup here would put
+    /// a hundred-and-twenty-eight-metre staircase into whatever is built from
+    /// it, on a lattice of its own that has nothing to do with the terrain.
+    ///
+    /// Nodata reads as sea level, as it does everywhere else that asks: past
+    /// the edge of the survey there is no ground, and zero is what the terrain
+    /// itself draws there. Corners are dropped rather than averaged in, so a
+    /// column beside a hole is not pulled down towards it.
+    pub fn ground_at(&self, world_x: f32, world_z: f32) -> f32 {
+        if self.ground.is_empty() {
+            return 0.0;
+        }
+        let texels = self
+            .placement
+            .texel_of_world(f64::from(world_x), f64::from(world_z))
+            / f64::from(1u32 << self.ground_level);
+        // Texel centres sit half a texel in, so the lattice the weights are
+        // taken against is offset by that much.
+        let across = texels - 0.5;
+        let low = DVec2::new(across.x.floor(), across.y.floor());
+        let f = (across - low).as_vec2();
+        let high = self.ground_size.as_ivec2() - IVec2::ONE;
+        let at = |dx: i32, dy: i32| {
+            let p = (IVec2::new(low.x as i32 + dx, low.y as i32 + dy)).clamp(IVec2::ZERO, high);
+            self.ground[p.y as usize * self.ground_size.x as usize + p.x as usize]
+        };
+        let corners = [
+            (at(0, 0), (1.0 - f.x) * (1.0 - f.y)),
+            (at(1, 0), f.x * (1.0 - f.y)),
+            (at(0, 1), (1.0 - f.x) * f.y),
+            (at(1, 1), f.x * f.y),
+        ];
+        let (sum, weight) = corners
+            .iter()
+            .filter(|(height, _)| *height > crate::terrain::NODATA_BELOW)
+            .fold((0.0, 0.0), |(sum, weight), (height, share)| {
+                (sum + height * share, weight + share)
+            });
+        if weight > 0.0 { sum / weight } else { 0.0 }
+    }
+
     /// Reads every mip of the heights and the ground cover in, then builds the
     /// max pyramid over them.
     ///
@@ -3252,6 +3307,68 @@ mod tests {
         assert!(
             checked > 1000,
             "only {checked} cells sat wholly on the raster, which is too few"
+        );
+    }
+
+    /// The coarse mirror is empty until the chain is read, and says so.
+    ///
+    /// [`Terrain::has_ground`] is a promise other things wait on: the wind is
+    /// solved around the shape of the land, and solving it before the mirror
+    /// is filled would silently solve it around a flat world -- a field that is
+    /// perfectly valid, entirely wrong, and impossible to tell apart from a
+    /// correct one by looking at it. So the promise is checked here, where it
+    /// is made, rather than at the far end where a wrong answer looks fine.
+    #[test]
+    fn the_coarse_mirror_is_empty_until_the_chain_is_read() {
+        let (device, queue) = crate::scene::test_device();
+        let mut terrain = terrain_from(&device, 0, 400.0, 30.0, 0);
+
+        assert!(
+            !terrain.has_ground(),
+            "the mirror answered before anything had been read into it"
+        );
+        // And it answers sea level rather than a stale or unallocated height,
+        // so a caller that ignores the promise gets a flat world and not a
+        // crash or a garbage number.
+        assert_eq!(terrain.ground_at(0.0, 0.0), 0.0);
+
+        terrain.update(
+            &device,
+            &queue,
+            Vec3::new(0.0, 900.0, 0.0),
+            &unwatched(&device),
+        );
+        assert!(
+            terrain.has_ground(),
+            "the chain was read but the mirror was not"
+        );
+
+        // Real heights reach the mirror, rather than it merely being allocated.
+        //
+        // Only that they are not all zero, and not that they resemble the
+        // raster: [`GROUND_MIP`] is four levels above the base, which on a
+        // raster this small is a four-by-four field, and averaging a rugged
+        // surface over four hundred and eighty metres a texel flattens it
+        // almost completely. The measured spread here is 20.5 m over a raster
+        // built with 400 m of relief, which is the mip doing its job and not a
+        // fault. What would fail is a mirror that was never filled.
+        let extent = terrain.world_extent();
+        let mut lowest = f32::INFINITY;
+        let mut highest = f32::NEG_INFINITY;
+        for row in 0..16 {
+            for column in 0..16 {
+                let at = glam::Vec2::new(
+                    (column as f32 / 15.0 - 0.5) * extent.x * 0.9,
+                    (row as f32 / 15.0 - 0.5) * extent.y * 0.9,
+                );
+                let height = terrain.ground_at(at.x, at.y);
+                lowest = lowest.min(height);
+                highest = highest.max(height);
+            }
+        }
+        assert!(
+            highest - lowest > 1.0,
+            "the mirror reads {lowest:.1} to {highest:.1} m, which is flat"
         );
     }
 

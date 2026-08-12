@@ -84,8 +84,17 @@ pub struct Scene {
     /// the camera is, set by whoever set the camera up -- see `--sun` in
     /// `src/main.rs`. Nothing moves it with the clock yet.
     pub sun: crate::sky::Sun,
+    /// Which way the wind blows. Public for the reason [`Scene::sun`] is:
+    /// a property of the scene, set by whoever set the camera up.
+    ///
+    /// Read only by the bake, and only until it has run. Changing it after
+    /// that has no effect until something asks for a re-bake, which nothing
+    /// does; it is a flag at startup, like the sun was before it moved.
+    pub wind: crate::air::Wind,
     /// What the world is lit by, on the GPU: [`Scene::sun`] as a uniform.
     sky: crate::sky::Sky,
+    /// The wind solved around the mountains, once, at load.
+    air: crate::air::Air,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     terrain: Terrain,
@@ -306,7 +315,9 @@ impl Scene {
         Self {
             camera,
             sun: crate::sky::Sun::default(),
+            wind: crate::air::Wind::default(),
             sky,
+            air: crate::air::Air::new(device),
             camera_buffer,
             camera_bind_group,
             terrain,
@@ -421,6 +432,23 @@ impl Scene {
         // written by the time the frame encoder resolves the query set.
         self.terrain
             .update(device, queue, self.camera.position, &self.profiler);
+        // After the terrain, because the first of those updates is the one that
+        // reads the chain in, and the wind is solved around the ground that
+        // reading produces. Once, on its own encoder, and unprofiled -- the
+        // same arrangement `Sky::ensure_built` has, for the same reason: it is
+        // a load cost and not a frame's.
+        self.air
+            .ensure_baked(device, queue, &self.terrain, self.wind);
+    }
+
+    /// Leaves the wind unsolved, and says so, so nothing solves it later.
+    ///
+    /// See [`crate::air::Air::assume_baked`] for why the offscreen tests want
+    /// this: a scene apiece, each paying six hundred milliseconds for a field
+    /// none of them reads.
+    #[cfg(test)]
+    pub fn skip_the_wind(&mut self) {
+        self.air.assume_baked(self.wind);
     }
 
     /// How the last frame's pixels were settled: carried over, sky, or marched.
@@ -895,6 +923,13 @@ mod tests {
     ///
     /// Only the aerial-perspective test wants one: a hundred kilometres of air
     /// cannot be measured on a raster four across.
+    ///
+    /// Every scene built here has its wind marked solved without solving it --
+    /// see [`Scene::skip_the_wind`]. Nothing any of these tests asserts can see
+    /// the field, and solving one apiece takes the suite from twelve seconds to
+    /// fifty-eight. The one test that does want the wiring exercised,
+    /// `a_scene_solves_the_wind_over_its_own_terrain`, builds its scene without
+    /// going through here.
     fn test_scene_over(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
@@ -903,7 +938,7 @@ mod tests {
         materials: Vec<MaterialId>,
         placement: Georeferencing,
     ) -> Scene {
-        Scene::from_terrain(
+        let mut scene = Scene::from_terrain(
             device,
             format,
             UVec2::splat(SIZE),
@@ -925,6 +960,39 @@ mod tests {
                             RASTER,
                             heights.clone(),
                         ))),
+                        materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
+                    },
+                )
+            },
+        );
+        scene.skip_the_wind();
+        scene
+    }
+
+    /// The same, but solving the wind the way the application does.
+    fn test_scene_with_wind(
+        device: &wgpu::Device,
+        heights: Vec<f32>,
+        materials: Vec<MaterialId>,
+    ) -> Scene {
+        Scene::from_terrain(
+            device,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            UVec2::splat(SIZE),
+            |camera_layout, storage_layout, work_layout, args_layout, risk_layout, reach_layout| {
+                Terrain::new(
+                    device,
+                    camera_layout,
+                    storage_layout,
+                    work_layout,
+                    args_layout,
+                    risk_layout,
+                    reach_layout,
+                    test_residency(),
+                    UVec2::splat(SIZE),
+                    placement(),
+                    Sources {
+                        heights: Box::new(Pyramid::build(Level::new(RASTER, RASTER, heights))),
                         materials: Box::new(Pyramid::build(Level::new(RASTER, RASTER, materials))),
                     },
                 )
@@ -3115,6 +3183,49 @@ mod tests {
             "settling aged the world by {:?}",
             scene.elapsed.saturating_sub(drawn),
         );
+    }
+
+    /// A scene solves its wind against the terrain it was built over, once.
+    ///
+    /// The one test that lets a scene do it. Every other scene in this file
+    /// skips the solve -- see [`test_scene_over`] -- so this is what says the
+    /// wiring works at all: that `Scene::update` reaches the bake, that the
+    /// bake finds the terrain's coarse heights once the chain has been read in,
+    /// and that it does not run again afterwards.
+    ///
+    /// It is deliberately not an assertion about the *field*, which this raster
+    /// is far too small to say anything useful about. What the solve produces
+    /// is `src/air.rs`'s own business and is tested there, over ground drawn
+    /// for the purpose.
+    #[test]
+    fn a_scene_solves_the_wind_over_its_own_terrain() {
+        let (device, queue) = test_device();
+        let breeze = crate::air::Wind {
+            speed: 8.0,
+            from_degrees: 200.0,
+        };
+        let mut scene = test_scene_with_wind(
+            &device,
+            vec![0.0; (RASTER * RASTER) as usize],
+            flat_ground(),
+        );
+        scene.wind = breeze;
+
+        // Nothing is solved before the chain has been read in, because there is
+        // no ground to solve around yet.
+        assert_eq!(scene.air.baked_for(), None);
+
+        scene.settle(&device, &queue);
+        assert_eq!(
+            scene.air.baked_for(),
+            Some(breeze),
+            "settling did not reach the bake"
+        );
+
+        // And it is spent: a second pass cannot solve again, because the bake
+        // dropped everything it would need to.
+        scene.update(&device, &queue, crate::headless::STEP);
+        assert_eq!(scene.air.baked_for(), Some(breeze));
     }
 
     /// A stalled frame ages the world by a frame's worth, not by the stall.
