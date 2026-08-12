@@ -1,5 +1,6 @@
 mod air;
 mod camera;
+mod cloud;
 mod controls;
 mod deferred;
 mod headless;

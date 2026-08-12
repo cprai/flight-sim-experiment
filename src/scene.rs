@@ -95,6 +95,8 @@ pub struct Scene {
     sky: crate::sky::Sky,
     /// The wind solved around the mountains, once, at load.
     air: crate::air::Air,
+    /// The noise a cloud is carved out of, built once at load.
+    cloud: crate::cloud::Cloud,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     terrain: Terrain,
@@ -318,6 +320,7 @@ impl Scene {
             wind: crate::air::Wind::default(),
             sky,
             air: crate::air::Air::new(device),
+            cloud: crate::cloud::Cloud::new(device),
             camera_buffer,
             camera_bind_group,
             terrain,
@@ -411,6 +414,9 @@ impl Scene {
         // medium alone, so nothing about a frame can change them. Here rather
         // than in the constructor because filling them needs a queue.
         self.sky.ensure_built(device, queue);
+        // Beside the scattering tables and for the same reason: functions of
+        // nothing a frame can change, so once is all they are ever built.
+        self.cloud.ensure_built(device, queue);
         // Uploaded every frame rather than only when it changes. Nothing moves
         // the sun yet, so this rewrites the same sixteen bytes each time --
         // which is cheaper than the branch that would avoid it, and is what
