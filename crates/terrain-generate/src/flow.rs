@@ -253,16 +253,19 @@ struct Queue {
     /// it: filling only ever raises ground towards a rim that is itself ground.
     base: u32,
     shift: u32,
+    /// The grid width, so a bucket's cells can be asked for a row either side.
+    stride: usize,
 }
 
 impl Queue {
-    fn reset(&mut self, low: f32, high: f32) {
+    fn reset(&mut self, low: f32, high: f32, stride: usize) {
         if self.waiting.len() != BUCKETS {
             self.waiting.resize_with(BUCKETS, Vec::new);
         }
         self.active.clear();
         self.at = 0;
         self.parked = 0;
+        self.stride = stride;
         self.base = ordered(low);
         // Spread whatever range this landscape has over the buckets, rather
         // than bucketing on the top bits of the float itself. Ground between
@@ -292,7 +295,7 @@ impl Queue {
         }
     }
 
-    fn pop(&mut self, filled: &[f32]) -> Option<usize> {
+    fn pop(&mut self, filled: &[f32], heights: &[f32]) -> Option<usize> {
         loop {
             if let Some(Reverse(packed)) = self.active.pop() {
                 return Some((packed & 0xffff_ffff) as usize);
@@ -309,12 +312,18 @@ impl Queue {
                 active,
                 at,
                 parked,
+                stride,
                 ..
             } = self;
             let bucket = &mut waiting[*at];
             *parked -= bucket.len();
             active.extend(bucket.drain(..).map(|index| {
-                Reverse((u64::from(ordered(filled[index as usize])) << 32) | u64::from(index))
+                let index = index as usize;
+                for line in [index.wrapping_sub(*stride), index, index + *stride] {
+                    prefetch(filled, line);
+                    prefetch(heights, line);
+                }
+                Reverse((u64::from(ordered(filled[index])) << 32) | index as u64)
             }));
         }
     }
@@ -337,7 +346,6 @@ pub struct Scratch {
     /// the only thing that can route across a lake's flat surface. Never
     /// escapes: the receivers read it and nothing else does.
     reached_by: Vec<u32>,
-    seen: Vec<bool>,
     queue: Queue,
     drainage: Drainage,
 }
@@ -387,17 +395,23 @@ impl Scratch {
         // to hold, because getting it wrong leaves a stale value from another
         // landscape somewhere in the middle of this one.
         let out = &mut self.drainage;
-        out.filled.resize(count, 0.0);
+        // Infinity means "the flood has not reached this cell", which is what a
+        // separate `seen` array used to say. Folding the two removes an 11 MB
+        // random-access grid from the hottest loop in the crate, and moves the
+        // has-this-been-reached test onto the very cache line the code is about
+        // to write the answer into. Nothing survives as infinity: the flood
+        // starts from the whole rim of a rectangular grid, so every cell is
+        // reached, and `every_cell_is_reached_by_the_flood` holds that.
+        out.filled.resize(count, f32::INFINITY);
+        out.filled.fill(f32::INFINITY);
         out.drains_to.resize(count, u32::MAX);
         out.area.resize(count, 1.0);
         out.area.fill(1.0);
         out.order.clear();
         out.order.reserve(count);
         self.reached_by.resize(count, u32::MAX);
-        self.seen.resize(count, false);
-        self.seen.fill(false);
         let (low, high) = fields.height.range();
-        self.queue.reset(low, high);
+        self.queue.reset(low, high, width);
 
         let (filled, drains_to, area, order) = (
             &mut out.filled,
@@ -405,7 +419,7 @@ impl Scratch {
             &mut out.area,
             &mut out.order,
         );
-        let (reached_by, seen, queue) = (&mut self.reached_by, &mut self.seen, &mut self.queue);
+        let (reached_by, queue) = (&mut self.reached_by, &mut self.queue);
 
         // The edge of the map is where water leaves, so that is where the flood
         // starts. A landscape with no outlet at all would otherwise fill to its
@@ -418,7 +432,6 @@ impl Scratch {
                 }
                 let index = row * width + column;
                 filled[index] = heights[index];
-                seen[index] = true;
                 // Written here rather than left to a full reset of the array.
                 // A seed cell is the one kind the flood never reaches from
                 // anywhere, so this is the only place its "reached from nowhere"
@@ -430,7 +443,7 @@ impl Scratch {
             }
         }
 
-        while let Some(index) = queue.pop(filled) {
+        while let Some(index) = queue.pop(filled, heights) {
             order.push(index as u32);
             let (column, row) = ((index % width) as i64, (index / width) as i64);
             for (dx, dy) in NEIGHBOURS {
@@ -439,10 +452,9 @@ impl Scratch {
                     continue;
                 }
                 let neighbour = ny as usize * width + nx as usize;
-                if seen[neighbour] {
+                if filled[neighbour].is_finite() {
                     continue;
                 }
-                seen[neighbour] = true;
                 filled[neighbour] = heights[neighbour].max(filled[index]);
                 reached_by[neighbour] = index as u32;
                 queue.push(neighbour, filled[neighbour]);
@@ -790,6 +802,38 @@ mod tests {
             // check it through the receivers it decides.
             let _ = reached_by;
             assert!(!order.is_empty(), "{name}: the flood reached nothing");
+        }
+    }
+
+    /// Every cell has to come out of the flood with a real height on it.
+    ///
+    /// The filled surface doubles as the flood's own record of what it has
+    /// reached -- infinity means "not yet" -- so a cell the flood somehow
+    /// missed would leave an infinity behind rather than a wrong number, and
+    /// then quietly poison the receivers, the accumulation and every height
+    /// downstream of them. It cannot happen on a rectangular grid seeded from
+    /// its whole rim, which is exactly the kind of reasoning worth pinning to a
+    /// test rather than to a comment.
+    ///
+    /// Sabotaged by a fencepost in the queue -- `drain(1..)` instead of
+    /// `drain(..)` when a bucket becomes active, losing one cell per bucket --
+    /// which leaves infinities behind and fails here.
+    ///
+    /// Seeding only the northern edge is *not* a sabotage of this and was tried
+    /// first: a rectangular grid is connected, so the flood still reaches every
+    /// cell from any non-empty seed set. What this catches is a queue that
+    /// loses cells, not a rim that is too small.
+    #[test]
+    fn every_cell_is_reached_by_the_flood() {
+        for fields in [bowl(41), bowl(9)] {
+            let drainage = drainage(&fields);
+            assert_eq!(drainage.order.len(), fields.height.values.len());
+            let missed = drainage
+                .filled
+                .iter()
+                .filter(|height| !height.is_finite())
+                .count();
+            assert_eq!(missed, 0, "cells the flood never reached");
         }
     }
 
