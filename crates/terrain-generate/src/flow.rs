@@ -164,6 +164,7 @@ fn ordered(value: f32) -> u32 {
 /// much of the map goes with it.
 ///
 /// Everything below is per cell of the grid it was computed from.
+#[derive(Default)]
 pub struct Drainage {
     /// The surface standing water settles to.
     pub filled: Vec<f32>,
@@ -182,6 +183,39 @@ pub struct Drainage {
     pub order: Vec<u32>,
 }
 
+/// The buffers a drainage needs, kept between calls.
+///
+/// `incise::rivers` calls the drainage ninety-two times over one landscape, and
+/// each call was allocating about 230 MB of grids and growing an eleven-million
+/// element heap from nothing by doubling. None of that is per-round work: the
+/// grid does not change size, so the buffers can be filled in once and then
+/// written over. What it costs instead is the first-touch page faults on a
+/// quarter of a gigabyte, ninety-two times over.
+///
+/// The same bargain `creep::settle` already takes with the caller's scratch,
+/// and for the same reason -- see `incise::rivers`.
+#[derive(Default)]
+pub struct Scratch {
+    /// Which cell reached each one. The flood's own tree, kept because it is
+    /// the only thing that can route across a lake's flat surface. Never
+    /// escapes: the receivers read it and nothing else does.
+    reached_by: Vec<u32>,
+    seen: Vec<bool>,
+    heap: BinaryHeap<Reverse<u64>>,
+    drainage: Drainage,
+}
+
+impl Scratch {
+    /// Hands the last drainage out, leaving the scratch empty.
+    ///
+    /// For the callers that want one drainage and no loop -- `route`, and every
+    /// test -- so that reusing buffers stays an option a caller takes rather
+    /// than an obligation the type imposes.
+    fn take(&mut self) -> Drainage {
+        std::mem::take(&mut self.drainage)
+    }
+}
+
 /// Fills the hollows and works out where the water goes.
 ///
 /// Three phases, and they are timed separately at `debug` because they are not
@@ -191,125 +225,154 @@ pub struct Drainage {
 /// dominates decides where any effort is worth spending, and that was worth
 /// measuring rather than assuming.
 pub fn drainage(fields: &Fields) -> Drainage {
-    let (width, rows) = (fields.width(), fields.rows());
-    let count = width * rows;
-    let heights: &[f32] = &fields.height.values;
-    let started = std::time::Instant::now();
+    let mut scratch = Scratch::default();
+    scratch.drainage(fields);
+    scratch.take()
+}
 
-    let mut filled = vec![0f32; count];
-    // Which cell reached each one. The flood's own tree, kept because it is the
-    // only thing that can route across a lake's flat surface.
-    let mut reached_by = vec![u32::MAX; count];
-    let mut seen = vec![false; count];
-    let mut order: Vec<u32> = Vec::with_capacity(count);
-    let mut heap: BinaryHeap<Reverse<u64>> = BinaryHeap::new();
+impl Scratch {
+    /// Fills the hollows and works out where the water goes, into the buffers
+    /// this scratch is already holding.
+    ///
+    /// See [`drainage`] for what the three phases are and why they are timed
+    /// apart.
+    pub fn drainage(&mut self, fields: &Fields) -> &Drainage {
+        let (width, rows) = (fields.width(), fields.rows());
+        let count = width * rows;
+        let heights: &[f32] = &fields.height.values;
+        let started = std::time::Instant::now();
 
-    // The edge of the map is where water leaves, so that is where the flood
-    // starts. A landscape with no outlet at all would otherwise fill to its own
-    // rim and drown.
-    for row in 0..rows {
-        for column in 0..width {
-            let edge = row == 0 || column == 0 || row == rows - 1 || column == width - 1;
-            if !edge {
-                continue;
-            }
-            let index = row * width + column;
-            filled[index] = heights[index];
-            seen[index] = true;
-            heap.push(Reverse(
-                (u64::from(ordered(filled[index])) << 32) | index as u64,
-            ));
-        }
-    }
+        // Everything is sized once and then reused for the life of the scratch.
+        // Which of these need clearing and which do not is not a judgement
+        // call: a buffer that is written for every cell before it is read needs
+        // nothing, and one that is not needs everything. That distinction is
+        // what `a_reused_scratch_does_not_remember_the_last_landscape` exists
+        // to hold, because getting it wrong leaves a stale value from another
+        // landscape somewhere in the middle of this one.
+        let out = &mut self.drainage;
+        out.filled.resize(count, 0.0);
+        out.drains_to.resize(count, u32::MAX);
+        out.area.resize(count, 1.0);
+        out.area.fill(1.0);
+        out.order.clear();
+        out.order.reserve(count);
+        self.reached_by.resize(count, u32::MAX);
+        self.seen.resize(count, false);
+        self.seen.fill(false);
+        self.heap.clear();
 
-    while let Some(Reverse(packed)) = heap.pop() {
-        let index = (packed & 0xffff_ffff) as usize;
-        order.push(index as u32);
-        let (column, row) = ((index % width) as i64, (index / width) as i64);
-        for (dx, dy) in NEIGHBOURS {
-            let (nx, ny) = (column + dx, row + dy);
-            if nx < 0 || ny < 0 || nx >= width as i64 || ny >= rows as i64 {
-                continue;
-            }
-            let neighbour = ny as usize * width + nx as usize;
-            if seen[neighbour] {
-                continue;
-            }
-            seen[neighbour] = true;
-            filled[neighbour] = heights[neighbour].max(filled[index]);
-            reached_by[neighbour] = index as u32;
-            heap.push(Reverse(
-                (u64::from(ordered(filled[neighbour])) << 32) | neighbour as u64,
-            ));
-        }
-    }
+        let (filled, drains_to, area, order) = (
+            &mut out.filled,
+            &mut out.drains_to,
+            &mut out.area,
+            &mut out.order,
+        );
+        let (reached_by, seen, heap) = (&mut self.reached_by, &mut self.seen, &mut self.heap);
 
-    log::debug!("drainage: the flood took {:.2?}", started.elapsed());
-    let at = std::time::Instant::now();
-
-    // Where each cell drains to: the steepest neighbour strictly below it on
-    // the filled surface, or -- on the flat of a lake, where there is no such
-    // neighbour -- whichever cell the flood reached it from, which is by
-    // construction on the way to the spill point.
-    // One row per task. Every cell's answer depends only on the finished filled
-    // surface and never on another cell's answer, so this is the one phase of
-    // the three that parallelises by simply being asked to: rayon splitting the
-    // rows cannot change a single value, only how long they take to arrive.
-    let mut drains_to = vec![u32::MAX; count];
-    drains_to
-        .par_chunks_mut(width)
-        .enumerate()
-        .for_each(|(row, drains_to)| {
-            for (column, drains_to) in drains_to.iter_mut().enumerate() {
-                let index = row * width + column;
-                let here = filled[index];
-                let (mut best, mut steepest) = (u32::MAX, 0.0f32);
-                for (dx, dy) in NEIGHBOURS {
-                    let (nx, ny) = (column as i64 + dx, row as i64 + dy);
-                    if nx < 0 || ny < 0 || nx >= width as i64 || ny >= rows as i64 {
-                        continue;
-                    }
-                    let neighbour = ny as usize * width + nx as usize;
-                    let reach = if dx != 0 && dy != 0 {
-                        std::f32::consts::SQRT_2
-                    } else {
-                        1.0
-                    };
-                    let fall = (here - filled[neighbour]) / reach;
-                    if fall > steepest {
-                        steepest = fall;
-                        best = neighbour as u32;
-                    }
+        // The edge of the map is where water leaves, so that is where the flood
+        // starts. A landscape with no outlet at all would otherwise fill to its
+        // own rim and drown.
+        for row in 0..rows {
+            for column in 0..width {
+                let edge = row == 0 || column == 0 || row == rows - 1 || column == width - 1;
+                if !edge {
+                    continue;
                 }
-                *drains_to = if best != u32::MAX {
-                    best
-                } else {
-                    reached_by[index]
-                };
+                let index = row * width + column;
+                filled[index] = heights[index];
+                seen[index] = true;
+                // Written here rather than left to a full reset of the array.
+                // A seed cell is the one kind the flood never reaches from
+                // anywhere, so this is the only place its "reached from nowhere"
+                // can be said -- and on a reused scratch, not saying it would
+                // leave the previous landscape's answer on the rim, where it
+                // decides which way a lake spills.
+                reached_by[index] = u32::MAX;
+                heap.push(Reverse(
+                    (u64::from(ordered(filled[index])) << 32) | index as u64,
+                ));
             }
+        }
+
+        while let Some(Reverse(packed)) = heap.pop() {
+            let index = (packed & 0xffff_ffff) as usize;
+            order.push(index as u32);
+            let (column, row) = ((index % width) as i64, (index / width) as i64);
+            for (dx, dy) in NEIGHBOURS {
+                let (nx, ny) = (column + dx, row + dy);
+                if nx < 0 || ny < 0 || nx >= width as i64 || ny >= rows as i64 {
+                    continue;
+                }
+                let neighbour = ny as usize * width + nx as usize;
+                if seen[neighbour] {
+                    continue;
+                }
+                seen[neighbour] = true;
+                filled[neighbour] = heights[neighbour].max(filled[index]);
+                reached_by[neighbour] = index as u32;
+                heap.push(Reverse(
+                    (u64::from(ordered(filled[neighbour])) << 32) | neighbour as u64,
+                ));
+            }
+        }
+
+        log::debug!("drainage: the flood took {:.2?}", started.elapsed());
+        let at = std::time::Instant::now();
+
+        // Where each cell drains to: the steepest neighbour strictly below it
+        // on the filled surface, or -- on the flat of a lake, where there is no
+        // such neighbour -- whichever cell the flood reached it from, which is
+        // by construction on the way to the spill point.
+        // One row per task. Every cell's answer depends only on the finished
+        // filled surface and never on another cell's answer, so this is the one
+        // phase of the three that parallelises by simply being asked to: rayon
+        // splitting the rows cannot change a single value, only how long they
+        // take to arrive.
+        let reached_by: &[u32] = reached_by;
+        let filled: &[f32] = filled;
+        drains_to
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(row, drains_to)| {
+                for (column, drains_to) in drains_to.iter_mut().enumerate() {
+                    let index = row * width + column;
+                    let here = filled[index];
+                    let (mut best, mut steepest) = (u32::MAX, 0.0f32);
+                    for (dx, dy) in NEIGHBOURS {
+                        let (nx, ny) = (column as i64 + dx, row as i64 + dy);
+                        if nx < 0 || ny < 0 || nx >= width as i64 || ny >= rows as i64 {
+                            continue;
+                        }
+                        let neighbour = ny as usize * width + nx as usize;
+                        let reach = if dx != 0 && dy != 0 {
+                            std::f32::consts::SQRT_2
+                        } else {
+                            1.0
+                        };
+                        let fall = (here - filled[neighbour]) / reach;
+                        if fall > steepest {
+                            steepest = fall;
+                            best = neighbour as u32;
+                        }
+                    }
+                    *drains_to = if best != u32::MAX {
+                        best
+                    } else {
+                        reached_by[index]
+                    };
+                }
+            });
+
+        log::debug!("drainage: the receivers took {:.2?}", at.elapsed());
+        let at = std::time::Instant::now();
+
+        accumulate::<AHEAD>(width, rows, filled, order, drains_to, area, |fall| {
+            fall.powf(SPREAD)
         });
 
-    log::debug!("drainage: the receivers took {:.2?}", at.elapsed());
-    let at = std::time::Instant::now();
+        log::debug!("drainage: the accumulation took {:.2?}", at.elapsed());
 
-    let mut area = vec![1.0f32; count];
-    accumulate::<AHEAD>(
-        width,
-        rows,
-        &filled,
-        &order,
-        &drains_to,
-        &mut area,
-        |fall| fall.powf(SPREAD),
-    );
-
-    log::debug!("drainage: the accumulation took {:.2?}", at.elapsed());
-
-    Drainage {
-        filled,
-        drains_to,
-        area,
-        order,
+        &self.drainage
     }
 }
 
@@ -440,6 +503,53 @@ mod tests {
             }
         }
         fields
+    }
+
+    /// A scratch that has already seen one landscape must answer about the next
+    /// one exactly as a fresh scratch would.
+    ///
+    /// This is the whole risk in reusing the buffers, and it is a quiet one. A
+    /// grid that is written for every cell before it is read needs no clearing;
+    /// one that is not needs all of it, and the difference is invisible until a
+    /// value from the *previous* landscape survives in the middle of this one.
+    /// `reached_by` is the trap: only cells the flood arrives at are written,
+    /// so the seed cells on the rim keep whatever was there -- and those are
+    /// exactly the cells that decide which way a lake spills.
+    ///
+    /// The grids are deliberately **different sizes**, and that is the whole
+    /// design of the test rather than incidental. Written the obvious way --
+    /// two landscapes of the same size -- it passes with the `reached_by` seed
+    /// deleted, because every landscape of a given size has the same rim, so
+    /// those cells hold `u32::MAX` from the first `resize` and never stop. It
+    /// takes a *smaller* second grid, where a cell that was interior before is
+    /// now on the rim carrying a real receiver from the last landscape, to make
+    /// the bug observable at all.
+    ///
+    /// All four products, against a fresh run, because each reset that is
+    /// missing fails somewhere different. Sabotaged three ways, all caught:
+    ///
+    /// - dropping the `reached_by` seed fails on `drains_to`, and on nothing
+    ///   else -- the surface is right and only the lake routing is wrong, which
+    ///   is why comparing `filled` alone would not have done
+    /// - dropping `seen.fill(false)` fails on `filled`: the previous run left
+    ///   every cell seen, so the flood reaches nothing past the rim and most of
+    ///   the surface is simply the last landscape's, truncated
+    /// - dropping `area.fill(1.0)` fails on `area`, every cell inflated by
+    ///   whatever drained through it last time
+    #[test]
+    fn a_reused_scratch_does_not_remember_the_last_landscape() {
+        let first = bowl(41);
+        let second = bowl(21);
+
+        let mut scratch = Scratch::default();
+        scratch.drainage(&first);
+        let reused = scratch.drainage(&second);
+        let fresh = drainage(&second);
+
+        assert_eq!(reused.filled, fresh.filled, "filled");
+        assert_eq!(reused.order, fresh.order, "order");
+        assert_eq!(reused.drains_to, fresh.drains_to, "drains_to");
+        assert_eq!(reused.area, fresh.area, "area");
     }
 
     /// The property everything downstream rests on: after routing, no cell is

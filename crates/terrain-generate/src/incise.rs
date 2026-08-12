@@ -110,8 +110,14 @@ const HARDNESS_RESISTANCE: f32 = 0.5;
 /// after.
 pub fn rivers(fields: &mut Fields, rounds: u32) {
     let mut scratch = vec![0.0f32; fields.height.values.len()];
+    // Everything the round needs, allocated once for the whole run. A round
+    // touches about 280 MB of grids, and allocating them fresh each time buys
+    // nothing but the page faults of filling a quarter of a gigabyte ninety-two
+    // times over.
+    let mut flow_scratch = flow::Scratch::default();
+    let mut bed = Vec::new();
     for _ in 0..rounds {
-        cut(fields);
+        cut(fields, &mut flow_scratch, &mut bed);
         // The other half of the model, and it belongs inside this loop rather
         // than after it. Creep is not a tidy-up of what the rivers left: it is
         // what the rivers are competing against, round by round, and the
@@ -125,11 +131,11 @@ pub fn rivers(fields: &mut Fields, rounds: u32) {
 }
 
 /// One round of stream-power incision, which only ever takes ground away.
-fn cut(fields: &mut Fields) {
+fn cut(fields: &mut Fields, scratch: &mut flow::Scratch, bed: &mut Vec<f32>) {
     let width = fields.width();
     let cell_area = fields.metres_per_cell * fields.metres_per_cell;
 
-    let drainage = flow::drainage(fields);
+    let drainage = scratch.drainage(fields);
 
     // Timed apart from the drainage, and at the same `debug` level, because
     // this sweep and the accumulation inside `flow` have the same shape -- a
@@ -144,8 +150,11 @@ fn cut(fields: &mut Fields) {
     let diagonal_reach = std::f32::consts::SQRT_2 * fields.metres_per_cell;
 
     // The surface the rivers would leave if there were no hollows, built
-    // downstream first so that every cell's receiver is already final.
-    let mut bed = drainage.filled.clone();
+    // downstream first so that every cell's receiver is already final. Filled
+    // from the caller's buffer rather than cloned, so this is a copy into pages
+    // that are already there rather than a fresh 44 MB every round.
+    bed.resize(drainage.filled.len(), 0.0);
+    bed.copy_from_slice(&drainage.filled);
     for (position, index) in drainage.order.iter().enumerate() {
         // The same lead the accumulation takes, in the other direction. This
         // sweep has the milder version of the same problem: one scattered read
@@ -155,7 +164,7 @@ fn cut(fields: &mut Fields) {
             && let Some(soon) = drainage.order.get(soon)
         {
             let soon = *soon as usize;
-            flow::prefetch(&bed, soon);
+            flow::prefetch(bed, soon);
             flow::prefetch(&drainage.area, soon);
             flow::prefetch(&fields.hardness.values, soon);
             flow::prefetch(&drainage.drains_to, soon);
@@ -209,7 +218,7 @@ fn cut(fields: &mut Fields) {
     // bedrock leaves no loose material anywhere. Recording the incision there
     // as well swamped the droplets' signal completely and stopped any scree at
     // all from being painted.
-    for (height, ceiling) in fields.height.values.iter_mut().zip(&bed) {
+    for (height, ceiling) in fields.height.values.iter_mut().zip(bed.iter()) {
         *height = height.min(*ceiling);
     }
 
@@ -323,8 +332,10 @@ mod tests {
     fn incision_only_lowers_the_ground() {
         let before = basin(101, 200.0, 260.0);
         let mut after = basin(101, 200.0, 260.0);
+        let mut scratch = flow::Scratch::default();
+        let mut bed = Vec::new();
         for _ in 0..40 {
-            cut(&mut after);
+            cut(&mut after, &mut scratch, &mut bed);
         }
         for (index, (was, now)) in before
             .height
