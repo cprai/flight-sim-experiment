@@ -442,7 +442,17 @@ impl Scene {
         // Beside the scattering tables and for the same reason: functions of
         // nothing a frame can change, so once is all they are ever built.
         self.cloud.ensure_built(device, queue);
-        self.cloud.set_frame(queue, self.weather, self.elapsed);
+        // The light volumes are placed on the camera and leaned along the sun,
+        // so this needs both -- and it is written before the sky's own uniform
+        // for no reason other than that it reads in the order the frame is
+        // built.
+        self.cloud.set_frame(
+            queue,
+            self.weather,
+            self.elapsed,
+            self.camera.position,
+            self.sun.direction,
+        );
         // Uploaded every frame rather than only when it changes. Nothing moves
         // the sun yet, so this rewrites the same sixteen bytes each time --
         // which is cheaper than the branch that would avoid it, and is what
@@ -733,6 +743,10 @@ impl Scene {
             {
                 let mut pass = cloud.scoped_compute_pass("cloud-ceiling");
                 self.march.draw_ceiling(&mut pass);
+            }
+            {
+                let mut pass = cloud.scoped_compute_pass("cloud-light");
+                self.march.draw_light(&mut pass);
             }
             {
                 let mut pass = cloud.scoped_compute_pass("cloud-march");
@@ -1238,7 +1252,7 @@ mod tests {
         // this viewport its rows are 1024 bytes, already a multiple of the copy
         // alignment, and the assertion says so rather than the reader having to
         // work it out.
-        let (cloud_colour, _, _) = scene.march.buffers_for_test();
+        let (cloud_colour, _, _, _) = scene.march.buffers_for_test();
         let cloud_size = scene.march.size();
         let cloud_row = cloud_size.x * 8;
         assert_eq!(cloud_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);

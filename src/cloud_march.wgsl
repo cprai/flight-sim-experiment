@@ -148,16 +148,17 @@ const CUTOFF: f32 = 1e-6;
 // costs the same as stepping through a solid one.
 const EMPTY: f32 = 1e-4;
 
-// The march towards the sun that shadows a sample: how many steps, and how far
-// they reach in total.
+// The light volumes' shape. Must match `LIGHT_ACROSS` and `LIGHT_SLICES` in
+// `src/cloud.rs`.
 //
-// Five steps, each twice the last, so the first resolves the metres just above
-// the sample -- where the gradient that shapes a billow is -- and the last
-// reaches far enough to know whether there is a deck's worth of cloud overhead.
-// This is the expensive part of the march by a wide margin and it is what the
-// light volume replaces.
-const LIGHT_STEPS: u32 = 5u;
-const LIGHT_SPAN: f32 = 800.0;
+// Two volumes of one shape: how much of the sun reaches a point, and how much
+// of the sky does. Camera-centred over sixty kilometres and twelve up, which
+// puts a texel at 312 m across and 250 m up -- coarse against a cloud and about
+// right for what these hold, which is not the cloud but the shadow of it. A
+// billow is five texels; the wisp on its edge is none, and the wisp on its edge
+// casts no shadow anybody can see.
+const LIGHT_ACROSS: u32 = 192u;
+const LIGHT_SLICES: u32 = 48u;
 
 // Octaves of Wrenninge's multiple-scattering approximation, and what each one
 // halves.
@@ -169,6 +170,22 @@ const LIGHT_SPAN: f32 = 800.0;
 // it. Three of them is what turns a cloud from a grey silhouette into something
 // that glows where it is thin.
 const OCTAVES: u32 = 3u;
+
+// How much of the sky a cloud blocks still arrives, having bounced.
+//
+// The sky volume says what fraction of the sky's own light reaches a point
+// unscattered, and under a deck that is nothing at all -- which would make the
+// underside of an overcast sky black. It is not black; it is grey, and it is
+// grey because the light the deck stopped was scattered rather than absorbed
+// (see `ALBEDO`, which is 0.95) and a good share of it comes out of the bottom
+// anyway. Those are the scattering orders this model does not carry: the sun
+// term has three octaves of them and the sky term has none, so it gets a
+// constant instead.
+//
+// The same trade the multiple-scattering table in `src/sky.wgsl` makes for the
+// atmosphere, and cruder: there the whole infinite series is summed in closed
+// form, here it is one number chosen by looking at the underside of a deck.
+const BOUNCED: f32 = 0.4;
 
 // The two lobes of the phase function: a strong forward one, which is the
 // silver lining when the sun is behind a cloud, and a weak backward one, which
@@ -207,6 +224,14 @@ struct Weather {
     decks: array<Deck, 3>,
     clock: vec4<f32>,
     span: vec4<f32>,
+    // Where the light volumes sit: the near corner in x and z, the height of
+    // their lowest slice, and the metres one texel covers across.
+    light_origin: vec4<f32>,
+    // How far a sun column drifts horizontally per metre it climbs, then the
+    // metres of ray one slice is worth walking towards the sun, then the metres
+    // of height one slice is worth -- which is what the same slice is worth
+    // walking straight up.
+    light_walk: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -233,6 +258,17 @@ struct Weather {
 @group(3) @binding(7) var out_cloud: texture_storage_2d<rgba16float, write>;
 @group(3) @binding(8) var out_cloud_depth: texture_storage_2d<r32float, write>;
 @group(3) @binding(9) var out_ceiling: texture_storage_3d<r32float, write>;
+// Whichever of the two light volumes is being filled. One binding and one
+// layout for both, because the only thing that differs between them is which
+// way the column walks -- see `cs_cloud_sun_light` and `cs_cloud_sky_light`.
+@group(3) @binding(10) var out_light: texture_storage_3d<rgba16float, write>;
+@group(3) @binding(11) var sun_light: texture_3d<f32>;
+@group(3) @binding(12) var sky_light: texture_3d<f32>;
+// Clamped rather than repeating: these do not tile. A point outside reads the
+// nearest column, which is a real transmittance from a real place and the most
+// plausible thing to continue with -- and everything that far out is behind
+// most of a hundred kilometres of haze.
+@group(3) @binding(13) var edge_sampler: sampler;
 
 // The ray through a point on the screen, before it is normalised. Must match
 // `ray_raw_at` in `src/shading.wgsl` and `src/terrain.wgsl`, character for
@@ -288,6 +324,23 @@ fn sample_multiscatter(r: f32, mu_s: f32) -> vec3<f32> {
         to_texture(altitude, f32(MULTISCATTER_SIZE)),
     );
     return textureSampleLevel(multiscatter_lut, lut_sampler, uv, 0.0).rgb;
+}
+
+// Distance to the ground, or a negative number if the ray misses it. Must match
+// `ground_distance` in `src/sky.wgsl`.
+//
+// A ray pointing at all upwards cannot meet the ground however the arithmetic
+// comes out, which is why `mu > 0` is rejected outright rather than left to the
+// discriminant: near the horizon the two roots are close and rounding decides.
+fn ground_distance(r: f32, mu: f32) -> f32 {
+    if mu > 0.0 {
+        return -1.0;
+    }
+    let discriminant = r * r * (mu * mu - 1.0) + GROUND_RADIUS * GROUND_RADIUS;
+    if discriminant < 0.0 {
+        return -1.0;
+    }
+    return -r * mu - sqrt(discriminant);
 }
 
 // Henyey-Greenstein, normalised over the sphere. The same function
@@ -532,7 +585,12 @@ fn cell_exit(p: vec3<f32>, direction: vec3<f32>) -> f32 {
 // on the way, which arrives having crossed less cloud and been turned less
 // sharply. Wrenninge's approximation, and the difference between a cloud that
 // glows and a cloud that is a grey cut-out.
-fn sunlit(tau: f32, cos_theta: f32, sunlight: vec3<f32>) -> vec3<f32> {
+fn sunlit(through: f32, cos_theta: f32, sunlight: vec3<f32>) -> vec3<f32> {
+    // The octaves take a share of the extinction, which on a transmittance
+    // already exponentiated is a power rather than a scaled exponent. Floored,
+    // because zero to the power of a half is zero but zero read out of a half
+    // float and raised to a power is a place a NaN can start.
+    let survived = max(through, 1e-6);
     var sum = vec3<f32>(0.0);
     var energy = 1.0;
     var depth = 1.0;
@@ -543,7 +601,7 @@ fn sunlit(tau: f32, cos_theta: f32, sunlight: vec3<f32>) -> vec3<f32> {
             henyey(cos_theta, HG_BACK * eccentricity),
             0.5,
         );
-        sum = sum + sunlight * (energy * phase * exp(-tau * depth));
+        sum = sum + sunlight * (energy * phase * pow(survived, depth));
         energy = energy * 0.5;
         depth = depth * 0.5;
         eccentricity = eccentricity * 0.5;
@@ -551,23 +609,124 @@ fn sunlit(tau: f32, cos_theta: f32, sunlight: vec3<f32>) -> vec3<f32> {
     return sum;
 }
 
-// The cloud between a sample and the sun, as an optical depth.
+// Where a light volume's texel sits in the world.
 //
-// Steps that double, so the first resolves the metres just overhead and the last
-// reaches most of a kilometre. No cone jitter and no cache: this is the part the
-// sheared light volume replaces wholesale, and it is here in its plainest form
-// so that what replacing it is worth can be measured.
-fn light_depth(p: vec3<f32>) -> f32 {
+// The whole of the shear. A column of the volume -- one `(x, z)`, every slice --
+// is a straight line in the world that leans by `shear` for every metre it
+// climbs. Give it the sun's own lean and the column *is* a sun ray, so walking
+// it top to bottom accumulates exactly the cloud between each point and the
+// sun, once, in one pass. Give it no lean and the column is a plumb line, and
+// the same walk accumulates the cloud between each point and the sky.
+//
+// Indexed by world x and z rather than by anything in the sun's frame, so a
+// texel covers the same ground however low the sun gets. A sun-space box
+// degenerates exactly where it is most wanted: at five degrees its own plane is
+// nearly vertical, which puts a hundred and fifty metres of resolution across
+// the two and a half kilometres a cloud deck occupies -- seventeen useful texels
+// over the whole interesting half of the sun's arc.
+fn light_position(at: vec3<u32>, shear: vec2<f32>) -> vec3<f32> {
+    let climbed = (f32(at.z) + 0.5) * cloud.light_walk.w;
+    let flat = cloud.light_origin.xy
+        + (vec2<f32>(at.xy) + 0.5) * cloud.light_origin.w
+        + climbed * shear;
+    return vec3<f32>(flat.x, cloud.light_origin.z + climbed, flat.y);
+}
+
+// The same mapping backwards: where a world point sits in a light volume.
+fn light_uvw(p: vec3<f32>, shear: vec2<f32>) -> vec3<f32> {
+    let climbed = p.y - cloud.light_origin.z;
+    let flat = p.xz - cloud.light_origin.xy - climbed * shear;
+    return vec3<f32>(
+        flat / (cloud.light_origin.w * f32(LIGHT_ACROSS)),
+        climbed / (cloud.light_walk.w * f32(LIGHT_SLICES)),
+    );
+}
+
+// How far outside a light volume a coordinate has strayed, as a share of it.
+//
+// Zero anywhere inside, one at a face, and more beyond. What is beyond is not a
+// rare case: the sun columns lean, and the lower the sun the further they lean,
+// so a point high above a low sun un-shears to somewhere tens of kilometres
+// outside a volume sixty across. Letting the sampler clamp there is what put
+// horizontal stripes across a dusk sky -- every slice above four kilometres
+// read the same edge column, so the transmittance stepped from slice to slice
+// instead of varying along the ray.
+//
+// So the answer fades to full light over the outermost tenth instead. Nothing
+// is lost by it: the sun that leans a column that far is a sun the air has
+// already taken out, and the fade is smooth where the clamp was a staircase.
+fn beyond_light(uvw: vec3<f32>) -> f32 {
+    let out = abs(uvw - vec3<f32>(0.5)) * 2.0;
+    return max(max(out.x, out.y), out.z);
+}
+
+// How much of the sun reaches a point, and how much of the sky does.
+//
+// No half-texel correction and none wanted: a texel of these stands for the
+// point at its own centre rather than for a sample of a function over a range,
+// so `light_position` and this are already inverses. See `to_texture` in
+// `src/sky.wgsl` for the case where the correction is needed.
+fn sun_reaching(p: vec3<f32>) -> f32 {
+    let uvw = light_uvw(p, cloud.light_walk.xy);
+    let inside = 1.0 - smoothstep(0.9, 1.0, beyond_light(uvw));
+    return mix(
+        1.0,
+        textureSampleLevel(sun_light, edge_sampler, uvw, 0.0).r,
+        inside,
+    );
+}
+
+fn sky_reaching(p: vec3<f32>) -> f32 {
+    let uvw = light_uvw(p, vec2<f32>(0.0));
+    let inside = 1.0 - smoothstep(0.9, 1.0, beyond_light(uvw));
+    return mix(
+        1.0,
+        textureSampleLevel(sky_light, edge_sampler, uvw, 0.0).r,
+        inside,
+    );
+}
+
+// One column of a light volume, walked from the top down.
+//
+// The cost of the whole technique is here and it is one density sample per
+// texel: a thread owns a column and carries the running integral down it, so
+// what would be a march per shaded sample becomes a fetch per shaded sample.
+// Structurally `cs_aerial` in `src/sky.wgsl`, which walks the frustum's froxel
+// columns the same way and for the same reason.
+fn walk_light(id: vec3<u32>, shear: vec2<f32>, metres: f32) {
     var tau = 0.0;
-    // The steps double, so five of them sum to thirty-one of the first.
-    var step = LIGHT_SPAN / 31.0;
-    var at = p;
-    for (var i = 0u; i < LIGHT_STEPS; i += 1u) {
-        at = at + sky.sun.xyz * step;
-        tau = tau + cloud_extinction(at, false) * step;
-        step = step * 2.0;
+    for (var slice = LIGHT_SLICES; slice > 0u; slice -= 1u) {
+        let at = vec3<u32>(id.x, id.y, slice - 1u);
+        let extinction = cloud_extinction(light_position(at, shear), false);
+        let crossed = extinction * metres;
+        tau = tau + crossed;
+        // Stored for the texel's own centre, so half of its own cell is not yet
+        // in front of it. Without this the volume reads half a cell dark
+        // everywhere, which is a deck's own shadow cast onto its own top.
+        textureStore(
+            out_light,
+            vec3<i32>(at),
+            vec4<f32>(exp(crossed * 0.5 - tau), 0.0, 0.0, 1.0),
+        );
     }
-    return tau;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_cloud_sun_light(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= LIGHT_ACROSS || id.y >= LIGHT_ACROSS {
+        return;
+    }
+    walk_light(id, cloud.light_walk.xy, cloud.light_walk.z);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_cloud_sky_light(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= LIGHT_ACROSS || id.y >= LIGHT_ACROSS {
+        return;
+    }
+    // No lean, and a slice is worth its own height rather than the longer ray a
+    // leaning one crosses.
+    walk_light(id, vec2<f32>(0.0), cloud.light_walk.w);
 }
 
 // Where a ray enters and leaves a horizontal slab, as distances along it.
@@ -645,7 +804,6 @@ fn cs_cloud_march(@builtin(global_invocation_id) id: vec3<u32>) {
         let cos_theta = dot(direction, sky.sun.xyz);
         let radius = max(length(eye + vec3<f32>(0.0, GROUND_RADIUS, 0.0)), GROUND_RADIUS);
         let sun_mu = dot(sky.up.xyz, sky.sun.xyz);
-        let sunlight = sample_transmittance(radius, sun_mu);
         let ambient = sample_multiscatter(radius, sun_mu);
 
         for (var taken = 0u; taken < MAX_STEPS; taken += 1u) {
@@ -663,10 +821,36 @@ fn cs_cloud_march(@builtin(global_invocation_id) id: vec3<u32>) {
             }
 
             let step = min(clamp(STEP_SLOPE * t, MIN_STEP, MAX_STEP), far - t);
-            let extinction = cloud_extinction(p + direction * (step * 0.5), true);
+            let middle = p + direction * (step * 0.5);
+            let extinction = cloud_extinction(middle, true);
             if extinction > 0.0 {
-                let tau = light_depth(p + direction * (step * 0.5));
-                let source = sunlit(tau, cos_theta, sunlight) + ambient;
+                // Two fetches, where this was a five-step march towards the sun
+                // and a flat constant for the sky. The second is what gives a
+                // cloud an inside: without it every part of a deck too deep for
+                // the sun to reach sits at exactly the same ambient, and a deck
+                // seen from below is cotton wool.
+                // What the air has left of the sun, at this sample's own
+                // altitude rather than the eye's. Both halves of that matter at
+                // dusk and only then: the air reddens a cloud at one kilometre
+                // far harder than one at ten, and the planet's own shadow rises
+                // through the decks -- a sun three degrees down is still up as
+                // seen from ten kilometres, which is why the last light of the
+                // day is on the highest cloud.
+                //
+                // The occlusion test rather than trusting the table, and for the
+                // reason `cs_skyview` gives: the parameterisation happily
+                // returns a transmittance for a ray that would have to pass
+                // through the planet to get here.
+                let centred = middle + vec3<f32>(0.0, GROUND_RADIUS, 0.0);
+                let at = max(length(centred), GROUND_RADIUS);
+                let facing = dot(centred / at, sky.sun.xyz);
+                var sunlight = sample_transmittance(at, facing);
+                if ground_distance(at, facing) >= 0.0 {
+                    sunlight = vec3<f32>(0.0);
+                }
+                let lit_by_sky = mix(BOUNCED, 1.0, sky_reaching(middle));
+                let source = sunlit(sun_reaching(middle), cos_theta, sunlight)
+                    + ambient * lit_by_sky;
                 let survived = exp(-extinction * step);
                 // Hillaire's energy-conserving segment integral, as
                 // `cs_skyview` and `cs_aerial` take it: the scattering
