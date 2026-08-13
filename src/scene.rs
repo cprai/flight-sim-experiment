@@ -442,17 +442,11 @@ impl Scene {
         // Beside the scattering tables and for the same reason: functions of
         // nothing a frame can change, so once is all they are ever built.
         self.cloud.ensure_built(device, queue);
+        self.cloud.set_frame(queue, self.weather, self.elapsed);
         // The light volumes are placed on the camera and leaned along the sun,
-        // so this needs both -- and it is written before the sky's own uniform
-        // for no reason other than that it reads in the order the frame is
-        // built.
-        self.cloud.set_frame(
-            queue,
-            self.weather,
-            self.elapsed,
-            self.camera.position,
-            self.sun.direction,
-        );
+        // so this needs both.
+        self.march
+            .set_frame(queue, self.camera.position, self.sun.direction);
         // Uploaded every frame rather than only when it changes. Nothing moves
         // the sun yet, so this rewrites the same sixteen bytes each time --
         // which is cheaper than the branch that would avoid it, and is what
@@ -3644,6 +3638,82 @@ mod tests {
         );
     }
 
+    /// An overcast sky darkens the ground it stands over.
+    ///
+    /// The whole of the user's ask that the design has not yet answered:
+    /// clouds cast shadows on the terrain. They do it out of the same volume
+    /// the cloud march lights itself from, read at the ground point instead --
+    /// there is no shadow map, no second traversal, and nothing that had to be
+    /// built for the ground's sake alone.
+    ///
+    /// Flat ground seen from above, so every pixel is the same slope under the
+    /// same sun and the only thing that differs between the two frames is what
+    /// is overhead. Both halves of the dimming are checked, and separately: the
+    /// direct sun, which an overcast deck takes away almost entirely, and the
+    /// ambient, which it must take down as well. Leaving the sky at full
+    /// strength gives an overcast landscape that is bright and flat rather than
+    /// dim, which reads less like weather than like the sun being switched off.
+    #[test]
+    fn an_overcast_sky_darkens_the_ground_it_stands_over() {
+        // Below the lowest a deck's base can sag, looking down. That matters:
+        // from above the deck the ray to the ground crosses the cloud, and what
+        // the frame then shows is the cloud in front of the ground rather than
+        // the shadow on it -- which is a different thing and would pass this
+        // test for the wrong reason. From underneath there is nothing between
+        // the eye and the ground but air.
+        let under = |weather| {
+            render_under(
+                vec![0.0; (RASTER * RASTER) as usize],
+                flat_ground(),
+                |camera: &mut Camera| {
+                    camera.position = Vec3::new(0.0, 400.0, 0.0);
+                    camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+                },
+                weather,
+            )
+        };
+        let clear = under(crate::cloud::Preset::Clear);
+        let cloudy = under(crate::cloud::Preset::Overcast);
+
+        let ground = |frame: &Frame| {
+            let mut lit = 0f64;
+            let mut count = 0f64;
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    if frame.sky(x, y) {
+                        continue;
+                    }
+                    let p = frame.pixel(x, y);
+                    lit += f64::from(p[0]) + f64::from(p[1]) + f64::from(p[2]);
+                    count += 1.0;
+                }
+            }
+            (lit / count.max(1.0), count)
+        };
+        let (open, seen) = ground(&clear);
+        let (shaded, also) = ground(&cloudy);
+        assert!(
+            seen > 40_000.0 && also == seen,
+            "the two frames disagree about where the ground is: {seen} against {also}"
+        );
+        let left = shaded / open;
+        // Measured at 0.34. Taking only the direct sun away and leaving the sky
+        // at full strength measures 0.51; dimming the sky the whole way instead
+        // of leaving `BOUNCED` of it measures 0.12; leaving the sun alone and
+        // dimming only the sky measures 0.95. The band below admits none of
+        // them.
+        assert!(
+            left < 0.45,
+            "an overcast sky left the ground at {left:.2} of its clear-sky \
+             brightness, which is not overcast"
+        );
+        assert!(
+            left > 0.20,
+            "an overcast sky left the ground at {left:.2}, which is not a dull \
+             day but a moonless night"
+        );
+    }
+
     /// A cloud in front of the sun hides the sun.
     ///
     /// Nothing in the composite mentions the sun's disc. It is hidden because
@@ -3766,6 +3836,16 @@ mod tests {
             crate::cloud::Preset::Overcast,
         );
 
+        // How much *brighter* the cloudy frame is, which is the whole of what
+        // separates a halo from a shadow. Ground under an overcast sky is
+        // legitimately darker -- that is the point of the commit that put the
+        // shadows there -- so an unsigned difference no longer says anything.
+        // Cloud leaking across a silhouette can only add light: it is white
+        // scatter composited over dark forest.
+        let brighter = |x, y| {
+            let (a, b) = (clear.pixel(x, y), cloudy.pixel(x, y));
+            (0..3).map(|c| b[c].saturating_sub(a[c])).max().unwrap_or(0)
+        };
         let apart = |x, y| {
             let (a, b) = (clear.pixel(x, y), cloudy.pixel(x, y));
             (0..3).map(|c| a[c].abs_diff(b[c])).max().unwrap_or(0)
@@ -3774,42 +3854,42 @@ mod tests {
         let mut sky = (255u8, 0usize);
         for y in 0..SIZE {
             for x in 0..SIZE {
-                let difference = apart(x, y);
                 if clear.sky(x, y) {
-                    sky.0 = sky.0.min(difference);
+                    sky.0 = sky.0.min(apart(x, y));
                     sky.1 += 1;
                 } else {
-                    ground.0 = ground.0.max(difference);
-                    ground.1 += usize::from(difference > 0);
+                    let leak = brighter(x, y);
+                    ground.0 = ground.0.max(leak);
+                    ground.1 += usize::from(leak > 0);
                     ground.2 += 1;
                 }
             }
         }
 
         // Ground below the skyline is showing rock that no cloud stands in
-        // front of, so the two frames have to agree about it. They do not agree
-        // *exactly* everywhere: within a pixel or two of the silhouette a tap
-        // that marched past the shelf still carries the one per cent the
-        // weighting leaves it, which is a few counts of colour.
+        // front of, so no cloud may be added to it. It is allowed to go darker
+        // -- a shelf under an overcast sky is in shadow -- but not brighter.
         //
-        // Measured: 6 counts at worst. Dropping the weighting for a plain
-        // bilinear measures 60 -- a white fringe running the whole ridge -- so
-        // the bound sits well clear of both.
+        // Measured: not one count, on any pixel. Dropping the weighting for a
+        // plain bilinear measures 41 counts over one per cent of the ground --
+        // a white fringe running the whole ridge -- so the bound below has an
+        // order of magnitude of room and still nothing to spare on the far
+        // side, which is what a bound on a leak should look like.
         assert!(
             ground.0 <= 15,
-            "cloud behind the shelf changed ground in front of it by {} counts",
+            "cloud behind the shelf put {} counts of light onto ground in \
+             front of it",
             ground.0
         );
         // How *far* the leak reaches is not what the weighting changes, and the
-        // number is here to say so rather than to discriminate: 0.91% of the
-        // ground moves at all with the weighting and 1.07% without it. Both are
-        // the same fringe, one pixel or two wide. What the weighting decides is
-        // how strong it is, which is the assertion above.
+        // number is here to say so rather than to discriminate: both upsamples
+        // leave the same fringe, a pixel or two wide, and what the weighting
+        // decides is how strong it is.
         let leaked = ground.1 as f64 / ground.2 as f64;
         assert!(
             leaked < 0.03,
-            "{leaked:.3} of the ground changed when cloud was put behind it, \
-             which is a band and not a fringe"
+            "{leaked:.3} of the ground brightened when cloud was put behind \
+             it, which is a band and not a fringe"
         );
         // ... and the sky above the skyline changed everywhere, which is what
         // says the frames differ at all and that the comparison has teeth.

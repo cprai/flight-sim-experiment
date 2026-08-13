@@ -33,6 +33,15 @@ const AERIAL_FAR: f32 = 100000.0;
 
 const PI: f32 = 3.14159265358979;
 
+// The light volumes' shape. Must match `LIGHT_ACROSS` and `LIGHT_SLICES` in
+// `src/cloud.rs`.
+const LIGHT_ACROSS: u32 = 192u;
+const LIGHT_SLICES: u32 = 48u;
+
+// How much of the sky a cloud blocks still arrives, having bounced. Must match
+// `BOUNCED` in `src/cloud_march.wgsl`; see there for what it stands in for.
+const BOUNCED: f32 = 0.4;
+
 // How much display brightness a unit of radiance is worth.
 //
 // Everything upstream is in units of the sun's irradiance at the top of the
@@ -74,6 +83,13 @@ struct Sky {
     sun_tangent: vec4<f32>,
 };
 
+// Where the light volumes stand and how their columns lean. Must match `Light`
+// in `src/cloud_march.wgsl` and `LightUniform` in `src/cloud.rs`.
+struct Light {
+    origin: vec4<f32>,
+    walk: vec4<f32>,
+};
+
 // Group 0 is the camera, as it is for every pipeline in this program: the
 // shading needs a world position now, and rebuilds it from the depth and the
 // same ray basis the march walked.
@@ -112,6 +128,18 @@ struct Sky {
 // avoid.
 @group(3) @binding(2) var cloud_colour: texture_2d<f32>;
 @group(3) @binding(5) var cloud_along: texture_2d<f32>;
+// How much of the sun reaches each point of a coarse world grid, and how much
+// of the sky does. The same two volumes the cloud march lights itself from, read
+// at the ground instead: a cloud's shadow on a mountain and a cloud's shadow on
+// another cloud are the same fact, looked up in the same place.
+//
+// Sampled rather than loaded, through the tables' own clamped sampler -- these
+// clamp too, and what is wanted between their texels is exactly what a linear
+// fetch gives. They are not maxima; see `cloud_colour` above for the buffers
+// that are.
+@group(3) @binding(6) var sun_light: texture_3d<f32>;
+@group(3) @binding(7) var sky_light: texture_3d<f32>;
+@group(3) @binding(8) var<uniform> light: Light;
 
 // The ray through a point on the screen, before it is normalised.
 //
@@ -180,6 +208,47 @@ fn sample_multiscatter(r: f32, mu_s: f32) -> vec3<f32> {
         to_texture(altitude, f32(MULTISCATTER_SIZE)),
     );
     return textureSampleLevel(multiscatter_lut, lut_sampler, uv, 0.0).rgb;
+}
+
+// Where a world point sits in a light volume. Must match `light_uvw` in
+// `src/cloud_march.wgsl`; there is a test comparing the four functions here as
+// text against that file, because a shadow the ground draws in a different place
+// from the one the cloud draws it is a cloud floating free of its own shadow.
+fn light_uvw(p: vec3<f32>, shear: vec2<f32>) -> vec3<f32> {
+    let climbed = p.y - light.origin.z;
+    let flat = p.xz - light.origin.xy - climbed * shear;
+    return vec3<f32>(
+        flat / (light.origin.w * f32(LIGHT_ACROSS)),
+        climbed / (light.walk.w * f32(LIGHT_SLICES)),
+    );
+}
+
+// How far outside a light volume a coordinate has strayed, as a share of it.
+// Must match `beyond_light` in `src/cloud_march.wgsl`.
+fn beyond_light(uvw: vec3<f32>) -> f32 {
+    let out = abs(uvw.xy - vec2<f32>(0.5)) * 2.0;
+    return max(out.x, out.y);
+}
+
+// Must match `sun_reaching` in `src/cloud_march.wgsl`, but for the sampler:
+// there the fields tile and are read through a repeating one, here everything
+// else in the group is a table and the clamped one is already to hand.
+fn sun_reaching(p: vec3<f32>) -> f32 {
+    let uvw = light_uvw(p, light.walk.xy);
+    let blocked = textureSampleLevel(sun_light, lut_sampler, uvw, 0.0).r;
+    return 1.0 - blocked * (1.0 - smoothstep(0.9, 1.0, beyond_light(uvw)));
+}
+
+// Must match `sky_reaching` in `src/cloud_march.wgsl`, likewise.
+fn sky_reaching(p: vec3<f32>) -> f32 {
+    let uvw = light_uvw(p, vec2<f32>(0.0));
+    let blocked = textureSampleLevel(sky_light, lut_sampler, uvw, 0.0).r;
+    return 1.0 - blocked * (1.0 - smoothstep(0.9, 1.0, beyond_light(uvw)));
+}
+
+// Must match `sky_share` in `src/cloud_march.wgsl`.
+fn sky_share(reaching: f32) -> f32 {
+    return 1.0 - (1.0 - BOUNCED) * (1.0 - reaching);
 }
 
 // The zenith angle of the horizon. Must match `horizon_zenith` in
@@ -489,10 +558,18 @@ fn fs_shade(@builtin(position)clip: vec4<f32>) -> @location(0) vec4<f32> {
     // where a low sun turns orange -- the same table that reddens the sky
     // reddens what the sky is lighting.
     //
-    // Still no shadows. A slope facing the sun is bright whatever stands
-    // between it and the sun, so the relief this brings out is local and a
-    // mountain does not yet darken the valley behind it.
-    let direct = sample_transmittance(radius, sun_mu) * max(dot(surface, sky.sun.xyz), 0.0);
+    // ... and by whatever cloud stands between this patch of ground and the
+    // sun, which is the same volume the cloud march shades itself from, read at
+    // the ground instead. There is no shadow map and there is no second
+    // traversal: a cloud's shadow on a mountain and a cloud's shadow on another
+    // cloud are one fact, and it was integrated once.
+    //
+    // Still no shadow from the terrain itself. A slope facing the sun is bright
+    // whatever ridge stands between it and the sun, so the relief that brings
+    // out is local and a mountain does not yet darken the valley behind it.
+    let direct = sample_transmittance(radius, sun_mu)
+        * max(dot(surface, sky.sun.xyz), 0.0)
+        * sun_reaching(ground);
 
     // ... and the sky itself, which is what `AMBIENT` was standing in for. The
     // multiple-scattering table already *is* the sky's isotropic radiance, so
@@ -501,7 +578,15 @@ fn fs_shade(@builtin(position)clip: vec4<f32>) -> @location(0) vec4<f32> {
     // the dome -- a cliff sees half a sky, not a whole one. Not a fifth table:
     // a proper irradiance table would be a whole extra precompute for a
     // difference the haze in front of it will shortly dominate.
-    let ambient = sample_multiscatter(radius, sun_mu) * PI * (0.5 + 0.5 * dot(surface, up));
+    //
+    // Dimmed by the cloud overhead as well, and that half is not optional:
+    // taking the sun away and leaving the sky at full strength gives an
+    // overcast landscape that is bright and flat rather than dim, which looks
+    // less like weather than like the sun having been switched off.
+    let ambient = sample_multiscatter(radius, sun_mu)
+        * PI
+        * (0.5 + 0.5 * dot(surface, up))
+        * sky_share(sky_reaching(ground));
 
     // A Lambertian surface scatters what lands on it over a hemisphere, which
     // is the `1 / pi`. The palette is stored linearised and is an albedo now

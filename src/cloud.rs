@@ -242,13 +242,52 @@ struct WeatherUniform {
     /// outside this is sky, and for a camera looking down at the ground it is
     /// most of the ray.
     span: [f32; 4],
-    /// The light volumes' near corner in x and z, the height of their lowest
-    /// slice, and the metres one of their texels covers across.
-    light_origin: [f32; 4],
+}
+
+/// Where the light volumes stand and how their columns lean.
+///
+/// Mirrors `Light` in `src/cloud_march.wgsl` and in `src/shading.wgsl`. Its own
+/// buffer rather than two more fields of [`WeatherUniform`], because the
+/// shading pass reads this and has no business reading that: where a volume
+/// stands is a fact about the camera and the sun, and what is in it is a fact
+/// about the weather. The shading would otherwise have to declare every deck's
+/// cover ramp to reach past them.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightUniform {
+    /// The near corner in x and z, the height of the lowest slice, and the
+    /// metres one texel covers across.
+    origin: [f32; 4],
     /// How far a sun column leans per metre it climbs, then the metres of ray
     /// one slice is worth towards the sun, then the metres of height one slice
     /// is worth -- which is what the same slice is worth straight up.
-    light_walk: [f32; 4],
+    walk: [f32; 4],
+}
+
+impl LightUniform {
+    /// Where the volumes go for an eye and a sun.
+    fn new(eye: glam::Vec3, sun: glam::Vec3) -> Self {
+        let across = LIGHT_EXTENT / LIGHT_ACROSS as f32;
+        let up = CEILING_TOP / LIGHT_SLICES as f32;
+        // Centred on the eye and then snapped to a whole texel. Both halves
+        // matter: centred, so the resolution is spent where the camera is, and
+        // snapped, so the lattice stands still in the world while the camera
+        // moves across it. A volume that slid with the eye would put a cloud's
+        // shadow in a slightly different place every frame, which reads as the
+        // whole sky crawling.
+        let centre = (glam::Vec2::new(eye.x, eye.z) / across).round() * across;
+        let corner = centre - LIGHT_EXTENT * 0.5;
+        // The sun's own lean, floored so a setting sun cannot run it away or a
+        // set one invert it. See [`SHEAR_FLOOR`].
+        let climb = sun.y.max(SHEAR_FLOOR);
+        let lean = glam::Vec2::new(sun.x, sun.z) / climb;
+        Self {
+            origin: [corner.x, corner.y, 0.0, across],
+            // A slice of height is a longer piece of a leaning ray than of a
+            // plumb one, by exactly the sun's climb.
+            walk: [lean.x, lean.y, up / climb, up],
+        }
+    }
 }
 
 /// Where each deck's fields are drawn from.
@@ -289,27 +328,8 @@ impl Preset {
         }
     }
 
-    fn uniform(
-        self,
-        elapsed: std::time::Duration,
-        eye: glam::Vec3,
-        sun: glam::Vec3,
-    ) -> WeatherUniform {
+    fn uniform(self, elapsed: std::time::Duration) -> WeatherUniform {
         let looks = self.decks();
-        let across = LIGHT_EXTENT / LIGHT_ACROSS as f32;
-        let up = CEILING_TOP / LIGHT_SLICES as f32;
-        // Centred on the eye and then snapped to a whole texel. Both halves
-        // matter: centred, so the resolution is spent where the camera is, and
-        // snapped, so the lattice stands still in the world while the camera
-        // moves across it. A volume that slid with the eye would put a cloud's
-        // shadow in a slightly different place every frame, which reads as the
-        // whole sky crawling.
-        let centre = (glam::Vec2::new(eye.x, eye.z) / across).round() * across;
-        let corner = centre - LIGHT_EXTENT * 0.5;
-        // The sun's own lean, floored so a setting sun cannot run it away or a
-        // set one invert it. See [`SHEAR_FLOOR`].
-        let climb = sun.y.max(SHEAR_FLOOR);
-        let lean = glam::Vec2::new(sun.x, sun.z) / climb;
         WeatherUniform {
             decks: std::array::from_fn(|deck| DeckUniform {
                 look: looks[deck],
@@ -318,10 +338,6 @@ impl Preset {
             }),
             clock: [elapsed.as_secs_f32(), WEATHER_PERIOD, 0.0, 0.0],
             span: [cloud_span().0, cloud_span().1, 0.0, 0.0],
-            light_origin: [corner.x, corner.y, 0.0, across],
-            // A slice of height is a longer piece of a leaning ray than of a
-            // plumb one, by exactly the sun's climb.
-            light_walk: [lean.x, lean.y, up / climb, up],
         }
     }
 }
@@ -593,18 +609,11 @@ impl Cloud {
     /// Uploaded every frame rather than when it changes, for the reason the sky
     /// uploads its sun every frame: the clock moves whatever else does, and a
     /// branch to avoid rewriting eighty bytes costs more than the write.
-    pub fn set_frame(
-        &self,
-        queue: &wgpu::Queue,
-        preset: Preset,
-        elapsed: std::time::Duration,
-        eye: glam::Vec3,
-        sun: glam::Vec3,
-    ) {
+    pub fn set_frame(&self, queue: &wgpu::Queue, preset: Preset, elapsed: std::time::Duration) {
         queue.write_buffer(
             &self.uniform,
             0,
-            bytemuck::bytes_of(&preset.uniform(elapsed, eye, sun)),
+            bytemuck::bytes_of(&preset.uniform(elapsed)),
         );
     }
 
@@ -667,6 +676,9 @@ pub struct March {
     ceiling_view: wgpu::TextureView,
     sun_light_view: wgpu::TextureView,
     sky_light_view: wgpu::TextureView,
+    /// Where the two volumes stand this frame; see [`LightUniform`]. Read by
+    /// the builds, by the march and by the shading.
+    light: wgpu::Buffer,
     sampler: wgpu::Sampler,
     edge_sampler: wgpu::Sampler,
     ceiling_group: wgpu::BindGroup,
@@ -697,6 +709,7 @@ struct Lit<'a> {
     sky: &'a wgpu::TextureView,
     tiling: &'a wgpu::Sampler,
     edge: &'a wgpu::Sampler,
+    light: &'a wgpu::Buffer,
 }
 
 impl March {
@@ -799,9 +812,29 @@ impl March {
             ..Default::default()
         });
 
+        let light = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cloud light uniform"),
+            size: std::mem::size_of::<LightUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let uniform = wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        // The one entry both the builds, the march and the shading want, which
+        // is why it is spelled once. Visible to the fragment stage as well: the
+        // ground reads these volumes too.
+        let light_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -892,6 +925,7 @@ impl March {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                light_entry(14),
             ],
         });
 
@@ -913,6 +947,7 @@ impl March {
                     count: None,
                 },
                 written(10, CLOUD_FORMAT, wgpu::TextureViewDimension::D3),
+                light_entry(14),
             ],
         });
         let (shape_view, detail_view, _) = cloud.views();
@@ -944,6 +979,10 @@ impl March {
                     wgpu::BindGroupEntry {
                         binding: 10,
                         resource: wgpu::BindingResource::TextureView(into),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 14,
+                        resource: light.as_entire_binding(),
                     },
                 ],
             })
@@ -1018,6 +1057,7 @@ impl March {
             sky: &sky_light_view,
             tiling: &sampler,
             edge: &edge_sampler,
+            light: &light,
         };
         let march_group = Self::bind(
             device,
@@ -1042,6 +1082,7 @@ impl March {
             sky_light_view,
             sampler,
             edge_sampler,
+            light,
             ceiling_group,
             light_groups,
             march_layout,
@@ -1083,6 +1124,7 @@ impl March {
                 sky: &self.sky_light_view,
                 tiling: &self.sampler,
                 edge: &self.edge_sampler,
+                light: &self.light,
             },
             &self.colour_view,
             &self.depth_view,
@@ -1151,6 +1193,10 @@ impl March {
                 texture(11, lit.sun),
                 texture(12, lit.sky),
                 sampler(13, lit.edge),
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: lit.light.as_entire_binding(),
+                },
             ],
         })
     }
@@ -1165,6 +1211,20 @@ impl March {
         pass.set_bind_group(3, &self.ceiling_group, &[]);
         let across = CEILING_ACROSS.div_ceil(CEILING_GROUP);
         pass.dispatch_workgroups(across, CEILING_SLICES.div_ceil(CEILING_GROUP), across);
+    }
+
+    /// Says where the light volumes stand for the frame about to be drawn.
+    ///
+    /// Every frame, because the camera moves and the sun may. Separate from
+    /// [`Cloud::set_frame`] because it answers a different question with
+    /// different inputs: that one is asked what kind of day it is, this one
+    /// where the eye is and where the sun is.
+    pub fn set_frame(&self, queue: &wgpu::Queue, eye: glam::Vec3, sun: glam::Vec3) {
+        queue.write_buffer(
+            &self.light,
+            0,
+            bytemuck::bytes_of(&LightUniform::new(eye, sun)),
+        );
     }
 
     /// Records both light volumes into an already-started compute pass.
@@ -1199,9 +1259,17 @@ impl March {
         );
     }
 
-    /// The two buffers the composite reads.
-    pub fn views(&self) -> (&wgpu::TextureView, &wgpu::TextureView) {
-        (&self.colour_view, &self.depth_view)
+    /// Everything the shading reads of the clouds: the two half-resolution
+    /// buffers the composite upsamples, and the two light volumes the ground is
+    /// shadowed out of.
+    pub fn views(&self) -> crate::deferred::Clouds<'_> {
+        crate::deferred::Clouds {
+            colour: &self.colour_view,
+            along: &self.depth_view,
+            sun: &self.sun_light_view,
+            sky: &self.sky_light_view,
+            light: &self.light,
+        }
     }
 
     /// The textures themselves, for the tests that read them back.
@@ -1509,15 +1577,7 @@ mod tests {
         let (device, queue) = crate::headless::device().expect("no headless device");
         let mut cloud = Cloud::new(&device);
         cloud.ensure_built(&device, &queue);
-        // The weather does not depend on where the eye is or where the sun is;
-        // only the light volumes do, and this reads none of them.
-        cloud.set_frame(
-            &queue,
-            preset,
-            elapsed,
-            glam::Vec3::ZERO,
-            crate::sky::Sun::default().direction,
-        );
+        cloud.set_frame(&queue, preset, elapsed);
 
         let mut encoder = device.create_command_encoder(&Default::default());
         {
@@ -1839,13 +1899,7 @@ mod tests {
 
         let mut cloud = Cloud::new(&device);
         cloud.ensure_built(&device, &queue);
-        cloud.set_frame(
-            &queue,
-            preset,
-            std::time::Duration::ZERO,
-            camera.position,
-            sun.direction,
-        );
+        cloud.set_frame(&queue, preset, std::time::Duration::ZERO);
 
         let gbuffer = crate::deferred::GBuffer::new(&device, size);
         let march = March::new(
@@ -1857,8 +1911,10 @@ mod tests {
             &gbuffer,
         );
 
+        march.set_frame(&queue, camera.position, sun.direction);
+
         let mut encoder = device.create_command_encoder(&Default::default());
-        // Three passes, as `Scene::draw` records them, and for the reason it
+        // Four passes, as `Scene::draw` records them, and for the reason it
         // does: each reads what the one before it wrote.
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
@@ -2207,35 +2263,37 @@ mod tests {
         );
     }
 
-    /// The light volume gets darker the further down a deck it goes.
+    /// The light volume blocks more the further down a deck it goes.
     ///
     /// The defining property of the walk, and the one an off-by-one in it
     /// destroys: a column is filled from the top down, so every texel holds the
-    /// cloud above it and no texel may be brighter than the one over its head.
+    /// cloud above it and no texel may block less than the one over its head.
     /// Walking the other way instead -- which is one character -- would fill a
     /// deck's *top* with its own shadow and leave its base in full sun, and the
     /// image that produces is a cloud lit from below, which reads as strange
     /// rather than as wrong.
     ///
-    /// Measured over an overcast sky, which is the one that fills the volume:
-    /// the highest slice keeps almost all of the sun and the lowest almost none.
+    /// The volume holds what it blocks rather than what it lets through; see
+    /// `walk_light` for why an empty sky has to come back as an exact zero.
+    /// Measured over an overcast sky, which is the one that fills it: the
+    /// highest slice blocks almost nothing and the lowest almost everything.
     #[test]
-    fn the_light_volume_darkens_downwards_through_a_deck() {
+    fn the_light_volume_blocks_more_the_further_down_a_deck_it_goes() {
         let frame = marched(
             Preset::Overcast,
             &looking(1500.0, 0.0),
             glam::UVec2::splat(32),
         );
         let mut worst: f32 = 0.0;
-        let mut darkest: f32 = 1.0;
-        let mut brightest: f32 = 0.0;
+        let mut most: f32 = 0.0;
+        let mut least: f32 = 1.0;
         for z in 0..LIGHT_ACROSS {
             for x in 0..LIGHT_ACROSS {
-                brightest = brightest.max(frame.lit(x, z, LIGHT_SLICES - 1));
-                darkest = darkest.min(frame.lit(x, z, 0));
+                least = least.min(frame.lit(x, z, LIGHT_SLICES - 1));
+                most = most.max(frame.lit(x, z, 0));
                 for slice in 0..LIGHT_SLICES - 1 {
-                    // Above may never be darker than below.
-                    worst = worst.max(frame.lit(x, z, slice) - frame.lit(x, z, slice + 1));
+                    // Below may never block less than above.
+                    worst = worst.max(frame.lit(x, z, slice + 1) - frame.lit(x, z, slice));
                 }
             }
         }
@@ -2243,16 +2301,16 @@ mod tests {
         // thousandth of what they hold.
         assert!(
             worst < 1e-3,
-            "a texel of the light volume is {worst} brighter than the one above it"
+            "a texel of the light volume blocks {worst} more than the one below it"
         );
         assert!(
-            brightest > 0.99,
-            "the top of the volume keeps only {brightest} of the sun, \
-             with nothing above it to take any"
+            least < 0.01,
+            "the top of the volume blocks {least} of the sun, with nothing \
+             above it to block any"
         );
         assert!(
-            darkest < 0.01,
-            "the bottom of an overcast deck still keeps {darkest} of the sun"
+            most > 0.99,
+            "the bottom of an overcast deck blocks only {most} of the sun"
         );
     }
 
@@ -2318,15 +2376,7 @@ mod tests {
     fn the_light_volume_stands_still_while_the_camera_moves() {
         let across = LIGHT_EXTENT / LIGHT_ACROSS as f32;
         let sun = crate::sky::Sun::default().direction;
-        let corner = |x: f32| {
-            Preset::Fair
-                .uniform(
-                    std::time::Duration::ZERO,
-                    glam::Vec3::new(x, 2000.0, 0.0),
-                    sun,
-                )
-                .light_origin
-        };
+        let corner = |x: f32| LightUniform::new(glam::Vec3::new(x, 2000.0, 0.0), sun).origin;
         // Two eyes a tenth of a texel apart put the volume in the same place...
         assert_eq!(corner(0.0), corner(across * 0.1));
         // ... and two a whole texel apart move it by exactly one texel, rather
@@ -2511,6 +2561,17 @@ mod tests {
             "transmittance_uv",
             "sample_transmittance",
             "sample_multiscatter",
+            // ... and the three that place a point in a light volume, which the
+            // ground now reads as well as the cloud. A shadow the ground draws
+            // in a different place from the one the cloud draws it is a cloud
+            // floating free of its own shadow. `sun_reaching` and `sky_reaching`
+            // are deliberately not in this list: they differ by one word, the
+            // sampler, because the march reads three tiling fields through a
+            // repeating one and the shading has the tables' clamped one already
+            // to hand.
+            "light_uvw",
+            "beyond_light",
+            "sky_share",
         ] {
             assert_eq!(
                 body(shade, name),
@@ -2526,6 +2587,9 @@ mod tests {
             "TRANSMITTANCE_HEIGHT",
             "MULTISCATTER_SIZE",
             "PI",
+            "LIGHT_ACROSS",
+            "LIGHT_SLICES",
+            "BOUNCED",
         ] {
             let declared = |source: &'static str| {
                 source
@@ -2577,8 +2641,8 @@ mod tests {
         // ... and Rust writes exactly what both of them expect to read.
         assert_eq!(
             std::mem::size_of::<WeatherUniform>(),
-            DECKS * 3 * 16 + 4 * 16,
-            "the uniform is not the three decks and four vectors both shaders read"
+            DECKS * 3 * 16 + 2 * 16,
+            "the uniform is not the three decks and two vectors both shaders read"
         );
     }
 

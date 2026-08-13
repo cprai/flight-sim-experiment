@@ -104,10 +104,6 @@ struct Weather {
     // The lowest and highest a cloud can be, over every deck. The march's own
     // business; see above.
     span: vec4<f32>,
-    // Where the light volumes sit, and how their columns lean. The march's own
-    // business too, and part of the buffer for the same reason.
-    light_origin: vec4<f32>,
-    light_walk: vec4<f32>,
 };
 
 @group(1) @binding(0) var<uniform> weather: Weather;

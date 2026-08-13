@@ -234,6 +234,20 @@ pub fn bind_storage(
     })
 }
 
+/// What the shading reads of the clouds.
+///
+/// The half-resolution buffers the march left, and the two light volumes it lit
+/// itself from -- which the ground is lit from too, out of the same texels.
+/// A bundle rather than five parameters because they always travel together and
+/// two of them are rebuilt on resize while three are not.
+pub struct Clouds<'a> {
+    pub colour: &'a wgpu::TextureView,
+    pub along: &'a wgpu::TextureView,
+    pub sun: &'a wgpu::TextureView,
+    pub sky: &'a wgpu::TextureView,
+    pub light: &'a wgpu::Buffer,
+}
+
 /// The pass that turns the G-buffer into the image.
 pub struct Shading {
     layout: wgpu::BindGroupLayout,
@@ -257,7 +271,7 @@ impl Shading {
         camera_layout: &wgpu::BindGroupLayout,
         sky_layout: &wgpu::BindGroupLayout,
         tables_layout: &wgpu::BindGroupLayout,
-        cloud: (&wgpu::TextureView, &wgpu::TextureView),
+        cloud: Clouds<'_>,
     ) -> Self {
         // Uploaded once: the table is a pure function of the material enum,
         // so nothing ever rewrites it.
@@ -279,6 +293,11 @@ impl Shading {
             count: None,
         };
         let unfiltered = texture(wgpu::TextureSampleType::Float { filterable: false });
+        let volume = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D3,
+            multisampled: false,
+        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shading layout"),
             entries: &[
@@ -307,6 +326,20 @@ impl Shading {
                 entry(3, unfiltered),
                 entry(4, unfiltered),
                 entry(5, unfiltered),
+                // The two cloud light volumes and where they stand. Filterable,
+                // unlike everything above them: these are a smooth field being
+                // read between its texels rather than a raster whose texels
+                // mean particular ground.
+                entry(6, volume),
+                entry(7, volume),
+                entry(
+                    8,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
             ],
         });
         let bind_group = Self::bind(device, &layout, &palette, gbuffer, cloud);
@@ -369,12 +402,7 @@ impl Shading {
     ///
     /// Both follow the frame's size, so both are gone by the time this is
     /// called and both have to be named again.
-    pub fn rebind(
-        &mut self,
-        device: &wgpu::Device,
-        gbuffer: &GBuffer,
-        cloud: (&wgpu::TextureView, &wgpu::TextureView),
-    ) {
+    pub fn rebind(&mut self, device: &wgpu::Device, gbuffer: &GBuffer, cloud: Clouds<'_>) {
         self.bind_group = Self::bind(device, &self.layout, &self.palette, gbuffer, cloud);
     }
 
@@ -383,20 +411,22 @@ impl Shading {
         layout: &wgpu::BindGroupLayout,
         palette: &wgpu::Buffer,
         gbuffer: &GBuffer,
-        cloud: (&wgpu::TextureView, &wgpu::TextureView),
+        cloud: Clouds<'_>,
     ) -> wgpu::BindGroup {
         let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
-        let (colour, along) = cloud;
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shading bind group"),
             layout,
             entries: &[
                 entry(0, palette.as_entire_binding()),
                 entry(1, wgpu::BindingResource::TextureView(&gbuffer.material)),
-                entry(2, wgpu::BindingResource::TextureView(colour)),
+                entry(2, wgpu::BindingResource::TextureView(cloud.colour)),
                 entry(3, wgpu::BindingResource::TextureView(&gbuffer.depth)),
                 entry(4, wgpu::BindingResource::TextureView(&gbuffer.normal)),
-                entry(5, wgpu::BindingResource::TextureView(along)),
+                entry(5, wgpu::BindingResource::TextureView(cloud.along)),
+                entry(6, wgpu::BindingResource::TextureView(cloud.sun)),
+                entry(7, wgpu::BindingResource::TextureView(cloud.sky)),
+                entry(8, cloud.light.as_entire_binding()),
             ],
         })
     }
