@@ -47,7 +47,7 @@ pub const WEATHER_SIZE: u32 = 256;
 /// mountains reach into, a middle one, and cirrus. They are layers of one array
 /// texture rather than three textures, so the march reads them with one binding
 /// and an index.
-pub const DECKS: usize = 3;
+pub const DECKS: usize = 4;
 
 /// Cells across the ceiling cache, in X and Z. Must match `CEILING_ACROSS` in
 /// `src/cloud_march.wgsl`.
@@ -101,10 +101,35 @@ const WEATHER_TILE: f32 = 60_000.0;
 /// where cumulus is water, and what it takes out of a beam is a quarter of what
 /// the same thickness of cumulus would.
 const DECK_SLABS: [[f32; 4]; DECKS] = [
+    [0.0, 1250.0, 120.0, 1.0],
     [700.0, 3000.0, 400.0, 1.0],
     [3500.0, 6000.0, 500.0, 0.65],
     [8500.0, 10000.0, 300.0, 0.25],
 ];
+
+/// Which entry of [`DECK_SLABS`] is the low deck.
+///
+/// The one every preset but `fog` is mostly about, and the one the tests reach
+/// for when they want to say what a name means. Named rather than written as a
+/// number, because it stopped being the first the day the fog went under it.
+#[cfg(test)]
+const LOW_DECK: usize = 1;
+
+/// How far each deck's base rides the ground rather than standing at an
+/// altitude of its own.
+///
+/// One for the fog and nothing for the rest. A deck that hugs keeps the top
+/// [`DECK_SLABS`] gives it and takes its base from the terrain under it, so it
+/// *pools*: it fills every valley floor below its top and leaves every ridge
+/// above it in clear air, which is what valley fog is and what a blanket laid
+/// over the hills at a constant depth would not be.
+///
+/// The top staying absolute is what keeps the rest of the system still. A
+/// hugging deck occupies exactly the heights [`DECK_SLABS`] says it does -- its
+/// base only ever rises into that band -- so `deck_at` needs no terrain, the
+/// ceiling cache's slab test needs no terrain, and nothing has to be told how
+/// high the mountains are.
+const DECK_HUG: [f32; DECKS] = [1.0, 0.0, 0.0, 0.0];
 
 /// Texels across each light volume, and slices up it. Must match `LIGHT_ACROSS`
 /// and `LIGHT_SLICES` in `src/cloud_march.wgsl`.
@@ -229,6 +254,8 @@ pub enum Preset {
     Overcast,
     /// The lid, lower and much thicker, heaped up underneath.
     Storm,
+    /// A still morning: fog lying in the valleys under a clear sky.
+    Fog,
 }
 
 /// What one preset asks of one deck.
@@ -249,6 +276,8 @@ struct DeckUniform {
     /// altitude cumulus forms at. It rides in the uniform anyway because the
     /// march wants it beside the rest, and one buffer beats two.
     slab: [f32; 4],
+    /// This deck's entry from [`DECK_HUG`], and three spare.
+    hug: [f32; 4],
 }
 
 /// Mirrors the `Weather` uniform block in `src/cloud.wgsl` and in
@@ -346,7 +375,7 @@ impl LightUniform {
 ///
 /// Far apart, so that the three fields one deck takes from consecutive seeds --
 /// cover, lean, density, base -- cannot collide with another deck's.
-const DECK_SEEDS: [u32; DECKS] = [0x4c6f7700, 0x4d696400, 0x48696700];
+const DECK_SEEDS: [u32; DECKS] = [0x466f6700, 0x4c6f7700, 0x4d696400, 0x48696700];
 
 impl Preset {
     /// What this preset asks of the low, middle and high decks.
@@ -364,19 +393,27 @@ impl Preset {
     fn decks(self) -> [[f32; 4]; DECKS] {
         const NONE: [f32; 4] = [2.0, 3.0, 0.0, 0.0];
         match self {
-            Self::Clear => [NONE, NONE, NONE],
-            Self::Fair => [[0.50, 0.72, 1.0, 0.75], NONE, [0.60, 0.85, 0.0, 0.35]],
+            Self::Clear => [NONE, NONE, NONE, NONE],
+            Self::Fair => [NONE, [0.50, 0.72, 1.0, 0.75], NONE, [0.60, 0.85, 0.0, 0.35]],
             Self::Broken => [
+                NONE,
                 [0.42, 0.66, 0.8, 0.9],
                 [0.58, 0.82, 0.4, 0.5],
                 [0.52, 0.80, 0.0, 0.4],
             ],
-            Self::Overcast => [[0.16, 0.44, 0.2, 1.0], [0.40, 0.70, 0.2, 0.7], NONE],
+            Self::Overcast => [NONE, [0.16, 0.44, 0.2, 1.0], [0.40, 0.70, 0.2, 0.7], NONE],
             Self::Storm => [
+                NONE,
                 [0.04, 0.34, 0.9, 1.0],
                 [0.24, 0.56, 0.6, 1.0],
                 [0.45, 0.75, 0.0, 0.5],
             ],
+            // A wide, low ramp and no lean: fog is the flattest stratus there
+            // is, and what decides where it lies is the ground rather than the
+            // field. Nothing above it -- a valley-fog morning is a morning
+            // under a clear sky, and putting cumulus over it would only hide
+            // what this preset is for.
+            Self::Fog => [[0.30, 0.62, 0.0, 1.0], NONE, NONE, NONE],
         }
     }
 
@@ -387,6 +424,7 @@ impl Preset {
                 look: looks[deck],
                 seed: [DECK_SEEDS[deck], 0, 0, 0],
                 slab: DECK_SLABS[deck],
+                hug: [DECK_HUG[deck], 0.0, 0.0, 0.0],
             }),
             clock: [elapsed.as_secs_f32(), WEATHER_PERIOD, 0.0, 0.0],
             span: [cloud_span().0, cloud_span().1, 0.0, 0.0],
@@ -790,6 +828,8 @@ struct Lit<'a> {
     light: &'a wgpu::Buffer,
     /// The baked wind's deviation field; see `src/air.rs`.
     drift: &'a wgpu::TextureView,
+    /// The ground the wind was solved around, for the deck that rides it.
+    ground: &'a wgpu::TextureView,
 }
 
 /// Everything the march keeps at the size of the frame, which a resize throws
@@ -870,8 +910,9 @@ impl March {
         sun_tables_layout: &wgpu::BindGroupLayout,
         cloud: &Cloud,
         gbuffer: &crate::deferred::GBuffer,
-        drift: &wgpu::TextureView,
+        air: &crate::air::Air,
     ) -> Self {
+        let (_, drift, ground) = air.views();
         // A deck reaching above the cache is a deck the march never finds: the
         // ceiling reads as empty above its own top, and the ray skips straight
         // past. Checked rather than trusted because the failure is silent -- the
@@ -1087,6 +1128,7 @@ impl March {
                     binding: 16,
                     ..uniform
                 },
+                sampled(21, wgpu::TextureViewDimension::D2, true),
             ],
         });
 
@@ -1154,6 +1196,7 @@ impl March {
                 },
                 light_entry(14),
                 sampled(15, wgpu::TextureViewDimension::D3, true),
+                sampled(21, wgpu::TextureViewDimension::D2, true),
             ],
         });
         let (shape_view, detail_view, _) = cloud.views();
@@ -1197,6 +1240,10 @@ impl March {
                     wgpu::BindGroupEntry {
                         binding: 15,
                         resource: wgpu::BindingResource::TextureView(drift),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 21,
+                        resource: wgpu::BindingResource::TextureView(ground),
                     },
                 ],
             })
@@ -1279,6 +1326,7 @@ impl March {
             edge: &edge_sampler,
             light: &light,
             drift,
+            ground,
         };
         let march_group = Self::bind(
             device,
@@ -1360,8 +1408,9 @@ impl March {
         device: &wgpu::Device,
         cloud: &Cloud,
         gbuffer: &crate::deferred::GBuffer,
-        drift: &wgpu::TextureView,
+        air: &crate::air::Air,
     ) {
+        let (_, drift, ground) = air.views();
         self.size = half_of(gbuffer.size);
         let screen = Screen::new(device, self.size);
         self.march_group = Self::bind(
@@ -1377,6 +1426,7 @@ impl March {
                 edge: &self.edge_sampler,
                 light: &self.light,
                 drift,
+                ground,
             },
             &screen,
             &self.rotation,
@@ -1451,6 +1501,7 @@ impl March {
                     binding: 16,
                     resource: rotation.as_entire_binding(),
                 },
+                texture(21, lit.ground),
             ],
         })
     }
@@ -2114,7 +2165,7 @@ mod tests {
         ];
         let covers: Vec<f64> = order
             .iter()
-            .map(|preset| cover(&forecast(*preset, std::time::Duration::ZERO)[0]))
+            .map(|preset| cover(&forecast(*preset, std::time::Duration::ZERO)[LOW_DECK]))
             .collect();
         for pair in order.iter().zip(&covers).collect::<Vec<_>>().windows(2) {
             let [(before, less), (after, more)] = pair else {
@@ -2160,8 +2211,8 @@ mod tests {
         let frame_later = at(1.0 / 60.0);
         let much_later = at(WEATHER_PERIOD / 3.0);
 
-        let flicker = difference(&start[0], &frame_later[0]);
-        let drift = difference(&start[0], &much_later[0]);
+        let flicker = difference(&start[LOW_DECK], &frame_later[LOW_DECK]);
+        let drift = difference(&start[LOW_DECK], &much_later[LOW_DECK]);
         assert!(
             flicker < 0.002,
             "the sky changed by {flicker:.4} in a single frame"
@@ -2339,7 +2390,15 @@ mod tests {
         wind: crate::air::Wind,
         elapsed: std::time::Duration,
     ) -> Marched {
-        marched_over(preset, &[camera; ROTATION.len()], size, sun, wind, elapsed)
+        marched_over(
+            preset,
+            &[camera; ROTATION.len()],
+            size,
+            sun,
+            wind,
+            elapsed,
+            None,
+        )
     }
 
     /// The same again, one camera per frame.
@@ -2350,6 +2409,7 @@ mod tests {
     /// texel. Given the same camera four times over -- which is what everything
     /// above hands it -- that reprojection is the identity and the four
     /// quarters compose into the frame a march of every texel would have left.
+    #[allow(clippy::too_many_arguments, reason = "one test wants a terrain too")]
     fn marched_over(
         preset: Preset,
         cameras: &[&crate::camera::Camera],
@@ -2357,6 +2417,7 @@ mod tests {
         sun: crate::sky::Sun,
         wind: crate::air::Wind,
         elapsed: std::time::Duration,
+        ground: Option<&[f32]>,
     ) -> Marched {
         let camera = cameras[0];
         let (device, queue) = crate::headless::device().expect("no headless device");
@@ -2380,7 +2441,13 @@ mod tests {
         // An unsolved wind, which reports a grid of no extent and so puts no
         // drift and no lift anywhere. What the wind does to a cloud is a
         // question about a terrain, and it is asked in `src/scene.rs` over one.
-        let air = crate::air::Air::new(&device);
+        let mut air = crate::air::Air::new(&device);
+        // A terrain for a deck to hang off, and no wind at all: what the ground
+        // does to a cloud base and what the wind does to it are two questions,
+        // and mixing them would leave neither answered.
+        if let Some(heights) = ground {
+            air.assume_ground(&queue, glam::Vec2::splat(GROUND_EXTENT), heights);
+        }
         let mut march = March::new(
             &device,
             &camera_layout,
@@ -2388,7 +2455,7 @@ mod tests {
             sky.sun_tables_layout(),
             &cloud,
             &gbuffer,
-            air.views().1,
+            &air,
         );
 
         let blocks = half_of(march.size());
@@ -2564,6 +2631,19 @@ mod tests {
         out
     }
 
+    /// How much world the ground the fog tests draw covers, in metres.
+    ///
+    /// The grid is centred on the origin, as [`crate::air::Air::bounds`] lays
+    /// it out, so a camera that wants a terrain under it has to fly here rather
+    /// than at [`AWAY`]. Wide enough that a level ray leaves the far side of
+    /// it well beyond anything the frame shows.
+    const GROUND_EXTENT: f32 = 40_000.0;
+
+    /// A ground field at one height everywhere.
+    fn ground_at_height(height: f32) -> Vec<f32> {
+        vec![height; (crate::air::CELLS[0] * crate::air::CELLS[2]) as usize]
+    }
+
     /// Three whole weather tiles from the origin, and negative.
     ///
     /// Every camera below flies from here rather than from nothing, so that
@@ -2676,6 +2756,7 @@ mod tests {
                 crate::sky::Sun::default(),
                 crate::air::Wind::default(),
                 std::time::Duration::ZERO,
+                None,
             )
         };
         let once = rounds(ROTATION.len());
@@ -2726,6 +2807,7 @@ mod tests {
                 crate::sky::Sun::default(),
                 crate::air::Wind::default(),
                 std::time::Duration::ZERO,
+                None,
             )
         };
         let apart = |a: &Marched, b: &Marched| {
@@ -2752,6 +2834,152 @@ mod tests {
             "a buffer carried through the turn is {ghost:.6} from one marched at \
              the new camera, against {moved:.6} for one not carried at all"
         );
+    }
+
+    /// Fog pools to a level and thins as the ground comes up under it.
+    ///
+    /// The whole of what a deck that rides the ground is for, and the whole of
+    /// what separates it from one laid over the hills at a constant depth. A
+    /// hugging deck keeps the top [`DECK_SLABS`] gives it and takes its base
+    /// from the terrain, so raising the ground under it does not raise the fog:
+    /// it *squeezes* it, until at the top there is none left. A blanket would
+    /// come back with the same reading at every height, which is what this
+    /// would look like if `hug` were dropped on the floor.
+    ///
+    /// Measured over a flat ground at three heights, from a camera above the
+    /// deck looking down into it: 0.912 of the frame covered at seven hundred
+    /// metres, 0.725 at eleven hundred, and nothing at all at fourteen hundred,
+    /// where the ground has come up past the highest the top can swing to.
+    ///
+    /// The last of those is exact and is the one that matters most: a ridge
+    /// standing out of the fog has to stand *clear* of it, not in a haze of
+    /// it, or every hilltop in the frame wears a halo.
+    #[test]
+    fn fog_pools_to_a_level_and_thins_as_the_ground_comes_up() {
+        // Over the origin rather than at [`AWAY`], because the ground grid is
+        // centred there; see [`GROUND_EXTENT`].
+        let camera = crate::camera::Camera::new(
+            glam::Vec3::new(0.0, 1500.0, 0.0),
+            crate::camera::Camera::from_yaw_pitch_roll(0.0, (-35f32).to_radians(), 0.0),
+            1.0,
+        );
+        let size = glam::UVec2::splat(96);
+        let over = |height: f32| {
+            marched_over(
+                Preset::Fog,
+                &[&camera; ROTATION.len()],
+                size,
+                crate::sky::Sun::default(),
+                crate::air::Wind::default(),
+                std::time::Duration::ZERO,
+                Some(&ground_at_height(height)),
+            )
+            .opacity()
+        };
+
+        let (deep, shallow, above) = (over(700.0), over(1100.0), over(1400.0));
+        assert!(
+            deep > 0.8,
+            "fog over ground at seven hundred metres covered only {deep:.3} of the frame"
+        );
+        assert!(
+            shallow < deep * 0.9,
+            "the ground rising four hundred metres into the fog left {shallow:.3} \
+             of the frame covered against {deep:.3}, which is not a pool being \
+             squeezed but a blanket being carried"
+        );
+        assert_eq!(
+            above, 0.0,
+            "ground above the highest the fog's top can reach still left \
+             {above:.3} of the frame in fog"
+        );
+    }
+
+    /// The cache bounds the fog too, over ground it is not allowed to read.
+    ///
+    /// A hugging deck's profile is measured from the terrain, and the cache
+    /// cannot know where the terrain is: it tiles every sixty kilometres and
+    /// the ground does not, so one cell of it stands over every terrain in the
+    /// world at once. So it bounds a hugging deck as though the deck were
+    /// filling anywhere in its band -- and this is what says that is still a
+    /// bound, walked over a ground that slopes twelve hundred metres across the
+    /// grid so that neighbouring cells hold the fog at quite different heights.
+    ///
+    /// Bounding it the way an ordinary deck is bounded -- by where in the cell's
+    /// own heights the profile could peak, measured from a base at sea level --
+    /// fails this by 0.05, which is most of the fog.
+    #[test]
+    fn no_cell_of_the_ceiling_claims_less_fog_than_it_holds() {
+        let camera = crate::camera::Camera::new(
+            glam::Vec3::new(0.0, 1500.0, 0.0),
+            crate::camera::Camera::from_yaw_pitch_roll(0.0, (-35f32).to_radians(), 0.0),
+            1.0,
+        );
+        // A slope rather than a plane, so that the ground varies inside a cell
+        // of the cache as well as between cells.
+        let across = crate::air::CELLS[0];
+        let heights: Vec<f32> = (0..across * crate::air::CELLS[2])
+            .map(|i| 400.0 + 1200.0 * (i % across) as f32 / (across - 1) as f32)
+            .collect();
+        let frame = marched_over(
+            Preset::Fog,
+            &[&camera; ROTATION.len()],
+            glam::UVec2::splat(32),
+            crate::sky::Sun::default(),
+            crate::air::Wind::default(),
+            std::time::Duration::ZERO,
+            Some(&heights),
+        );
+
+        let step = 61.0;
+        let mut worst: f32 = 0.0;
+        let mut checked = 0u32;
+        for iz in -40..40 {
+            for ix in -40..40 {
+                for slice in 0..CEILING_SLICES {
+                    let p = glam::Vec3::new(
+                        ix as f32 * step,
+                        (f32::from(slice as u16) + 0.37) * (CEILING_TOP / CEILING_SLICES as f32),
+                        iz as f32 * step,
+                    );
+                    let across = CEILING_ACROSS as i32;
+                    let cell = |v: f32| {
+                        let raw = (v / (WEATHER_TILE / CEILING_ACROSS as f32)).floor() as i32;
+                        ((raw % across) + across) % across
+                    };
+                    let bound = frame.cell(cell(p.x) as u32, slice, cell(p.z) as u32);
+                    let most = most_at(&frame, p, sampled_ground(&heights, p.x, p.z));
+                    worst = worst.max(most - bound);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            worst < 5e-4,
+            "the cache fell {worst:.5} short of the fog in it, over {checked} points"
+        );
+    }
+
+    /// The ground under a point, sampled the way `ground_at` samples it.
+    ///
+    /// Bilinear over the grid `Air` lays out, clamped at its edges, through the
+    /// half floats the map is stored in -- all three of which the shader does,
+    /// and the last of which is worth a couple of metres at a thousand.
+    fn sampled_ground(heights: &[f32], x: f32, z: f32) -> f32 {
+        let across = crate::air::CELLS[0] as i32;
+        let down = crate::air::CELLS[2] as i32;
+        let uv = glam::Vec2::new(x, z) / GROUND_EXTENT + 0.5;
+        let at = uv * glam::Vec2::new(across as f32, down as f32) - 0.5;
+        let corner = at.floor();
+        let f = at - corner;
+        let tap = |dx: i32, dy: i32| {
+            let ix = (corner.x as i32 + dx).clamp(0, across - 1);
+            let iy = (corner.y as i32 + dy).clamp(0, down - 1);
+            half::f16::from_f32(heights[(iy * across + ix) as usize]).to_f32()
+        };
+        let low = tap(0, 0) + (tap(1, 0) - tap(0, 0)) * f.x;
+        let high = tap(0, 1) + (tap(1, 1) - tap(0, 1)) * f.x;
+        low + (high - low) * f.y
     }
 
     /// A clear sky marches to no cloud at any pixel, and marches every pixel.
@@ -2859,18 +3087,25 @@ mod tests {
     /// `src/cloud_march.wgsl`; `EXTINCTION` and `EDGE` are read out of the
     /// shader rather than restated, so a change to either fails the test that
     /// compares them rather than quietly moving both sides at once.
-    fn most_at(frame: &Marched, p: glam::Vec3) -> f32 {
+    fn most_at(frame: &Marched, p: glam::Vec3, ground: f32) -> f32 {
         let extinction = shader_constant("EXTINCTION");
         let edge = shader_constant("EDGE");
-        let mut most: f32 = 0.0;
+        // Summed rather than maxed, because the march sums: decks may share
+        // heights, and where they do a point is in both of them.
+        let mut most = 0.0;
         for (deck, slab) in DECK_SLABS.iter().enumerate() {
             if p.y < slab[0] || p.y > slab[1] + slab[2] {
                 continue;
             }
             let w = frame.forecast_at(deck, p.x, p.z);
-            let base = slab[0] + w[3] * slab[2];
-            let coverage = w[0] * vertical((p.y - base) / (slab[1] - slab[0]), w[1]);
-            most = most.max(extinction * w[2] * slab[3] * (coverage / edge).clamp(0.0, 1.0));
+            let mut base = slab[0] + w[3] * slab[2];
+            let mut thickness = slab[1] - slab[0];
+            if DECK_HUG[deck] > 0.0 {
+                base = base.max(ground);
+                thickness = (slab[1] + w[3] * slab[2] - base).max(1.0);
+            }
+            let coverage = w[0] * vertical((p.y - base) / thickness, w[1]);
+            most += extinction * w[2] * slab[3] * (coverage / edge).clamp(0.0, 1.0);
         }
         most
     }
@@ -2937,7 +3172,7 @@ mod tests {
                         ((raw % across) + across) % across
                     };
                     let bound = frame.cell(cell(p.x) as u32, slice, cell(p.z) as u32);
-                    let most = most_at(&frame, p);
+                    let most = most_at(&frame, p, 0.0);
                     worst = worst.max(most - bound);
                     checked += 1;
                 }
@@ -3464,28 +3699,41 @@ mod tests {
         // ... and Rust writes exactly what both of them expect to read.
         assert_eq!(
             std::mem::size_of::<WeatherUniform>(),
-            DECKS * 3 * 16 + 2 * 16,
-            "the uniform is not the three decks and two vectors both shaders read"
+            DECKS * 4 * 16 + 2 * 16,
+            "the uniform is not the four decks and two vectors both shaders read"
         );
     }
 
-    /// No height belongs to two decks at once.
+    /// Only a deck that rides the ground shares heights with another.
     ///
-    /// What lets a sample in the march cost one weather fetch rather than three:
-    /// it finds the deck a height is in and stops looking. Overlapping slabs
-    /// would not fail -- the lower deck would simply win everywhere the two met,
-    /// and the upper one would be missing its underside for reasons nothing
-    /// records. The swing counts: a deck's base lifts and carries its top with
-    /// it, so what it can occupy runs to its top plus its whole swing.
+    /// A sample costs one weather fetch per deck it stands in, so two decks
+    /// standing in the same heights cost two -- and that is worth paying for
+    /// exactly one reason: fog pools at a level the low cumulus already
+    /// occupies over terrain whose valleys are at seven hundred metres and
+    /// whose ridges are at two and a half thousand. Between two decks that both
+    /// stand at fixed altitudes it buys nothing at all and is simply a mistake,
+    /// so it is not allowed. The swing counts: a deck's base lifts and carries
+    /// its top with it, so what it can occupy runs to its top plus its whole
+    /// swing.
     #[test]
-    fn the_decks_never_reach_into_one_another() {
-        for pair in DECK_SLABS.windows(2) {
-            let [below, above] = pair else { unreachable!() };
+    fn only_a_hugging_deck_shares_heights_with_another() {
+        for (deck, slab) in DECK_SLABS.iter().enumerate().skip(1) {
+            let below = DECK_SLABS[deck - 1];
             assert!(
-                below[1] + below[2] < above[0],
-                "a deck reaching {} m sits under one starting at {} m",
+                slab[0] > below[0],
+                "the decks are not in order: one starting at {} m follows one at {} m",
+                slab[0],
+                below[0]
+            );
+            if DECK_HUG[deck - 1] > 0.0 {
+                continue;
+            }
+            assert!(
+                below[1] + below[2] < slab[0],
+                "a deck reaching {} m sits under one starting at {} m, and neither \
+                 of them rides the ground",
                 below[1] + below[2],
-                above[0]
+                slab[0]
             );
         }
         // ... and each is a slab with a thickness, rather than a plane or an

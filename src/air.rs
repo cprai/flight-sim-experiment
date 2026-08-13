@@ -154,6 +154,13 @@ const GROUP: u32 = 4;
 /// after the same reasoning.
 const FIELD_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// The format the ground map is held in.
+///
+/// Sampled and never stored into, which is what lets it be a format core
+/// WebGPU will not let anything write as storage. Half a float is a couple of
+/// metres at four thousand, which is finer than the grid it is laid on.
+const GROUND_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
+
 /// Where the wind comes from and how hard it blows.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Wind {
@@ -256,8 +263,18 @@ pub struct Air {
     /// in metres, and in `w` how far it has climbed to get there.
     #[allow(dead_code, reason = "read through its view")]
     drift: wgpu::Texture,
+    /// The ground under every column of the grid, in metres.
+    ///
+    /// The same field the solve was run around, kept for the clouds: a deck
+    /// whose base rides the terrain has to know where the terrain is, and this
+    /// is already the one place the mirror the terrain keeps on the CPU has
+    /// been read into a lattice. Filled by [`Air::solve`] and never written
+    /// again.
+    #[allow(dead_code, reason = "read through its view")]
+    ground_map: wgpu::Texture,
     wind_view: wgpu::TextureView,
     drift_view: wgpu::TextureView,
+    ground_view: wgpu::TextureView,
     /// Dropped once the bake has run; see [`Build`].
     build: Option<Build>,
     /// What the field was solved for, so a change of wind can be noticed.
@@ -343,8 +360,31 @@ impl Air {
         let wind = field("air wind");
         let drift = field("air drift");
         let scratch = field("air scratch");
+        // One height per column, at the grid's own resolution, uploaded rather
+        // than computed: it is the very field the solve is run around, and it
+        // is on the CPU already. `R16Float` because this is only ever sampled
+        // and never stored into -- the format restriction that rules it out of
+        // everything else here does not apply -- and because a metre of
+        // precision at four thousand is more than a cloud base wants. A quarter
+        // of a megabyte less than the alternative, and filterable, which the
+        // one storage-writable single-channel format is not.
+        let ground_map = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("air ground map"),
+            size: wgpu::Extent3d {
+                width: CELLS[0],
+                height: CELLS[2],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GROUND_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
         let view = |texture: &wgpu::Texture| texture.create_view(&Default::default());
         let (wind_view, drift_view, scratch_view) = (view(&wind), view(&drift), view(&scratch));
+        let ground_view = view(&ground_map);
 
         let buffer = |label, size| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -533,6 +573,8 @@ impl Air {
         Self {
             wind_view: wind_view.clone(),
             drift_view: drift_view.clone(),
+            ground_view,
+            ground_map,
             build: Some(Build {
                 reading: [
                     reads("air reads wind", &wind_view),
@@ -627,6 +669,7 @@ impl Air {
 
         let build = self.build.as_ref().expect("checked by the only caller");
         queue.write_buffer(&build.ground, 0, bytemuck::cast_slice(heights));
+        self.raise_ground(queue, heights);
         let aloft = wind.velocity();
         queue.write_buffer(
             &build.uniform,
@@ -697,10 +740,11 @@ impl Air {
         self.build = None;
     }
 
-    /// The solved velocity and displacement fields.
+    /// The solved velocity and displacement fields, and the ground they were
+    /// solved around.
     #[allow(dead_code, reason = "only the drift is read; the velocity is not")]
-    pub fn views(&self) -> (&wgpu::TextureView, &wgpu::TextureView) {
-        (&self.wind_view, &self.drift_view)
+    pub fn views(&self) -> (&wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView) {
+        (&self.wind_view, &self.drift_view, &self.ground_view)
     }
 
     /// Where the grid stands: its near corner in x and z, then how much world
@@ -717,6 +761,47 @@ impl Air {
             self.extent.x,
             self.extent.y,
         ]
+    }
+
+    /// Copies the ground the solve was run around into the map the clouds read.
+    ///
+    /// The same heights as the buffer the solve itself uses, as a texture this
+    /// time, for whoever wants to hang something off the ground rather than
+    /// solve around it -- see `ground_at` in `src/cloud_march.wgsl`.
+    fn raise_ground(&self, queue: &wgpu::Queue, heights: &[f32]) {
+        let raised: Vec<u8> = heights
+            .iter()
+            .flat_map(|h| half::f16::from_f32(*h).to_le_bytes())
+            .collect();
+        queue.write_texture(
+            self.ground_map.as_image_copy(),
+            &raised,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(CELLS[0] * 2),
+                rows_per_image: Some(CELLS[2]),
+            },
+            wgpu::Extent3d {
+                width: CELLS[0],
+                height: CELLS[2],
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Lays a ground field out without solving a wind over it.
+    ///
+    /// For the cloud tests, which want a terrain for a deck to hang off and
+    /// have no use at all for the field solved around it -- the wind costs
+    /// half a second and this costs a texture upload. What it leaves is a grid
+    /// with an extent, a ground, and a drift of exactly nothing, which is what
+    /// [`Air::assume_baked`] leaves too and for the same reason.
+    #[cfg(test)]
+    pub fn assume_ground(&mut self, queue: &wgpu::Queue, extent: glam::Vec2, heights: &[f32]) {
+        assert_eq!(heights.len(), column_count() as usize);
+        self.extent = extent;
+        self.raise_ground(queue, heights);
+        self.assume_baked(Wind::default());
     }
 
     /// What the field was solved for, or [`None`] if it has not been.

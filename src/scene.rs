@@ -323,7 +323,7 @@ impl Scene {
             sky.sun_tables_layout(),
             &cloud,
             &gbuffer,
-            air.views().1,
+            &air,
         );
         let shading = Shading::new(
             device,
@@ -394,7 +394,7 @@ impl Scene {
         // reads the depth of the G-buffer just rebuilt above. Before the
         // shading, which reads the buffers this throws away and remakes.
         self.march
-            .resize(device, &self.cloud, &self.gbuffer, self.air.views().1);
+            .resize(device, &self.cloud, &self.gbuffer, &self.air);
         self.shading
             .rebind(device, &self.gbuffer, self.march.views());
         self.terrain.resize(viewport);

@@ -38,7 +38,7 @@ const MULTISCATTER_SIZE: u32 = 32u;
 // The weather map's shape. Must match `WEATHER_SIZE` and `DECKS` in
 // `src/cloud.rs`.
 const WEATHER_SIZE: u32 = 256u;
-const DECKS: u32 = 3u;
+const DECKS: u32 = 4u;
 
 // The ceiling cache's shape. Must match `CEILING_ACROSS`, `CEILING_SLICES` and
 // `CEILING_TOP` in `src/cloud.rs`.
@@ -277,11 +277,12 @@ struct Deck {
     look: vec4<f32>,
     seed: vec4<u32>,
     slab: vec4<f32>,
+    hug: vec4<f32>,
 };
 
 // Must match `Weather` in `src/cloud.wgsl`, for the same reason.
 struct Weather {
-    decks: array<Deck, 3>,
+    decks: array<Deck, 4>,
     clock: vec4<f32>,
     span: vec4<f32>,
 };
@@ -375,6 +376,9 @@ struct Rotation {
 @group(3) @binding(18) var fresh_along: texture_2d<f32>;
 @group(3) @binding(19) var was_cloud: texture_2d<f32>;
 @group(3) @binding(20) var was_along: texture_2d<f32>;
+// The ground under every column of the baked wind's own grid, in metres. Read
+// only by a deck whose base rides it; see `ground_at`.
+@group(3) @binding(21) var air_ground: texture_2d<f32>;
 
 // The ray through a point on the screen, before it is normalised. Must match
 // `ray_raw_at` in `src/shading.wgsl` and `src/terrain.wgsl`, character for
@@ -488,21 +492,33 @@ fn vertical_peak(lean: f32) -> f32 {
     return 0.5 * (mix(0.10, 0.35, lean) + mix(0.88, 0.60, lean));
 }
 
-// Which deck a height belongs to, or nothing.
+// Whether a preset has switched a deck off altogether.
+//
+// A deck with no cloud in it is described by a cover ramp whose lower end is
+// above one, which the field cannot reach -- see `Preset::decks` in
+// `src/cloud.rs`, where that is what `clear` is. So its layer of the weather map
+// is exactly zero everywhere, and this is what says so without fetching it.
+//
+// Cheap and worth more than it looks. Every preset but `storm` switches at
+// least one deck off, and the fog shares its heights with the low cumulus, so
+// without this every sample low in the sky would pay a fetch to be told there
+// is no fog today.
+fn empty_deck(deck: u32) -> bool {
+    return cloud.decks[deck].look.x >= 1.0;
+}
+
+// Whether a deck can put cloud at a height at all.
 //
 // A deck's base lifts by up to its swing, carrying its top with it, so the most
-// it can occupy is from its nominal base to its nominal top plus that swing. The
-// three do not overlap, so this is a single answer rather than a set, and it is
-// what lets a sample cost one weather fetch instead of three.
-fn deck_at(y: f32) -> i32 {
-    for (var deck = 0u; deck < DECKS; deck += 1u) {
-        let slab = cloud.decks[deck].slab;
-        if y >= slab.x && y <= slab.y + slab.z {
-            return i32(deck);
-        }
-    }
-    return -1;
-}
+// it can occupy is from its nominal base to its nominal top plus that swing.
+//
+// Decks may overlap, and the fog and the low cumulus over this terrain do: the
+// valleys here stand at seven hundred metres and the ridges at two and a half
+// thousand, so fog pools at a level the cumulus deck already occupies. What
+// that costs is a weather fetch for each deck a sample stands in rather than
+// one for the sample -- and it buys the only arrangement in which both are the
+// height they should be. It is also the physical answer: two things in the air
+// at the same place add up.
 
 // The weather over a point, for one deck: cover, lean, density, base offset.
 fn weather_at(deck: i32, p: vec3<f32>) -> vec4<f32> {
@@ -587,17 +603,29 @@ fn carve(field: f32, coverage: f32) -> f32 {
 // darker cloud base -- and it halves the cost of the most expensive part of the
 // march.
 fn cloud_extinction(p: vec3<f32>, fine: bool) -> f32 {
-    let deck = deck_at(p.y);
-    if deck < 0 {
-        return 0.0;
+    var total = 0.0;
+    for (var deck = 0u; deck < DECKS; deck += 1u) {
+        if empty_deck(deck) {
+            continue;
+        }
+        let slab = cloud.decks[deck].slab;
+        if p.y < slab.x || p.y > slab.y + slab.z {
+            continue;
+        }
+        total = total + deck_extinction(deck, p, fine);
     }
+    return total;
+}
+
+// The same, for one deck a point is known to stand in.
+fn deck_extinction(deck: u32, p: vec3<f32>, fine: bool) -> f32 {
     // The weather is carried bodily by the mean wind and by nothing else. That
     // is not a simplification for its own sake: the ceiling cache bounds the
     // coverage of a cell without reading the wind, and it can carry a bulk
     // offset exactly where it could not carry a field that varies from cell to
     // cell. A front moves; it does not wrap itself around a mountain.
     let front = p - light.carried.xyz;
-    let w = weather_at(deck, front);
+    let w = weather_at(i32(deck), front);
 
     // Where in its slab this point sits, before the wind has had a say. The
     // wind's say is a *multiplier*, so nought times it is still nought -- which
@@ -605,8 +633,23 @@ fn cloud_extinction(p: vec3<f32>, fine: bool) -> f32 {
     // majority of samples have already turned out to be empty sky. Moving this
     // one fetch below this one test is worth 0.11 ms of the march.
     let slab = cloud.decks[deck].slab;
-    let base = slab.x + w.a * slab.z;
-    let thickness = max(slab.y - slab.x, 1.0);
+    var base = slab.x + w.a * slab.z;
+    var thickness = max(slab.y - slab.x, 1.0);
+    // A deck that rides the ground keeps its top and takes its base from the
+    // terrain, so it pools rather than blankets: it fills a valley to a level
+    // and leaves the ridges above that level in clear air. Where the ground is
+    // already above the top there is no deck at all, which `max` and the
+    // clamped thickness between them say.
+    //
+    // Branched rather than folded into the arithmetic above, which would be
+    // shorter: `ground_at` is a fetch, no deck but the fog has any use for it,
+    // and the same reasoning put the drift fetch below the cover test.
+    let hug = cloud.decks[deck].hug.x;
+    if hug > 0.0 {
+        let top = slab.y + w.a * slab.z;
+        base = mix(base, max(base, ground_at(p)), hug);
+        thickness = max(mix(slab.y - slab.x, top - base, hug), 1.0);
+    }
     let profile = vertical((p.y - base) / thickness, w.g);
     if w.r * profile <= 0.0 {
         return 0.0;
@@ -652,6 +695,29 @@ fn cloud_extinction(p: vec3<f32>, fine: bool) -> f32 {
     return EXTINCTION * w.b * cloud.decks[deck].slab.w * density;
 }
 
+// How high the ground is under a point, in metres.
+//
+// Sampled from the lattice the wind was solved on, which is the one place the
+// terrain's own height mirror has already been read into something a shader can
+// address. That is a couple of hundred metres to a texel over this raster --
+// coarse against a hillside, and about right for what it is for: the top of a
+// pool of fog is a soft thing, and a shoreline drawn to the nearest hundred
+// metres is not what anyone looks at.
+//
+// Sea level outside the grid and before it is solved, which is the honest
+// answer in both cases: there is no terrain out there, and a deck that rides
+// the ground rides nothing.
+fn ground_at(p: vec3<f32>) -> f32 {
+    if light.air.z <= 0.0 || light.air.w <= 0.0 {
+        return 0.0;
+    }
+    let uv = (p.xz - light.air.xy) / light.air.zw;
+    if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) {
+        return 0.0;
+    }
+    return textureSampleLevel(air_ground, edge_sampler, uv, 0.0).r;
+}
+
 // A deviation, cut down to something a cloud can be stretched by.
 fn clamp_deviation(strayed: vec3<f32>) -> vec3<f32> {
     let far = length(strayed);
@@ -670,12 +736,46 @@ fn cell_bound(deck: u32, w: vec4<f32>, low: f32, high: f32) -> f32 {
     let slab = cloud.decks[deck].slab;
     let base = slab.x + w.a * slab.z;
     let thickness = max(slab.y - slab.x, 1.0);
-    let peak = clamp(
-        vertical_peak(w.g),
-        (low - base) / thickness,
-        (high - base) / thickness,
-    );
-    let coverage = covered(w.r, LIFT_METRES) * vertical(peak, w.g);
+    var reached = 1.0;
+    if cloud.decks[deck].hug.x <= 0.0 {
+        // Where in this cell's heights the deck's profile comes nearest to
+        // filling, which for most of the sky is nowhere near it.
+        let peak = clamp(
+            vertical_peak(w.g),
+            (low - base) / thickness,
+            (high - base) / thickness,
+        );
+        reached = vertical(peak, w.g);
+    } else {
+        // A hugging deck's profile is measured from ground the cache cannot
+        // read and must not try to. The cache tiles every sixty kilometres and
+        // the ground does not, so one cell of it stands over every terrain in
+        // the world at once -- there is no ground to measure from. What is left
+        // is the honest bound: a deck that rides the ground may be filling
+        // anywhere inside its own band.
+        //
+        // The clamp above cannot stand in for this, and the reason is worth
+        // keeping. Riding the ground only ever *lowers* the height fraction a
+        // point sits at -- the base rises towards the point while the top stays
+        // put -- so a cell that reaches the plateau is bounded either way. A
+        // cell entirely above the plateau is not: measured from sea level its
+        // fraction is past the falling edge and the clamp reports the profile
+        // on the way down, while the same point measured from ground just below
+        // it sits in the middle of a thin pool and is filled. A band of five
+        // hundred and twenty metres would do it -- the cell at five hundred is
+        // then at 0.96 of the way up, where the clamp says 0.15 and the truth
+        // is 1.0, and every second cache cell would cut a hole in the fog.
+        //
+        // The fog's band is a kilometre and a quarter, so no cell of the cache
+        // reaches past its plateau and the two agree today. They agree by
+        // arithmetic rather than by rule, which is not a thing to build on.
+        //
+        // What the rule costs is the band and nothing else, and only when there
+        // is fog in the forecast: above the cover ramp's reach `w.r` is a hard
+        // zero and this is zero with it.
+        reached = vertical(vertical_peak(w.g), w.g);
+    }
+    let coverage = covered(w.r, LIFT_METRES) * reached;
     return EXTINCTION * w.b * slab.w * carve(SHAPE_CEILING, coverage);
 }
 
@@ -714,19 +814,29 @@ fn cs_cloud_ceiling(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var bound = 0.0;
     for (var deck = 0u; deck < DECKS; deck += 1u) {
+        if empty_deck(deck) {
+            continue;
+        }
         let slab = cloud.decks[deck].slab;
         // A deck that does not reach into these heights cannot put cloud in
         // them, whatever the weather over them says.
         if high < slab.x || low > slab.y + slab.z {
             continue;
         }
+        var worst = 0.0;
         for (var j = 0; j <= TEXELS_PER_CELL + 2; j += 1) {
             for (var i = 0; i <= TEXELS_PER_CELL + 2; i += 1) {
                 let at = wrap_texel(first + vec2<i32>(i, j));
                 let w = textureLoad(weather_map, at, i32(deck), 0);
-                bound = max(bound, cell_bound(deck, w, low, high));
+                worst = max(worst, cell_bound(deck, w, low, high));
             }
         }
+        // Summed across decks and maxed across the map. Two decks may stand in
+        // one cell -- the fog and the low cumulus do over this terrain -- and
+        // the march adds what it finds in each, so a bound on the pair has to
+        // add too. Where they do not overlap only one term is ever non-zero and
+        // this is the maximum it was.
+        bound = bound + worst;
     }
     textureStore(out_ceiling, vec3<i32>(id), vec4<f32>(bound, 0.0, 0.0, 0.0));
 }

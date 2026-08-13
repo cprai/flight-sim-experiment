@@ -60,7 +60,7 @@ const DETAIL_SEED: u32 = 0x44746c73u;
 // shape of the weather rather than the shape of a cumulus. The volumes above
 // supply everything finer.
 const WEATHER_SIZE: u32 = 256u;
-const DECKS: u32 = 3u;
+const DECKS: u32 = 4u;
 
 // Lattice cells across one tile of the weather map.
 //
@@ -93,11 +93,14 @@ struct Deck {
     // weather is, not where it hangs -- but it is part of the buffer and so has
     // to be part of the struct.
     slab: vec4<f32>,
+    // How far the base rides the ground rather than standing at its own
+    // altitude, and three spare. The march's business too; see above.
+    hug: vec4<f32>,
 };
 
 // Must match `Weather` in `src/cloud_march.wgsl`, for the same reason.
 struct Weather {
-    decks: array<Deck, 3>,
+    decks: array<Deck, 4>,
     // Seconds since the world started, then how long the weather takes to come
     // back round to where it was. The rest is spare.
     clock: vec4<f32>,
