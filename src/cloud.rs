@@ -162,6 +162,29 @@ const CEILING_GROUP: u32 = 4;
 /// match `@workgroup_size` on `cs_cloud_march`.
 const MARCH_GROUP: u32 = 8;
 
+/// Which texel of a two-by-two block of the cloud buffer each frame marches.
+///
+/// The two-by-two Bayer matrix, read as an order rather than as a threshold:
+/// `0 2 / 3 1`, so the sequence is a corner, the opposite corner, and then the
+/// other two. Each frame's texel is as far as it can be from the last one's,
+/// which is what makes a partly-filled buffer look like a coarse image rather
+/// than like one half of a fine one -- the same reason the pattern is used for
+/// dithering, applied to time instead of tone.
+pub const ROTATION: [[u32; 2]; 4] = [[0, 0], [1, 1], [1, 0], [0, 1]];
+
+/// Which quarter of the buffer this frame marches, and how big the buffer is.
+///
+/// Mirrors `Rotation` in `src/cloud_march.wgsl`. Its own buffer rather than two
+/// more fields of anything already bound: the march and the resolve both read
+/// it and nothing else does, and the size is here rather than derived from the
+/// bound textures so that the two passes cannot disagree about it -- the resolve
+/// writes a buffer the march never sees.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RotationUniform {
+    at: [u32; 4],
+}
+
 /// How long the weather takes to come back round to where it was, in seconds.
 ///
 /// Ten minutes. Long enough that a front does not visibly cycle within a
@@ -687,12 +710,20 @@ pub struct March {
     ceiling: wgpu::Texture,
     /// Scattered radiance and transmittance, at half the frame's resolution.
     ///
-    /// Nothing reads it yet; the composite lands next. `COPY_SRC` for the reason
-    /// the G-buffer's targets carry it -- a frame this does not appear in says
-    /// nothing about what is in it.
-    colour: wgpu::Texture,
+    /// Two of them, alternating: the one this frame resolves into, and the one
+    /// last frame left for it to carry. They swap roles rather than contents,
+    /// which is what keeps this to a pair of bind groups instead of a copy.
+    /// `COPY_SRC` for the reason the G-buffer's targets carry it -- a frame this
+    /// does not appear in says nothing about what is in it.
+    colour: [wgpu::Texture; 2],
     /// How far along each of those rays the cloud it found actually was.
-    depth: wgpu::Texture,
+    depth: [wgpu::Texture; 2],
+    /// This frame's own quarter of the two above, one texel per two-by-two
+    /// block, before the other three quarters are carried in beside it.
+    #[allow(dead_code, reason = "read through its view")]
+    fresh_colour: wgpu::Texture,
+    #[allow(dead_code, reason = "read through its view")]
+    fresh_depth: wgpu::Texture,
     /// How much of the sun reaches each point of a coarse world grid, and how
     /// much of the sky does. One shape, two leans; see `light_position` in
     /// `src/cloud_march.wgsl`.
@@ -700,14 +731,18 @@ pub struct March {
     sun_light: wgpu::Texture,
     #[allow(dead_code, reason = "read through their views")]
     sky_light: wgpu::Texture,
-    colour_view: wgpu::TextureView,
-    depth_view: wgpu::TextureView,
+    colour_view: [wgpu::TextureView; 2],
+    depth_view: [wgpu::TextureView; 2],
+    fresh_colour_view: wgpu::TextureView,
+    fresh_depth_view: wgpu::TextureView,
     ceiling_view: wgpu::TextureView,
     sun_light_view: wgpu::TextureView,
     sky_light_view: wgpu::TextureView,
     /// Where the two volumes stand this frame; see [`LightUniform`]. Read by
     /// the builds, by the march and by the shading.
     light: wgpu::Buffer,
+    /// Which quarter this frame marches; see [`RotationUniform`].
+    rotation: wgpu::Buffer,
     sampler: wgpu::Sampler,
     edge_sampler: wgpu::Sampler,
     ceiling_group: wgpu::BindGroup,
@@ -718,12 +753,26 @@ pub struct March {
 
     march_layout: wgpu::BindGroupLayout,
     march_group: wgpu::BindGroup,
+    /// One group per parity: which of the two buffers is written and which is
+    /// read. Chosen here rather than in [`crate::scene::Scene::draw`] because
+    /// that takes `&self` and cannot flip anything.
+    resolve_layout: wgpu::BindGroupLayout,
+    resolve_groups: [wgpu::BindGroup; 2],
     ceiling_pipeline: wgpu::ComputePipeline,
     sun_light_pipeline: wgpu::ComputePipeline,
     sky_light_pipeline: wgpu::ComputePipeline,
     march_pipeline: wgpu::ComputePipeline,
+    resolve_pipeline: wgpu::ComputePipeline,
     /// The half-resolution size every buffer above was built at.
     size: glam::UVec2,
+    /// Which frame this is, as [`crate::scene::Scene`] counts them. Its low two
+    /// bits pick the quarter marched and its low bit picks the buffer written,
+    /// so the whole of the alternation is one number the scene already keeps --
+    /// and putting it back after settling is therefore already done.
+    frame: u32,
+    /// Whether the history has been filled with an empty sky; see
+    /// [`March::ensure_cleared`].
+    cleared: bool,
 }
 
 /// The world-fixed things the march reads, and the two samplers it reads them
@@ -741,6 +790,70 @@ struct Lit<'a> {
     light: &'a wgpu::Buffer,
     /// The baked wind's deviation field; see `src/air.rs`.
     drift: &'a wgpu::TextureView,
+}
+
+/// Everything the march keeps at the size of the frame, which a resize throws
+/// away and remakes.
+///
+/// Together rather than eight fields threaded through three functions, because
+/// they are made together, replaced together, and are exactly the set that
+/// [`March::resize`] has to be careful about.
+struct Screen {
+    colour: [wgpu::Texture; 2],
+    depth: [wgpu::Texture; 2],
+    fresh_colour: wgpu::Texture,
+    fresh_depth: wgpu::Texture,
+    colour_view: [wgpu::TextureView; 2],
+    depth_view: [wgpu::TextureView; 2],
+    fresh_colour_view: wgpu::TextureView,
+    fresh_depth_view: wgpu::TextureView,
+}
+
+impl Screen {
+    /// `size` is the half-resolution size the resolved pair is held at; the
+    /// pair the march writes is half of that again.
+    fn new(device: &wgpu::Device, size: glam::UVec2) -> Self {
+        let buffer = |label, format, size: glam::UVec2| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size.x,
+                    height: size.y,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let blocks = half_of(size);
+        let colour = [
+            buffer("cloud colour 0", CLOUD_FORMAT, size),
+            buffer("cloud colour 1", CLOUD_FORMAT, size),
+        ];
+        let depth = [
+            buffer("cloud depth 0", DISTANCE_FORMAT, size),
+            buffer("cloud depth 1", DISTANCE_FORMAT, size),
+        ];
+        let fresh_colour = buffer("cloud colour marched", CLOUD_FORMAT, blocks);
+        let fresh_depth = buffer("cloud depth marched", DISTANCE_FORMAT, blocks);
+        Self {
+            colour_view: std::array::from_fn(|i| colour[i].create_view(&Default::default())),
+            depth_view: std::array::from_fn(|i| depth[i].create_view(&Default::default())),
+            fresh_colour_view: fresh_colour.create_view(&Default::default()),
+            fresh_depth_view: fresh_depth.create_view(&Default::default()),
+            colour,
+            depth,
+            fresh_colour,
+            fresh_depth,
+        }
+    }
 }
 
 impl March {
@@ -847,6 +960,12 @@ impl March {
         let light = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cloud light uniform"),
             size: std::mem::size_of::<LightUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let rotation = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cloud rotation uniform"),
+            size: std::mem::size_of::<RotationUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -964,6 +1083,48 @@ impl March {
                 },
                 light_entry(14),
                 sampled(15, wgpu::TextureViewDimension::D3, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    ..uniform
+                },
+            ],
+        });
+
+        // What the resolve reads and writes, and deliberately nothing else. The
+        // march's own fields are absent because it has no use for them: it does
+        // not evaluate a cloud, it decides where last frame's answer has moved
+        // to. The buffer it writes is bound writable here and sampled by the
+        // shading, which is a different pass; the buffer it reads is the other
+        // one of the pair, which is the whole point of there being two.
+        let resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cloud resolve layout"),
+            entries: &[
+                // Only for its size: `ray_raw_at` measures the screen in
+                // full-resolution pixels, and the half-resolution buffer cannot
+                // say whether the frame was an odd number of them wide.
+                sampled(5, wgpu::TextureViewDimension::D2, false),
+                written(7, CLOUD_FORMAT, wgpu::TextureViewDimension::D2),
+                written(8, DISTANCE_FORMAT, wgpu::TextureViewDimension::D2),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    ..uniform
+                },
+                // This frame's quarter, read at the texels it was marched at.
+                sampled(17, wgpu::TextureViewDimension::D2, false),
+                sampled(18, wgpu::TextureViewDimension::D2, false),
+                // The history. Its colour is filtered, because it is read at
+                // wherever the camera has moved this texel to rather than at a
+                // texel centre; its distance is not, and could not be -- an
+                // `r32float` is unfilterable in core WebGPU, which here is the
+                // restriction agreeing with what was wanted anyway.
+                sampled(19, wgpu::TextureViewDimension::D2, true),
+                sampled(20, wgpu::TextureViewDimension::D2, false),
             ],
         });
 
@@ -1099,11 +1260,17 @@ impl March {
                 Some(&march_layout),
             ],
         );
+        // The camera and nothing else: where a texel used to be on the screen
+        // is a question about the two view matrices, and the answer says
+        // nothing about what is in the sky.
+        let resolve_pipeline = pipeline(
+            "cloud resolve",
+            "cs_cloud_resolve",
+            &[Some(camera_layout), None, None, Some(&resolve_layout)],
+        );
 
         let size = half_of(gbuffer.size);
-        let (colour, depth) = Self::buffers(device, size);
-        let colour_view = colour.create_view(&Default::default());
-        let depth_view = depth.create_view(&Default::default());
+        let screen = Screen::new(device, size);
         let lit = Lit {
             ceiling: &ceiling_view,
             sun: &sun_light_view,
@@ -1119,42 +1286,75 @@ impl March {
             cloud,
             gbuffer,
             &lit,
-            &colour_view,
-            &depth_view,
+            &screen,
+            &rotation,
+        );
+        let resolve_groups = Self::resolve_bind(
+            device,
+            &resolve_layout,
+            gbuffer,
+            &edge_sampler,
+            &screen,
+            &rotation,
         );
 
+        let Screen {
+            colour,
+            depth,
+            fresh_colour,
+            fresh_depth,
+            colour_view,
+            depth_view,
+            fresh_colour_view,
+            fresh_depth_view,
+        } = screen;
         Self {
             ceiling,
             sun_light,
             sky_light,
             colour,
             depth,
+            fresh_colour,
+            fresh_depth,
             colour_view,
             depth_view,
+            fresh_colour_view,
+            fresh_depth_view,
             ceiling_view,
             sun_light_view,
             sky_light_view,
             sampler,
             edge_sampler,
             light,
+            rotation,
             ceiling_group,
             light_groups,
             march_layout,
             march_group,
+            resolve_layout,
+            resolve_groups,
             ceiling_pipeline,
             sun_light_pipeline,
             sky_light_pipeline,
             march_pipeline,
+            resolve_pipeline,
             size,
+            frame: 0,
+            cleared: false,
         }
     }
 
     /// Follows the render target to a new size.
     ///
     /// The cache does not move -- it is a fact about the world, at a resolution
-    /// of its own -- so only the two screen-sized buffers and the group naming
-    /// them are rebuilt. Called from [`crate::scene::Scene::resize`], which also
+    /// of its own -- so only the screen-sized buffers and the groups naming them
+    /// are rebuilt. Called from [`crate::scene::Scene::resize`], which also
     /// hands over the rebuilt G-buffer this reads the depth of.
+    ///
+    /// The history goes with them, and is the zeroes a new texture is created
+    /// with. Nothing has to be said about that: the resolve clamps a carried
+    /// texel to the range of the answers around it, and on the first frame
+    /// after a resize those are the only answers there are.
     pub fn resize(
         &mut self,
         device: &wgpu::Device,
@@ -1163,11 +1363,7 @@ impl March {
         drift: &wgpu::TextureView,
     ) {
         self.size = half_of(gbuffer.size);
-        let (colour, depth) = Self::buffers(device, self.size);
-        self.colour_view = colour.create_view(&Default::default());
-        self.depth_view = depth.create_view(&Default::default());
-        self.colour = colour;
-        self.depth = depth;
+        let screen = Screen::new(device, self.size);
         self.march_group = Self::bind(
             device,
             &self.march_layout,
@@ -1182,34 +1378,27 @@ impl March {
                 light: &self.light,
                 drift,
             },
-            &self.colour_view,
-            &self.depth_view,
+            &screen,
+            &self.rotation,
         );
-    }
-
-    fn buffers(device: &wgpu::Device, size: glam::UVec2) -> (wgpu::Texture, wgpu::Texture) {
-        let buffer = |label, format| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width: size.x,
-                    height: size.y,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::STORAGE_BINDING
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            })
-        };
-        (
-            buffer("cloud colour", CLOUD_FORMAT),
-            buffer("cloud depth", DISTANCE_FORMAT),
-        )
+        self.resolve_groups = Self::resolve_bind(
+            device,
+            &self.resolve_layout,
+            gbuffer,
+            &self.edge_sampler,
+            &screen,
+            &self.rotation,
+        );
+        self.colour = screen.colour;
+        self.depth = screen.depth;
+        self.fresh_colour = screen.fresh_colour;
+        self.fresh_depth = screen.fresh_depth;
+        self.colour_view = screen.colour_view;
+        self.depth_view = screen.depth_view;
+        self.fresh_colour_view = screen.fresh_colour_view;
+        self.fresh_depth_view = screen.fresh_depth_view;
+        // A new pair, so a new empty sky to put in it.
+        self.cleared = false;
     }
 
     fn bind(
@@ -1218,8 +1407,8 @@ impl March {
         cloud: &Cloud,
         gbuffer: &crate::deferred::GBuffer,
         lit: &Lit<'_>,
-        colour: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
+        screen: &Screen,
+        rotation: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         let (shape, detail, weather) = cloud.views();
         let texture = |binding, view| wgpu::BindGroupEntry {
@@ -1244,8 +1433,12 @@ impl March {
                 texture(4, lit.ceiling),
                 texture(5, &gbuffer.depth),
                 sampler(6, lit.tiling),
-                texture(7, colour),
-                texture(8, depth),
+                // The quarter-sized pair. The march writes one texel per
+                // two-by-two block of the frame's own buffer, and writes it
+                // packed rather than scattered: a dispatch a quarter the size,
+                // with every thread of it marching.
+                texture(7, &screen.fresh_colour_view),
+                texture(8, &screen.fresh_depth_view),
                 texture(11, lit.sun),
                 texture(12, lit.sky),
                 sampler(13, lit.edge),
@@ -1254,7 +1447,49 @@ impl March {
                     resource: lit.light.as_entire_binding(),
                 },
                 texture(15, lit.drift),
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: rotation.as_entire_binding(),
+                },
             ],
+        })
+    }
+
+    /// One group per parity: which buffer is written and which is carried.
+    fn resolve_bind(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        gbuffer: &crate::deferred::GBuffer,
+        edge: &wgpu::Sampler,
+        screen: &Screen,
+        rotation: &wgpu::Buffer,
+    ) -> [wgpu::BindGroup; 2] {
+        std::array::from_fn(|parity| {
+            let texture = |binding, view| wgpu::BindGroupEntry {
+                binding,
+                resource: wgpu::BindingResource::TextureView(view),
+            };
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cloud resolve group"),
+                layout,
+                entries: &[
+                    texture(5, &gbuffer.depth),
+                    texture(7, &screen.colour_view[parity]),
+                    texture(8, &screen.depth_view[parity]),
+                    wgpu::BindGroupEntry {
+                        binding: 13,
+                        resource: wgpu::BindingResource::Sampler(edge),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 16,
+                        resource: rotation.as_entire_binding(),
+                    },
+                    texture(17, &screen.fresh_colour_view),
+                    texture(18, &screen.fresh_depth_view),
+                    texture(19, &screen.colour_view[1 - parity]),
+                    texture(20, &screen.depth_view[1 - parity]),
+                ],
+            })
         })
     }
 
@@ -1294,6 +1529,85 @@ impl March {
         queue.write_buffer(&self.light, 0, bytemuck::bytes_of(&placed));
     }
 
+    /// Says which quarter of the buffer this frame marches.
+    ///
+    /// `frame` is [`crate::scene::Scene`]'s own frame counter, which it already
+    /// puts back after settling -- and settling is not time passing, so the
+    /// rotation must not advance through it either. Its own call rather than
+    /// two more arguments above, because the scene has to make it again by
+    /// itself when it puts that counter back.
+    pub fn set_rotation(&mut self, queue: &wgpu::Queue, frame: u32) {
+        self.frame = frame;
+        let at = ROTATION[self.phase()];
+        queue.write_buffer(
+            &self.rotation,
+            0,
+            bytemuck::bytes_of(&RotationUniform {
+                at: [at[0], at[1], self.size.x, self.size.y],
+            }),
+        );
+    }
+
+    /// Fills the history with an empty sky, once, before anything reads it.
+    ///
+    /// The zeroes a new texture comes with are a transmittance of nothing,
+    /// which is opaque black cloud. The resolve clamps a carried texel to the
+    /// range of the marched answers around it and that puts almost all of them
+    /// right -- but where a texel sits on a silhouette and too few of its
+    /// neighbours are looking as far as it is, the range widens to let a stale
+    /// answer through, and on the first frame the stale answer is the zeroes.
+    /// Measured at fifty-three black specks in the first frame of a flight and
+    /// none in the second, which is the rotation coming round.
+    ///
+    /// Exactly one in the fourth channel, which matters: it is what the
+    /// composite's early return reads, and it is the value a clear-sky frame
+    /// has to keep bit for bit. See `cloud_at` in `src/shading.wgsl`.
+    ///
+    /// The same shape as [`Cloud::ensure_built`] and [`crate::sky::Sky`]'s, and
+    /// here rather than in the constructor for the same reason: writing a
+    /// texture needs a queue, and a constructor has only a device.
+    pub fn ensure_cleared(&mut self, queue: &wgpu::Queue) {
+        if self.cleared {
+            return;
+        }
+        self.cleared = true;
+        let empty = half::f16::ONE.to_le_bytes();
+        let sky: Vec<u8> = std::iter::repeat_n(
+            [0, 0, 0, 0, 0, 0, empty[0], empty[1]],
+            (self.size.x * self.size.y) as usize,
+        )
+        .flatten()
+        .collect();
+        for texture in &self.colour {
+            queue.write_texture(
+                texture.as_image_copy(),
+                &sky,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.size.x * 8),
+                    rows_per_image: Some(self.size.y),
+                },
+                wgpu::Extent3d {
+                    width: self.size.x,
+                    height: self.size.y,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    /// Which texel of a two-by-two block this frame marches, as an index into
+    /// [`ROTATION`].
+    fn phase(&self) -> usize {
+        (self.frame & 3) as usize
+    }
+
+    /// Which of the two resolved buffers this frame writes; the other is the
+    /// history it carries.
+    pub fn parity(&self) -> usize {
+        (self.frame & 1) as usize
+    }
+
     /// Records both light volumes into an already-started compute pass.
     ///
     /// After the ceiling and before the march, though only the second ordering
@@ -1314,11 +1628,29 @@ impl March {
     }
 
     /// Records the march. The caller has set group 0 to the camera.
+    ///
+    /// A quarter of the buffer's texels, packed: see [`ROTATION`].
     pub fn draw(&self, pass: &mut wgpu::ComputePass<'_>, sky: &crate::sky::Sky) {
+        let blocks = half_of(self.size);
         pass.set_pipeline(&self.march_pipeline);
         pass.set_bind_group(1, sky.bind_group(), &[]);
         pass.set_bind_group(2, sky.sun_tables_bind_group(), &[]);
         pass.set_bind_group(3, &self.march_group, &[]);
+        pass.dispatch_workgroups(
+            blocks.x.div_ceil(MARCH_GROUP),
+            blocks.y.div_ceil(MARCH_GROUP),
+            1,
+        );
+    }
+
+    /// Records the resolve, which fills the other three quarters from the last
+    /// frame's answer. The caller has set group 0 to the camera.
+    ///
+    /// Its own pass, after the march: it reads what the march wrote, and a pass
+    /// boundary is what makes those writes visible.
+    pub fn draw_resolve(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.resolve_pipeline);
+        pass.set_bind_group(3, &self.resolve_groups[self.parity()], &[]);
         pass.dispatch_workgroups(
             self.size.x.div_ceil(MARCH_GROUP),
             self.size.y.div_ceil(MARCH_GROUP),
@@ -1326,13 +1658,17 @@ impl March {
         );
     }
 
-    /// Everything the shading reads of the clouds: the two half-resolution
-    /// buffers the composite upsamples, and the two light volumes the ground is
+    /// Everything the shading reads of the clouds: the half-resolution buffers
+    /// the composite upsamples, and the two light volumes the ground is
     /// shadowed out of.
+    ///
+    /// Both of the alternating pair, because the shading is built once and the
+    /// alternation is per frame; which one is read is [`March::parity`], handed
+    /// over at the draw.
     pub fn views(&self) -> crate::deferred::Clouds<'_> {
         crate::deferred::Clouds {
-            colour: &self.colour_view,
-            along: &self.depth_view,
+            colour: [&self.colour_view[0], &self.colour_view[1]],
+            along: [&self.depth_view[0], &self.depth_view[1]],
             sun: &self.sun_light_view,
             sky: &self.sky_light_view,
             light: &self.light,
@@ -1340,6 +1676,10 @@ impl March {
     }
 
     /// The textures themselves, for the tests that read them back.
+    ///
+    /// The resolved pair is the one this frame wrote, which is what the shading
+    /// read: a test asking what the frame showed wants that one and not the
+    /// history beside it.
     #[cfg(test)]
     pub fn buffers_for_test(
         &self,
@@ -1349,7 +1689,18 @@ impl March {
         &wgpu::Texture,
         &wgpu::Texture,
     ) {
-        (&self.colour, &self.depth, &self.ceiling, &self.sun_light)
+        (
+            &self.colour[self.parity()],
+            &self.depth[self.parity()],
+            &self.ceiling,
+            &self.sun_light,
+        )
+    }
+
+    /// This frame's own quarter, before the rest was carried in beside it.
+    #[cfg(test)]
+    pub fn marched_for_test(&self) -> (&wgpu::Texture, &wgpu::Texture) {
+        (&self.fresh_colour, &self.fresh_depth)
     }
 
     /// The half-resolution size the buffers were last built at.
@@ -1884,6 +2235,11 @@ mod tests {
         sun_light: Vec<f32>,
         /// The weather the cache was built from, one layer per deck.
         weather: Vec<Volume>,
+        /// What each frame of the rotation actually marched, one entry per
+        /// frame, at one texel per two-by-two block of `colour`.
+        marched: Vec<Vec<[f32; 4]>>,
+        /// The size those are held at.
+        blocks: glam::UVec2,
     }
 
     impl Marched {
@@ -1933,7 +2289,19 @@ mod tests {
         }
     }
 
-    /// Marches one frame of one preset, from a camera of the caller's choosing.
+    /// Marches a full rotation of one preset, from a camera of the caller's
+    /// choosing.
+    ///
+    /// Four frames rather than one, because one frame is a quarter of an answer:
+    /// the march fills one texel of every two-by-two block and the resolve
+    /// carries the rest in from the frame before. Four is what it takes for
+    /// every texel of the buffer to have been marched at its own place, which is
+    /// the state a flight is in at every frame but its first three.
+    ///
+    /// The camera is still and the clock is stopped, so the reprojection between
+    /// them is the identity and the four quarters compose into exactly the frame
+    /// a march of every texel would have left. That is the point of
+    /// [`Marched::marched`], which keeps what each of the four actually did.
     ///
     /// No terrain: the G-buffer is left as it was made, which is zeroes, and
     /// zero depth is exactly what the march reads as "this ray found no ground".
@@ -1971,8 +2339,29 @@ mod tests {
         wind: crate::air::Wind,
         elapsed: std::time::Duration,
     ) -> Marched {
+        marched_over(preset, &[camera; ROTATION.len()], size, sun, wind, elapsed)
+    }
+
+    /// The same again, one camera per frame.
+    ///
+    /// A frame apiece rather than one for all of them, because what the resolve
+    /// does is only visible when the camera has moved: it reads the buffer the
+    /// last frame left, at wherever this frame's camera has since put that
+    /// texel. Given the same camera four times over -- which is what everything
+    /// above hands it -- that reprojection is the identity and the four
+    /// quarters compose into the frame a march of every texel would have left.
+    fn marched_over(
+        preset: Preset,
+        cameras: &[&crate::camera::Camera],
+        size: glam::UVec2,
+        sun: crate::sky::Sun,
+        wind: crate::air::Wind,
+        elapsed: std::time::Duration,
+    ) -> Marched {
+        let camera = cameras[0];
         let (device, queue) = crate::headless::device().expect("no headless device");
-        let (camera_layout, camera_group) = crate::scene::test_camera(&device, &queue, camera);
+        let (camera_buffer, camera_layout, camera_group) =
+            crate::scene::test_camera_buffer(&device, &queue, camera);
 
         let mut sky = crate::sky::Sky::new(&device, &camera_layout);
         sky.ensure_built(&device, &queue);
@@ -1992,7 +2381,7 @@ mod tests {
         // drift and no lift anywhere. What the wind does to a cloud is a
         // question about a terrain, and it is asked in `src/scene.rs` over one.
         let air = crate::air::Air::new(&device);
-        let march = March::new(
+        let mut march = March::new(
             &device,
             &camera_layout,
             sky.layout(),
@@ -2002,33 +2391,73 @@ mod tests {
             air.views().1,
         );
 
-        march.set_frame(&queue, camera.position, sun.direction, &air, wind, elapsed);
+        let blocks = half_of(march.size());
+        let mut fresh = Vec::new();
+        for (frame, aim) in cameras.iter().enumerate() {
+            // Where this frame's camera is and where it has just come from,
+            // which is the whole of what the resolve carries a texel through.
+            queue.write_buffer(
+                &camera_buffer,
+                0,
+                bytemuck::bytes_of(&crate::scene::test_camera_moved(
+                    aim,
+                    cameras[frame.saturating_sub(1)],
+                )),
+            );
+            march.set_frame(&queue, aim.position, sun.direction, &air, wind, elapsed);
+            march.set_rotation(&queue, frame as u32);
 
-        let mut encoder = device.create_command_encoder(&Default::default());
-        // Four passes, as `Scene::draw` records them, and for the reason it
-        // does: each reads what the one before it wrote.
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            cloud.draw_weather(&mut pass);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            // Five passes, as `Scene::draw` records them, and for the reason it
+            // does: each reads what the one before it wrote.
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                cloud.draw_weather(&mut pass);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                march.draw_ceiling(&mut pass);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                march.draw_light(&mut pass);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_bind_group(0, &camera_group, &[]);
+                march.draw(&mut pass, &sky);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_bind_group(0, &camera_group, &[]);
+                march.draw_resolve(&mut pass);
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+            fresh.push(
+                read_texels(
+                    &device,
+                    &queue,
+                    march.marched_for_test().0,
+                    blocks.x,
+                    blocks.y,
+                    1,
+                    8,
+                )
+                .chunks_exact(8)
+                .map(|texel| {
+                    std::array::from_fn(|c| {
+                        half::f16::from_le_bytes([texel[c * 2], texel[c * 2 + 1]]).to_f32()
+                    })
+                })
+                .collect(),
+            );
         }
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            march.draw_ceiling(&mut pass);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            march.draw_light(&mut pass);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_bind_group(0, &camera_group, &[]);
-            march.draw(&mut pass, &sky);
-        }
-        queue.submit(std::iter::once(encoder.finish()));
 
         let (colour, depth, ceiling, _) = march.buffers_for_test();
         let half = march.size();
         Marched {
+            marched: fresh,
+            blocks,
             colour: read_texels(&device, &queue, colour, half.x, half.y, 1, 8)
                 .chunks_exact(8)
                 .map(|texel| {
@@ -2152,6 +2581,177 @@ mod tests {
             crate::camera::Camera::from_yaw_pitch_roll(0.0, pitch_degrees.to_radians(), 0.0),
             1.0,
         )
+    }
+
+    /// The rotation marches every texel of the buffer, each at its own place.
+    ///
+    /// The whole of what makes a quarter of a march look like a march. Each
+    /// frame marches one texel of every two-by-two block and the resolve puts
+    /// it back where it was taken from; over four frames the four sub-positions
+    /// between them cover the buffer exactly once. Get the offsets wrong -- a
+    /// repeated one, a transposed one, a block index used where a texel index
+    /// was wanted -- and some texels are marched twice while others are never
+    /// marched at all, and the ones that are never marched hold whatever three
+    /// frames of carrying has left there.
+    ///
+    /// Two claims. The cover is exact and is counted rather than sampled: every
+    /// texel claimed by exactly one frame of the rotation. What is in them is
+    /// then checked against those very answers, assembled on the CPU -- the
+    /// camera is still and the clock is stopped, so a texel carried through
+    /// three frames should come back to itself. Measured at 0.0018 of mean
+    /// transmittance and 0.062 at worst, which is the round trip through a
+    /// filtered fetch and a clamp and not a texel in the wrong place.
+    #[test]
+    fn the_rotation_marches_every_texel_at_its_own_place() {
+        let frame = marched(
+            Preset::Broken,
+            &looking(1500.0, 0.0),
+            glam::UVec2::splat(128),
+        );
+        assert!(
+            frame.opacity() > 0.2,
+            "a broken sky covered only {:.3} of the frame, so this measures nothing",
+            frame.opacity()
+        );
+
+        let mut oracle = vec![[0.0f32; 4]; frame.colour.len()];
+        let mut claims = vec![0u32; frame.colour.len()];
+        for (phase, marched) in frame.marched.iter().enumerate() {
+            let off = ROTATION[phase];
+            for by in 0..frame.blocks.y {
+                for bx in 0..frame.blocks.x {
+                    // `marched_texel` in `src/cloud_march.wgsl`, in Rust.
+                    let x = (bx * 2 + off[0]).min(frame.size.x - 1);
+                    let y = (by * 2 + off[1]).min(frame.size.y - 1);
+                    let at = (y * frame.size.x + x) as usize;
+                    oracle[at] = marched[(by * frame.blocks.x + bx) as usize];
+                    claims[at] += 1;
+                }
+            }
+        }
+        let missed = claims.iter().filter(|c| **c == 0).count();
+        let twice = claims.iter().filter(|c| **c > 1).count();
+        assert_eq!(
+            (missed, twice),
+            (0, 0),
+            "of {} texels the rotation never marched {missed} and marched {twice} more than once",
+            claims.len()
+        );
+
+        let apart = oracle
+            .iter()
+            .zip(&frame.colour)
+            .map(|(want, got)| (want[3] - got[3]).abs());
+        let mean = apart.clone().map(f64::from).sum::<f64>() / oracle.len() as f64;
+        let worst = apart.fold(0.0f32, f32::max);
+        assert!(
+            mean < 0.005 && worst < 0.12,
+            "a texel carried back to itself came back {mean:.6} from its own march \
+             on average and {worst:.6} at worst"
+        );
+    }
+
+    /// A still world leaves the buffer where it was.
+    ///
+    /// What "the clouds stopped boiling" is, said as a number. Every texel is
+    /// re-marched once every four frames and carried through the other three,
+    /// and the carry is a fetch of a filtered texel clamped to the range of its
+    /// neighbours -- three operations that could each leave a little of
+    /// themselves behind, and compound over a flight into a sky that crawls
+    /// while nothing moves.
+    ///
+    /// Three rotations against one, over a camera that does not move and a
+    /// clock that does not run, so the only thing that can differ is what the
+    /// carrying has done. Measured at 0.0016 of mean transmittance, and 0.049
+    /// at the single worst texel.
+    #[test]
+    fn a_still_world_leaves_the_buffer_where_it_was() {
+        let camera = looking(1500.0, 0.0);
+        let size = glam::UVec2::splat(128);
+        let rounds = |n: usize| {
+            marched_over(
+                Preset::Broken,
+                &vec![&camera; n],
+                size,
+                crate::sky::Sun::default(),
+                crate::air::Wind::default(),
+                std::time::Duration::ZERO,
+            )
+        };
+        let once = rounds(ROTATION.len());
+        let thrice = rounds(ROTATION.len() * 3);
+        let apart = once
+            .colour
+            .iter()
+            .zip(&thrice.colour)
+            .map(|(a, b)| (a[3] - b[3]).abs());
+        let mean = apart.clone().map(f64::from).sum::<f64>() / once.colour.len() as f64;
+        let worst = apart.fold(0.0f32, f32::max);
+        assert!(
+            mean < 0.005 && worst < 0.1,
+            "two more rotations over a world that did not move shifted the sky by \
+             {mean:.6} on average and {worst:.6} at worst"
+        );
+    }
+
+    /// A camera that turns carries the sky it was looking at with it.
+    ///
+    /// The reprojection, which is what the other three quarters of every frame
+    /// are worth. A texel not marched this frame is read out of the last
+    /// frame's buffer at wherever the camera has since moved that texel to; get
+    /// that wrong and the buffer holds the *old* view, three quarters of it,
+    /// smeared across the new one.
+    ///
+    /// Four frames of one camera and then a single frame three degrees to the
+    /// side, against four frames of the turned camera from cold. Carried, the
+    /// two are 0.0040 of mean transmittance apart -- a fifth of the 0.0197 that
+    /// separates the old view from the new one, which is what a frame with no
+    /// reprojection in it would be showing. The second number is asserted as
+    /// well, because without it the first says nothing: two frames of the same
+    /// sky are close whatever the pass does with them.
+    #[test]
+    fn a_camera_that_turns_carries_the_sky_with_it() {
+        let size = glam::UVec2::splat(128);
+        let still = looking(1500.0, 0.0);
+        let turned = crate::camera::Camera::new(
+            still.position,
+            crate::camera::Camera::from_yaw_pitch_roll(3f32.to_radians(), 0.0, 0.0),
+            1.0,
+        );
+        let at = |cameras: &[&crate::camera::Camera]| {
+            marched_over(
+                Preset::Broken,
+                cameras,
+                size,
+                crate::sky::Sun::default(),
+                crate::air::Wind::default(),
+                std::time::Duration::ZERO,
+            )
+        };
+        let apart = |a: &Marched, b: &Marched| {
+            a.colour
+                .iter()
+                .zip(&b.colour)
+                .map(|(x, y)| f64::from((x[3] - y[3]).abs()))
+                .sum::<f64>()
+                / a.colour.len() as f64
+        };
+
+        let cold = at(&[&turned; ROTATION.len()]);
+        let carried = at(&[&still, &still, &still, &still, &turned]);
+        let left = at(&[&still; ROTATION.len() + 1]);
+        let moved = apart(&left, &cold);
+        assert!(
+            moved > 0.015,
+            "turning three degrees changed the sky by only {moved:.6}, so nothing \
+             here is being measured"
+        );
+        let ghost = apart(&carried, &cold);
+        assert!(
+            ghost < 0.010 && ghost < moved * 0.5,
+            "a buffer carried through the turn is {ghost:.6} from one marched at \
+             the new camera, against {moved:.6} for one not carried at all"
+        );
     }
 
     /// A clear sky marches to no cloud at any pixel, and marches every pixel.
@@ -2731,11 +3331,11 @@ mod tests {
         for (name, value) in [("CEILING_TOP", CEILING_TOP), ("WEATHER_TILE", WEATHER_TILE)] {
             assert_eq!(shader_constant(name), value, "{name} differs");
         }
-        // One cubic kernel -- the ceiling -- and three flat ones: the march and
-        // the two light columns, which are one kernel written twice because
-        // only their lean differs.
+        // One cubic kernel -- the ceiling -- and four flat ones: the march, the
+        // resolve that fills in around it, and the two light columns, which are
+        // one kernel written twice because only their lean differs.
         let source = include_str!("cloud_march.wgsl");
-        for (group, flat, count) in [(CEILING_GROUP, CEILING_GROUP, 1), (MARCH_GROUP, 1, 3)] {
+        for (group, flat, count) in [(CEILING_GROUP, CEILING_GROUP, 1), (MARCH_GROUP, 1, 4)] {
             assert_eq!(
                 source
                     .matches(&format!(

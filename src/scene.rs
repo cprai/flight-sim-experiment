@@ -446,6 +446,9 @@ impl Scene {
         // nothing a frame can change, so once is all they are ever built.
         self.cloud.ensure_built(device, queue);
         self.cloud.set_frame(queue, self.weather, self.elapsed);
+        // Once, after the buffers are made and before the resolve reads them:
+        // a texel of the history nothing has written yet is opaque black cloud.
+        self.march.ensure_cleared(queue);
         // The light volumes are placed on the camera and leaned along the sun,
         // so this needs both.
         self.march.set_frame(
@@ -456,6 +459,7 @@ impl Scene {
             self.wind,
             self.elapsed,
         );
+        self.march.set_rotation(queue, self.frame);
         // Uploaded every frame rather than only when it changes. Nothing moves
         // the sun yet, so this rewrites the same sixteen bytes each time --
         // which is cheaper than the branch that would avoid it, and is what
@@ -580,6 +584,11 @@ impl Scene {
             self.camera.z_near,
             self.camera.position.distance(self.was_eye),
         );
+        // And the cloud march's own rotation with it, which is counted off the
+        // same number: settling must not decide which quarter of the buffer the
+        // first drawn frame marches, any more than it decides the dither's
+        // phase.
+        self.march.set_rotation(queue, self.frame);
     }
 
     /// Records the two passes that make a frame into `view`.
@@ -756,6 +765,15 @@ impl Scene {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 self.march.draw(&mut pass, &self.sky);
             }
+            {
+                // The march fills one texel in four; this fills the rest from
+                // the buffer the last frame left, carried through the camera's
+                // own motion. Its own pass because it reads what the march just
+                // wrote.
+                let mut pass = cloud.scoped_compute_pass("cloud-resolve");
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                self.march.draw_resolve(&mut pass);
+            }
         }
 
         // The clear never survives -- the shading pass writes every pixel --
@@ -772,7 +790,97 @@ impl Scene {
             },
         );
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        self.shading.draw(&mut pass, &self.sky);
+        self.shading.draw(&mut pass, &self.sky, self.march.parity());
+    }
+
+    /// Marches out the rest of the cloud rotation over the frame just drawn,
+    /// and draws the image again from it.
+    ///
+    /// The march fills one texel of every two-by-two block and carries the
+    /// other three from the frame before, so the buffer is whole only after a
+    /// full rotation. Every frame a running renderer shows has one, because it
+    /// has been drawing for longer than four frames; a harness that draws once
+    /// has a quarter of one, and a texel that no marched neighbour is looking
+    /// at -- which is what a ridge line makes -- has nothing at all.
+    ///
+    /// So this gives it one, and gives it the *same* one: the G-buffer, the
+    /// reprojection and the tally are left exactly as the single draw left
+    /// them, because they are not what is being warmed. Only the cloud passes
+    /// run again, over the depth already written, and then the shading reads
+    /// the buffer they filled.
+    #[cfg(test)]
+    fn finish_the_cloud(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+    ) {
+        // These rounds are the same frame over again, so the camera they are
+        // carried back through is this one. Said rather than left to whatever
+        // the last update wrote: a harness aims its camera and then draws once,
+        // so the frame before this one was taken from somewhere else entirely,
+        // and reprojecting through that would scatter the history across the
+        // screen. A running renderer's history came from the frame before, and
+        // this one's comes from itself.
+        queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::bytes_of(&CameraUniform::new(
+                &self.camera,
+                self.camera.view_projection(),
+            )),
+        );
+        for step in 1..crate::cloud::ROTATION.len() as u32 {
+            self.march
+                .set_rotation(queue, self.frame.wrapping_add(step));
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                self.cloud.draw_weather(&mut pass);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                self.march.draw_ceiling(&mut pass);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                self.march.draw_light(&mut pass);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                self.march.draw(&mut pass, &self.sky);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                self.march.draw_resolve(&mut pass);
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shading pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            self.shading.draw(&mut pass, &self.sky, self.march.parity());
+        }
+        queue.submit(std::iter::once(encoder.finish()));
     }
 }
 
@@ -858,13 +966,37 @@ pub fn test_camera(
     queue: &wgpu::Queue,
     camera: &Camera,
 ) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+    let (_, layout, bind_group) = test_camera_buffer(device, queue, camera);
+    (layout, bind_group)
+}
+
+/// The same, keeping the buffer, for a test that moves the camera between
+/// frames.
+///
+/// What that needs and the above does not is the second matrix: a pass that
+/// reads where a point *was* -- which the cloud resolve does -- says nothing
+/// until two cameras have been written, and they have to go into the one
+/// buffer the one bind group names. Rewrite it with
+/// [`CameraUniform::new(camera, was)`].
+#[cfg(test)]
+pub fn test_camera_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    camera: &Camera,
+) -> (wgpu::Buffer, wgpu::BindGroupLayout, wgpu::BindGroup) {
     let (buffer, layout, bind_group) = camera_binding(device);
     queue.write_buffer(
         &buffer,
         0,
         bytemuck::bytes_of(&CameraUniform::new(camera, camera.view_projection())),
     );
-    (layout, bind_group)
+    (buffer, layout, bind_group)
+}
+
+/// The camera uniform for a camera that has just come from `was`.
+#[cfg(test)]
+pub fn test_camera_moved(camera: &Camera, was: &Camera) -> impl bytemuck::Pod {
+    CameraUniform::new(camera, was.view_projection())
 }
 
 /// Where a world point lands on screen, in pixels, with (0, 0) at the top left.
@@ -1253,11 +1385,21 @@ mod tests {
         let material_readback = staging("material readback");
 
         let profiler = crate::profile::profiler(&device, false);
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
-            let mut gpu = profiler.scope("gpu", &mut encoder);
-            scene.draw(&mut gpu, &view);
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut gpu = profiler.scope("gpu", &mut encoder);
+                scene.draw(&mut gpu, &view);
+            }
+            queue.submit(std::iter::once(encoder.finish()));
         }
+        // The cloud buffer is a quarter marched after one frame; see
+        // [`Scene::finish_the_cloud`]. Every frame the renderer shows has a
+        // whole one, so this frame gets one too.
+        scene.finish_the_cloud(&device, &queue, &view);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let mut copy = |source: wgpu::TexelCopyTextureInfo, into: &wgpu::Buffer| {
             encoder.copy_texture_to_buffer(
                 source,

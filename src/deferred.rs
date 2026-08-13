@@ -241,8 +241,10 @@ pub fn bind_storage(
 /// A bundle rather than five parameters because they always travel together and
 /// two of them are rebuilt on resize while three are not.
 pub struct Clouds<'a> {
-    pub colour: &'a wgpu::TextureView,
-    pub along: &'a wgpu::TextureView,
+    /// Both of the alternating pair the march resolves into; see
+    /// [`crate::cloud::March::parity`], which says which one a frame wrote.
+    pub colour: [&'a wgpu::TextureView; 2],
+    pub along: [&'a wgpu::TextureView; 2],
     pub sun: &'a wgpu::TextureView,
     pub sky: &'a wgpu::TextureView,
     pub light: &'a wgpu::Buffer,
@@ -253,7 +255,10 @@ pub struct Shading {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     palette: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    /// One per parity of the cloud buffer. Two groups rather than one rebuilt
+    /// each frame, because the only thing that differs is which of the pair is
+    /// named and both outlive the frame.
+    bind_groups: [wgpu::BindGroup; 2],
 }
 
 impl Shading {
@@ -342,7 +347,7 @@ impl Shading {
                 ),
             ],
         });
-        let bind_group = Self::bind(device, &layout, &palette, gbuffer, cloud);
+        let bind_groups = Self::bind(device, &layout, &palette, gbuffer, cloud);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shading shader"),
@@ -394,7 +399,7 @@ impl Shading {
             layout,
             pipeline,
             palette,
-            bind_group,
+            bind_groups,
         }
     }
 
@@ -403,7 +408,7 @@ impl Shading {
     /// Both follow the frame's size, so both are gone by the time this is
     /// called and both have to be named again.
     pub fn rebind(&mut self, device: &wgpu::Device, gbuffer: &GBuffer, cloud: Clouds<'_>) {
-        self.bind_group = Self::bind(device, &self.layout, &self.palette, gbuffer, cloud);
+        self.bind_groups = Self::bind(device, &self.layout, &self.palette, gbuffer, cloud);
     }
 
     fn bind(
@@ -412,34 +417,38 @@ impl Shading {
         palette: &wgpu::Buffer,
         gbuffer: &GBuffer,
         cloud: Clouds<'_>,
-    ) -> wgpu::BindGroup {
+    ) -> [wgpu::BindGroup; 2] {
         let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shading bind group"),
-            layout,
-            entries: &[
-                entry(0, palette.as_entire_binding()),
-                entry(1, wgpu::BindingResource::TextureView(&gbuffer.material)),
-                entry(2, wgpu::BindingResource::TextureView(cloud.colour)),
-                entry(3, wgpu::BindingResource::TextureView(&gbuffer.depth)),
-                entry(4, wgpu::BindingResource::TextureView(&gbuffer.normal)),
-                entry(5, wgpu::BindingResource::TextureView(cloud.along)),
-                entry(6, wgpu::BindingResource::TextureView(cloud.sun)),
-                entry(7, wgpu::BindingResource::TextureView(cloud.sky)),
-                entry(8, cloud.light.as_entire_binding()),
-            ],
+        std::array::from_fn(|parity| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shading bind group"),
+                layout,
+                entries: &[
+                    entry(0, palette.as_entire_binding()),
+                    entry(1, wgpu::BindingResource::TextureView(&gbuffer.material)),
+                    entry(2, wgpu::BindingResource::TextureView(cloud.colour[parity])),
+                    entry(3, wgpu::BindingResource::TextureView(&gbuffer.depth)),
+                    entry(4, wgpu::BindingResource::TextureView(&gbuffer.normal)),
+                    entry(5, wgpu::BindingResource::TextureView(cloud.along[parity])),
+                    entry(6, wgpu::BindingResource::TextureView(cloud.sun)),
+                    entry(7, wgpu::BindingResource::TextureView(cloud.sky)),
+                    entry(8, cloud.light.as_entire_binding()),
+                ],
+            })
         })
     }
 
     /// Records the shading into an already-started render pass.
     ///
     /// Group 0, the camera, is set by the caller: it is the same bind group
-    /// every other pass in the frame has already set.
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, sky: &crate::sky::Sky) {
+    /// every other pass in the frame has already set. `parity` is which of the
+    /// alternating cloud buffers this frame resolved into; see
+    /// [`crate::cloud::March::parity`].
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, sky: &crate::sky::Sky, parity: usize) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(1, sky.bind_group(), &[]);
         pass.set_bind_group(2, sky.tables_bind_group(), &[]);
-        pass.set_bind_group(3, &self.bind_group, &[]);
+        pass.set_bind_group(3, &self.bind_groups[parity], &[]);
         pass.draw(0..3, 0..1);
     }
 }

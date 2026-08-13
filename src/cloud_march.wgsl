@@ -160,6 +160,20 @@ const STEP_SLOPE: f32 = 0.01;
 const MIN_STEP: f32 = 30.0;
 const MAX_STEP: f32 = 400.0;
 
+// How far apart two blocks' rays may be stopped and still be taken to be
+// looking at the same thing, as a share of the farther of the two.
+//
+// What the resolve uses to decide which of the marched texels around it are
+// entitled to say what it may hold. A tenth is loose enough that a hillside
+// running away from the eye is one surface all the way down it, and tight
+// enough that a ridge and the sky beyond it are two things -- there the ratio
+// is not ten per cent but two orders of magnitude.
+const TOGETHER: f32 = 0.1;
+
+// How far outside the range of the marched texels around it a carried texel is
+// allowed to sit, as a multiple of that range's own width.
+const SLACK: f32 = 1.0;
+
 // How many times round the loop before a ray gives up.
 //
 // Both kinds of step count against it -- a skip across an empty cell and a
@@ -298,6 +312,16 @@ struct Light {
     carried: vec4<f32>,
 };
 
+// Which quarter of the resolved buffer this frame actually marches.
+//
+// Mirrors `RotationUniform` in `src/cloud.rs`.
+struct Rotation {
+    // In `xy`, the sub-position of the two-by-two block whose ray is marched
+    // this frame; in `zw`, the size of the resolved buffer the other three
+    // quarters are carried into.
+    at: vec4<u32>,
+};
+
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var<uniform> sky: Sky;
 
@@ -338,6 +362,19 @@ struct Light {
 // bulk drift, and in `w` how far it has climbed to get there. Solved once at
 // load around the actual mountains; see `src/air.rs`.
 @group(3) @binding(15) var air_drift: texture_3d<f32>;
+@group(3) @binding(16) var<uniform> rotation: Rotation;
+// This frame's march, one texel per two-by-two block of the resolved buffer,
+// and the resolved buffer the last frame left. Both read by `cs_cloud_resolve`
+// and by nothing else.
+//
+// The fresh pair is loaded rather than filtered: each texel is one ray's
+// answer at one place, and the resolve wants those places exactly. The history
+// colour is filtered, because it is read at wherever this texel used to be,
+// which is not a texel centre.
+@group(3) @binding(17) var fresh_cloud: texture_2d<f32>;
+@group(3) @binding(18) var fresh_along: texture_2d<f32>;
+@group(3) @binding(19) var was_cloud: texture_2d<f32>;
+@group(3) @binding(20) var was_along: texture_2d<f32>;
 
 // The ray through a point on the screen, before it is normalised. Must match
 // `ray_raw_at` in `src/shading.wgsl` and `src/terrain.wgsl`, character for
@@ -895,6 +932,30 @@ fn cs_cloud_sky_light(@builtin(global_invocation_id) id: vec3<u32>) {
     walk_light(id, vec2<f32>(0.0), light.walk.w);
 }
 
+// How far the ground lets a two-by-two block of pixels see, along the view
+// axis and in metres.
+//
+// The farthest of the block's four depths, which is what `cs_cloud_march` takes
+// and for the reason given there. Along the view axis rather than along the ray
+// -- one axis for every block, so two blocks' answers can be compared, which is
+// the only thing this is used for. `cs_cloud_march` wants the same number in
+// metres of its own ray instead, and scales as it goes.
+fn reach_of(block: vec2<i32>) -> f32 {
+    let full = vec2<i32>(textureDimensions(depth));
+    var reach = 0.0;
+    for (var j = 0; j < 2; j += 1) {
+        for (var i = 0; i < 2; i += 1) {
+            let d = textureLoad(depth, min(block + vec2<i32>(i, j), full - 1), 0).r;
+            if d == 0.0 {
+                reach = MAX_DISTANCE;
+            } else {
+                reach = max(reach, min(distance_at(d), MAX_DISTANCE));
+            }
+        }
+    }
+    return reach;
+}
+
 // Where a ray enters and leaves a horizontal slab, as distances along it.
 //
 // Returns an empty range -- the far end before the near one -- when the ray
@@ -911,21 +972,38 @@ fn slab_range(y: f32, dy: f32, low: f32, high: f32) -> vec2<f32> {
     return vec2<f32>(min(first, second), max(first, second));
 }
 
-// The clouds in front of every pixel, at half resolution.
+// Which texel of a two-by-two block of the resolved buffer `block` marches.
+//
+// Clamped, so the last block of an odd-sized buffer marches a ray that is on
+// the screen rather than one texel off the end of it. Both the march and the
+// resolve ask this, which is why it is a function: they have to agree about
+// where this frame's answers landed or the resolve carries the wrong texel.
+fn marched_texel(block: vec2<i32>) -> vec2<i32> {
+    let last = vec2<i32>(rotation.at.zw) - 1;
+    return min(block * 2 + vec2<i32>(rotation.at.xy), last);
+}
+
+// The clouds in front of one texel in four, at half resolution.
 //
 // Half because the field is smooth and the frame is not: a cloud edge is soft
 // over metres where a mountain silhouette is sharp over a pixel, so what is lost
 // by marching one ray per two-by-two block is far less than what is saved. What
 // clips the ray at the near end of that trade is the G-buffer's own depth, which
 // makes the terrain's occlusion of cloud exact and free.
+//
+// One texel in four because the answer keeps. A cloud is a slow, smooth thing
+// and the camera moves a few metres a frame, so a texel marched three frames
+// ago and carried through the camera's own motion is very nearly the texel
+// marched now -- and it costs a fetch rather than a march. This dispatch is a
+// quarter the size of the buffer it fills; `cs_cloud_resolve` fills the rest.
 @compute @workgroup_size(8, 8, 1)
 fn cs_cloud_march(@builtin(global_invocation_id) id: vec3<u32>) {
-    let half_size = textureDimensions(out_cloud);
-    if id.x >= half_size.x || id.y >= half_size.y {
+    let blocks = textureDimensions(out_cloud);
+    if id.x >= blocks.x || id.y >= blocks.y {
         return;
     }
     let at = vec2<i32>(id.xy);
-    let block = at * 2;
+    let block = marched_texel(at) * 2;
     let full = vec2<i32>(textureDimensions(depth));
 
     // The ray through the corner where the block's four pixels meet, which is
@@ -1044,4 +1122,139 @@ fn cs_cloud_march(@builtin(global_invocation_id) id: vec3<u32>) {
         at,
         vec4<f32>(depth_sum / max(weight_sum, 1e-6), 0.0, 0.0, 0.0),
     );
+}
+
+// This frame's quarter, and the last frame's answer carried into the other
+// three.
+//
+// One texel in four is `cs_cloud_march`'s own work and is written through
+// untouched. The rest are read out of the buffer this pass left last frame, at
+// wherever the camera has since moved them to, and then clamped to the range of
+// the marched answers around them.
+//
+// The clamp is what makes a carried texel safe. A cloud swinging out of frame
+// leaves its colour behind in the history, and the neighbours are what say
+// there is nothing there now; the same clamp catches a history that has never
+// been written at all, which is the zeroes a new texture comes with and would
+// read as opaque black cloud. And where every neighbour agrees, the range they
+// span is a single point and the clamp returns that point exactly, whatever the
+// filter it came through made of it -- which is what keeps an empty sky exactly
+// empty. A filtered field of ones is not something to take on trust here; see
+// what the light volumes hold, and why, in `src/cloud.rs`.
+//
+// Which neighbours are entitled to speak is the whole of the difficulty, and it
+// is the same question the composite's bilateral upsample asks: a marched texel
+// whose ray was stopped by a ridge says nothing about a texel beside it looking
+// past the ridge. So the range is built from the ones whose ray ran as far as
+// this one's, and only from them -- until there are too few of those to make a
+// range at all, and then every neighbour is taken rather than none, because a
+// wide range that lets a stale answer through is a far smaller fault than a
+// point that replaces this texel with its neighbour.
+@compute @workgroup_size(8, 8, 1)
+fn cs_cloud_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = vec2<i32>(rotation.at.zw);
+    let at = vec2<i32>(id.xy);
+    if at.x >= size.x || at.y >= size.y {
+        return;
+    }
+
+    let last = vec2<i32>(textureDimensions(fresh_cloud)) - 1;
+    let own = at / 2;
+
+    // The nine blocks around this texel, twice over: the range of the ones
+    // looking as far as it is, and the range of all of them.
+    //
+    // Nine rather than the four that bracket it, measured: four leaves too many
+    // texels along a skyline with one agreeing neighbour or none, and a range
+    // built from one neighbour is a point. Widening the search took the frame
+    // from 0.54 per cent of its pixels visibly moved by the amortization to
+    // 0.27.
+    let mine_reach = reach_of(at * 2);
+    var low = vec4<f32>(1e30);
+    var high = vec4<f32>(-1e30);
+    var near = 1e30;
+    var far = -1e30;
+    var any_low = vec4<f32>(1e30);
+    var any_high = vec4<f32>(-1e30);
+    var any_near = 1e30;
+    var any_far = -1e30;
+    var agreeing = 0;
+    for (var j = -1; j < 2; j += 1) {
+        for (var i = -1; i < 2; i += 1) {
+            let tap = clamp(own + vec2<i32>(i, j), vec2<i32>(0), last);
+            let lit = textureLoad(fresh_cloud, tap, 0);
+            let along = textureLoad(fresh_along, tap, 0).r;
+            any_low = min(any_low, lit);
+            any_high = max(any_high, lit);
+            any_near = min(any_near, along);
+            any_far = max(any_far, along);
+            let reach = reach_of(marched_texel(tap) * 2);
+            if abs(reach - mine_reach) > TOGETHER * max(reach, mine_reach) {
+                continue;
+            }
+            agreeing += 1;
+            low = min(low, lit);
+            high = max(high, lit);
+            near = min(near, along);
+            far = max(far, along);
+        }
+    }
+    // A range wants two ends. One neighbour that agrees is not a range but a
+    // point, and clamping to a point is replacing this texel with that
+    // neighbour -- which shows as flat rectangles cut out of a cloud.
+    if agreeing < 2 {
+        low = any_low;
+        high = any_high;
+        near = any_near;
+        far = any_far;
+    }
+
+    // This frame's own answer, written through and never carried.
+    let mine = textureLoad(fresh_cloud, own, 0);
+    let mine_along = textureLoad(fresh_along, own, 0).r;
+    if all(at == marched_texel(own)) {
+        textureStore(out_cloud, at, mine);
+        textureStore(out_cloud_depth, at, vec4<f32>(mine_along, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    // Where this texel's ray was on the screen the last frame drew. The
+    // distance is this block's own, which is the nearest answer there is and is
+    // never more than one texel away -- and where the block found no cloud at
+    // all there is no distance to speak of, so the ray is followed to infinity
+    // instead. That is the `w = 0` point, and it is the right answer for a sky
+    // whose contents are kilometres off: all that is left of the motion is the
+    // camera's own turn, which is exactly what a point at infinity carries.
+    let raw = ray_raw_at(vec2<f32>(at * 2) + 1.0);
+    let direction = raw / length(raw);
+    var probe = vec4<f32>(direction, 0.0);
+    if mine_along > 0.0 {
+        probe = vec4<f32>(camera.position.xyz + direction * mine_along, 1.0);
+    }
+    let clip = camera.was_view_proj * probe;
+
+    var carried = mine;
+    var carried_along = mine_along;
+    if clip.w > 0.0 {
+        let ndc = clip.xy / clip.w;
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if all(uv > vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) {
+            let texel = min(vec2<i32>(uv * vec2<f32>(size)), size - 1);
+            let slack = (high - low) * SLACK;
+            carried = clamp(
+                textureSampleLevel(was_cloud, edge_sampler, uv, 0.0),
+                low - slack,
+                high + slack,
+            );
+            // Loaded rather than filtered, and not only because an `r32float`
+            // cannot be. A blended distance addresses the aerial-perspective
+            // volume at a place no cloud is; the composite refuses to blend one
+            // for the same reason.
+            let room = (far - near) * SLACK;
+            carried_along =
+                clamp(textureLoad(was_along, texel, 0).r, near - room, far + room);
+        }
+    }
+    textureStore(out_cloud, at, carried);
+    textureStore(out_cloud_depth, at, vec4<f32>(carried_along, 0.0, 0.0, 0.0));
 }
