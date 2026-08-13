@@ -314,6 +314,7 @@ impl Scene {
             crate::reproject::Reprojection::new(device, camera_layout, &gbuffer, &carried);
         let sky = crate::sky::Sky::new(device, camera_layout);
         let cloud = crate::cloud::Cloud::new(device);
+        let air = crate::air::Air::new(device);
         // Before the shading, which now reads what it leaves.
         let march = crate::cloud::March::new(
             device,
@@ -322,6 +323,7 @@ impl Scene {
             sky.sun_tables_layout(),
             &cloud,
             &gbuffer,
+            air.views().1,
         );
         let shading = Shading::new(
             device,
@@ -337,7 +339,7 @@ impl Scene {
             sun: crate::sky::Sun::default(),
             wind: crate::air::Wind::default(),
             sky,
-            air: crate::air::Air::new(device),
+            air,
             weather: crate::cloud::Preset::default(),
             cloud,
             march,
@@ -391,7 +393,8 @@ impl Scene {
         // The half-resolution cloud buffers follow the frame, and the march
         // reads the depth of the G-buffer just rebuilt above. Before the
         // shading, which reads the buffers this throws away and remakes.
-        self.march.resize(device, &self.cloud, &self.gbuffer);
+        self.march
+            .resize(device, &self.cloud, &self.gbuffer, self.air.views().1);
         self.shading
             .rebind(device, &self.gbuffer, self.march.views());
         self.terrain.resize(viewport);
@@ -445,8 +448,14 @@ impl Scene {
         self.cloud.set_frame(queue, self.weather, self.elapsed);
         // The light volumes are placed on the camera and leaned along the sun,
         // so this needs both.
-        self.march
-            .set_frame(queue, self.camera.position, self.sun.direction);
+        self.march.set_frame(
+            queue,
+            self.camera.position,
+            self.sun.direction,
+            &self.air,
+            self.wind,
+            self.elapsed,
+        );
         // Uploaded every frame rather than only when it changes. Nothing moves
         // the sun yet, so this rewrites the same sixteen bytes each time --
         // which is cheaper than the branch that would avoid it, and is what
@@ -983,7 +992,15 @@ mod tests {
         heights: Vec<f32>,
         materials: Vec<MaterialId>,
     ) -> Scene {
-        test_scene_over(device, format, residency, heights, materials, placement())
+        test_scene_over(
+            device,
+            format,
+            residency,
+            heights,
+            materials,
+            placement(),
+            None,
+        )
     }
 
     /// The same, over a georeferencing of the caller's choosing.
@@ -997,6 +1014,7 @@ mod tests {
     /// fifty-eight. The one test that does want the wiring exercised,
     /// `a_scene_solves_the_wind_over_its_own_terrain`, builds its scene without
     /// going through here.
+    #[allow(clippy::too_many_arguments, reason = "one test wants every knob")]
     fn test_scene_over(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
@@ -1004,6 +1022,7 @@ mod tests {
         heights: Vec<f32>,
         materials: Vec<MaterialId>,
         placement: Georeferencing,
+        wind: Option<crate::air::Wind>,
     ) -> Scene {
         let mut scene = Scene::from_terrain(
             device,
@@ -1032,7 +1051,12 @@ mod tests {
                 )
             },
         );
-        scene.skip_the_wind();
+        // Solved only for the one test that is about the wind; see
+        // [`Scene::skip_the_wind`] for what a solve apiece costs the suite.
+        match wind {
+            Some(blowing) => scene.wind = blowing,
+            None => scene.skip_the_wind(),
+        }
         // Under a clear sky unless the caller says otherwise, for the reason
         // given on [`render_sunlit`]: none of these tests is about cloud, and
         // cloud in front of what one of them is measuring is noise in the
@@ -1122,6 +1146,7 @@ mod tests {
             sun,
             placement(),
             crate::cloud::Preset::Clear,
+            None,
         )
     }
 
@@ -1145,6 +1170,7 @@ mod tests {
             crate::sky::Sun::default(),
             placement(),
             weather,
+            None,
         )
     }
 
@@ -1160,6 +1186,7 @@ mod tests {
         sun: crate::sky::Sun,
         placement: Georeferencing,
         weather: crate::cloud::Preset,
+        wind: Option<crate::air::Wind>,
     ) -> Frame {
         let (device, queue) = test_device();
 
@@ -1180,10 +1207,25 @@ mod tests {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut scene = test_scene_over(&device, format, residency, heights, materials, placement);
+        let mut scene = test_scene_over(
+            &device, format, residency, heights, materials, placement, wind,
+        );
         scene.sun = sun;
         scene.weather = weather;
         aim(&mut scene.camera);
+
+        // A wind is solved around the ground, and there is no ground until the
+        // resident chain has been read in -- which is what settling does. Only
+        // when one was asked for: settling is a second of updates, and the
+        // frames that do not care about the wind are the ones that walk a path
+        // below and would have it walked from somewhere else.
+        if wind.is_some() {
+            scene.settle(&device, &queue);
+            assert!(
+                scene.air.baked_for().is_some(),
+                "settling did not reach the bake, so this frame has no wind in it"
+            );
+        }
 
         // Walk the requested path first, so the windows arrive at the captured
         // frame through a series of incremental updates.
@@ -2818,6 +2860,7 @@ mod tests {
             crate::sky::Sun::default(),
             wide,
             crate::cloud::Preset::Clear,
+            None,
         );
 
         // Two bands of ground, near the bottom of the frame and just under the
@@ -3638,6 +3681,107 @@ mod tests {
         );
     }
 
+    /// Cloud gathers on the windward side of a ridge and thins in its lee.
+    ///
+    /// The föhn, and the whole reason the wind was solved around the actual
+    /// mountains rather than blown across them as a constant. Air pushed up a
+    /// windward slope cools and makes cloud; air coming back down the other
+    /// side warms and unmakes it. The bake carries how far the parcel arriving
+    /// at each cell has climbed in the last minute and a half, and this is that
+    /// number reaching a pixel.
+    ///
+    /// The one test in the tree that solves the wind rather than skipping it,
+    /// and it does so twice -- once with the wind from the west and once from
+    /// the east, over the same ridge under the same sky. Comparing the two
+    /// halves of one frame against each other would be comparing two different
+    /// pieces of noise; comparing the *same* half of two frames leaves the
+    /// wind's direction as the only thing that differs.
+    #[test]
+    fn cloud_gathers_on_the_windward_side_of_a_ridge() {
+        // A ridge running north-south, so a wind along x crosses it square. Its
+        // crest reaches into the lowest a deck's base can sag, which is what
+        // gives the air something to climb.
+        let crest = RASTER as f32 * 0.5;
+        let heights = (0..RASTER * RASTER)
+            .map(|i| {
+                let across = (i % RASTER) as f32;
+                1400.0 * (1.0 - ((across - crest) / 16.0).abs()).max(0.0)
+            })
+            .collect::<Vec<f32>>();
+
+        let over_at = |speed, from_degrees| {
+            render_over(
+                test_residency(),
+                heights.clone(),
+                flat_ground(),
+                |camera: &mut Camera| {
+                    // Well above every deck, looking straight down, so a pixel
+                    // is a column of sky over a known patch of ground.
+                    camera.position = Vec3::new(0.0, 11_000.0, 0.0);
+                    camera.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+                },
+                &[],
+                crate::sky::Sun::default(),
+                // Two hundred metres a texel rather than thirty, so the raster
+                // is twenty-five kilometres across instead of four. The baked
+                // wind covers the raster and nothing outside it, and a camera
+                // high enough to see a whole deck from above sees far more
+                // ground than four kilometres -- over the small world most of
+                // the frame is outside the grid, faded to no wind at all, and
+                // the föhn is a detail in the middle of a still sky.
+                Georeferencing::square(RASTER, RASTER, 200.0),
+                crate::cloud::Preset::Broken,
+                Some(crate::air::Wind {
+                    speed,
+                    from_degrees,
+                }),
+            )
+        };
+        // Three frames: one with the air standing still, and one with it
+        // crossing the ridge each way. The still frame is the baseline the
+        // other two are measured against, because the weather field has a
+        // lopsidedness of its own that has nothing to do with any wind -- it is
+        // noise, and it does not know where the ridge is. Solved rather than
+        // skipped, so all three take the same path through the same code.
+        let still = over_at(0.0, 270.0);
+        let westerly = over_at(18.0, 270.0);
+        let easterly = over_at(18.0, 90.0);
+
+        // How much more cloud one side of the crest holds than the other. The
+        // ridge is centred on the raster and the camera over its middle, so the
+        // crest runs down the middle of the frame; which half is west does not
+        // have to be worked out, because the test is that *reversing the wind
+        // reverses the sign*. Nothing else in the two frames differs.
+        let lopsided = |frame: &Frame| {
+            let side = |columns: std::ops::Range<u32>| {
+                let mut sum = 0.0f64;
+                let mut count = 0.0f64;
+                for y in 0..SIZE {
+                    for x in columns.clone() {
+                        sum += f64::from(frame.cloud(x, y));
+                        count += 1.0;
+                    }
+                }
+                sum / count
+            };
+            side(0..SIZE / 2) - side(SIZE / 2..SIZE)
+        };
+        let calm = lopsided(&still);
+        let (west, east) = (lopsided(&westerly) - calm, lopsided(&easterly) - calm);
+        assert!(
+            west * east < 0.0,
+            "reversing the wind moved the cloud the same way across the ridge: \
+             {west:.4} under a westerly and {east:.4} under an easterly, \
+             against {calm:.4} in still air"
+        );
+        // ... and by enough to be the wind rather than the noise.
+        assert!(
+            west.abs() > 0.05 && east.abs() > 0.05,
+            "the wind moved the cloud across the ridge by {west:.4} one way and \
+             {east:.4} the other, which is no föhn at all"
+        );
+    }
+
     /// An overcast sky darkens the ground it stands over.
     ///
     /// The whole of the user's ask that the design has not yet answered:
@@ -3745,6 +3889,7 @@ mod tests {
                 crate::sky::Sun::from_angles(25.0, 90.0),
                 placement(),
                 weather,
+                None,
             )
         };
         let clear = frame(crate::cloud::Preset::Clear);

@@ -262,11 +262,17 @@ struct LightUniform {
     /// one slice is worth towards the sun, then the metres of height one slice
     /// is worth -- which is what the same slice is worth straight up.
     walk: [f32; 4],
+    /// Where the baked wind's grid stands; see [`crate::air::Air::bounds`].
+    air: [f32; 4],
+    /// How far the mean wind has carried the weather since the world started,
+    /// in metres.
+    carried: [f32; 4],
 }
 
 impl LightUniform {
-    /// Where the volumes go for an eye and a sun.
-    fn new(eye: glam::Vec3, sun: glam::Vec3) -> Self {
+    /// Where the volumes go for an eye and a sun, over a wind's own grid and
+    /// however far that wind has carried the weather by now.
+    fn at(eye: glam::Vec3, sun: glam::Vec3, air: [f32; 4], carried: glam::Vec3) -> Self {
         let across = LIGHT_EXTENT / LIGHT_ACROSS as f32;
         let up = CEILING_TOP / LIGHT_SLICES as f32;
         // Centred on the eye and then snapped to a whole texel. Both halves
@@ -286,7 +292,30 @@ impl LightUniform {
             // A slice of height is a longer piece of a leaning ray than of a
             // plumb one, by exactly the sun's climb.
             walk: [lean.x, lean.y, up / climb, up],
+            air,
+            carried: [carried.x, carried.y, carried.z, 0.0],
         }
+    }
+
+    /// How far the mean wind has carried the weather by now, in metres.
+    ///
+    /// Folded into one tile of the weather map, which is what keeps a long
+    /// flight from walking the offset out of the precision an `f32` addresses a
+    /// lattice with: at ten metres a second an hour is thirty-six kilometres,
+    /// and a day is nine hundred. The fold is exact for every field the march
+    /// reads, because the shape's tile divides the weather's and the detail's
+    /// divides the shape's -- so wrapping at the largest wraps all three.
+    ///
+    /// Computed here rather than in the shader for the same reason: this is an
+    /// `f64` seconds count times a speed, and the shader would have to be
+    /// handed the product anyway.
+    fn carried_by(wind: crate::air::Wind, elapsed: std::time::Duration) -> glam::Vec3 {
+        let moved = wind.velocity() * elapsed.as_secs_f32();
+        glam::Vec3::new(
+            moved.x.rem_euclid(WEATHER_TILE),
+            0.0,
+            moved.z.rem_euclid(WEATHER_TILE),
+        )
     }
 }
 
@@ -710,6 +739,8 @@ struct Lit<'a> {
     tiling: &'a wgpu::Sampler,
     edge: &'a wgpu::Sampler,
     light: &'a wgpu::Buffer,
+    /// The baked wind's deviation field; see `src/air.rs`.
+    drift: &'a wgpu::TextureView,
 }
 
 impl March {
@@ -726,6 +757,7 @@ impl March {
         sun_tables_layout: &wgpu::BindGroupLayout,
         cloud: &Cloud,
         gbuffer: &crate::deferred::GBuffer,
+        drift: &wgpu::TextureView,
     ) -> Self {
         // A deck reaching above the cache is a deck the march never finds: the
         // ceiling reads as empty above its own top, and the ray skips straight
@@ -875,6 +907,7 @@ impl March {
                 uniform,
                 sampled(1, wgpu::TextureViewDimension::D2Array, true),
                 written(9, DISTANCE_FORMAT, wgpu::TextureViewDimension::D3),
+                light_entry(14),
             ],
         });
         let (_, _, weather_view) = cloud.views();
@@ -893,6 +926,10 @@ impl March {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::TextureView(&ceiling_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: light.as_entire_binding(),
                 },
             ],
         });
@@ -926,6 +963,7 @@ impl March {
                     count: None,
                 },
                 light_entry(14),
+                sampled(15, wgpu::TextureViewDimension::D3, true),
             ],
         });
 
@@ -947,7 +985,14 @@ impl March {
                     count: None,
                 },
                 written(10, CLOUD_FORMAT, wgpu::TextureViewDimension::D3),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
                 light_entry(14),
+                sampled(15, wgpu::TextureViewDimension::D3, true),
             ],
         });
         let (shape_view, detail_view, _) = cloud.views();
@@ -981,8 +1026,16 @@ impl March {
                         resource: wgpu::BindingResource::TextureView(into),
                     },
                     wgpu::BindGroupEntry {
+                        binding: 13,
+                        resource: wgpu::BindingResource::Sampler(&edge_sampler),
+                    },
+                    wgpu::BindGroupEntry {
                         binding: 14,
                         resource: light.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 15,
+                        resource: wgpu::BindingResource::TextureView(drift),
                     },
                 ],
             })
@@ -1058,6 +1111,7 @@ impl March {
             tiling: &sampler,
             edge: &edge_sampler,
             light: &light,
+            drift,
         };
         let march_group = Self::bind(
             device,
@@ -1106,6 +1160,7 @@ impl March {
         device: &wgpu::Device,
         cloud: &Cloud,
         gbuffer: &crate::deferred::GBuffer,
+        drift: &wgpu::TextureView,
     ) {
         self.size = half_of(gbuffer.size);
         let (colour, depth) = Self::buffers(device, self.size);
@@ -1125,6 +1180,7 @@ impl March {
                 tiling: &self.sampler,
                 edge: &self.edge_sampler,
                 light: &self.light,
+                drift,
             },
             &self.colour_view,
             &self.depth_view,
@@ -1197,6 +1253,7 @@ impl March {
                     binding: 14,
                     resource: lit.light.as_entire_binding(),
                 },
+                texture(15, lit.drift),
             ],
         })
     }
@@ -1219,12 +1276,22 @@ impl March {
     /// [`Cloud::set_frame`] because it answers a different question with
     /// different inputs: that one is asked what kind of day it is, this one
     /// where the eye is and where the sun is.
-    pub fn set_frame(&self, queue: &wgpu::Queue, eye: glam::Vec3, sun: glam::Vec3) {
-        queue.write_buffer(
-            &self.light,
-            0,
-            bytemuck::bytes_of(&LightUniform::new(eye, sun)),
+    pub fn set_frame(
+        &self,
+        queue: &wgpu::Queue,
+        eye: glam::Vec3,
+        sun: glam::Vec3,
+        air: &crate::air::Air,
+        wind: crate::air::Wind,
+        elapsed: std::time::Duration,
+    ) {
+        let placed = LightUniform::at(
+            eye,
+            sun,
+            air.bounds(),
+            LightUniform::carried_by(wind, elapsed),
         );
+        queue.write_buffer(&self.light, 0, bytemuck::bytes_of(&placed));
     }
 
     /// Records both light volumes into an already-started compute pass.
@@ -1885,6 +1952,25 @@ mod tests {
         size: glam::UVec2,
         sun: crate::sky::Sun,
     ) -> Marched {
+        marched_at(
+            preset,
+            camera,
+            size,
+            sun,
+            crate::air::Wind::default(),
+            std::time::Duration::ZERO,
+        )
+    }
+
+    /// The same again, at a moment of a day the wind has been blowing through.
+    fn marched_at(
+        preset: Preset,
+        camera: &crate::camera::Camera,
+        size: glam::UVec2,
+        sun: crate::sky::Sun,
+        wind: crate::air::Wind,
+        elapsed: std::time::Duration,
+    ) -> Marched {
         let (device, queue) = crate::headless::device().expect("no headless device");
         let (camera_layout, camera_group) = crate::scene::test_camera(&device, &queue, camera);
 
@@ -1899,9 +1985,13 @@ mod tests {
 
         let mut cloud = Cloud::new(&device);
         cloud.ensure_built(&device, &queue);
-        cloud.set_frame(&queue, preset, std::time::Duration::ZERO);
+        cloud.set_frame(&queue, preset, elapsed);
 
         let gbuffer = crate::deferred::GBuffer::new(&device, size);
+        // An unsolved wind, which reports a grid of no extent and so puts no
+        // drift and no lift anywhere. What the wind does to a cloud is a
+        // question about a terrain, and it is asked in `src/scene.rs` over one.
+        let air = crate::air::Air::new(&device);
         let march = March::new(
             &device,
             &camera_layout,
@@ -1909,9 +1999,10 @@ mod tests {
             sky.sun_tables_layout(),
             &cloud,
             &gbuffer,
+            air.views().1,
         );
 
-        march.set_frame(&queue, camera.position, sun.direction);
+        march.set_frame(&queue, camera.position, sun.direction, &air, wind, elapsed);
 
         let mut encoder = device.create_command_encoder(&Default::default());
         // Four passes, as `Scene::draw` records them, and for the reason it
@@ -2364,6 +2455,119 @@ mod tests {
         assert!(day > 1e-3, "daylight only put {day:.6} into the cloud");
     }
 
+    /// The wind carries the sky, and only the wind does.
+    ///
+    /// The bulk drift is the whole of "clouds animate over time": the field is
+    /// sampled where it *was* rather than advected forward, so nothing
+    /// diffuses, nothing is stored between frames, and a sky an hour old is as
+    /// crisp as the one it started as. All it costs is a subtraction.
+    ///
+    /// Two frames a minute apart under a strong wind, against the same two
+    /// under none. The weather evolves on its own -- that is what makes a front
+    /// arrive rather than appear -- so the still pair is what says the moving
+    /// pair moved because of the wind and not merely because time passed.
+    #[test]
+    fn the_wind_carries_the_sky_it_is_blowing_through() {
+        // Looking down on the deck rather than along it. A level view is mostly
+        // saturated cloud near the horizon, opaque before the wind and opaque
+        // after it, and the mean of the frame is then a measure of how much sky
+        // is not worth measuring.
+        let camera = looking(6000.0, -35.0);
+        let size = glam::UVec2::splat(64);
+        let at = |speed, seconds| {
+            marched_at(
+                Preset::Broken,
+                &camera,
+                size,
+                crate::sky::Sun::default(),
+                crate::air::Wind {
+                    speed,
+                    from_degrees: 270.0,
+                },
+                std::time::Duration::from_secs_f32(seconds),
+            )
+        };
+        let apart = |a: &Marched, b: &Marched| {
+            a.colour
+                .iter()
+                .zip(&b.colour)
+                .map(|(x, y)| f64::from((x[3] - y[3]).abs()))
+                .sum::<f64>()
+                / a.colour.len() as f64
+        };
+
+        // Two frames of the *same instant*, one under a gale and one under
+        // nothing. Comparing two instants instead would compare the weather's
+        // own evolution as well, and that turns out to swamp the carry
+        // completely: a minute apart, a still sky differs from itself by 0.29
+        // where a minute of a twenty-metre wind differs by 0.27. Both numbers
+        // are the front moving through, and neither is the wind.
+        let still = at(0.0, 60.0);
+        let blown = at(20.0, 60.0);
+        // Measured at 0.132 of mean transmittance over the frame, against 0.015
+        // seen along the deck rather than down onto it.
+        let carried = apart(&still, &blown);
+        assert!(
+            carried > 0.05,
+            "a minute of a twenty-metre wind left the sky {carried:.4} from \
+             where no wind at all left it"
+        );
+
+        // ... and at the very start of the world the two are the same sky, to
+        // the last bit, because no time has passed for a wind to carry it
+        // through. That is what says the difference above is the carry and not
+        // the wind having got into something else.
+        let (early, gale) = (at(0.0, 0.0), at(20.0, 0.0));
+        assert_eq!(apart(&early, &gale), 0.0, "the wind blew before time began");
+    }
+
+    /// The carried offset folds into one tile of the map, exactly.
+    ///
+    /// A flight is long and an `f32` is not: at ten metres a second a day is
+    /// nine hundred kilometres, and addressing a two-hundred-metre detail
+    /// lattice at that range has lost most of the precision it needs. The
+    /// offset is folded into one tile of the weather map instead -- which is
+    /// exact for all three fields at once, because the shape's tile divides the
+    /// weather's and the detail's divides the shape's.
+    #[test]
+    fn the_carried_offset_folds_into_one_tile_of_the_map() {
+        let westerly = crate::air::Wind {
+            speed: 10.0,
+            from_degrees: 270.0,
+        };
+        let after = |seconds| {
+            LightUniform::carried_by(westerly, std::time::Duration::from_secs_f32(seconds))
+        };
+        // A westerly blows east, so the offset grows along +x and nowhere else.
+        // Within a millimetre: a bearing of 270 degrees is a cosine that is not
+        // quite zero, and sixty seconds of ten metres a second multiplies it up
+        // to a few microns of northward drift.
+        let minute = after(60.0);
+        assert!(
+            minute.distance(glam::Vec3::new(600.0, 0.0, 0.0)) < 1e-3,
+            "a minute of a ten-metre westerly carried the sky to {minute}"
+        );
+        // ... and a tile's worth of it is no offset at all, however many tiles
+        // have gone by.
+        let tile = WEATHER_TILE / westerly.speed;
+        for laps in [1.0f32, 2.0, 500.0] {
+            let round = after(tile * laps);
+            assert!(
+                round.length() < 1.0,
+                "{laps} tiles of wind left an offset of {round}"
+            );
+        }
+        // And every fold lands where the unfolded one would, to the metre.
+        for seconds in [30.0f32, 3_600.0, 86_400.0] {
+            let folded = after(seconds).x;
+            let whole = (10.0 * seconds).rem_euclid(WEATHER_TILE);
+            assert!(
+                (folded - whole).abs() < 1.0,
+                "{seconds} s folds to {folded} where it should fold to {whole}"
+            );
+        }
+    }
+
     /// The light volume stands still while the camera moves across it.
     ///
     /// It is placed on the camera, so that its resolution is spent where the
@@ -2376,7 +2580,15 @@ mod tests {
     fn the_light_volume_stands_still_while_the_camera_moves() {
         let across = LIGHT_EXTENT / LIGHT_ACROSS as f32;
         let sun = crate::sky::Sun::default().direction;
-        let corner = |x: f32| LightUniform::new(glam::Vec3::new(x, 2000.0, 0.0), sun).origin;
+        let corner = |x: f32| {
+            LightUniform::at(
+                glam::Vec3::new(x, 2000.0, 0.0),
+                sun,
+                [0.0; 4],
+                glam::Vec3::ZERO,
+            )
+            .origin
+        };
         // Two eyes a tenth of a texel apart put the volume in the same place...
         assert_eq!(corner(0.0), corner(across * 0.1));
         // ... and two a whole texel apart move it by exactly one texel, rather
@@ -2484,6 +2696,17 @@ mod tests {
             body(include_str!("terrain.wgsl")),
             "src/cloud.wgsl and src/terrain.wgsl spell `noise_mix` differently"
         );
+    }
+
+    /// Rust and the shader agree about how high the baked wind reaches.
+    ///
+    /// The march reads the drift field by a world height, and the number it
+    /// divides by lives in `src/air.rs`. A disagreement would read the wind at
+    /// the wrong altitude -- lee air where there should be a ridge's updraught,
+    /// which is a föhn drawn upside down and looks like nothing in particular.
+    #[test]
+    fn the_march_and_the_wind_agree_on_how_high_the_air_goes() {
+        assert_eq!(shader_constant("AIR_TOP"), crate::air::TOP_METRES);
     }
 
     /// Rust and the shader agree about the grid the march walks.

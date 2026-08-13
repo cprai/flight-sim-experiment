@@ -70,6 +70,52 @@ const CELL_UP: f32 = CEILING_TOP / f32(CEILING_SLICES);
 // measured in.
 const TEXELS_PER_CELL: i32 = i32(WEATHER_SIZE / CEILING_ACROSS);
 
+// How high the baked wind reaches, in metres. Must match `TOP_METRES` in
+// `src/air.rs`.
+const AIR_TOP: f32 = 7000.0;
+
+// The most of its own deviation a parcel is allowed to carry the cloud by, in
+// metres.
+//
+// The bake's own bound is three times the free stream over the drift window,
+// which at twenty-five metres a second is nearly seven kilometres -- a bound,
+// not a typical value, and far more than a deformation should be. Clamped to
+// something a cloud can be stretched by without ceasing to be where the weather
+// says it is.
+const MAX_DEVIATION: f32 = 600.0;
+
+// What a parcel's recent climb is worth in cover, the climb that buys all of
+// it, and how much of that the lee gets to take away again.
+//
+// The whole of the orographic lift, and the reason the bake carries a fourth
+// channel at all: air that has just been pushed up a windward slope has cooled,
+// and cloud forms in it. The same mechanism clears the lee, where the rise is
+// negative and this subtracts -- which is the föhn, and it is why a range can
+// have a wall of cloud on one side and blue sky on the other.
+//
+// It multiplies the cover rather than adding to it, and that is not a detail.
+// Added, the wind could put cloud where the weather says there is none -- a cap
+// over a bare ridge in clear air, which is a real thing -- but the ceiling cache
+// would then have to allow for it everywhere, because the cache bounds a cell
+// without reading the wind. `saturate(0 + 0.35)` is not zero, so every cell of
+// every deck stopped being skippable and the march went from 0.43 ms to 0.94
+// under fair weather. Multiplied, a cell with no cover has none however hard
+// the air is climbing through it, the cache stays exactly as tight as it was,
+// and what the wind does is thicken and thin the cloud the weather allows.
+//
+// The numbers were arrived at by looking. At 120 m for the full swing a
+// twenty-five metre wind swept a broken sky nearly clean; the drift window is a
+// minute and a half and vertical excursions of hundreds of metres are ordinary
+// over this terrain. Three hundred and fifty leaves it a modulation rather than
+// a switch.
+//
+// The lee is deliberately weaker than the windward side. Air that has risen
+// makes cloud promptly; air coming back down has to warm through the cloud it
+// already carries before the cloud goes, so the clearing lags the building.
+const LIFT_GAIN: f32 = 1.2;
+const LIFT_METRES: f32 = 350.0;
+const LIFT_LEE: f32 = 0.5;
+
 // What a unit of density takes out of a beam, per metre.
 //
 // A kilometre of solid cloud at density one is an optical depth of sixty, which
@@ -242,6 +288,14 @@ struct Light {
     // of height one slice is worth -- which is what the same slice is worth
     // walking straight up.
     walk: vec4<f32>,
+    // Where the baked wind's own grid stands: its near corner in x and z, then
+    // how much world it covers in each. Zero-sized until the wind has been
+    // solved, which is what says there is no field to read yet.
+    air: vec4<f32>,
+    // How far the weather has been carried by the mean wind since the world
+    // started, in metres. Folded into one tile of the map, so a long flight
+    // cannot walk it out of the range an `f32` holds a lattice index in.
+    carried: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -280,6 +334,10 @@ struct Light {
 // most of a hundred kilometres of haze.
 @group(3) @binding(13) var edge_sampler: sampler;
 @group(3) @binding(14) var<uniform> light: Light;
+// How far the air arriving at each cell of the baked grid has strayed from the
+// bulk drift, and in `w` how far it has climbed to get there. Solved once at
+// load around the actual mountains; see `src/air.rs`.
+@group(3) @binding(15) var air_drift: texture_3d<f32>;
 
 // The ray through a point on the screen, before it is normalised. Must match
 // `ray_raw_at` in `src/shading.wgsl` and `src/terrain.wgsl`, character for
@@ -420,11 +478,46 @@ fn weather_at(deck: i32, p: vec3<f32>) -> vec4<f32> {
 // sits. Zero is the answer almost everywhere -- above the deck, below it, and
 // wherever the front has not reached -- and zero is what the ceiling cache is
 // built to find in bulk.
-fn coverage_at(deck: i32, w: vec4<f32>, y: f32) -> f32 {
-    let slab = cloud.decks[deck].slab;
-    let base = slab.x + w.a * slab.z;
-    let thickness = max(slab.y - slab.x, 1.0);
-    return w.r * vertical((y - base) / thickness, w.g);
+// The cover a patch has, once the ground under it has had its say.
+//
+// Air pushed up a windward slope cools, and cloud forms in it; air coming back
+// down the lee warms, and cloud in it goes away. That is one number out of the
+// bake -- how far the parcel arriving here has climbed in the last minute and a
+// half -- and it is the whole of the föhn.
+//
+// Clamped both ways, and the upper clamp is what the ceiling cache stands on:
+// it bounds a cell without reading the wind, which it can only do because the
+// most the wind can add is written down. See `cell_bound`.
+fn covered(cover: f32, risen: f32) -> f32 {
+    let lift = clamp(risen / LIFT_METRES, -LIFT_LEE, 1.0);
+    return saturate(cover * (1.0 + LIFT_GAIN * lift));
+}
+
+// Where in the baked wind's grid a world point sits.
+fn air_uvw(p: vec3<f32>) -> vec3<f32> {
+    let flat = (p.xz - light.air.xy) / max(light.air.zw, vec2<f32>(1.0));
+    return vec3<f32>(flat.x, clamp(p.y / AIR_TOP, 0.0, 1.0), flat.y);
+}
+
+// How far the air arriving at a point has strayed, and how far it has climbed.
+//
+// Zero outside the solved grid, and faded to zero at its sides rather than
+// clamped: the grid covers the raster and the march runs a hundred kilometres,
+// so most of a level ray is outside it, and a wall of edge values would draw a
+// straight line of cloud across the sky at the survey's boundary.
+//
+// Zero before the bake has run as well. The grid is zero-sized until then and
+// the guard above turns that into a coordinate far outside, which the fade
+// takes to nothing -- so the frames drawn while the terrain is still loading
+// have no wind in them rather than a division by no extent.
+fn air_at(p: vec3<f32>) -> vec4<f32> {
+    if light.air.z <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    let uvw = air_uvw(p);
+    let out = abs(uvw.xz - vec2<f32>(0.5)) * 2.0;
+    let inside = 1.0 - smoothstep(0.9, 1.0, max(out.x, out.y));
+    return textureSampleLevel(air_drift, edge_sampler, uvw, 0.0) * inside;
 }
 
 // How far above the threshold the shape field has to climb before the cloud it
@@ -461,13 +554,41 @@ fn cloud_extinction(p: vec3<f32>, fine: bool) -> f32 {
     if deck < 0 {
         return 0.0;
     }
-    let w = weather_at(deck, p);
-    let coverage = coverage_at(deck, w, p.y);
+    // The weather is carried bodily by the mean wind and by nothing else. That
+    // is not a simplification for its own sake: the ceiling cache bounds the
+    // coverage of a cell without reading the wind, and it can carry a bulk
+    // offset exactly where it could not carry a field that varies from cell to
+    // cell. A front moves; it does not wrap itself around a mountain.
+    let front = p - light.carried.xyz;
+    let w = weather_at(deck, front);
+
+    // Where in its slab this point sits, before the wind has had a say. The
+    // wind's say is a *multiplier*, so nought times it is still nought -- which
+    // is what lets the drift be fetched here rather than above, after the great
+    // majority of samples have already turned out to be empty sky. Moving this
+    // one fetch below this one test is worth 0.11 ms of the march.
+    let slab = cloud.decks[deck].slab;
+    let base = slab.x + w.a * slab.z;
+    let thickness = max(slab.y - slab.x, 1.0);
+    let profile = vertical((p.y - base) / thickness, w.g);
+    if w.r * profile <= 0.0 {
+        return 0.0;
+    }
+
+    let air = air_at(p);
+    let coverage = covered(w.r, air.w) * profile;
     if coverage <= 0.0 {
         return 0.0;
     }
 
-    let shape = textureSampleLevel(shape_noise, tile_sampler, p / SHAPE_TILE, 0.0);
+    // The cloud's own structure is carried *and* deformed. The deviation is
+    // what the bake was for: it stretches a field through a valley and piles it
+    // against a slope, and it may move the noise as far as it likes without
+    // costing the cache anything, because where the shape is has no bearing on
+    // how much cloud a cell is allowed to hold.
+    let strayed = clamp_deviation(air.xyz);
+    let taken = front - strayed;
+    let shape = textureSampleLevel(shape_noise, tile_sampler, taken / SHAPE_TILE, 0.0);
     var density = carve(shape.r, coverage);
     if density <= 0.0 {
         return 0.0;
@@ -484,10 +605,8 @@ fn cloud_extinction(p: vec3<f32>, fine: bool) -> f32 {
         // and the field wants no such thing yet: what is missing from a cloud
         // here is light inside it, not another frequency of hole in it. They
         // cost nothing to leave in the volume they are already in.
-        let detail = textureSampleLevel(detail_noise, tile_sampler, p / DETAIL_TILE, 0.0);
-        let slab = cloud.decks[deck].slab;
-        let base = slab.x + w.a * slab.z;
-        let h = saturate((p.y - base) / max(slab.y - slab.x, 1.0));
+        let detail = textureSampleLevel(detail_noise, tile_sampler, taken / DETAIL_TILE, 0.0);
+        let h = saturate((p.y - base) / thickness);
         let wisp = mix(detail.a, 1.0 - detail.a, saturate(h * 5.0));
         let eaten = wisp * DETAIL_STRENGTH;
         density = saturate((density - eaten) / max(1.0 - eaten, 1e-3));
@@ -496,8 +615,20 @@ fn cloud_extinction(p: vec3<f32>, fine: bool) -> f32 {
     return EXTINCTION * w.b * cloud.decks[deck].slab.w * density;
 }
 
+// A deviation, cut down to something a cloud can be stretched by.
+fn clamp_deviation(strayed: vec3<f32>) -> vec3<f32> {
+    let far = length(strayed);
+    return strayed * min(far, MAX_DEVIATION) / max(far, 1e-3);
+}
+
 // The largest extinction a cell of the cache may have to bound, from one texel
 // of the weather over one range of heights.
+//
+// The wind is not read here and does not need to be. What it does to the cover
+// is bounded by `LIFT_COVER`, so the most a cell can hold is what it would hold
+// with the strongest updraught the model allows over it -- and what it does to
+// the shape does not enter, because this bounds the field at its own ceiling
+// wherever the field is sampled from.
 fn cell_bound(deck: u32, w: vec4<f32>, low: f32, high: f32) -> f32 {
     let slab = cloud.decks[deck].slab;
     let base = slab.x + w.a * slab.z;
@@ -507,7 +638,7 @@ fn cell_bound(deck: u32, w: vec4<f32>, low: f32, high: f32) -> f32 {
         (low - base) / thickness,
         (high - base) / thickness,
     );
-    let coverage = w.r * vertical(peak, w.g);
+    let coverage = covered(w.r, LIFT_METRES) * vertical(peak, w.g);
     return EXTINCTION * w.b * slab.w * carve(SHAPE_CEILING, coverage);
 }
 
@@ -523,8 +654,9 @@ fn wrap_texel(at: vec2<i32>) -> vec2<i32> {
 // for the reason the weather map is: what it reads is a quarter-million texels
 // describing a whole sky, not the sky itself.
 //
-// The footprint is the two weather texels the cell covers in each axis *and one
-// either side*. That margin is not caution: the march samples the weather map
+// The footprint is the two weather texels the cell covers in each axis, one
+// either side, and one more for the fraction of a texel the wind has carried
+// the map by. The margin is not caution: the march samples the weather map
 // bilinearly, so a point just inside a cell reads texels just outside it, and a
 // bound taken over the covered texels alone would be a bound on something the
 // march never asks for.
@@ -535,7 +667,13 @@ fn cs_cloud_ceiling(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let low = f32(id.y) * CELL_UP;
     let high = low + CELL_UP;
-    let first = vec2<i32>(vec2<u32>(id.x, id.z)) * TEXELS_PER_CELL - 1;
+    // Where this cell's ground was before the wind carried the weather over it.
+    // The offset is a whole number of nothing in particular, so the footprint
+    // starts at a texel found by division rather than by multiplying the cell
+    // index, and it is one wider on each side to cover the fraction.
+    let across = WEATHER_TILE / f32(WEATHER_SIZE);
+    let corner = vec2<f32>(vec2<u32>(id.x, id.z)) * CELL_ACROSS - light.carried.xz;
+    let first = vec2<i32>(floor(corner / across)) - 1;
 
     var bound = 0.0;
     for (var deck = 0u; deck < DECKS; deck += 1u) {
@@ -545,8 +683,8 @@ fn cs_cloud_ceiling(@builtin(global_invocation_id) id: vec3<u32>) {
         if high < slab.x || low > slab.y + slab.z {
             continue;
         }
-        for (var j = 0; j <= TEXELS_PER_CELL + 1; j += 1) {
-            for (var i = 0; i <= TEXELS_PER_CELL + 1; i += 1) {
+        for (var j = 0; j <= TEXELS_PER_CELL + 2; j += 1) {
+            for (var i = 0; i <= TEXELS_PER_CELL + 2; i += 1) {
                 let at = wrap_texel(first + vec2<i32>(i, j));
                 let w = textureLoad(weather_map, at, i32(deck), 0);
                 bound = max(bound, cell_bound(deck, w, low, high));

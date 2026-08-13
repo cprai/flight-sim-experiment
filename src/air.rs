@@ -49,8 +49,8 @@ use crate::terrain::gpu::Terrain;
 pub const CELLS: [u32; 3] = [160, 20, 160];
 
 /// How high the solved air reaches, in metres. Must match `TOP_METRES` in
-/// `src/air.wgsl`.
-#[allow(dead_code, reason = "read by the tests and by the cloud march to come")]
+/// `src/air.wgsl` and `AIR_TOP` in `src/cloud_march.wgsl`.
+#[allow(dead_code, reason = "read by the tests and mirrored into two shaders")]
 pub const TOP_METRES: f32 = 7000.0;
 
 /// Metres per layer. Must match `CELL_Y` in `src/air.wgsl`, which derives it
@@ -244,11 +244,17 @@ struct AirUniform {
 /// The solved wind, and the machinery that solved it until it has.
 pub struct Air {
     /// One velocity per cell, in metres per second.
-    #[allow(dead_code, reason = "read by the cloud march, which lands later")]
+    ///
+    /// Not read by anything outside the solve. What the cloud wants is where
+    /// the air has *been*, which is the field below; a velocity would have to
+    /// be integrated to say that, and it was integrated once here rather than
+    /// per sample per frame. It is kept because the solve's own tests read it
+    /// and because it is the field a future glider or a windsock would want.
+    #[allow(dead_code, reason = "read only by the solve's own tests")]
     wind: wgpu::Texture,
     /// How far the air arriving at each cell has strayed from the bulk drift,
     /// in metres, and in `w` how far it has climbed to get there.
-    #[allow(dead_code, reason = "read by the cloud march, which lands later")]
+    #[allow(dead_code, reason = "read through its view")]
     drift: wgpu::Texture,
     wind_view: wgpu::TextureView,
     drift_view: wgpu::TextureView,
@@ -256,6 +262,9 @@ pub struct Air {
     build: Option<Build>,
     /// What the field was solved for, so a change of wind can be noticed.
     baked: Option<Wind>,
+    /// How much world the grid was laid over, in metres. Zero until it has
+    /// been: see [`Air::bounds`].
+    extent: glam::Vec2,
 }
 
 /// Everything the bake needs and the frame does not.
@@ -547,6 +556,7 @@ impl Air {
             wind,
             drift,
             baked: None,
+            extent: glam::Vec2::ZERO,
         }
     }
 
@@ -610,6 +620,7 @@ impl Air {
         wind: Wind,
     ) {
         assert_eq!(heights.len(), column_count() as usize);
+        self.extent = extent;
         let started = std::time::Instant::now();
         let cell = glam::Vec2::new(extent.x / CELLS[0] as f32, extent.y / CELLS[2] as f32);
         let origin = -extent * 0.5;
@@ -687,9 +698,25 @@ impl Air {
     }
 
     /// The solved velocity and displacement fields.
-    #[allow(dead_code, reason = "read by the cloud march, which lands later")]
+    #[allow(dead_code, reason = "only the drift is read; the velocity is not")]
     pub fn views(&self) -> (&wgpu::TextureView, &wgpu::TextureView) {
         (&self.wind_view, &self.drift_view)
+    }
+
+    /// Where the grid stands: its near corner in x and z, then how much world
+    /// it covers in each.
+    ///
+    /// Zero-sized until the bake has run, which is what a reader outside this
+    /// module tests to know whether there is a field to read at all -- and what
+    /// stops it dividing by an extent of nothing on the frames before there is.
+    /// The grid is centred on the origin, as the raster is.
+    pub fn bounds(&self) -> [f32; 4] {
+        [
+            -self.extent.x * 0.5,
+            -self.extent.y * 0.5,
+            self.extent.x,
+            self.extent.y,
+        ]
     }
 
     /// What the field was solved for, or [`None`] if it has not been.
