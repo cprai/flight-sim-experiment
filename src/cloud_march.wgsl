@@ -156,9 +156,18 @@ const MAX_DISTANCE: f32 = 100000.0;
 // here, so a step that grows with distance keeps the sampling matched to what
 // can be seen rather than spending the same effort on cloud a kilometre away and
 // cloud fifty kilometres away.
+//
+// The upper bound is the proportional rule's own value at the far end, which is
+// to say the rule is never clamped and the bound is a guard rather than a knob.
+// It was four hundred metres, and that is where a third of the step budget was
+// going: past forty kilometres the clamp bound instead of the rule, so every
+// step out there was finer than the pixel it was drawn into -- fifty-eight
+// steps spent to sample the last sixty kilometres at a resolution nothing could
+// resolve. Raising it costs nothing visible and is worth those steps to the far
+// end of the ray, where they are the difference between cloud and no cloud.
 const STEP_SLOPE: f32 = 0.01;
 const MIN_STEP: f32 = 30.0;
-const MAX_STEP: f32 = 400.0;
+const MAX_STEP: f32 = STEP_SLOPE * MAX_DISTANCE;
 
 // How far apart two blocks' rays may be stopped and still be taken to be
 // looking at the same thing, as a share of the farther of the two.
@@ -181,7 +190,37 @@ const SLACK: f32 = 1.0;
 // fifty kilometres is what sets it. Running out leaves cloud undrawn at the far
 // end of the ray rather than anything worse: the transmittance stored is what
 // had accumulated, which is what the ray had established.
-const MAX_STEPS: u32 = 256u;
+//
+// Enough to reach `MAX_DISTANCE` under the rule above and not a step chosen by
+// eye, because "not anything worse" turned out to be a poor description of what
+// running out looks like. It was 256, and a level ray cannot get past about
+// fourteen kilometres on that: a hundred steps go into the first three, where
+// `MIN_STEP` is the binding bound, and the proportional rule then wants a
+// hundred more for every factor of e. That is a level ray and only a level ray
+// -- every other direction leaves the decks and stops -- so what it drew was a
+// sky whose clouds thinned out and vanished along the horizon, worst in exactly
+// the view that has the most of them in it. Under an overcast deck it was not
+// even thinning: the deck simply stopped, and thirty kilometres of unhazed
+// mountain showed through the gap where the rest of it should have been.
+//
+// A ray that steps the whole hundred kilometres without ever skipping a cell
+// takes 453 of these, so 512 is the bound and not a sample of one. Measured
+// against a march given 4096, which is more than any ray can use: 25 views --
+// five presets over five cameras, level and pitched, above the decks and inside
+// them -- come out byte-identical, so no ray in any of them now runs out. The
+// same 25 at 256 got 19 wrong, over as much as 12.2 per cent of their pixels.
+// The six it did not were the ones with the eye buried in cloud, where the
+// first few hundred metres reach `CUTOFF` and the budget never binds -- which
+// is why this went unnoticed: the sky it ruins is the fine one.
+//
+// It is close to free, which is the other half of why it is a bound rather than
+// a compromise. Nothing costs a step it was not already going to spend: a ray
+// that stopped on `CUTOFF` or on the ground still stops there, and only the
+// rays that were being cut off take more. Fair weather 0.31 ms to 0.29 -- the
+// saving is `MAX_STEP` above, which more than pays for this -- storm unchanged
+// at 0.20, and overcast, where a level ray really does cross a hundred
+// kilometres of cloud, 0.40 ms to 0.52.
+const MAX_STEPS: u32 = 512u;
 
 // Below this transmittance the ray has established that nothing behind it will
 // be seen, and stops.
