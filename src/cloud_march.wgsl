@@ -142,6 +142,25 @@ const SHAPE_CEILING: f32 = 1.0;
 // How hard the detail volume eats into the shape's edges.
 const DETAIL_STRENGTH: f32 = 0.35;
 
+// The wavelength of each of the detail volume's three octaves, in metres, and
+// the weights the fourth channel sums them at. Must match `cs_cloud_detail` in
+// `src/cloud.wgsl`, which stores `worley` at `DETAIL_CELLS`, twice that and four
+// times it -- so over a two-hundred-metre tile the cells are a hundred metres
+// across, then fifty, then twenty-five.
+const DETAIL_LOW: f32 = 100.0;
+const DETAIL_MID: f32 = 50.0;
+const DETAIL_HIGH: f32 = 25.0;
+const DETAIL_WEIGHTS: vec3<f32> = vec3<f32>(0.625, 0.25, 0.125);
+
+// What one of those octaves averages over the whole volume.
+//
+// Measured off the built volume rather than derived, and one constant serves all
+// three because they agree to within a hundredth -- 0.468, 0.476 and 0.475 --
+// which is not luck: a Worley field's distribution does not depend on how many
+// cells the volume is cut into. See
+// `the_detail_octaves_average_what_the_march_replaces_them_with`.
+const DETAIL_MEAN: f32 = 0.471;
+
 // How far a ray is followed, in metres.
 //
 // The same hundred kilometres the aerial-perspective volume reaches, and for the
@@ -634,14 +653,49 @@ fn carve(field: f32, coverage: f32) -> f32 {
     return saturate((field - 1.0 + coverage) / EDGE);
 }
 
+// How much of an octave a sampling this coarse is entitled to.
+//
+// All of it while two samples still land inside a cell of the octave, none of it
+// once a whole cell fits between neighbouring samples, and a smooth ramp between
+// so that nothing switches on or off as a cloud comes nearer. That is Nyquist,
+// and past it what comes back is not the octave: it is an arbitrary number that
+// changes whenever the samples move, which -- since the samples hang off the eye
+// -- means whenever the camera does.
+//
+// Nyquist is where this ends up rather than where it started. The ramp was swept
+// at a half, three quarters, one and two wavelengths against the same pair of
+// frames, and the half is best in every band of the screen and by a factor of
+// three in the middle distance. Placing it looser to spare the near field turned
+// out to spare nothing worth having and to give the shimmer back: at one
+// wavelength the middle distance goes from 0.29 per cent of its pixels moving
+// under a five-metre step to 0.79, which is most of the way back to the 1.09 it
+// started at.
+//
+// What it costs is that the finest octave never survives at all. Its cells are
+// twenty-five metres and `MIN_STEP` is thirty, so there is no distance at which
+// the march can resolve it, and a rule that admits as much drops it from the
+// cloud a kilometre off as well as from the cloud at fifty. That is a real loss
+// of edge on near cloud -- 1.5 per cent of the frame moves by more than eight
+// levels -- and it is the honest reading of a volume built finer than anything
+// that reads it. Sharpening the near field again is a matter of lowering
+// `MIN_STEP` towards twelve metres, which is a cost this has not been asked to
+// pay; it is not a matter of pretending the octave was resolved.
+fn resolved(span: f32, wavelength: f32) -> f32 {
+    return 1.0 - smoothstep(wavelength * 0.5, wavelength, span);
+}
+
 // What a beam loses per metre at a point, and how much of that is a guess.
 //
-// `fine` is off for the samples taken along the way to the sun, where the two
-// erosions are left out. They only ever subtract, so leaving them out reports
+// `erode` is off for the samples taken along the way to the sun, where the
+// detail volume is left out. It only ever subtracts, so leaving it out reports
 // more cloud between a sample and the sun than there is, which errs towards a
 // darker cloud base -- and it halves the cost of the most expensive part of the
 // march.
-fn cloud_extinction(p: vec3<f32>, fine: bool) -> f32 {
+//
+// `span` is the metres of ray a sample stands for, and it decides how much of
+// the detail volume is read and how much of it is replaced by its own average --
+// see `resolved`.
+fn cloud_extinction(p: vec3<f32>, span: f32, erode: bool) -> f32 {
     var total = 0.0;
     for (var deck = 0u; deck < DECKS; deck += 1u) {
         if empty_deck(deck) {
@@ -651,13 +705,13 @@ fn cloud_extinction(p: vec3<f32>, fine: bool) -> f32 {
         if p.y < slab.x || p.y > slab.y + slab.z {
             continue;
         }
-        total = total + deck_extinction(deck, p, fine);
+        total = total + deck_extinction(deck, p, span, erode);
     }
     return total;
 }
 
 // The same, for one deck a point is known to stand in.
-fn deck_extinction(deck: u32, p: vec3<f32>, fine: bool) -> f32 {
+fn deck_extinction(deck: u32, p: vec3<f32>, span: f32, erode: bool) -> f32 {
     // The weather is carried bodily by the mean wind and by nothing else. That
     // is not a simplification for its own sake: the ceiling cache bounds the
     // coverage of a cell without reading the wind, and it can carry a bulk
@@ -713,7 +767,21 @@ fn deck_extinction(deck: u32, p: vec3<f32>, fine: bool) -> f32 {
         return 0.0;
     }
 
-    if fine {
+    if !erode {
+        return EXTINCTION * w.b * cloud.decks[deck].slab.w * density;
+    }
+
+    // How much of each of the detail volume's three octaves this sample may
+    // read. Fetched only if some of one survives -- and the fetch is the whole
+    // cost of the term, so a sample too coarse for any of them costs no more
+    // than one that skipped the volume outright.
+    let keep = vec3<f32>(
+        resolved(span, DETAIL_LOW),
+        resolved(span, DETAIL_MID),
+        resolved(span, DETAIL_HIGH),
+    );
+    var fractal = DETAIL_MEAN;
+    if any(keep > vec3<f32>(0.0)) {
         // The detail volume, as a remap that can only take cloud away -- which
         // is what keeps the cache's bound a bound. Wispy at the bottom of the
         // deck and billowy at the top, which is Schneider's own inversion: an
@@ -724,12 +792,23 @@ fn deck_extinction(deck: u32, p: vec3<f32>, fine: bool) -> f32 {
         // and the field wants no such thing yet: what is missing from a cloud
         // here is light inside it, not another frequency of hole in it. They
         // cost nothing to leave in the volume they are already in.
+        //
+        // Summed here from the three octaves the volume keeps apart rather than
+        // read out of the fourth channel it sums them into, because an octave a
+        // sampling this coarse cannot resolve is replaced by its own average
+        // instead of being read. That is the only way to drop it that leaves
+        // the cloud the weight it had: an octave stands for `DETAIL_MEAN` of
+        // erosion whether or not anything can see where it puts it, and octaves
+        // dropped to zero would hand the far field back about a quarter of its
+        // density, leaving the horizon denser than the sky over it. The weights
+        // already sum to one, so the substitution needs no renormalising.
         let detail = textureSampleLevel(detail_noise, tile_sampler, taken / DETAIL_TILE, 0.0);
-        let h = saturate((p.y - base) / thickness);
-        let wisp = mix(detail.a, 1.0 - detail.a, saturate(h * 5.0));
-        let eaten = wisp * DETAIL_STRENGTH;
-        density = saturate((density - eaten) / max(1.0 - eaten, 1e-3));
+        fractal = dot(mix(vec3<f32>(DETAIL_MEAN), detail.rgb, keep), DETAIL_WEIGHTS);
     }
+    let h = saturate((p.y - base) / thickness);
+    let wisp = mix(fractal, 1.0 - fractal, saturate(h * 5.0));
+    let eaten = wisp * DETAIL_STRENGTH;
+    density = saturate((density - eaten) / max(1.0 - eaten, 1e-3));
 
     return EXTINCTION * w.b * cloud.decks[deck].slab.w * density;
 }
@@ -1040,7 +1119,7 @@ fn walk_light(id: vec3<u32>, shear: vec2<f32>, metres: f32) {
     var tau = 0.0;
     for (var slice = LIGHT_SLICES; slice > 0u; slice -= 1u) {
         let at = vec3<u32>(id.x, id.y, slice - 1u);
-        let extinction = cloud_extinction(light_position(at, shear), false);
+        let extinction = cloud_extinction(light_position(at, shear), metres, false);
         let crossed = extinction * metres;
         tau = tau + crossed;
         // What is *blocked*, not what gets through, and that is not a matter of
@@ -1215,7 +1294,7 @@ fn cs_cloud_march(@builtin(global_invocation_id) id: vec3<u32>) {
 
             let step = min(clamp(STEP_SLOPE * t, MIN_STEP, MAX_STEP), far - t);
             let middle = p + direction * (step * 0.5);
-            let extinction = cloud_extinction(middle, true);
+            let extinction = cloud_extinction(middle, step, true);
             if extinction > 0.0 {
                 // Two fetches, where this was a five-step march towards the sun
                 // and a flat constant for the sky. The second is what gives a

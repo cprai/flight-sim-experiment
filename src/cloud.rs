@@ -1976,6 +1976,70 @@ mod tests {
     /// field that did both and still looked like static rather than like cloud
     /// would pass them all. Run it with
     /// `cargo test --release -- --ignored dump_noise --nocapture` and open the
+    /// Each of the detail volume's octaves averages what the march puts in its
+    /// place.
+    ///
+    /// The march drops an octave the step has outgrown and substitutes
+    /// `DETAIL_MEAN` for it, which is only a band limit rather than a thinning
+    /// of the cloud if that constant really is what the octave averages -- and
+    /// only one constant serves all three if the three averages agree. They do,
+    /// and not by luck: a Worley field's distribution does not depend on how
+    /// many cells the volume is cut into, so cutting it into twice as many
+    /// changes where the field is high without changing how often it is.
+    ///
+    /// Measured off the built volume, because the alternative is to trust that
+    /// a mean derived on paper survives the eight bits it is stored in.
+    #[test]
+    fn the_detail_octaves_average_what_the_march_replaces_them_with() {
+        let (_, detail) = built();
+        let mean = |channel: usize| {
+            let total: f64 = detail
+                .texels
+                .iter()
+                .map(|texel| texel[channel] as f64 / 255.0)
+                .sum();
+            total / detail.texels.len() as f64
+        };
+        let claimed = shader_constant("DETAIL_MEAN") as f64;
+        for (channel, name) in [(0, "low"), (1, "mid"), (2, "high")] {
+            let measured = mean(channel);
+            assert!(
+                (measured - claimed).abs() < 0.01,
+                "the {name} octave averages {measured:.5}, where the march \
+                 replaces it with {claimed}"
+            );
+        }
+    }
+
+    /// The march knows how wide the detail volume's cells actually are.
+    ///
+    /// Three wavelengths written into `src/cloud_march.wgsl` as bare metres,
+    /// because that is what `resolved` compares a step against -- and three
+    /// numbers derived from constants two files away, where nothing would fail
+    /// to compile if `cs_cloud_detail` were given a different cell count. What
+    /// it would do instead is drop the octaves at the wrong distances: too soon
+    /// and the near field loses an edge it could have resolved, too late and the
+    /// far field keeps the noise this is all here to take away.
+    #[test]
+    fn the_march_knows_how_wide_the_detail_octaves_cells_are() {
+        let noise = include_str!("cloud.wgsl");
+        let cells: f32 = noise
+            .lines()
+            .find_map(|line| line.strip_prefix("const DETAIL_CELLS: i32 = "))
+            .expect("src/cloud.wgsl declares no DETAIL_CELLS")
+            .trim_end_matches(';')
+            .parse()
+            .expect("DETAIL_CELLS is not a number");
+        let tile = shader_constant("DETAIL_TILE");
+        for (name, frequency) in [("DETAIL_LOW", 1.0), ("DETAIL_MID", 2.0), ("DETAIL_HIGH", 4.0)] {
+            assert_eq!(
+                shader_constant(name),
+                tile / (cells * frequency),
+                "{name} is not the cell size `cs_cloud_detail` builds"
+            );
+        }
+    }
+
     /// PNGs it names.
     ///
     /// Two slices of the shape a quarter of the volume apart, so the tiling can
