@@ -976,6 +976,78 @@ fn ceiling_at(p: vec3<f32>) -> f32 {
     return textureLoad(ceiling, vec3<i32>(folded.x, slice, folded.y), 0).r;
 }
 
+// The places along a ray the step rule would put a sample, as a lattice of rungs
+// a distance can be rounded onto.
+//
+// The rule is `clamp(STEP_SLOPE * t, MIN_STEP, MAX_STEP)`, and `MAX_STEP` is the
+// rule's own value at `MAX_DISTANCE`, so it never binds and there are two regimes
+// rather than three: even steps of `MIN_STEP` out to `STEP_KNEE`, where the
+// proportional term overtakes the floor, and a constant ratio of `1 + STEP_SLOPE`
+// beyond it. `STEP_KNEE` is a whole number of `MIN_STEP`s, exactly, so it is a
+// rung of the near regime as well and the two arms meet without a seam -- which
+// is what lets this be a closed form rather than a walk.
+//
+// It exists so that skipping an empty cell does not move the samples. Without it a
+// skip lands a metre past the
+// cell's face and the step sequence begins again from there, so every sample
+// beyond that skip is a function of where the ray crossed the face. For a level
+// ray crossing a *vertical* face that is a grazing intersection: the crossing
+// distance goes as one over the sine of the angle, so a five-metre sideways shift
+// of the eye moves it by hundreds of metres. So the shimmer is not the field
+// moving, nor even the samples sliding with the eye -- it is a five-metre eye
+// movement amplified by a grazing angle into a step of a wholly different size.
+// Rounding the landing onto a lattice fixed in distance removes the amplifier,
+// and the face may then be crossed wherever it likes.
+//
+// What that is worth depends on how much of a level ray runs through cells that
+// are partly full, which is to say on the weather. A broken sheet is the case it
+// was found in and the one it fixes; a sky of scattered cumulus never had the
+// fault, because a ray there is either inside a cloud or clear of the cells
+// around it, and an overcast lid reaches `CUTOFF` before it has skipped anything.
+//
+// Rounded up, and the direction was measured rather than reasoned. Rounding down
+// looked like the safe choice -- it cannot step over any of the cell being
+// entered, where rounding up leaves as much as one rung of it unsampled -- and it
+// draws the same picture to within a rounding of the figures against a march
+// twelve times finer, so the cloud that overshoot loses is not cloud anything can
+// see. What rounding down does instead is land back inside the cell it was
+// skipping whenever a rung is shorter than what was left of that cell, which is
+// most of the sky: the ray then crosses a cell a rung at a time and the skipping
+// has been disabled rather than fixed. That is 0.43 ms of the fair-weather march
+// against 0.28 for rounding up, for the same image.
+const STEP_KNEE: f32 = MIN_STEP / STEP_SLOPE;
+// Rungs of the even part, which `STEP_KNEE / MIN_STEP` is by construction.
+const STEP_RUNGS: f32 = 1.0 / STEP_SLOPE;
+// `log2(1 + STEP_SLOPE)`, and the rungs of the geometric part to a doubling of
+// distance, which is its reciprocal.
+//
+// A literal because WGSL has no logarithm it can evaluate while compiling, and so
+// worked out in Rust and compared against instead: see
+// `the_march_counts_the_rungs_of_its_own_lattice_correctly`. Base two and not the
+// natural base, with the ratio folded into the exponent, because `log2` and
+// `exp2` are what the hardware has -- and the skip this serves runs over most of
+// an empty sky.
+const STEP_OCTAVE: f32 = 0.014355293;
+const LATTICE_RUNGS_PER_OCTAVE: f32 = 1.0 / STEP_OCTAVE;
+
+// Where a distance sits on the lattice, as a rung index that need not be whole.
+fn lattice_rung(t: f32) -> f32 {
+    if t <= STEP_KNEE {
+        return t / MIN_STEP;
+    }
+    return STEP_RUNGS + log2(t / STEP_KNEE) * LATTICE_RUNGS_PER_OCTAVE;
+}
+
+// Where a rung is, in metres along the ray. The inverse of the above on whole
+// rungs, and what makes the two regimes meet is that rung `STEP_RUNGS` is
+// `STEP_KNEE` under either arm.
+fn lattice_at(rung: f32) -> f32 {
+    if rung <= STEP_RUNGS {
+        return rung * MIN_STEP;
+    }
+    return STEP_KNEE * exp2((rung - STEP_RUNGS) / LATTICE_RUNGS_PER_OCTAVE);
+}
+
 // How far it is to the far side of the cell a point stands in.
 //
 // A slab test per axis rather than a stepped digital line, because the grid is
@@ -1288,7 +1360,18 @@ fn cs_cloud_march(@builtin(global_invocation_id) id: vec3<u32>) {
                 // Nothing in this cell can be seen, so leave all of it at once.
                 // The metre is what guarantees the next iteration stands in the
                 // next cell rather than on the boundary of this one.
-                t = t + cell_exit(p, direction) + 1.0;
+                //
+                // Then forward onto the sampling lattice, which is the whole of
+                // what stops a skip shimmering: where the ray leaves the cell
+                // stops deciding where the samples beyond it fall. See
+                // `lattice_rung`.
+                //
+                // The metre of slack is a backstop against `log2` and `exp2` not
+                // being exact inverses rather than a path anything takes -- a
+                // rung at or past where the ray stands is at or past where it
+                // stands, so without the rounding this could stand still.
+                let leapt = t + cell_exit(p, direction) + 1.0;
+                t = max(lattice_at(ceil(lattice_rung(leapt))), t + 1.0);
                 continue;
             }
 

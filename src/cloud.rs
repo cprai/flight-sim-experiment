@@ -1969,13 +1969,6 @@ mod tests {
         }
     }
 
-    /// Writes a slice of each volume out to look at.
-    ///
-    /// Ignored because it asserts nothing: it is the check the tests above
-    /// cannot make. They say the field tiles and that it uses its range, and a
-    /// field that did both and still looked like static rather than like cloud
-    /// would pass them all. Run it with
-    /// `cargo test --release -- --ignored dump_noise --nocapture` and open the
     /// Each of the detail volume's octaves averages what the march puts in its
     /// place.
     ///
@@ -2031,7 +2024,11 @@ mod tests {
             .parse()
             .expect("DETAIL_CELLS is not a number");
         let tile = shader_constant("DETAIL_TILE");
-        for (name, frequency) in [("DETAIL_LOW", 1.0), ("DETAIL_MID", 2.0), ("DETAIL_HIGH", 4.0)] {
+        for (name, frequency) in [
+            ("DETAIL_LOW", 1.0),
+            ("DETAIL_MID", 2.0),
+            ("DETAIL_HIGH", 4.0),
+        ] {
             assert_eq!(
                 shader_constant(name),
                 tile / (cells * frequency),
@@ -2040,6 +2037,87 @@ mod tests {
         }
     }
 
+    /// The march counts the rungs of its own lattice correctly.
+    ///
+    /// `STEP_OCTAVE` is `log2(1 + STEP_SLOPE)`, written into the shader as a
+    /// decimal literal because WGSL has no logarithm it can evaluate while
+    /// compiling, so the two ways of saying it are compared here. Nothing would
+    /// fail to compile if they parted: the lattice would have rungs of a
+    /// different spacing from the steps the march takes between them, so rounding
+    /// a skip onto it would land the ray wherever it liked -- which is the fault
+    /// the lattice exists to remove, and would look exactly like not having fixed
+    /// it.
+    #[test]
+    fn the_march_counts_the_rungs_of_its_own_lattice_correctly() {
+        let slope = shader_constant("STEP_SLOPE");
+        let claimed = shader_constant("STEP_OCTAVE");
+        let wanted = (1.0 + slope).log2();
+        assert!(
+            (claimed - wanted).abs() / wanted < 1e-6,
+            "the shader says log2(1 + {slope}) is {claimed}, where it is {wanted}"
+        );
+    }
+
+    /// The lattice's two regimes meet, and a rung of it really is a step.
+    ///
+    /// `lattice_rung` and `lattice_at` each branch at the knee, and the lattice is
+    /// the places the step rule puts a sample only if the two arms agree there and
+    /// consecutive rungs are one step apart. Where they part, a skip rounds onto a
+    /// lattice offset from the one the near field steps on, and a ray crossing the
+    /// knee jumps or stalls at a fixed distance from the eye -- a ring in the sky
+    /// travelling with the camera, which is the class of fault the lattice was
+    /// added to remove.
+    ///
+    /// Reimplemented here rather than read out of the shader, which is the only
+    /// way round it: there is no calling a WGSL function from a test, and the
+    /// property is about arithmetic rather than about pixels.
+    #[test]
+    fn the_step_lattice_meets_itself_at_the_knee() {
+        let slope = shader_constant("STEP_SLOPE");
+        let floor = shader_constant("MIN_STEP");
+        let knee = floor / slope;
+        let rungs = 1.0 / slope;
+
+        // The knee is `1 / STEP_SLOPE` floors along, whatever the floor is, so
+        // what has to hold is that the slope's reciprocal is a whole number --
+        // otherwise the last rung of the even arm stops short of the knee and the
+        // step across the join is neither a floor nor a proportion.
+        assert_eq!(
+            rungs.fract(),
+            0.0,
+            "1/{slope} is not a whole number of rungs"
+        );
+
+        // Then the two arms, as `lattice_at` writes them, against the step rule
+        // they are supposed to be the samples of.
+        let per_octave = 1.0 / (1.0 + slope).log2();
+        let at = |rung: f32| {
+            if rung <= rungs {
+                rung * floor
+            } else {
+                knee * ((rung - rungs) / per_octave).exp2()
+            }
+        };
+        let ceiling = slope * shader_constant("MAX_DISTANCE");
+        for rung in [1.0, rungs - 1.0, rungs, rungs + 1.0, rungs + 200.0] {
+            let here = at(rung);
+            let step = (slope * here).clamp(floor, ceiling);
+            let taken = at(rung + 1.0) - here;
+            assert!(
+                (taken - step).abs() < here * 1e-4 + 1e-3,
+                "rung {rung} stands at {here} and the next {taken} on, where the \
+                 step rule asks for {step}"
+            );
+        }
+    }
+
+    /// Writes a slice of each volume out to look at.
+    ///
+    /// Ignored because it asserts nothing: it is the check the tests above
+    /// cannot make. They say the field tiles and that it uses its range, and a
+    /// field that did both and still looked like static rather than like cloud
+    /// would pass them all. Run it with
+    /// `cargo test --release -- --ignored dump_noise --nocapture` and open the
     /// PNGs it names.
     ///
     /// Two slices of the shape a quarter of the volume apart, so the tiling can
