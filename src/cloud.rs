@@ -2820,9 +2820,24 @@ mod tests {
     /// texel claimed by exactly one frame of the rotation. What is in them is
     /// then checked against those very answers, assembled on the CPU -- the
     /// camera is still and the clock is stopped, so a texel carried through
-    /// three frames should come back to itself. Measured at 0.0018 of mean
-    /// transmittance and 0.062 at worst, which is the round trip through a
-    /// filtered fetch and a clamp and not a texel in the wrong place.
+    /// three frames should come back to itself, and does: zero, to every bit of
+    /// the buffer, over every texel.
+    ///
+    /// It was 0.0018 of mean transmittance and 0.062 at worst, and the doc here
+    /// called that "the round trip through a filtered fetch and a clamp". Both
+    /// halves of that were faults rather than costs. The fetch missed the texel
+    /// it was aiming at because the reprojection formed a world-scale coordinate
+    /// on the way -- see [`crate::camera::Camera::clip_of`], and note that this
+    /// camera stands a hundred and eighty kilometres out, which is what made it
+    /// the test that showed it. The clamp then pulled the result back towards
+    /// the marched texels around it, which is what kept the number small enough
+    /// to look like rounding.
+    ///
+    /// Asserted with a little slack rather than as an equality, because nothing
+    /// promises a sampler's weights are exact at a texel centre -- the light
+    /// volumes are built the way they are for that very reason; see
+    /// `walk_light`. The bound is still fifty times tighter than what it
+    /// replaces.
     #[test]
     fn the_rotation_marches_every_texel_at_its_own_place() {
         let frame = marched(
@@ -2867,7 +2882,7 @@ mod tests {
         let mean = apart.clone().map(f64::from).sum::<f64>() / oracle.len() as f64;
         let worst = apart.fold(0.0f32, f32::max);
         assert!(
-            mean < 0.005 && worst < 0.12,
+            mean < 1e-4 && worst < 5e-3,
             "a texel carried back to itself came back {mean:.6} from its own march \
              on average and {worst:.6} at worst"
         );
@@ -2884,8 +2899,11 @@ mod tests {
     ///
     /// Three rotations against one, over a camera that does not move and a
     /// clock that does not run, so the only thing that can differ is what the
-    /// carrying has done. Measured at 0.0016 of mean transmittance, and 0.049
-    /// at the single worst texel.
+    /// carrying has done. Nothing does: zero on average and zero at the single
+    /// worst texel, where it was 0.0016 and 0.049. See
+    /// `the_rotation_marches_every_texel_at_its_own_place` for what the two
+    /// faults behind those were, and why the bound has slack in it rather than
+    /// being an equality.
     #[test]
     fn a_still_world_leaves_the_buffer_where_it_was() {
         let camera = looking(1500.0, 0.0);
@@ -2911,9 +2929,67 @@ mod tests {
         let mean = apart.clone().map(f64::from).sum::<f64>() / once.colour.len() as f64;
         let worst = apart.fold(0.0f32, f32::max);
         assert!(
-            mean < 0.005 && worst < 0.1,
+            mean < 1e-4 && worst < 5e-3,
             "two more rotations over a world that did not move shifted the sky by \
              {mean:.6} on average and {worst:.6} at worst"
+        );
+    }
+
+    /// One more frame over a still world changes nothing either.
+    ///
+    /// The same claim as above and a strictly harder one, because it compares
+    /// frames whose rotation phase *differs*. Four rotations against three and a
+    /// quarter: every texel has been marched in both, but a different quarter of
+    /// them was marched last, so anything that depends on where this frame's
+    /// marched texels happen to sit shows up here and cancels out of a
+    /// comparison that keeps the phase fixed.
+    ///
+    /// Something did. The carried texels were clamped to the range of the
+    /// marched texels around them, and those are a stencil that slides by a texel
+    /// every frame -- so a texel whose own answer sat outside its neighbours'
+    /// range, which along the horizon is most of them, was pinned to a window
+    /// that moved. It read as a sparkle of single texels in the far field on a
+    /// four-frame cycle, over a world in which nothing was moving at all: 0.82
+    /// per cent of the band under the horizon moving by more than eight levels of
+    /// 255 between consecutive frames of a 960x540 view. See `TRUSTED` in
+    /// `src/cloud_march.wgsl`.
+    ///
+    /// Kept apart from the test above rather than folded into it because the two
+    /// fail for different reasons and a reader who has broken one wants to know
+    /// which.
+    #[test]
+    fn one_more_frame_over_a_still_world_changes_nothing() {
+        let camera = looking(1500.0, 0.0);
+        let size = glam::UVec2::splat(128);
+        let rounds = |n: usize| {
+            marched_over(
+                Preset::Broken,
+                &vec![&camera; n],
+                size,
+                crate::sky::Sun::default(),
+                crate::air::Wind::default(),
+                std::time::Duration::ZERO,
+                None,
+            )
+        };
+        let four = rounds(ROTATION.len());
+        let five = rounds(ROTATION.len() + 1);
+        assert!(
+            four.opacity() > 0.2,
+            "a broken sky covered only {:.3} of the frame, so this measures nothing",
+            four.opacity()
+        );
+        let apart = four
+            .colour
+            .iter()
+            .zip(&five.colour)
+            .map(|(a, b)| (a[3] - b[3]).abs());
+        let mean = apart.clone().map(f64::from).sum::<f64>() / four.colour.len() as f64;
+        let worst = apart.fold(0.0f32, f32::max);
+        assert!(
+            mean < 1e-4 && worst < 5e-3,
+            "a frame and the one after it over a world that did not move are \
+             {mean:.6} apart on average and {worst:.6} at worst"
         );
     }
 
@@ -2927,11 +3003,16 @@ mod tests {
     ///
     /// Four frames of one camera and then a single frame three degrees to the
     /// side, against four frames of the turned camera from cold. Carried, the
-    /// two are 0.0040 of mean transmittance apart -- a fifth of the 0.0197 that
+    /// two are 0.0019 of mean transmittance apart -- a tenth of the 0.0182 that
     /// separates the old view from the new one, which is what a frame with no
     /// reprojection in it would be showing. The second number is asserted as
     /// well, because without it the first says nothing: two frames of the same
     /// sky are close whatever the pass does with them.
+    ///
+    /// It was 0.0040 against 0.0197, a fifth rather than a tenth. A turn moves
+    /// every texel by many texels, so this is the case the clamp is *for* and it
+    /// still applies in full here; what halved the number is the reprojection
+    /// landing where it was aiming. See [`crate::camera::Camera::clip_of`].
     #[test]
     fn a_camera_that_turns_carries_the_sky_with_it() {
         let size = glam::UVec2::splat(128);
@@ -2972,7 +3053,7 @@ mod tests {
         );
         let ghost = apart(&carried, &cold);
         assert!(
-            ghost < 0.010 && ghost < moved * 0.5,
+            ghost < 0.004 && ghost < moved * 0.2,
             "a buffer carried through the turn is {ghost:.6} from one marched at \
              the new camera, against {moved:.6} for one not carried at all"
         );

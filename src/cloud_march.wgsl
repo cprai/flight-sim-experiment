@@ -202,6 +202,42 @@ const TOGETHER: f32 = 0.1;
 // allowed to sit, as a multiple of that range's own width.
 const SLACK: f32 = 1.0;
 
+// How far a carried texel has to have travelled across the screen, in texels,
+// before the clamp above applies to it at all.
+//
+// The clamp is for a history that belongs somewhere else: cloud that has swung
+// out of frame leaves its colour behind, and the marched texels around it are
+// what say there is nothing there now. How much of that there can be is exactly
+// how far the frame's contents moved -- nothing can have arrived in a texel that
+// nothing left. So a texel that comes back to where it started is taken as it
+// stands, one that has moved half a texel or more is clamped as hard as it ever
+// was, and in between the two are mixed.
+//
+// What that is worth is that clamping a texel which has not moved is not free.
+// Its neighbours here are quarter-resolution taps, four full-resolution pixels
+// apart, which along the horizon is most of a kilometre of sky; a texel there
+// honestly holds something none of them do, and pinning it to their range throws
+// that away. Worse, it throws it away differently every frame: one texel in four
+// is marched and which one rotates, so the range comes from a stencil that slides
+// by a texel a frame, and a pinned texel follows it. That was a sparkle of single
+// texels along the horizon on a four-frame cycle, and it was there with the
+// camera and the wind both stopped -- 0.82 per cent of the band under the horizon
+// moving by more than eight levels of 255 between consecutive frames of a world
+// in which nothing whatever was moving. See
+// `one_more_frame_over_a_still_world_changes_nothing`.
+//
+// This only became visible once the reprojection was made exact. While an
+// identity reprojection still missed the texel it aimed at, the clamp was
+// quietly correcting the blur that caused -- doing a second job badly and
+// covering for a first job done badly. `Camera::clip_of` in `src/camera.rs` is
+// the other half of this and neither half works without the other.
+//
+// A camera that turns moves every texel by many, so the case the clamp was
+// written for is untouched: measured at 0.0019 of mean transmittance against a
+// cold march of the turned view, where it was 0.0040. See
+// `a_camera_that_turns_carries_the_sky_with_it`.
+const TRUSTED: f32 = 0.5;
+
 // How many times round the loop before a ray gives up.
 //
 // Both kinds of step count against it -- a skip across an empty cell and a
@@ -319,6 +355,10 @@ struct Camera {
     ray_right: vec4<f32>,
     ray_up: vec4<f32>,
     ray_forward: vec4<f32>,
+    // Where this frame's eye lands in the previous frame's clip space. Mirrors
+    // `CameraUniform` in `src/scene.rs`, which says why it is handed over rather
+    // than worked out here.
+    was_clip: vec4<f32>,
 };
 
 // Mirrors `SkyUniform` in `src/sky.rs`; see `src/sky.wgsl` for what each is.
@@ -1535,14 +1575,24 @@ fn cs_cloud_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     // all there is no distance to speak of, so the ray is followed to infinity
     // instead. That is the `w = 0` point, and it is the right answer for a sky
     // whose contents are kilometres off: all that is left of the motion is the
-    // camera's own turn, which is exactly what a point at infinity carries.
+    // camera's own turn, which is exactly what a point at infinity carries -- and
+    // a point at infinity does not depend on where the eye is, which is why that
+    // arm is one product and the other is two.
+    //
+    // The other arm is split because `was_view_proj * (position + o, 1)` is the
+    // same thing as `was_clip + was_view_proj * (o, 0)` by linearity, and only
+    // the first spelling forms a coordinate the size of the world on the way to
+    // a view-space one the size of the scene. What that cancellation costs is a
+    // reprojection that no longer lands on the texel it started from -- a
+    // hundredth of a texel over this raster and a fifth of one out where the
+    // tests put their camera. See `Camera::clip_of` in `src/camera.rs`.
     let raw = ray_raw_at(vec2<f32>(at * 2) + 1.0);
     let direction = raw / length(raw);
-    var probe = vec4<f32>(direction, 0.0);
+    var clip = camera.was_view_proj * vec4<f32>(direction, 0.0);
     if mine_along > 0.0 {
-        probe = vec4<f32>(camera.position.xyz + direction * mine_along, 1.0);
+        clip = camera.was_clip
+            + camera.was_view_proj * vec4<f32>(direction * mine_along, 0.0);
     }
-    let clip = camera.was_view_proj * probe;
 
     var carried = mine;
     var carried_along = mine_along;
@@ -1552,11 +1602,13 @@ fn cs_cloud_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
         if all(uv > vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) {
             let texel = min(vec2<i32>(uv * vec2<f32>(size)), size - 1);
             let slack = (high - low) * SLACK;
-            carried = clamp(
-                textureSampleLevel(was_cloud, edge_sampler, uv, 0.0),
-                low - slack,
-                high + slack,
-            );
+            // How far this texel's own answer travelled across the screen since
+            // the last frame drew it, in texels. Everything below turns on it:
+            // see `TRUSTED`.
+            let travelled = length(uv * vec2<f32>(size) - (vec2<f32>(at) + 0.5));
+            let trusted = 1.0 - smoothstep(0.0, TRUSTED, travelled);
+            let held = textureSampleLevel(was_cloud, edge_sampler, uv, 0.0);
+            carried = mix(clamp(held, low - slack, high + slack), held, trusted);
             // Loaded rather than filtered, and not only because an `r32float`
             // cannot be. A blended distance addresses the aerial-perspective
             // volume at a place no cloud is; the composite refuses to blend one

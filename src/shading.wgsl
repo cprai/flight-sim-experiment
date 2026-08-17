@@ -66,6 +66,10 @@ struct Camera {
     ray_right: vec4<f32>,
     ray_up: vec4<f32>,
     ray_forward: vec4<f32>,
+    // Where this frame's eye lands in the previous frame's clip space. Mirrors
+    // `CameraUniform` in `src/scene.rs`, which says why it is handed over rather
+    // than worked out here.
+    was_clip: vec4<f32>,
 };
 
 struct Palette {

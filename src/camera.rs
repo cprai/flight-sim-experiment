@@ -124,6 +124,33 @@ impl Camera {
         self.projection() * self.view()
     }
 
+    /// Where a world point lands in this camera's clip space, worked out about
+    /// the camera instead of about the world origin.
+    ///
+    /// Algebraically `view_projection() * point.extend(1.0)` and numerically
+    /// not, which is the whole reason it exists. `view` translates by
+    /// `-position` before it rotates, so that product forms `R * point` and
+    /// `-R * position` -- two quantities the size of the *world* -- and then
+    /// subtracts them to get a view-space coordinate the size of the *scene*.
+    /// In `f32` the cancellation costs whatever the larger of the two had in
+    /// its last bits: an ulp at fifty kilometres is three millimetres, and a
+    /// point a few hundred metres in front of the eye comes back displaced by
+    /// enough to matter to anything that reprojects it back onto a texel.
+    ///
+    /// Subtracting first costs nothing and leaves no large intermediate at all.
+    /// Measured through the cloud resolve, which reprojects a texel and asks how
+    /// far it lands from where it started: at the origin the round trip is off
+    /// by 0.00003 of a texel, at twenty kilometres by 0.0001, at the corner of
+    /// this raster by 0.004, and at a hundred and eighty kilometres -- where the
+    /// cloud tests put their camera, to exercise a negative weather tile -- by
+    /// 0.0098, with a tenth of the frame past 0.079 and the worst texel at 0.20.
+    /// Those last are enough for a filtered fetch to blend a fifth of a
+    /// neighbour in.
+    pub fn clip_of(&self, point: Vec3) -> glam::Vec4 {
+        let towards = point - self.position;
+        self.projection() * (Mat4::from_quat(self.orientation.inverse()) * towards.extend(1.0))
+    }
+
     /// Right, up, and forward vectors that turn a screen position into a ray.
     ///
     /// A pixel at normalized device coordinates `(x, y)` looks along
@@ -306,6 +333,73 @@ mod tests {
                 (ndc.x - x).abs() < 1e-4 && (ndc.y - y).abs() < 1e-4,
                 "ray through ({x}, {y}) projects back to {ndc}"
             );
+        }
+    }
+
+    /// A point in front of the eye lands in the same place however far the eye
+    /// stands from the world origin.
+    ///
+    /// The property [`Camera::clip_of`] exists for, tested the way the cloud
+    /// resolve uses it: a point `offset` metres from *this* frame's eye,
+    /// projected into the *previous* frame's clip space. Done in one product it
+    /// is `was.view_projection() * (position + offset, 1)`, which forms a
+    /// world-scale coordinate twice over -- once building the point and once
+    /// inside the matrix -- and cancels them down to a view-space coordinate the
+    /// size of the scene. Split in two it is `was.clip_of(position)` plus
+    /// `was.view_projection() * (offset, 0)`, where the first subtracts two eyes
+    /// a few metres apart -- exact, by Sterbenz -- and the second has no
+    /// translation in it at all.
+    ///
+    /// The reference is the same split evaluated on quantities that are all
+    /// small, so it carries no cancellation to be right or wrong about. A point
+    /// three hundred metres out is the case that bites, because the error is an
+    /// absolute displacement in view space and so tells worst against a short
+    /// distance.
+    #[test]
+    fn a_point_ahead_of_the_eye_projects_the_same_anywhere_in_the_world() {
+        for out in [0.0f32, 20_000.0, 60_000.0, 180_000.0] {
+            let orientation = Camera::from_yaw_pitch_roll(0.7, -0.2, 0.0);
+            let was = Camera::new(Vec3::new(out, 1_500.0, -out), orientation, 16.0 / 9.0);
+            // A frame of an aircraft's motion later.
+            let now = Camera::new(
+                was.position + Vec3::new(4.0, 0.0, -1.0),
+                orientation,
+                16.0 / 9.0,
+            );
+            let [right, up, forward] = now.ray_basis();
+
+            let mut worst_together = 0.0f32;
+            let mut worst_split = 0.0f32;
+            for (x, y) in [(0.0, 0.0), (0.9, 0.9), (-0.9, 0.4), (0.35, -0.8)] {
+                let offset = (right * x + up * y + forward).normalize() * 300.0;
+                let ndc = |clip: glam::Vec4| clip.truncate().truncate() / clip.w;
+                let want = ndc(was.projection()
+                    * (Mat4::from_quat(was.orientation.inverse())
+                        * ((now.position - was.position) + offset).extend(1.0)));
+                let together = ndc(was.view_projection() * (now.position + offset).extend(1.0));
+                let split =
+                    ndc(was.clip_of(now.position) + was.view_projection() * offset.extend(0.0));
+                worst_together = worst_together.max((together - want).abs().max_element());
+                worst_split = worst_split.max((split - want).abs().max_element());
+            }
+            // Half-resolution texels are 480 across a 960-wide frame, so a
+            // normalized device coordinate is 240 of them: this is a thousandth
+            // of a texel, and the split holds it everywhere.
+            assert!(
+                worst_split < 4e-6,
+                "at {out} m out the split projection is {worst_split} from where \
+                 it should be"
+            );
+            // ... where the single product is not merely worse but worse in
+            // proportion to how far out the camera has gone, which is what says
+            // the fault is the world-scale coordinate and not the arithmetic.
+            if out >= 60_000.0 {
+                assert!(
+                    worst_together > 20.0 * worst_split,
+                    "at {out} m out the two agree to {worst_together} and \
+                     {worst_split}, so this measures nothing"
+                );
+            }
         }
     }
 

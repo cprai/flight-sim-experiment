@@ -61,14 +61,26 @@ struct CameraUniform {
     ray_right: [f32; 4],
     ray_up: [f32; 4],
     ray_forward: [f32; 4],
+    /// Where *this* frame's eye lands in the previous frame's clip space, from
+    /// [`Camera::clip_of`].
+    ///
+    /// The fixed half of a reprojection, handed over already worked out because
+    /// working it out on the GPU is what loses the precision. A pass that
+    /// reprojects a point `o` metres from this eye wants
+    /// `was_view_proj * (position + o, 1)`, and that is `was_clip` plus
+    /// `was_view_proj * (o, 0)` exactly -- the second term never forms a
+    /// world-scale coordinate, and the first was computed where the subtraction
+    /// could be done first. See [`Camera::clip_of`] for what that is worth.
+    was_clip: [f32; 4],
 }
 
 impl CameraUniform {
-    fn new(camera: &Camera, was_view_proj: glam::Mat4) -> Self {
+    fn new(camera: &Camera, was: &Camera) -> Self {
         let [right, up, forward] = camera.ray_basis();
         Self {
             view_proj: camera.view_projection().to_cols_array_2d(),
-            was_view_proj: was_view_proj.to_cols_array_2d(),
+            was_view_proj: was.view_projection().to_cols_array_2d(),
+            was_clip: was.clip_of(camera.position).to_array(),
             position: camera.position.extend(1.0).to_array(),
             ray_right: right.extend(0.0).to_array(),
             ray_up: up.extend(0.0).to_array(),
@@ -157,7 +169,7 @@ pub struct Scene {
     /// true and a translation does not. See `swept` in `src/reproject.wgsl`.
     was_eye: glam::Vec3,
     /// The projection that drew what is now the history, for motion vectors.
-    was_view_proj: glam::Mat4,
+    was_camera: Camera,
     shading: Shading,
     /// What the last camera upload cost, zero unless a run asked to be timed.
     camera_span: std::time::Duration,
@@ -363,7 +375,7 @@ impl Scene {
             elapsed: std::time::Duration::ZERO,
             was_basis: camera.ray_basis(),
             was_eye: camera.position,
-            was_view_proj: camera.view_projection(),
+            was_camera: camera,
             shading,
             camera_span: std::time::Duration::ZERO,
             profiler: crate::profile::profiler(device, false),
@@ -424,7 +436,7 @@ impl Scene {
         queue.write_buffer(
             &self.camera_buffer,
             0,
-            bytemuck::bytes_of(&CameraUniform::new(&self.camera, self.was_view_proj)),
+            bytemuck::bytes_of(&CameraUniform::new(&self.camera, &self.was_camera)),
         );
         self.camera_span = clock.elapsed();
         // Wrapping is fine and deliberate: the dither reads the low six bits,
@@ -475,7 +487,7 @@ impl Scene {
         // through.
         self.was_basis = self.camera.ray_basis();
         self.was_eye = self.camera.position;
-        self.was_view_proj = self.camera.view_projection();
+        self.was_camera = self.camera;
         // Scoped by this scene's own profiler, on the terrain's own encoders.
         // They are submitted before the frame's, so the timestamps are already
         // written by the time the frame encoder resolves the query set.
@@ -825,10 +837,7 @@ impl Scene {
         queue.write_buffer(
             &self.camera_buffer,
             0,
-            bytemuck::bytes_of(&CameraUniform::new(
-                &self.camera,
-                self.camera.view_projection(),
-            )),
+            bytemuck::bytes_of(&CameraUniform::new(&self.camera, &self.camera)),
         );
         for step in 1..crate::cloud::ROTATION.len() as u32 {
             self.march
@@ -898,6 +907,7 @@ fn camera_binding(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::BindGroupLayout
             ray_right: [0.0; 4],
             ray_up: [0.0; 4],
             ray_forward: [0.0; 4],
+            was_clip: [0.0; 4],
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
@@ -988,7 +998,7 @@ pub fn test_camera_buffer(
     queue.write_buffer(
         &buffer,
         0,
-        bytemuck::bytes_of(&CameraUniform::new(camera, camera.view_projection())),
+        bytemuck::bytes_of(&CameraUniform::new(camera, camera)),
     );
     (buffer, layout, bind_group)
 }
@@ -996,7 +1006,7 @@ pub fn test_camera_buffer(
 /// The camera uniform for a camera that has just come from `was`.
 #[cfg(test)]
 pub fn test_camera_moved(camera: &Camera, was: &Camera) -> impl bytemuck::Pod {
-    CameraUniform::new(camera, was.view_projection())
+    CameraUniform::new(camera, was)
 }
 
 /// Where a world point lands on screen, in pixels, with (0, 0) at the top left.
