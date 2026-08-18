@@ -38,6 +38,14 @@ const PI: f32 = 3.14159265358979;
 const LIGHT_ACROSS: u32 = 192u;
 const LIGHT_SLICES: u32 = 48u;
 
+// Cascades of each light volume. Must match `LIGHT_CASCADES` in `src/cloud.rs`,
+// which says why there is more than one.
+const LIGHT_CASCADES: u32 = 2u;
+
+// Where one hands over to the next. Must match `CASCADE_EDGE` in
+// `src/cloud_march.wgsl`.
+const CASCADE_EDGE: f32 = 0.9;
+
 // How much of the sky a cloud blocks still arrives, having bounced. Must match
 // `BOUNCED` in `src/cloud_march.wgsl`; see there for what it stands in for.
 const BOUNCED: f32 = 0.4;
@@ -90,7 +98,7 @@ struct Sky {
 // Where the light volumes stand and how their columns lean. Must match `Light`
 // in `src/cloud_march.wgsl` and `LightUniform` in `src/cloud.rs`.
 struct Light {
-    origin: vec4<f32>,
+    cascade: array<vec4<f32>, LIGHT_CASCADES>,
     walk: vec4<f32>,
 };
 
@@ -214,40 +222,76 @@ fn sample_multiscatter(r: f32, mu_s: f32) -> vec3<f32> {
     return textureSampleLevel(multiscatter_lut, lut_sampler, uv, 0.0).rgb;
 }
 
-// Where a world point sits in a light volume. Must match `light_uvw` in
-// `src/cloud_march.wgsl`; there is a test comparing the four functions here as
-// text against that file, because a shadow the ground draws in a different place
-// from the one the cloud draws it is a cloud floating free of its own shadow.
-fn light_uvw(p: vec3<f32>, shear: vec2<f32>) -> vec3<f32> {
-    let climbed = p.y - light.origin.z;
-    let flat = p.xz - light.origin.xy - climbed * shear;
+// Where a world point sits in one cascade of a light volume. Must match
+// `light_uvw` in `src/cloud_march.wgsl`; there is a test comparing these
+// functions here as text against that file, because a shadow the ground draws in
+// a different place from the one the cloud draws it is a cloud floating free of
+// its own shadow.
+fn light_uvw(p: vec3<f32>, shear: vec2<f32>, cascade: u32) -> vec3<f32> {
+    let origin = light.cascade[cascade];
+    let climbed = p.y - origin.z;
+    let flat = p.xz - origin.xy - climbed * shear;
     return vec3<f32>(
-        flat / (light.origin.w * f32(LIGHT_ACROSS)),
+        flat / (origin.w * f32(LIGHT_ACROSS)),
         climbed / (light.walk.w * f32(LIGHT_SLICES)),
     );
 }
 
-// How far outside a light volume a coordinate has strayed, as a share of it.
-// Must match `beyond_light` in `src/cloud_march.wgsl`.
+// A cascade's own vertical coordinate in the stacked volume. Must match
+// `stacked_w` in `src/cloud_march.wgsl`.
+fn stacked_w(w: f32, cascade: u32) -> f32 {
+    let slices = f32(LIGHT_SLICES);
+    let inside = clamp(w * slices, 0.5, slices - 0.5);
+    return (f32(cascade) * slices + inside) / (slices * f32(LIGHT_CASCADES));
+}
+
+// How far outside a cascade a coordinate has strayed, as a share of it. Must
+// match `beyond_light` in `src/cloud_march.wgsl`.
 fn beyond_light(uvw: vec3<f32>) -> f32 {
     let out = abs(uvw.xy - vec2<f32>(0.5)) * 2.0;
     return max(out.x, out.y);
+}
+
+// How much of a light volume reaches a point, over all its cascades. Must match
+// `reaching` in `src/cloud_march.wgsl` -- which is what the texture and the
+// sampler are parameters for: the two callers hold different ones and everything
+// else about the walk has to be the same.
+fn reaching(
+    volume: texture_3d<f32>,
+    filtering: sampler,
+    p: vec3<f32>,
+    shear: vec2<f32>,
+) -> f32 {
+    var blocked = 0.0;
+    var answered = 0.0;
+    for (var cascade = 0u; cascade < LIGHT_CASCADES; cascade += 1u) {
+        if answered >= 1.0 {
+            break;
+        }
+        let uvw = light_uvw(p, shear, cascade);
+        let inside = 1.0 - smoothstep(CASCADE_EDGE, 1.0, beyond_light(uvw));
+        let share = min(inside, 1.0 - answered);
+        if share > 0.0 {
+            let at = vec3<f32>(uvw.xy, stacked_w(uvw.z, cascade));
+            blocked = blocked + share * textureSampleLevel(volume, filtering, at, 0.0).r;
+            answered = answered + share;
+        }
+    }
+    // What is blocked, so an unanswered share leaves the light alone and an
+    // empty volume returns exactly one. See `walk_light`.
+    return 1.0 - blocked;
 }
 
 // Must match `sun_reaching` in `src/cloud_march.wgsl`, but for the sampler:
 // there the fields tile and are read through a repeating one, here everything
 // else in the group is a table and the clamped one is already to hand.
 fn sun_reaching(p: vec3<f32>) -> f32 {
-    let uvw = light_uvw(p, light.walk.xy);
-    let blocked = textureSampleLevel(sun_light, lut_sampler, uvw, 0.0).r;
-    return 1.0 - blocked * (1.0 - smoothstep(0.9, 1.0, beyond_light(uvw)));
+    return reaching(sun_light, lut_sampler, p, light.walk.xy);
 }
 
 // Must match `sky_reaching` in `src/cloud_march.wgsl`, likewise.
 fn sky_reaching(p: vec3<f32>) -> f32 {
-    let uvw = light_uvw(p, vec2<f32>(0.0));
-    let blocked = textureSampleLevel(sky_light, lut_sampler, uvw, 0.0).r;
-    return 1.0 - blocked * (1.0 - smoothstep(0.9, 1.0, beyond_light(uvw)));
+    return reaching(sky_light, lut_sampler, p, vec2<f32>(0.0));
 }
 
 // Must match `sky_share` in `src/cloud_march.wgsl`.

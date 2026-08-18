@@ -334,6 +334,18 @@ const EMPTY: f32 = 1e-4;
 const LIGHT_ACROSS: u32 = 192u;
 const LIGHT_SLICES: u32 = 48u;
 
+// Cascades of each light volume. Must match `LIGHT_CASCADES` in `src/cloud.rs`,
+// which says why there is more than one. How much wider each is than the one
+// inside it is `LIGHT_SPREAD` there and is not needed here: a cascade's own span
+// arrives in the uniform, one corner and one texel size apiece.
+const LIGHT_CASCADES: u32 = 2u;
+
+// Where a cascade stops answering for a point and hands over to the one outside
+// it, as a share of its own half-span. The outermost tenth, so the join is a
+// tenth of a cascade wide -- three kilometres at the innermost, which is a
+// gentle enough ramp that flying it over a cloud does not read as an edge.
+const CASCADE_EDGE: f32 = 0.9;
+
 // Octaves of Wrenninge's multiple-scattering approximation, and what each one
 // halves.
 //
@@ -413,9 +425,9 @@ struct Weather {
 // about the weather. Mirrors `LightUniform` in `src/cloud.rs` and `Light` in
 // `src/shading.wgsl`.
 struct Light {
-    // The near corner in x and z, the height of the lowest slice, and the
-    // metres one texel covers across.
-    origin: vec4<f32>,
+    // One per cascade, innermost first: the near corner in x and z, the height
+    // of the lowest slice, and the metres one texel covers across.
+    cascade: array<vec4<f32>, LIGHT_CASCADES>,
     // How far a sun column drifts horizontally per metre it climbs, then the
     // metres of ray one slice is worth walking towards the sun, then the metres
     // of height one slice is worth -- which is what the same slice is worth
@@ -1170,22 +1182,36 @@ fn sunlit(through: f32, cos_theta: f32, sunlight: vec3<f32>) -> vec3<f32> {
 // nearly vertical, which puts a hundred and fifty metres of resolution across
 // the two and a half kilometres a cloud deck occupies -- seventeen useful texels
 // over the whole interesting half of the sun's arc.
-fn light_position(at: vec3<u32>, shear: vec2<f32>) -> vec3<f32> {
+fn light_position(at: vec3<u32>, cascade: u32, shear: vec2<f32>) -> vec3<f32> {
+    let origin = light.cascade[cascade];
     let climbed = (f32(at.z) + 0.5) * light.walk.w;
-    let flat = light.origin.xy
-        + (vec2<f32>(at.xy) + 0.5) * light.origin.w
-        + climbed * shear;
-    return vec3<f32>(flat.x, light.origin.z + climbed, flat.y);
+    let flat = origin.xy + (vec2<f32>(at.xy) + 0.5) * origin.w + climbed * shear;
+    return vec3<f32>(flat.x, origin.z + climbed, flat.y);
 }
 
-// The same mapping backwards: where a world point sits in a light volume.
-fn light_uvw(p: vec3<f32>, shear: vec2<f32>) -> vec3<f32> {
-    let climbed = p.y - light.origin.z;
-    let flat = p.xz - light.origin.xy - climbed * shear;
+// The same mapping backwards: where a world point sits in one cascade.
+fn light_uvw(p: vec3<f32>, shear: vec2<f32>, cascade: u32) -> vec3<f32> {
+    let origin = light.cascade[cascade];
+    let climbed = p.y - origin.z;
+    let flat = p.xz - origin.xy - climbed * shear;
     return vec3<f32>(
-        flat / (light.origin.w * f32(LIGHT_ACROSS)),
+        flat / (origin.w * f32(LIGHT_ACROSS)),
         climbed / (light.walk.w * f32(LIGHT_SLICES)),
     );
+}
+
+// A cascade's own vertical coordinate, in the stacked volume that holds them all.
+//
+// The cascades sit end to end up the third axis of one texture, so a read has to
+// be kept off its neighbours: half a texel in from each end of the band is
+// exactly where a linear filter stops reaching past it. Clamping there also
+// reproduces what a volume of its own would do at its floor and ceiling, which
+// is what the sampler's own clamp used to give -- and the floor is where the
+// ground stands, so it is not a corner that can be given up.
+fn stacked_w(w: f32, cascade: u32) -> f32 {
+    let slices = f32(LIGHT_SLICES);
+    let inside = clamp(w * slices, 0.5, slices - 0.5);
+    return (f32(cascade) * slices + inside) / (slices * f32(LIGHT_CASCADES));
 }
 
 // How far outside a light volume a coordinate has strayed, across.
@@ -1198,9 +1224,11 @@ fn light_uvw(p: vec3<f32>, shear: vec2<f32>) -> vec3<f32> {
 // read the same edge column, so the transmittance stepped from slice to slice
 // instead of varying along the ray.
 //
-// So the answer fades to full light over the outermost tenth instead. Nothing
-// is lost by it: the sun that leans a column that far is a sun the air has
-// already taken out, and the fade is smooth where the clamp was a staircase.
+// So the answer hands over to the next cascade out over the outermost tenth
+// instead, and past the last of them fades to full light. Nothing is lost by the
+// fade: a point that falls outside the widest cascade is either past the end of
+// the march or under a sun leaning so far that the air has already taken it out,
+// and the fade is smooth where the clamp was a staircase.
 //
 // Across only, and that is the point of the `.xy`. The volume's floor is sea
 // level and its ceiling is above every deck, so a point outside it vertically
@@ -1212,6 +1240,47 @@ fn beyond_light(uvw: vec3<f32>) -> f32 {
     return max(out.x, out.y);
 }
 
+// How much of a light volume reaches a point, over all the cascades it has.
+//
+// Each cascade is asked in turn, innermost first, and answers for as much of the
+// point as it still has room for: fully inside its own span it answers for all
+// of it, over the outermost tenth it hands what is left to the one outside, and
+// past the widest of them what nobody answered for reads as unblocked. So the
+// join between two cascades is a blend and not a step, which is the whole reason
+// the resolution may change across it without anything popping as the camera
+// moves that join over a cloud.
+//
+// The texture and the sampler are handed in because the two callers of this hold
+// different ones -- the march reads three tiling fields through a repeating
+// sampler, the shading has the tables' clamped one already -- and everything else
+// about the walk has to be the same in both. Passing them is what lets this be
+// one function compared as text rather than two that drift.
+fn reaching(
+    volume: texture_3d<f32>,
+    filtering: sampler,
+    p: vec3<f32>,
+    shear: vec2<f32>,
+) -> f32 {
+    var blocked = 0.0;
+    var answered = 0.0;
+    for (var cascade = 0u; cascade < LIGHT_CASCADES; cascade += 1u) {
+        if answered >= 1.0 {
+            break;
+        }
+        let uvw = light_uvw(p, shear, cascade);
+        let inside = 1.0 - smoothstep(CASCADE_EDGE, 1.0, beyond_light(uvw));
+        let share = min(inside, 1.0 - answered);
+        if share > 0.0 {
+            let at = vec3<f32>(uvw.xy, stacked_w(uvw.z, cascade));
+            blocked = blocked + share * textureSampleLevel(volume, filtering, at, 0.0).r;
+            answered = answered + share;
+        }
+    }
+    // What is blocked, so an unanswered share leaves the light alone and an
+    // empty volume returns exactly one. See `walk_light`.
+    return 1.0 - blocked;
+}
+
 // How much of the sun reaches a point, and how much of the sky does.
 //
 // No half-texel correction and none wanted: a texel of these stands for the
@@ -1219,17 +1288,11 @@ fn beyond_light(uvw: vec3<f32>) -> f32 {
 // so `light_position` and this are already inverses. See `to_texture` in
 // `src/sky.wgsl` for the case where the correction is needed.
 fn sun_reaching(p: vec3<f32>) -> f32 {
-    let uvw = light_uvw(p, light.walk.xy);
-    let blocked = textureSampleLevel(sun_light, edge_sampler, uvw, 0.0).r;
-    // The fade to full light is a fade of what is blocked to nothing, which is
-    // the same arithmetic and leaves an empty volume returning exactly one.
-    return 1.0 - blocked * (1.0 - smoothstep(0.9, 1.0, beyond_light(uvw)));
+    return reaching(sun_light, edge_sampler, p, light.walk.xy);
 }
 
 fn sky_reaching(p: vec3<f32>) -> f32 {
-    let uvw = light_uvw(p, vec2<f32>(0.0));
-    let blocked = textureSampleLevel(sky_light, edge_sampler, uvw, 0.0).r;
-    return 1.0 - blocked * (1.0 - smoothstep(0.9, 1.0, beyond_light(uvw)));
+    return reaching(sky_light, edge_sampler, p, vec2<f32>(0.0));
 }
 
 // What a point gets of the sky, given how much of it reaches there unscattered.
@@ -1248,10 +1311,19 @@ fn sky_share(reaching: f32) -> f32 {
 // Structurally `cs_aerial` in `src/sky.wgsl`, which walks the frustum's froxel
 // columns the same way and for the same reason.
 fn walk_light(id: vec3<u32>, shear: vec2<f32>, metres: f32) {
+    let cascade = id.z;
+    // A cascade's texels are `LIGHT_SPREAD` times wider than the one inside it,
+    // so a slice of it stands for that much more ray and the extinction it
+    // samples is that much coarser. The metres a slice is worth do not change
+    // with it: the cascades differ across, not up.
     var tau = 0.0;
     for (var slice = LIGHT_SLICES; slice > 0u; slice -= 1u) {
         let at = vec3<u32>(id.x, id.y, slice - 1u);
-        let extinction = cloud_extinction(light_position(at, shear), metres, false);
+        let extinction = cloud_extinction(
+            light_position(at, cascade, shear),
+            metres,
+            false,
+        );
         let crossed = extinction * metres;
         tau = tau + crossed;
         // What is *blocked*, not what gets through, and that is not a matter of
@@ -1268,7 +1340,7 @@ fn walk_light(id: vec3<u32>, shear: vec2<f32>, metres: f32) {
         // everywhere, which is a deck's own shadow cast onto its own top.
         textureStore(
             out_light,
-            vec3<i32>(at),
+            vec3<i32>(i32(at.x), i32(at.y), i32(cascade * LIGHT_SLICES + at.z)),
             vec4<f32>(1.0 - exp(crossed * 0.5 - tau), 0.0, 0.0, 1.0),
         );
     }
@@ -1276,7 +1348,7 @@ fn walk_light(id: vec3<u32>, shear: vec2<f32>, metres: f32) {
 
 @compute @workgroup_size(8, 8, 1)
 fn cs_cloud_sun_light(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= LIGHT_ACROSS || id.y >= LIGHT_ACROSS {
+    if id.x >= LIGHT_ACROSS || id.y >= LIGHT_ACROSS || id.z >= LIGHT_CASCADES {
         return;
     }
     walk_light(id, light.walk.xy, light.walk.z);
@@ -1284,7 +1356,7 @@ fn cs_cloud_sun_light(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8, 1)
 fn cs_cloud_sky_light(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= LIGHT_ACROSS || id.y >= LIGHT_ACROSS {
+    if id.x >= LIGHT_ACROSS || id.y >= LIGHT_ACROSS || id.z >= LIGHT_CASCADES {
         return;
     }
     // No lean, and a slice is worth its own height rather than the longer ray a

@@ -134,21 +134,47 @@ const DECK_HUG: [f32; DECKS] = [1.0, 0.0, 0.0, 0.0];
 /// Texels across each light volume, and slices up it. Must match `LIGHT_ACROSS`
 /// and `LIGHT_SLICES` in `src/cloud_march.wgsl`.
 ///
-/// Over [`LIGHT_EXTENT`] and [`CEILING_TOP`] that is 312 m across and 250 m up.
-/// Coarse against a cloud, and about right for what these hold: not the cloud
-/// but the shadow of it, which is soft by the time it has been cast through a
-/// kilometre of anything. Fourteen megabytes apiece.
+/// Over [`LIGHT_EXTENT`] and [`CEILING_TOP`] that is 312 m across and 250 m up
+/// in the innermost cascade, and [`LIGHT_SPREAD`] times as coarse across in each
+/// one outside it. Coarse against a cloud, and about right for what these hold:
+/// not the cloud but the shadow of it, which is soft by the time it has been
+/// cast through a kilometre of anything. Fourteen megabytes per cascade apiece,
+/// so the pair of them costs fifty-seven across [`LIGHT_CASCADES`] cascades.
 pub const LIGHT_ACROSS: u32 = 192;
 pub const LIGHT_SLICES: u32 = 48;
 
-/// How much world the light volumes span horizontally, in metres.
+/// How much world the innermost light cascade spans horizontally, in metres.
 ///
 /// Camera-centred, and snapped to a whole texel so the shadows do not crawl
 /// under the camera: the volume is a fact about the world, and a fact about the
-/// world that moved when the eye did would shimmer. Sixty kilometres is far
-/// enough that what falls outside is behind most of a hundred kilometres of
-/// haze, where the sampler's clamp is as good an answer as any.
+/// world that moved when the eye did would shimmer.
 const LIGHT_EXTENT: f32 = 60_000.0;
+
+/// Cascades of each light volume, and how much wider each is than the one
+/// inside it. Must match `LIGHT_CASCADES` and `LIGHT_SPREAD` in
+/// `src/cloud_march.wgsl`.
+///
+/// One cascade of sixty kilometres was what this had, on the reasoning that
+/// what fell outside was behind most of a hundred kilometres of haze. That is
+/// not true of anything a level view shows: the march runs to
+/// [`MAX_DISTANCE`](../cloud_march.wgsl), so beyond thirty kilometres ahead --
+/// which is most of the cloud in the frame -- there was no self-shadowing at
+/// all, and the volume being centred on the eye meant that boundary travelled
+/// with the camera. Flying at it turned a flat white deck into a shaped one,
+/// over about three kilometres of approach.
+///
+/// Two cascades at four times the span put the outer edge a hundred and twenty
+/// kilometres out, past everything the march can reach, so there is no longer a
+/// distance at which the shadowing stops. What is left at the join is a change
+/// of resolution rather than a change of kind, 312 m against 1250 m, and it is
+/// crossed by a blend rather than a step -- see `reaching` in
+/// `src/cloud_march.wgsl`.
+///
+/// The spread is what decides how visible that join is against what the far
+/// cascade costs. Four was measured against two-at-three-cascades, which spends
+/// half as much again to halve the resolution step.
+pub const LIGHT_CASCADES: u32 = 2;
+const LIGHT_SPREAD: f32 = 4.0;
 
 /// The lowest the sun may be taken to be when the volume's columns are leaned
 /// along it.
@@ -307,9 +333,14 @@ struct WeatherUniform {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct LightUniform {
-    /// The near corner in x and z, the height of the lowest slice, and the
-    /// metres one texel covers across.
-    origin: [f32; 4],
+    /// One per cascade, innermost first: the near corner in x and z, the height
+    /// of the lowest slice, and the metres one texel covers across.
+    ///
+    /// Each is snapped to its *own* texel, which is what lets the coarse ones
+    /// stand as still in the world as the fine one does. A cascade snapped to a
+    /// neighbour's grid would slide by the difference every time the camera
+    /// crossed one of its own texels.
+    cascade: [[f32; 4]; LIGHT_CASCADES as usize],
     /// How far a sun column leans per metre it climbs, then the metres of ray
     /// one slice is worth towards the sun, then the metres of height one slice
     /// is worth -- which is what the same slice is worth straight up.
@@ -325,22 +356,26 @@ impl LightUniform {
     /// Where the volumes go for an eye and a sun, over a wind's own grid and
     /// however far that wind has carried the weather by now.
     fn at(eye: glam::Vec3, sun: glam::Vec3, air: [f32; 4], carried: glam::Vec3) -> Self {
-        let across = LIGHT_EXTENT / LIGHT_ACROSS as f32;
         let up = CEILING_TOP / LIGHT_SLICES as f32;
-        // Centred on the eye and then snapped to a whole texel. Both halves
-        // matter: centred, so the resolution is spent where the camera is, and
-        // snapped, so the lattice stands still in the world while the camera
-        // moves across it. A volume that slid with the eye would put a cloud's
-        // shadow in a slightly different place every frame, which reads as the
-        // whole sky crawling.
-        let centre = (glam::Vec2::new(eye.x, eye.z) / across).round() * across;
-        let corner = centre - LIGHT_EXTENT * 0.5;
+        // Each cascade centred on the eye and then snapped to a whole texel of
+        // its own. Both halves matter: centred, so the resolution is spent where
+        // the camera is, and snapped, so the lattice stands still in the world
+        // while the camera moves across it. A volume that slid with the eye
+        // would put a cloud's shadow in a slightly different place every frame,
+        // which reads as the whole sky crawling.
+        let cascade = std::array::from_fn(|level| {
+            let extent = LIGHT_EXTENT * LIGHT_SPREAD.powi(level as i32);
+            let across = extent / LIGHT_ACROSS as f32;
+            let centre = (glam::Vec2::new(eye.x, eye.z) / across).round() * across;
+            let corner = centre - extent * 0.5;
+            [corner.x, corner.y, 0.0, across]
+        });
         // The sun's own lean, floored so a setting sun cannot run it away or a
         // set one invert it. See [`SHEAR_FLOOR`].
         let climb = sun.y.max(SHEAR_FLOOR);
         let lean = glam::Vec2::new(sun.x, sun.z) / climb;
         Self {
-            origin: [corner.x, corner.y, 0.0, across],
+            cascade,
             // A slice of height is a longer piece of a leaning ray than of a
             // plumb one, by exactly the sun's climb.
             walk: [lean.x, lean.y, up / climb, up],
@@ -946,7 +981,13 @@ impl March {
                 size: wgpu::Extent3d {
                     width: LIGHT_ACROSS,
                     height: LIGHT_ACROSS,
-                    depth_or_array_layers: LIGHT_SLICES,
+                    // The cascades are stacked up the third axis rather than
+                    // held as separate textures, which keeps one binding and one
+                    // sampler for the pair of them. What that costs is a clamp
+                    // when the volume is read, so the filter never reaches out
+                    // of one cascade's band into the next; see `stacked_w` in
+                    // `src/cloud_march.wgsl`.
+                    depth_or_array_layers: LIGHT_SLICES * LIGHT_CASCADES,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
@@ -1674,7 +1715,10 @@ impl March {
         ] {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(3, group, &[]);
-            pass.dispatch_workgroups(across, across, 1);
+            // One layer of the dispatch per cascade: a thread owns a column of
+            // one of them and walks it, which is the same work the single
+            // volume was, once per cascade.
+            pass.dispatch_workgroups(across, across, LIGHT_CASCADES);
         }
     }
 
@@ -3626,34 +3670,107 @@ mod tests {
         }
     }
 
-    /// The light volume stands still while the camera moves across it.
+    /// Every cascade stands still while the camera moves across it.
     ///
-    /// It is placed on the camera, so that its resolution is spent where the
-    /// eye is; it is snapped to a whole texel, so that being placed on a moving
-    /// thing does not make it a moving thing. Without the snap every cloud's
-    /// shadow would land a fraction of a texel differently each frame, and a
-    /// whole sky of shadows shifting under a walking camera is exactly the kind
-    /// of crawl a still image cannot show and a flight cannot hide.
+    /// Each is placed on the camera, so that its resolution is spent where the
+    /// eye is; each is snapped to a whole texel *of its own*, so that being
+    /// placed on a moving thing does not make it a moving thing. Without the
+    /// snap every cloud's shadow would land a fraction of a texel differently
+    /// each frame, and a whole sky of shadows shifting under a walking camera is
+    /// exactly the kind of crawl a still image cannot show and a flight cannot
+    /// hide.
+    ///
+    /// Per cascade and not just the innermost, because a coarse one snapped to
+    /// the fine one's grid would slide by the difference between them every time
+    /// the camera crossed a fine texel -- which is the same crawl, on the shadows
+    /// furthest away, where it is least excusable.
     #[test]
-    fn the_light_volume_stands_still_while_the_camera_moves() {
-        let across = LIGHT_EXTENT / LIGHT_ACROSS as f32;
+    fn every_light_cascade_stands_still_while_the_camera_moves() {
         let sun = crate::sky::Sun::default().direction;
-        let corner = |x: f32| {
+        let corners = |x: f32| {
             LightUniform::at(
                 glam::Vec3::new(x, 2000.0, 0.0),
                 sun,
                 [0.0; 4],
                 glam::Vec3::ZERO,
             )
-            .origin
+            .cascade
         };
-        // Two eyes a tenth of a texel apart put the volume in the same place...
-        assert_eq!(corner(0.0), corner(across * 0.1));
-        // ... and two a whole texel apart move it by exactly one texel, rather
-        // than by a texel and a fraction.
-        let moved = corner(across);
-        assert_eq!(moved[0] - corner(0.0)[0], across);
-        assert_eq!(moved[1], corner(0.0)[1]);
+        for level in 0..LIGHT_CASCADES as usize {
+            let across = LIGHT_EXTENT * LIGHT_SPREAD.powi(level as i32) / LIGHT_ACROSS as f32;
+            let at = |x: f32| corners(x)[level];
+            // Two eyes a tenth of a texel apart put the cascade in the same
+            // place...
+            assert_eq!(at(0.0), at(across * 0.1), "cascade {level} slid");
+            // ... and two a whole texel apart move it by exactly one texel,
+            // rather than by a texel and a fraction.
+            let moved = at(across);
+            assert_eq!(moved[0] - at(0.0)[0], across, "cascade {level} jumped");
+            assert_eq!(moved[1], at(0.0)[1]);
+            assert_eq!(moved[3], across, "cascade {level} is the wrong width");
+
+            // And a coarse one is snapped to its *own* texel and not to a finer
+            // one, which the two claims above cannot tell apart because the fine
+            // grid divides the coarse one -- a cascade snapped to the innermost
+            // grid still lands on its own texels, it just lands on them four
+            // times as often, sliding in between. So a step of the innermost
+            // texel must leave every cascade outside the innermost exactly where
+            // it was.
+            if level > 0 {
+                let finest = LIGHT_EXTENT / LIGHT_ACROSS as f32;
+                assert_eq!(
+                    at(finest),
+                    at(0.0),
+                    "cascade {level} moved for a step of the innermost texel"
+                );
+            }
+        }
+    }
+
+    /// Nothing the march can reach falls outside the widest cascade.
+    ///
+    /// The property the cascades were added for, and the one the single volume
+    /// did not have: it spanned sixty kilometres about the eye and the march
+    /// runs to a hundred, so past thirty kilometres ahead there was no
+    /// self-shadowing at all -- and because the volume was centred on the eye,
+    /// that boundary travelled with the camera. What it looked like was a flat
+    /// white deck gaining shape as it was flown at.
+    ///
+    /// So: a point as far away as a ray can go, as high as a cloud can be, has
+    /// to land inside the outermost cascade with the hand-over band to spare.
+    /// Checked around the compass, because the volume is square and the corners
+    /// are its worst case.
+    ///
+    /// Under a sun overhead, which is what bounds the *march*. A leaning sun
+    /// shears the columns and a high point un-shears to somewhere further out
+    /// still -- as far as `SHEAR_FLOOR` allows, eighty kilometres at the top of
+    /// the volume -- and that is deliberately not covered: the sun that leans a
+    /// column that far is one the air has already taken out. See `beyond_light`
+    /// in `src/cloud_march.wgsl`.
+    #[test]
+    fn nothing_the_march_can_reach_falls_outside_the_cascades() {
+        let outer = LIGHT_EXTENT * LIGHT_SPREAD.powi(LIGHT_CASCADES as i32 - 1);
+        let uniform = LightUniform::at(
+            glam::Vec3::new(0.0, 2000.0, 0.0),
+            glam::Vec3::Y,
+            [0.0; 4],
+            glam::Vec3::ZERO,
+        );
+        let corner = uniform.cascade[LIGHT_CASCADES as usize - 1];
+        let edge = shader_constant("CASCADE_EDGE");
+        for turn in 0..16 {
+            let angle = std::f32::consts::TAU * turn as f32 / 16.0;
+            let far = glam::Vec2::new(angle.cos(), angle.sin()) * shader_constant("MAX_DISTANCE");
+            // The same `beyond_light` the shader computes, with no shear: how
+            // far out of the cascade this is, as a share of its half-span.
+            let uv = (far - glam::Vec2::new(corner[0], corner[1])) / outer;
+            let beyond = ((uv - glam::Vec2::splat(0.5)) * 2.0).abs().max_element();
+            assert!(
+                beyond < edge,
+                "a ray's end {angle:.2} round reads {beyond:.3} of the way out of \
+                 the widest cascade, where the hand-over starts at {edge}"
+            );
+        }
     }
 
     /// Writes what the march drew, and the cache it walked, out to look at.
@@ -3783,6 +3900,7 @@ mod tests {
             ("CEILING_SLICES", CEILING_SLICES),
             ("LIGHT_ACROSS", LIGHT_ACROSS),
             ("LIGHT_SLICES", LIGHT_SLICES),
+            ("LIGHT_CASCADES", LIGHT_CASCADES),
         ] {
             assert_eq!(shader_says(name), format!("{value}u"), "{name} differs");
         }
@@ -3842,16 +3960,26 @@ mod tests {
             "transmittance_uv",
             "sample_transmittance",
             "sample_multiscatter",
-            // ... and the three that place a point in a light volume, which the
-            // ground now reads as well as the cloud. A shadow the ground draws
-            // in a different place from the one the cloud draws it is a cloud
-            // floating free of its own shadow. `sun_reaching` and `sky_reaching`
-            // are deliberately not in this list: they differ by one word, the
-            // sampler, because the march reads three tiling fields through a
-            // repeating one and the shading has the tables' clamped one already
-            // to hand.
+            // ... and the five that read a light volume, which the ground now
+            // does as well as the cloud. A shadow the ground draws in a
+            // different place from the one the cloud draws it is a cloud
+            // floating free of its own shadow, and with cascades there is more
+            // to get wrong than a coordinate: which cascade answers, and how the
+            // two of them are blended where they meet, have to be the same for
+            // both or the join lands in a different place on the ground from
+            // where it lands in the sky.
+            //
+            // `sun_reaching` and `sky_reaching` are deliberately not in this
+            // list: they differ by one word, the sampler, because the march
+            // reads three tiling fields through a repeating one and the shading
+            // has the tables' clamped one already to hand. That is exactly why
+            // `reaching` takes the texture and the sampler as parameters -- so
+            // that the part which must not differ can be one function and be
+            // compared here.
             "light_uvw",
+            "stacked_w",
             "beyond_light",
+            "reaching",
             "sky_share",
         ] {
             assert_eq!(
@@ -3870,6 +3998,8 @@ mod tests {
             "PI",
             "LIGHT_ACROSS",
             "LIGHT_SLICES",
+            "LIGHT_CASCADES",
+            "CASCADE_EDGE",
             "BOUNCED",
         ] {
             let declared = |source: &'static str| {
