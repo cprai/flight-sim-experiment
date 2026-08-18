@@ -3723,6 +3723,7 @@ mod tests {
             crate::headless::Flight {
                 frames: 1,
                 speed: 0.0,
+                turn: 0.0,
             },
         )
         .expect("failed to read the frame back");

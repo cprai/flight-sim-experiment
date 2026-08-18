@@ -231,6 +231,16 @@ pub struct Flight {
     pub frames: u32,
     /// Metres per second along the camera's forward vector.
     pub speed: f32,
+    /// Degrees per second of yaw, positive turning right.
+    ///
+    /// The other half of a flight, and the half that asks the harder question.
+    /// Flying forward barely moves what is far away across the screen -- a
+    /// kilometre of travel is a hundredth of a degree against something forty
+    /// kilometres off -- so a straight run says almost nothing about what the
+    /// reprojection does with the distance. A turn moves every texel by the
+    /// same angle whatever its distance, which is what makes it the case the
+    /// carry has to be right about.
+    pub turn: f32,
 }
 
 impl Flight {
@@ -244,6 +254,19 @@ impl Flight {
             let forward = scene.camera.ray_basis()[2];
             scene.camera.position += forward * self.speed * STEP.as_secs_f32();
         }
+        self.turn_by(&mut scene.camera);
+    }
+
+    /// The turn alone, on a camera rather than a scene, so a test can call it.
+    fn turn_by(self, camera: &mut crate::camera::Camera) {
+        if self.turn == 0.0 {
+            return;
+        }
+        // About world up rather than the camera's own, so a turn is a heading
+        // change and not a roll into one -- which is what `--camera` takes and
+        // so what a reader of one of these runs will expect.
+        let by = (self.turn * STEP.as_secs_f32()).to_radians();
+        camera.orientation = glam::Quat::from_rotation_y(-by) * camera.orientation;
     }
 }
 
@@ -708,5 +731,48 @@ mod tests {
         // the one `Sun::default` cannot express.
         assert!(SunAngles::or_default(Some(dusk)).direction.y < 0.0);
         assert!(crate::sky::Sun::default().direction.y > 0.0);
+    }
+
+    /// A turn is a heading change, of the size and the sense asked for.
+    ///
+    /// Three things none of which fails to compile if it is wrong. The sense:
+    /// `--turn` is positive to the right, as `--camera`'s yaw is, and a sign
+    /// slip would send every run the other way round. The size: degrees per
+    /// second against a sixtieth-of-a-second step, so a run's path is the same
+    /// on any machine -- see [`STEP`]. And that it is a *yaw*, leaving the pitch
+    /// where it was, because a turn taken about the camera's own up axis rolls
+    /// into the turn and walks the horizon out of the frame over a long one.
+    #[test]
+    fn a_turn_changes_the_heading_and_nothing_else() {
+        let angles = |camera: &crate::camera::Camera| {
+            crate::camera::Camera::to_yaw_pitch_roll(camera.orientation)
+        };
+        let mut camera = crate::camera::Camera::new(
+            glam::Vec3::ZERO,
+            crate::camera::Camera::from_yaw_pitch_roll(0.0, (-10.0f32).to_radians(), 0.0),
+            16.0 / 9.0,
+        );
+        let flight = Flight {
+            frames: 0,
+            speed: 0.0,
+            turn: 30.0,
+        };
+        let was = angles(&camera);
+        for _ in 0..60 {
+            flight.turn_by(&mut camera);
+        }
+        let now = angles(&camera);
+        // A second of thirty degrees a second, to the right.
+        assert!(
+            (now.x.to_degrees() - 30.0).abs() < 1e-3,
+            "a second of a thirty-degree turn left the heading at {} degrees",
+            now.x.to_degrees()
+        );
+        // And the pitch is where it started, rather than having been rolled
+        // into.
+        assert!(
+            (now.y - was.y).abs() < 1e-5 && now.z.abs() < 1e-5,
+            "the turn moved the pitch or the roll: {was:?} to {now:?}"
+        );
     }
 }

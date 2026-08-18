@@ -100,9 +100,20 @@ Nothing goes to stdout. A `render` run whose stdout is empty is working.
 ```
 
 `--frames N` draws N frames and writes the last; `--motion M/S` flies the camera
-forward between them, at a nominal sixtieth of a second each so the path is the
-same on any machine. Both default to the old behaviour -- one frame, standing
-still -- so a plain `render` is unchanged.
+forward between them, and `--turn DEG/S` yaws it as it goes, positive to the
+right. Each step is a nominal sixtieth of a second, so the path is the same on
+any machine. All three default to the old behaviour -- one frame, standing still,
+holding its heading -- so a plain `render` is unchanged.
+
+**`--turn` is the one that asks the hard question, and a straight run will not
+ask it.** Flying forward barely moves anything distant across the screen: a
+kilometre of travel is a hundredth of a degree against something forty kilometres
+off, so what is far away lands back on almost the same pixel and the reprojection
+is barely tested by it. A turn moves every texel by the same angle whatever its
+distance -- at twenty degrees a second, three pixels a frame at 540 rows -- which
+is what makes it the case anything carried between frames has to be right about.
+If a change is meant to help a moving camera, measure it turning as well as
+flying; the two disagree.
 
 This is the only way to see anything the reprojection does, and the only way to
 see it go wrong. What to look for, none of which a single frame can show:
@@ -111,11 +122,21 @@ together; terrain smeared or lagging at a silhouette, where near ground slides
 over far; and holes at the edges of the view, where ground the previous frame
 never saw has to be marched from nothing.
 
-A still camera is the case to check first, and it has an exact answer: with the
-camera unmoved, every carried point projects back to the pixel it came from, so
-`--frames 200` must be **byte-identical** to `--frames 1`. If it is not,
-something in the carry is wrong, and that test localises it far better than
-looking at a moving frame does.
+A still camera is the case to check first, and it very nearly has an exact
+answer: with the camera unmoved, every carried point projects back to the pixel
+it came from, so a settled still run must not change from one frame to the next.
+Compare `--frames 200` against `--frames 201`, not against `--frames 1`.
+
+**One frame is not the settled answer, and the difference is mostly cloud.** The
+march fills one texel of every two-by-two block and carries the other three, so a
+single frame has a quarter of a rotation in it and shows a regular dither over
+every cloud in the frame -- 26 per cent of the pixels of a `broken` sky more than
+eight levels from where they settle, an eighth of them more than thirty. Four
+frames is a whole rotation and clears it. What is left after that drifts on for
+hundreds of frames, because the weather field evolves with the clock even when
+`--wind 0,270` has stopped the wind carrying it: `--frames 20` is still 5 per
+cent of its pixels away from `--frames 200`. So a comparison of two still runs
+only means anything when both were given the *same* `--frames`.
 
 ## Comparing two frames
 
@@ -134,9 +155,14 @@ view. That is a genuine finding -- but read the next section before concluding
 the code is dead.
 
 Comparing a flight against the truth needs a little arithmetic: render
-`--frames N --motion M` and then render *one* frame from the position that
-flight ends at, which is `(N-1) * M / 60` metres along the camera's forward
-vector. The first is what the reprojection produced, the second what marching
+`--frames N --motion M` and then render a *still* run of the same `--frames N`
+from the pose that flight ends at, which is `(N-1) * M / 60` metres along the
+camera's forward vector -- and with `--turn T`, a heading `(N-1) * T / 60`
+degrees round, over a path that curves, so step it rather than solving it. The
+frame count has to match: the weather evolves with the clock even when the wind
+is stopped, so a 200-frame still run is a different sky from a 61-frame one. A
+still run of more than four frames has a whole cloud rotation in it and is
+settled; a single frame has a quarter of one and shows a dither. The first is what the reprojection produced, the second what marching
 every pixel would have. They will not be identical -- carried material and
 normals are a few frames old -- but the size of the difference is the measure of
 how much staleness the drop rate is letting through.

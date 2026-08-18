@@ -159,6 +159,17 @@ struct View {
     #[arg(long, default_value_t = 0.0, value_name = "M/S")]
     motion: f32,
 
+    /// How fast to yaw while flying, in degrees per second. Positive turns
+    /// right.
+    ///
+    /// Zero, the default, holds the heading. A turn is the hard case for
+    /// everything a frame carries over: flying forward leaves what is far away
+    /// almost where it was on screen, where a turn sweeps the whole frame
+    /// sideways and gives the reprojection every texel to find a new home for.
+    /// Three degrees a second is a gentle airliner turn; thirty is a fighter's.
+    #[arg(long, default_value_t = 0.0, value_name = "DEG/S")]
+    turn: f32,
+
     #[command(flatten)]
     weather: Weather,
 }
@@ -418,6 +429,7 @@ fn main() -> anyhow::Result<()> {
                 headless::Flight {
                     frames,
                     speed: view.motion,
+                    turn: view.turn,
                 },
                 &output,
             );
@@ -435,6 +447,7 @@ fn main() -> anyhow::Result<()> {
                 headless::Flight {
                     frames,
                     speed: view.motion,
+                    turn: view.turn,
                 },
             );
         }
