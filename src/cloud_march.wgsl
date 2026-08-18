@@ -170,21 +170,40 @@ const MAX_DISTANCE: f32 = 100000.0;
 
 // The step, as a share of how far along the ray we are, and its bounds.
 //
-// Proportional to distance because a step should cover about a pixel: a cone a
-// hundredth of a radian wide is roughly what a half-resolution pixel subtends
-// here, so a step that grows with distance keeps the sampling matched to what
-// can be seen rather than spending the same effort on cloud a kilometre away and
-// cloud fifty kilometres away.
+// Proportional to distance so that the effort follows what can be seen, rather
+// than being spent equally on cloud a kilometre away and cloud fifty kilometres
+// away.
+//
+// The share is what decides how much of a cloud's *shape* is real, and it is the
+// reason this is a two-hundredth rather than the hundredth it was. A cloud is
+// reconstructed by the steps taken through it, so its silhouette is a function of
+// the step -- and the step is a function of how far away the eye is. Flying
+// towards a cloud therefore reshapes it, continuously, and that is a change in
+// the world that only the camera made. Measured by halving this and holding the
+// camera still, which is the same thing to a cloud as halving its distance: at a
+// hundredth, 3.28 per cent of a 3440x1440 frame moves by more than eight levels
+// of 255. At a two-hundredth, halving again moves 1.00. So most of the morphing
+// is in the first halving and it is bought here.
+//
+// Not tied to the viewport, though it reads as if it should be. The old note
+// here said a hundredth of a radian was "roughly what a half-resolution pixel
+// subtends", which was true of nothing: a half-resolution texel is 0.0043 radians
+// at 540 rows and 0.0016 at 1440, so the rule was between two and seven times
+// coarser than the screen depending on a number it never saw. Tying it to
+// `pixel_angle` would make the *quality* the same everywhere and the *cost* scale
+// with the pixel count, which is the honest arrangement and a larger change than
+// this one; what is here is a fixed share, chosen against the finest screen this
+// runs on.
 //
 // The upper bound is the proportional rule's own value at the far end, which is
 // to say the rule is never clamped and the bound is a guard rather than a knob.
-// It was four hundred metres, and that is where a third of the step budget was
-// going: past forty kilometres the clamp bound instead of the rule, so every
-// step out there was finer than the pixel it was drawn into -- fifty-eight
-// steps spent to sample the last sixty kilometres at a resolution nothing could
-// resolve. Raising it costs nothing visible and is worth those steps to the far
-// end of the ray, where they are the difference between cloud and no cloud.
-const STEP_SLOPE: f32 = 0.01;
+// It was four hundred metres against a slope of a hundredth, and that is where a
+// third of the step budget was going: past forty kilometres the clamp bound
+// instead of the rule, so every step out there was finer than the pixel it was
+// drawn into. Deriving it from the slope costs nothing visible and is worth those
+// steps to the far end of the ray, where they are the difference between cloud
+// and no cloud.
+const STEP_SLOPE: f32 = 0.005;
 const MIN_STEP: f32 = 30.0;
 const MAX_STEP: f32 = STEP_SLOPE * MAX_DISTANCE;
 
@@ -259,23 +278,24 @@ const TRUSTED: f32 = 0.5;
 // mountain showed through the gap where the rest of it should have been.
 //
 // A ray that steps the whole hundred kilometres without ever skipping a cell
-// takes 453 of these, so 512 is the bound and not a sample of one. Measured
-// against a march given 4096, which is more than any ray can use: 25 views --
-// five presets over five cameras, level and pitched, above the decks and inside
-// them -- come out byte-identical, so no ray in any of them now runs out. The
-// same 25 at 256 got 19 wrong, over as much as 12.2 per cent of their pixels.
-// The six it did not were the ones with the eye buried in cloud, where the
-// first few hundred metres reach `CUTOFF` and the budget never binds -- which
-// is why this went unnoticed: the sky it ruins is the fine one.
+// takes 764 of these under the slope above, so 1024 is the bound and not a
+// sample of one. It was 512 against a slope of a hundredth, where the same sum
+// came to 453; halving the slope doubles the count and this has to follow it or
+// the fault comes straight back.
 //
-// It is close to free, which is the other half of why it is a bound rather than
-// a compromise. Nothing costs a step it was not already going to spend: a ray
-// that stopped on `CUTOFF` or on the ground still stops there, and only the
-// rays that were being cut off take more. Fair weather 0.31 ms to 0.29 -- the
-// saving is `MAX_STEP` above, which more than pays for this -- storm unchanged
-// at 0.20, and overcast, where a level ray really does cross a hundred
-// kilometres of cloud, 0.40 ms to 0.52.
-const MAX_STEPS: u32 = 512u;
+// Measured against a march given eight times the bound, which is more than any
+// ray can use: 25 views -- five presets over five cameras, level and pitched,
+// above the decks and inside them -- come out byte-identical, so no ray in any
+// of them runs out. The same 25 at 256 got 19 wrong, over as much as 12.2 per
+// cent of their pixels. The six it did not were the ones with the eye buried in
+// cloud, where the first few hundred metres reach `CUTOFF` and the budget never
+// binds -- which is why that went unnoticed: the sky it ruins is the fine one.
+//
+// The bound itself is free; what costs is the slope it follows from. Nothing
+// takes a step it was not already going to take -- a ray that stopped on
+// `CUTOFF` or on the ground still stops there, and only the rays that were being
+// cut short take more.
+const MAX_STEPS: u32 = 1024u;
 
 // Below this transmittance the ray has established that nothing behind it will
 // be seen, and stops.
@@ -1067,7 +1087,7 @@ const STEP_RUNGS: f32 = 1.0 / STEP_SLOPE;
 // natural base, with the ratio folded into the exponent, because `log2` and
 // `exp2` are what the hardware has -- and the skip this serves runs over most of
 // an empty sky.
-const STEP_OCTAVE: f32 = 0.014355293;
+const STEP_OCTAVE: f32 = 0.0071955014;
 const LATTICE_RUNGS_PER_OCTAVE: f32 = 1.0 / STEP_OCTAVE;
 
 // Where a distance sits on the lattice, as a rung index that need not be whole.
