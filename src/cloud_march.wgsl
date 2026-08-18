@@ -338,13 +338,37 @@ const LIGHT_SLICES: u32 = 48u;
 // which says why there is more than one. How much wider each is than the one
 // inside it is `LIGHT_SPREAD` there and is not needed here: a cascade's own span
 // arrives in the uniform, one corner and one texel size apiece.
-const LIGHT_CASCADES: u32 = 2u;
+const LIGHT_CASCADES: u32 = 3u;
 
 // Where a cascade stops answering for a point and hands over to the one outside
-// it, as a share of its own half-span. The outermost tenth, so the join is a
-// tenth of a cascade wide -- three kilometres at the innermost, which is a
-// gentle enough ramp that flying it over a cloud does not read as an edge.
-const CASCADE_EDGE: f32 = 0.9;
+// it, as a share of its own half-span. The outermost fifth, so the join is six
+// kilometres wide at the innermost cascade and twelve at the next.
+//
+// This trades one fault against another and both are visible. Narrower, and a
+// cloud crosses the whole hand-over in less flying, so what change there is
+// arrives faster: at a tenth the worst kilometre of a twelve-kilometre approach
+// moves a texel by 24 levels, at a fifth by 17, at a third by 11. Wider, and
+// the coarse cascade is mixed into ground the fine one covers perfectly well,
+// so more of the frame is worse and more of it changes at all: over that same
+// approach three tenths moves 1.86 per cent of the frame by more than eight
+// levels and two fifths moves 2.73, against 1.39 at a fifth and 1.12 at a
+// tenth. A fifth is the knee.
+const CASCADE_EDGE: f32 = 0.8;
+
+// Where the widest cascade gives up instead, as the same share of its half-span.
+//
+// Not the same job as the hand-over above and so not the same number. A join
+// blends two answers that are both real, and wants to be wide because what it is
+// blending is a change of quality. This is the edge of the data: past it nothing
+// answers and the light is left alone, which is a change of *kind*, and the one
+// the cascades exist to keep away from anything the march can see. So it is held
+// as late as it can be without bringing back the staircase `beyond_light`
+// describes -- the outermost tenth, a hundred and eight kilometres out, where
+// `MAX_DISTANCE` is a hundred. Widening this to match the joins was measured and
+// is a regression: it starts the fade at ninety-six and puts a boundary the
+// camera carries back inside the march, which is the whole fault being fixed.
+// `nothing_the_march_can_reach_falls_outside_the_cascades` pins it.
+const CASCADE_FADE: f32 = 0.9;
 
 // Octaves of Wrenninge's multiple-scattering approximation, and what each one
 // halves.
@@ -1268,7 +1292,13 @@ fn reaching(
             break;
         }
         let uvw = light_uvw(p, shear, cascade);
-        let inside = 1.0 - smoothstep(CASCADE_EDGE, 1.0, beyond_light(uvw));
+        // The widest one is not handing over to anything, so it holds on to its
+        // own edge for longer. See `CASCADE_FADE`.
+        var edge = CASCADE_EDGE;
+        if cascade + 1u == LIGHT_CASCADES {
+            edge = CASCADE_FADE;
+        }
+        let inside = 1.0 - smoothstep(edge, 1.0, beyond_light(uvw));
         let share = min(inside, 1.0 - answered);
         if share > 0.0 {
             let at = vec3<f32>(uvw.xy, stacked_w(uvw.z, cascade));
@@ -1303,27 +1333,62 @@ fn sky_share(reaching: f32) -> f32 {
     return 1.0 - (1.0 - BOUNCED) * (1.0 - reaching);
 }
 
+// What a light texel's own cell holds, rather than what the point at its centre
+// does.
+//
+// A cascade's texels are `LIGHT_SPREAD` times wider than the one inside it, so
+// a coarse one stands for that much more ground -- and the cloud has structure
+// far below even the fine one's spacing. Reading the field at a texel's centre
+// alone is therefore a point sample of something it cannot resolve, which is
+// aliasing and not blur, and the difference matters here: a blurred cascade
+// would be a smoothed version of the one inside it and would agree with it in
+// the large, where an aliased one is a different draw from the same field and
+// disagrees everywhere. That disagreement is exactly what a hand-over exposes.
+// Filtered, a cloud crossing a join loses sharpness; unfiltered, it changes
+// shape -- and the join travels with the camera, so the shape changes as it is
+// flown at.
+//
+// So average the cell instead of sampling its centre: two points at opposite
+// quarters of it, on a diagonal that swaps with every slice so that a column of
+// forty-eight covers both. Two rather than four because the column is an
+// integral of forty-eight of these and what one slice misses the next supplies
+// -- over the full sweep of a join, four taps on the coarse cascades leave 0.17
+// per cent of the frame swinging by more than thirty-two levels where two leave
+// 0.15, and cost another 1.0 ms for it.
+//
+// Every cascade and not merely the coarse ones, which is 0.16 ms and no special
+// case: the innermost aliases against the truth for the same reason the others
+// alias against it, and filtering it too takes the worst texel of that sweep
+// from 91 levels to 78.
+//
+// Only across. The metres a slice is worth do not change from cascade to
+// cascade: these differ in ground, not in height, and the vertical sample is
+// already band-limited by `metres`.
+fn cell_extinction(at: vec3<u32>, cascade: u32, shear: vec2<f32>, metres: f32) -> f32 {
+    let quarter = light.cascade[cascade].w * 0.25;
+    var away = vec3<f32>(quarter, 0.0, quarter);
+    if (at.z & 1u) == 1u {
+        away = vec3<f32>(quarter, 0.0, -quarter);
+    }
+    let centre = light_position(at, cascade, shear);
+    return 0.5
+        * (cloud_extinction(centre - away, metres, false)
+            + cloud_extinction(centre + away, metres, false));
+}
+
 // One column of a light volume, walked from the top down.
 //
-// The cost of the whole technique is here and it is one density sample per
+// The cost of the whole technique is here and it is two density samples per
 // texel: a thread owns a column and carries the running integral down it, so
 // what would be a march per shaded sample becomes a fetch per shaded sample.
 // Structurally `cs_aerial` in `src/sky.wgsl`, which walks the frustum's froxel
 // columns the same way and for the same reason.
 fn walk_light(id: vec3<u32>, shear: vec2<f32>, metres: f32) {
     let cascade = id.z;
-    // A cascade's texels are `LIGHT_SPREAD` times wider than the one inside it,
-    // so a slice of it stands for that much more ray and the extinction it
-    // samples is that much coarser. The metres a slice is worth do not change
-    // with it: the cascades differ across, not up.
     var tau = 0.0;
     for (var slice = LIGHT_SLICES; slice > 0u; slice -= 1u) {
         let at = vec3<u32>(id.x, id.y, slice - 1u);
-        let extinction = cloud_extinction(
-            light_position(at, cascade, shear),
-            metres,
-            false,
-        );
+        let extinction = cell_extinction(at, cascade, shear, metres);
         let crossed = extinction * metres;
         tau = tau + crossed;
         // What is *blocked*, not what gets through, and that is not a matter of

@@ -139,7 +139,7 @@ const DECK_HUG: [f32; DECKS] = [1.0, 0.0, 0.0, 0.0];
 /// one outside it. Coarse against a cloud, and about right for what these hold:
 /// not the cloud but the shadow of it, which is soft by the time it has been
 /// cast through a kilometre of anything. Fourteen megabytes per cascade apiece,
-/// so the pair of them costs fifty-seven across [`LIGHT_CASCADES`] cascades.
+/// so the pair of them costs eighty-five across [`LIGHT_CASCADES`] cascades.
 pub const LIGHT_ACROSS: u32 = 192;
 pub const LIGHT_SLICES: u32 = 48;
 
@@ -163,18 +163,28 @@ const LIGHT_EXTENT: f32 = 60_000.0;
 /// with the camera. Flying at it turned a flat white deck into a shaped one,
 /// over about three kilometres of approach.
 ///
-/// Two cascades at four times the span put the outer edge a hundred and twenty
-/// kilometres out, past everything the march can reach, so there is no longer a
-/// distance at which the shadowing stops. What is left at the join is a change
-/// of resolution rather than a change of kind, 312 m against 1250 m, and it is
-/// crossed by a blend rather than a step -- see `reaching` in
-/// `src/cloud_march.wgsl`.
+/// Cascades put the outer edge a hundred and twenty kilometres out, past
+/// everything the march can reach, so there is no longer a distance at which the
+/// shadowing stops. What is left at a join is a change of resolution rather than
+/// a change of kind, and it is crossed by a blend rather than a step -- see
+/// `reaching` in `src/cloud_march.wgsl`.
 ///
-/// The spread is what decides how visible that join is against what the far
-/// cascade costs. Four was measured against two-at-three-cascades, which spends
-/// half as much again to halve the resolution step.
-pub const LIGHT_CASCADES: u32 = 2;
-const LIGHT_SPREAD: f32 = 4.0;
+/// The spread is what decides how visible a join is against what the outer
+/// cascades cost, and it is the whole of the choice: three at twice the span
+/// reach the same hundred and twenty kilometres as two at four times it, over
+/// two joins of 312-to-625 and 625-to-1250 metres instead of one of 312-to-1250.
+/// Halving the step at a join more than halves what crossing it does. Over a
+/// full sweep of the hand-over, from a camera eight kilometres up looking five
+/// degrees down at `broken` weather, the share of a 3440x1440 frame that swings
+/// by more than thirty-two levels goes from 1.29 per cent to 0.49, and the worst
+/// texel from 92 levels to 80. See `cell_extinction` in `src/cloud_march.wgsl`
+/// for the other half of that fix, which is worth rather more.
+///
+/// Four cascades at 4^(1/3) would halve the step again, but the return is
+/// already flattening -- the joins multiply as fast as each one softens -- and
+/// it is a third more memory and a third more walking.
+pub const LIGHT_CASCADES: u32 = 3;
+const LIGHT_SPREAD: f32 = 2.0;
 
 /// The lowest the sun may be taken to be when the volume's columns are leaned
 /// along it.
@@ -2467,9 +2477,12 @@ mod tests {
         size: glam::UVec2,
         /// The ceiling cache, indexed `(x, slice, z)`.
         ceiling: Vec<f32>,
-        /// How much of the sun reaches each texel of the light volume, indexed
-        /// `(x, z, slice)`.
+        /// How much of the sun reaches each texel of the light volumes, indexed
+        /// `(x, z, slice)` within a cascade and the cascades stacked up the last
+        /// axis, exactly as the texture holds them.
         sun_light: Vec<f32>,
+        /// Where each cascade of that stands, as [`LightUniform::cascade`].
+        cascades: [[f32; 4]; LIGHT_CASCADES as usize],
         /// The weather the cache was built from, one layer per deck.
         weather: Vec<Volume>,
         /// What each frame of the rotation actually marched, one entry per
@@ -2485,9 +2498,26 @@ mod tests {
             self.ceiling[((z * CEILING_SLICES + slice) * across + x) as usize]
         }
 
-        /// How much of the sun reaches one texel of the light volume.
+        /// How much of the sun reaches one texel of the innermost light cascade.
         fn lit(&self, x: u32, z: u32, slice: u32) -> f32 {
-            self.sun_light[((slice * LIGHT_ACROSS + z) * LIGHT_ACROSS + x) as usize]
+            self.lit_in(0, x, z, slice)
+        }
+
+        /// The same, in whichever cascade is asked for.
+        fn lit_in(&self, cascade: u32, x: u32, z: u32, slice: u32) -> f32 {
+            let up = cascade * LIGHT_SLICES + slice;
+            self.sun_light[((up * LIGHT_ACROSS + z) * LIGHT_ACROSS + x) as usize]
+        }
+
+        /// Where a texel of one cascade sits in the world, across.
+        ///
+        /// The Rust twin of `light_position` in `src/cloud_march.wgsl`, less the
+        /// lean: the shear is the same for every cascade at a given slice, so it
+        /// cancels out of any comparison between them.
+        fn light_across(&self, cascade: u32, x: u32, z: u32) -> glam::Vec2 {
+            let corner = self.cascades[cascade as usize];
+            glam::Vec2::new(corner[0], corner[1])
+                + (glam::Vec2::new(x as f32, z as f32) + 0.5) * corner[3]
         }
 
         /// The weather over a world point, sampled the way the march samples it.
@@ -2742,12 +2772,17 @@ mod tests {
                 march.buffers_for_test().3,
                 LIGHT_ACROSS,
                 LIGHT_ACROSS,
-                LIGHT_SLICES,
+                LIGHT_SLICES * LIGHT_CASCADES,
                 8,
             )
             .chunks_exact(8)
             .map(|texel| half::f16::from_le_bytes([texel[0], texel[1]]).to_f32())
             .collect(),
+            // Where the volumes just walked stand. The corners are a function of
+            // the eye alone -- the sun leans the columns, it does not move them
+            // -- so this is the same placement the pass was given.
+            cascades: LightUniform::at(camera.position, glam::Vec3::Y, [0.0; 4], glam::Vec3::ZERO)
+                .cascade,
             // Read back from this very run rather than rebuilt beside it: the
             // field is deterministic, so a second build would give the same
             // bytes -- but then the oracle would be checking the cache against a
@@ -3507,6 +3542,110 @@ mod tests {
         );
     }
 
+    /// A coarse cascade holds what the fine one averages to over its cell.
+    ///
+    /// The property that decides whether a hand-over is visible, and the one a
+    /// centre sample does not have. Every cascade walks the same cloud field;
+    /// they differ only in how much ground a texel stands for. Read at its
+    /// centre, a texel four times the width is not a blurred version of the four
+    /// under it -- the field has structure far below even the fine one's spacing,
+    /// so it is a fresh draw from it, and two fresh draws disagree by the whole
+    /// variance of the field rather than by the difference of their resolutions.
+    /// A camera crossing the join then sees the cloud change shape rather than
+    /// sharpness, which is exactly the fault `cell_extinction` exists to remove.
+    ///
+    /// So: over the ground two neighbouring cascades both cover, what the coarse
+    /// one stores must be close to the mean of the fine ones inside it. Measured
+    /// rather than asserted in the abstract -- the bound below is a little under
+    /// what the filter achieves and a long way under what a centre sample does,
+    /// which is what makes it bite.
+    ///
+    /// Not exact and cannot be: a texel holds `1 - exp(-tau)` of a column, and
+    /// the mean of that over four columns is not that of the mean column. The
+    /// gap left is that curvature and the cloud's own variance under it.
+    #[test]
+    fn a_coarse_cascade_holds_what_the_fine_one_averages_to() {
+        let frame = marched(
+            Preset::Broken,
+            &looking(3000.0, 0.0),
+            glam::UVec2::splat(32),
+        );
+        let spread = LIGHT_SPREAD as u32;
+        let mut gap = 0.0f32;
+        let mut spare = 0.0f32;
+        let mut counted = 0u32;
+        for cascade in 1..LIGHT_CASCADES {
+            let fine = frame.cascades[cascade as usize - 1][3];
+            for z in 0..LIGHT_ACROSS {
+                for x in 0..LIGHT_ACROSS {
+                    // Where this coarse texel's cell starts, in texels of the
+                    // cascade inside it. The corners are both whole multiples of
+                    // the finer texel, so this lands on one exactly.
+                    let corner = frame.light_across(cascade, x, z)
+                        - frame.cascades[cascade as usize][3] * 0.5;
+                    let at = (corner - frame.light_across(cascade - 1, 0, 0)
+                        + glam::Vec2::splat(fine * 0.5))
+                        / fine;
+                    if at.x < 0.0
+                        || at.y < 0.0
+                        || at.x + spread as f32 > LIGHT_ACROSS as f32
+                        || at.y + spread as f32 > LIGHT_ACROSS as f32
+                    {
+                        continue;
+                    }
+                    for slice in 0..LIGHT_SLICES {
+                        let mut mean = 0.0;
+                        for dz in 0..spread {
+                            for dx in 0..spread {
+                                mean += frame.lit_in(
+                                    cascade - 1,
+                                    at.x as u32 + dx,
+                                    at.y as u32 + dz,
+                                    slice,
+                                );
+                            }
+                        }
+                        mean /= (spread * spread) as f32;
+                        gap += (frame.lit_in(cascade, x, z, slice) - mean).abs();
+                        // How far the fine cascade itself ranges over the same
+                        // cell, so that a volume of one constant value -- which
+                        // would satisfy the bound above perfectly -- cannot pass.
+                        let mut low = 1.0f32;
+                        let mut high = 0.0f32;
+                        for dz in 0..spread {
+                            for dx in 0..spread {
+                                let one = frame.lit_in(
+                                    cascade - 1,
+                                    at.x as u32 + dx,
+                                    at.y as u32 + dz,
+                                    slice,
+                                );
+                                low = low.min(one);
+                                high = high.max(one);
+                            }
+                        }
+                        spare += high - low;
+                        counted += 1;
+                    }
+                }
+            }
+        }
+        assert!(counted > 100_000, "only {counted} texels overlapped");
+        let gap = gap / counted as f32;
+        let spare = spare / counted as f32;
+        assert!(
+            spare > 0.01,
+            "the fine cascade varies by only {spare:.4} over a coarse cell, so \
+             agreeing with it says nothing"
+        );
+        assert!(
+            gap < 0.042,
+            "a coarse cascade sits {gap:.4} from the mean of the fine one under \
+             it, where averaging its cell holds it to 0.0355 and sampling the \
+             middle of it gives 0.0503"
+        );
+    }
+
     /// A sun below the horizon puts no direct light in the clouds.
     ///
     /// Not because the volume says so -- it says nothing about where the sun is,
@@ -3712,16 +3851,24 @@ mod tests {
             // And a coarse one is snapped to its *own* texel and not to a finer
             // one, which the two claims above cannot tell apart because the fine
             // grid divides the coarse one -- a cascade snapped to the innermost
-            // grid still lands on its own texels, it just lands on them four
-            // times as often, sliding in between. So a step of the innermost
-            // texel must leave every cascade outside the innermost exactly where
-            // it was.
-            if level > 0 {
+            // grid still lands on its own texels, it just lands on them twice as
+            // often, sliding half a texel in between. So walk the eye across in
+            // steps of the innermost texel and demand the corner stay a whole
+            // number of the cascade's own: snapped to the finest it would come
+            // out on a half at every other step.
+            //
+            // Stated as the invariant rather than as "a step of the innermost
+            // texel moves nothing", which is the same claim only while the
+            // innermost texel is under half of this one -- true at
+            // [`LIGHT_SPREAD`] of four, exactly on the boundary at two, and there
+            // a legitimate snap does flip.
+            for step in 0..16 {
                 let finest = LIGHT_EXTENT / LIGHT_ACROSS as f32;
+                let rungs = at(finest * step as f32)[0] / across;
                 assert_eq!(
-                    at(finest),
-                    at(0.0),
-                    "cascade {level} moved for a step of the innermost texel"
+                    rungs,
+                    rungs.round(),
+                    "cascade {level} landed off its own grid {step} steps along"
                 );
             }
         }
@@ -3757,7 +3904,10 @@ mod tests {
             glam::Vec3::ZERO,
         );
         let corner = uniform.cascade[LIGHT_CASCADES as usize - 1];
-        let edge = shader_constant("CASCADE_EDGE");
+        // The widest cascade's own fade, which is not the hand-over the joins
+        // use: see `CASCADE_FADE` in `src/cloud_march.wgsl`. Reading the wrong
+        // one here would let the fade start inside the march and call it passing.
+        let edge = shader_constant("CASCADE_FADE");
         for turn in 0..16 {
             let angle = std::f32::consts::TAU * turn as f32 / 16.0;
             let far = glam::Vec2::new(angle.cos(), angle.sin()) * shader_constant("MAX_DISTANCE");
@@ -3988,6 +4138,21 @@ mod tests {
                 "{name} differs between src/shading.wgsl and src/cloud_march.wgsl"
             );
         }
+        // The hand-over reads both of its constants, and reads them for
+        // different cascades. `nothing_the_march_can_reach_falls_outside_the
+        // _cascades` pins the geometry against `CASCADE_FADE` by reading the
+        // constant, so it would not notice `reaching` widening the outermost
+        // cascade's fade to `CASCADE_EDGE` and starting it inside the march.
+        // This is what notices.
+        let hand_over = body(march, "reaching");
+        assert!(
+            hand_over.contains("CASCADE_FADE") && hand_over.contains("CASCADE_EDGE"),
+            "reaching no longer distinguishes a join from the outermost fade"
+        );
+        assert!(
+            hand_over.contains("cascade + 1u == LIGHT_CASCADES"),
+            "reaching no longer picks the outermost cascade out to fade it"
+        );
         // ... and the constants those seven read.
         for name in [
             "GROUND_RADIUS",
@@ -4000,6 +4165,7 @@ mod tests {
             "LIGHT_SLICES",
             "LIGHT_CASCADES",
             "CASCADE_EDGE",
+            "CASCADE_FADE",
             "BOUNCED",
         ] {
             let declared = |source: &'static str| {

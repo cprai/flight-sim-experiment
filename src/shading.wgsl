@@ -40,11 +40,15 @@ const LIGHT_SLICES: u32 = 48u;
 
 // Cascades of each light volume. Must match `LIGHT_CASCADES` in `src/cloud.rs`,
 // which says why there is more than one.
-const LIGHT_CASCADES: u32 = 2u;
+const LIGHT_CASCADES: u32 = 3u;
 
 // Where one hands over to the next. Must match `CASCADE_EDGE` in
 // `src/cloud_march.wgsl`.
-const CASCADE_EDGE: f32 = 0.9;
+const CASCADE_EDGE: f32 = 0.8;
+
+// Where the widest gives up instead. Must match `CASCADE_FADE` in
+// `src/cloud_march.wgsl`, which says why it is not the same number.
+const CASCADE_FADE: f32 = 0.9;
 
 // How much of the sky a cloud blocks still arrives, having bounced. Must match
 // `BOUNCED` in `src/cloud_march.wgsl`; see there for what it stands in for.
@@ -269,7 +273,13 @@ fn reaching(
             break;
         }
         let uvw = light_uvw(p, shear, cascade);
-        let inside = 1.0 - smoothstep(CASCADE_EDGE, 1.0, beyond_light(uvw));
+        // The widest one is not handing over to anything, so it holds on to its
+        // own edge for longer. See `CASCADE_FADE`.
+        var edge = CASCADE_EDGE;
+        if cascade + 1u == LIGHT_CASCADES {
+            edge = CASCADE_FADE;
+        }
+        let inside = 1.0 - smoothstep(edge, 1.0, beyond_light(uvw));
         let share = min(inside, 1.0 - answered);
         if share > 0.0 {
             let at = vec3<f32>(uvw.xy, stacked_w(uvw.z, cascade));
