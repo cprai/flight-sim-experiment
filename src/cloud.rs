@@ -2103,8 +2103,16 @@ mod tests {
     /// it.
     #[test]
     fn the_march_counts_the_rungs_of_its_own_lattice_correctly() {
-        let slope = shader_constant("STEP_SLOPE");
-        let claimed = shader_constant("STEP_OCTAVE");
+        let slope = f64::from(shader_constant("STEP_SLOPE"));
+        let claimed = f64::from(shader_constant("STEP_OCTAVE"));
+        // In `f64`, and that is not fussiness. Worked in `f32` this reference is
+        // itself wrong by more than the tolerance: 1 + slope rounds, and `log2`
+        // near one divides by the logarithm, so the rounding comes out
+        // multiplied by about `1 / (ln 2 * STEP_OCTAVE)` -- four hundredfold at
+        // a four-hundredth. That reads as 2.3e-5 against a correct literal. At
+        // the two-hundredth this used to be it came to 9.2e-7 and slipped under
+        // a 1e-6 bar, so the check was passing on the size of the slope rather
+        // than on the constant being right.
         let wanted = (1.0 + slope).log2();
         assert!(
             (claimed - wanted).abs() / wanted < 1e-6,
@@ -2142,18 +2150,32 @@ mod tests {
             "1/{slope} is not a whole number of rungs"
         );
 
-        // Then the two arms, as `lattice_at` writes them, against the step rule
-        // they are supposed to be the samples of.
+        // Then the three arms, as `lattice_at` writes them, against the step
+        // rule they are supposed to be the samples of.
+        let ceiling = shader_constant("MAX_STEP");
+        let roof = ceiling / slope;
         let per_octave = 1.0 / (1.0 + slope).log2();
+        let roof_rung = rungs + shader_constant("STEP_ROOF_OCTAVES") * per_octave;
         let at = |rung: f32| {
             if rung <= rungs {
                 rung * floor
-            } else {
+            } else if rung <= roof_rung {
                 knee * ((rung - rungs) / per_octave).exp2()
+            } else {
+                roof + (rung - roof_rung) * ceiling
             }
         };
-        let ceiling = slope * shader_constant("MAX_DISTANCE");
-        for rung in [1.0, rungs - 1.0, rungs, rungs + 1.0, rungs + 200.0] {
+        for rung in [
+            1.0,
+            rungs - 1.0,
+            rungs,
+            rungs + 1.0,
+            rungs + 200.0,
+            roof_rung - 1.0,
+            roof_rung,
+            roof_rung + 1.0,
+            roof_rung + 200.0,
+        ] {
             let here = at(rung);
             let step = (slope * here).clamp(floor, ceiling);
             let taken = at(rung + 1.0) - here;
@@ -2161,6 +2183,69 @@ mod tests {
                 (taken - step).abs() < here * 1e-4 + 1e-3,
                 "rung {rung} stands at {here} and the next {taken} on, where the \
                  step rule asks for {step}"
+            );
+        }
+    }
+
+    /// The lattice meets itself at its ceiling too.
+    ///
+    /// The same claim as the knee above, at the other join, and it needs its own
+    /// arithmetic because the two joins are made differently. The knee is where
+    /// the proportional term overtakes `MIN_STEP` and it lands on a rung because
+    /// `1 / STEP_SLOPE` is whole; the ceiling is where it meets `MAX_STEP` and it
+    /// lands on one because `STEP_ROOF / STEP_KNEE` is a whole number of
+    /// doublings. Nothing in the shader can check that: `STEP_ROOF_OCTAVES` is a
+    /// literal standing in for a logarithm WGSL cannot take while compiling, so
+    /// it is a third number that has to agree with two others and would not fail
+    /// to compile if it did not.
+    ///
+    /// What a disagreement does is put a seam in the lattice at forty-eight
+    /// kilometres: the arms would meet part way through a rung, so a skip landing
+    /// beyond the ceiling would round onto a lattice offset from the one the
+    /// field beyond it steps on -- which is the shimmer `lattice_rung` exists to
+    /// remove, reintroduced in exactly the far field this rule was tightened for.
+    #[test]
+    fn the_step_lattice_meets_itself_at_its_ceiling_too() {
+        let slope = shader_constant("STEP_SLOPE");
+        let knee = shader_constant("MIN_STEP") / slope;
+        let roof = shader_constant("MAX_STEP") / slope;
+        let octaves = shader_constant("STEP_ROOF_OCTAVES");
+
+        assert_eq!(
+            octaves.fract(),
+            0.0,
+            "the ceiling is {octaves} doublings past the knee, which is not whole"
+        );
+        assert_eq!(
+            roof,
+            knee * octaves.exp2(),
+            "the ceiling binds at {roof} m, where {octaves} doublings past a \
+             knee at {knee} m is {}",
+            knee * octaves.exp2()
+        );
+        // And it binds inside the march rather than past the end of it, which is
+        // the whole point of it binding at all.
+        assert!(
+            roof < shader_constant("MAX_DISTANCE"),
+            "the ceiling binds at {roof} m, past everything the march can reach"
+        );
+
+        // The arithmetic above is this test's own, as the knee's is: what it
+        // pins is that the constants describe a lattice without a seam, not
+        // that the shader walks one. So also demand the third arm is there at
+        // all. Deleting it compiles and leaves the geometric arm running away
+        // past the ceiling, which lands a skip well beyond the rung it should
+        // and drops whatever cloud was in between -- silently, and furthest
+        // away, where it would be taken for the fault this rule was tightened
+        // to fix rather than for a new one.
+        let march = include_str!("cloud_march.wgsl");
+        for name in ["lattice_rung", "lattice_at"] {
+            let start = march.find(&format!("fn {name}(")).expect("no lattice");
+            let end = march[start..].find("\n}").expect("unterminated");
+            let body = &march[start..start + end];
+            assert!(
+                body.contains("STEP_ROOF"),
+                "{name} has no ceiling arm, so the lattice runs away past {roof} m"
             );
         }
     }

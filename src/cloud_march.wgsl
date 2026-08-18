@@ -175,15 +175,23 @@ const MAX_DISTANCE: f32 = 100000.0;
 // away.
 //
 // The share is what decides how much of a cloud's *shape* is real, and it is the
-// reason this is a two-hundredth rather than the hundredth it was. A cloud is
+// reason this is a four-hundredth rather than the hundredth it was. A cloud is
 // reconstructed by the steps taken through it, so its silhouette is a function of
 // the step -- and the step is a function of how far away the eye is. Flying
 // towards a cloud therefore reshapes it, continuously, and that is a change in
-// the world that only the camera made. Measured by halving this and holding the
-// camera still, which is the same thing to a cloud as halving its distance: at a
-// hundredth, 3.28 per cent of a 3440x1440 frame moves by more than eight levels
-// of 255. At a two-hundredth, halving again moves 1.00. So most of the morphing
-// is in the first halving and it is bought here.
+// the world that only the camera made.
+//
+// Measured by marching in a parameter shifted along the ray -- samples placed
+// where they would be for an eye twelve kilometres further back, along the very
+// same rays from the very same point -- so that the sampling changes and nothing
+// else does. That isolates this from perspective, from the reprojection and from
+// the light volumes completely, which the earlier measurement here did not: it
+// halved the slope and compared, which answers how much the step *rule* is worth
+// rather than how much a cloud moves when the eye does.
+//
+// Under the shifted eye, a two-hundredth moved 2.45 per cent of a 3440x1440
+// frame by more than eight levels of 255, and a four-hundredth with the ceiling
+// below moves 0.36.
 //
 // Not tied to the viewport, though it reads as if it should be. The old note
 // here said a hundredth of a radian was "roughly what a half-resolution pixel
@@ -195,17 +203,37 @@ const MAX_DISTANCE: f32 = 100000.0;
 // this one; what is here is a fixed share, chosen against the finest screen this
 // runs on.
 //
-// The upper bound is the proportional rule's own value at the far end, which is
-// to say the rule is never clamped and the bound is a guard rather than a knob.
-// It was four hundred metres against a slope of a hundredth, and that is where a
-// third of the step budget was going: past forty kilometres the clamp bound
-// instead of the rule, so every step out there was finer than the pixel it was
-// drawn into. Deriving it from the slope costs nothing visible and is worth those
-// steps to the far end of the ray, where they are the difference between cloud
-// and no cloud.
-const STEP_SLOPE: f32 = 0.005;
+// The ceiling is a real bound and not a guard, which it was not before: it was
+// the proportional rule's own value at `MAX_DISTANCE`, so the rule was never
+// clamped and there were two regimes rather than three.
+//
+// What makes it worth binding is that the proportional rule is matched to the
+// *screen* and the fault is not on the screen. A deck is two or three kilometres
+// thick however far away it is, so a step matched to a pixel at a hundred
+// kilometres puts four or five samples through the whole of it, and four or five
+// samples do not settle an integral -- they land where the step happens to put
+// them, and the step is a function of the eye. That is the far horizon changing
+// shape as it is flown at, and no amount of screen-matched stepping fixes it,
+// because the screen is not what is being undersampled.
+//
+// A hundred and twenty metres puts sixteen to twenty-five samples through a deck
+// at any distance, and binds past forty-eight kilometres. Out there it is worth
+// far more than halving the slope again: over the shifted-eye measurement above,
+// the furthest band of the frame goes from 3.45 per cent of its pixels moving by
+// more than eight levels to 0.04, where halving the slope alone leaves 0.44.
+// Each is bought separately and both are kept -- the ceiling settles the far
+// field and the slope the middle of the frame, and neither does the other's job.
+// Together they are 0.36 per cent of the whole frame against the slope's 0.45
+// and the ceiling's 0.79, and the worst texel 41 levels against 49 and 77.
+//
+// Past the ceiling the step is constant, which is worth noting for anyone
+// measuring this: the sample positions are then a uniform lattice in distance,
+// so shifting the eye by a whole number of them changes nothing at all. A probe
+// that happens to pick such a shift will report a fault as fixed when it is only
+// invisible from that one place. Shift by something off the lattice.
+const STEP_SLOPE: f32 = 0.0025;
 const MIN_STEP: f32 = 30.0;
-const MAX_STEP: f32 = STEP_SLOPE * MAX_DISTANCE;
+const MAX_STEP: f32 = 120.0;
 
 // How far apart two blocks' rays may be stopped and still be taken to be
 // looking at the same thing, as a share of the farther of the two.
@@ -278,10 +306,12 @@ const TRUSTED: f32 = 0.5;
 // mountain showed through the gap where the rest of it should have been.
 //
 // A ray that steps the whole hundred kilometres without ever skipping a cell
-// takes 764 of these under the slope above, so 1024 is the bound and not a
-// sample of one. It was 512 against a slope of a hundredth, where the same sum
-// came to 453; halving the slope doubles the count and this has to follow it or
-// the fault comes straight back.
+// takes 1390 of these under the rule above -- 400 even rungs to the knee, 556
+// geometric to the ceiling and 434 even beyond it -- so 1536 is the bound and
+// not a sample of one. It was 512 against a slope of a hundredth, where the same
+// sum came to 453, and 1024 against a two-hundredth with no ceiling, where it
+// came to 764; every change to the step rule has to be followed here or the
+// fault comes straight back.
 //
 // Measured against a march given eight times the bound, which is more than any
 // ray can use: 25 views -- five presets over five cameras, level and pitched,
@@ -295,7 +325,7 @@ const TRUSTED: f32 = 0.5;
 // takes a step it was not already going to take -- a ray that stopped on
 // `CUTOFF` or on the ground still stops there, and only the rays that were being
 // cut short take more.
-const MAX_STEPS: u32 = 1024u;
+const MAX_STEPS: u32 = 1536u;
 
 // Below this transmittance the ray has established that nothing behind it will
 // be seen, and stops.
@@ -1075,13 +1105,14 @@ fn ceiling_at(p: vec3<f32>) -> f32 {
 // The places along a ray the step rule would put a sample, as a lattice of rungs
 // a distance can be rounded onto.
 //
-// The rule is `clamp(STEP_SLOPE * t, MIN_STEP, MAX_STEP)`, and `MAX_STEP` is the
-// rule's own value at `MAX_DISTANCE`, so it never binds and there are two regimes
-// rather than three: even steps of `MIN_STEP` out to `STEP_KNEE`, where the
-// proportional term overtakes the floor, and a constant ratio of `1 + STEP_SLOPE`
-// beyond it. `STEP_KNEE` is a whole number of `MIN_STEP`s, exactly, so it is a
-// rung of the near regime as well and the two arms meet without a seam -- which
-// is what lets this be a closed form rather than a walk.
+// The rule is `clamp(STEP_SLOPE * t, MIN_STEP, MAX_STEP)` and both bounds bind,
+// so there are three regimes: even steps of `MIN_STEP` out to `STEP_KNEE`, where
+// the proportional term overtakes the floor; a constant ratio of `1 +
+// STEP_SLOPE` from there to `STEP_ROOF`, where it meets the ceiling; and even
+// steps of `MAX_STEP` beyond that. Each join is a rung of both the arms that
+// meet at it -- `STEP_KNEE` is a whole number of `MIN_STEP`s and `STEP_ROOF` is
+// a whole number of doublings past `STEP_KNEE` -- so the three arms meet without
+// a seam, which is what lets this be a closed form rather than a walk.
 //
 // It exists so that skipping an empty cell does not move the samples. Without it a
 // skip lands a metre past the
@@ -1123,25 +1154,43 @@ const STEP_RUNGS: f32 = 1.0 / STEP_SLOPE;
 // natural base, with the ratio folded into the exponent, because `log2` and
 // `exp2` are what the hardware has -- and the skip this serves runs over most of
 // an empty sky.
-const STEP_OCTAVE: f32 = 0.0071955014;
+const STEP_OCTAVE: f32 = 0.0036022367;
 const LATTICE_RUNGS_PER_OCTAVE: f32 = 1.0 / STEP_OCTAVE;
+// Where the ceiling overtakes the proportional rule, and how many doublings of
+// distance that is past the knee.
+//
+// The count is a literal for the same reason `STEP_OCTAVE` is -- no compile-time
+// logarithm -- and it has to be a whole number, or the third arm would start
+// part way through a rung of the second and the lattice would have a seam in it
+// exactly where the far field is sampled. The test named for meeting at the
+// ceiling is what says the three constants agree, in `src/cloud.rs`.
+const STEP_ROOF: f32 = MAX_STEP / STEP_SLOPE;
+const STEP_ROOF_OCTAVES: f32 = 2.0;
+const STEP_ROOF_RUNG: f32 = STEP_RUNGS + STEP_ROOF_OCTAVES * LATTICE_RUNGS_PER_OCTAVE;
 
 // Where a distance sits on the lattice, as a rung index that need not be whole.
 fn lattice_rung(t: f32) -> f32 {
     if t <= STEP_KNEE {
         return t / MIN_STEP;
     }
-    return STEP_RUNGS + log2(t / STEP_KNEE) * LATTICE_RUNGS_PER_OCTAVE;
+    if t <= STEP_ROOF {
+        return STEP_RUNGS + log2(t / STEP_KNEE) * LATTICE_RUNGS_PER_OCTAVE;
+    }
+    return STEP_ROOF_RUNG + (t - STEP_ROOF) / MAX_STEP;
 }
 
 // Where a rung is, in metres along the ray. The inverse of the above on whole
-// rungs, and what makes the two regimes meet is that rung `STEP_RUNGS` is
-// `STEP_KNEE` under either arm.
+// rungs, and what makes the regimes meet is that rung `STEP_RUNGS` is `STEP_KNEE`
+// under either of the arms that share it and rung `STEP_ROOF_RUNG` is
+// `STEP_ROOF` under either of the arms that share that.
 fn lattice_at(rung: f32) -> f32 {
     if rung <= STEP_RUNGS {
         return rung * MIN_STEP;
     }
-    return STEP_KNEE * exp2((rung - STEP_RUNGS) / LATTICE_RUNGS_PER_OCTAVE);
+    if rung <= STEP_ROOF_RUNG {
+        return STEP_KNEE * exp2((rung - STEP_RUNGS) / LATTICE_RUNGS_PER_OCTAVE);
+    }
+    return STEP_ROOF + (rung - STEP_ROOF_RUNG) * MAX_STEP;
 }
 
 // How far it is to the far side of the cell a point stands in.
