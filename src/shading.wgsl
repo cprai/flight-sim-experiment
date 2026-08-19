@@ -413,6 +413,52 @@ fn tonemap(radiance: vec3<f32>) -> vec3<f32> {
     return saturate(x * (1.0 + x / (WHITE * WHITE)) / (1.0 + x));
 }
 
+// One step of the eight-bit sRGB target, in the linear units this shader writes.
+//
+// The frame is the only place in the renderer that is not floating point: the
+// cloud is carried in `Rgba16Float` and the sky tables likewise, and then the
+// whole thing is written to `Rgba8UnormSrgb`. Two hundred and fifty-six levels
+// is plenty for a picture with texture in it and nowhere near enough for a
+// smooth one, and a translucent cloud is the smoothest thing in this program --
+// a veil of it over ground crosses sixteen levels in five hundred pixels, so the
+// steps between them are flat bands thirty pixels wide.
+//
+// The target re-encodes on write, so a step is not a constant: it is the inverse
+// slope of the sRGB transfer at this value. Below the toe the encode is linear
+// and the step is constant; above it the encode is a power and the step grows
+// with the value, which is the whole point of the curve and the reason a fixed
+// dither would be far too coarse in the shadows and too fine in the highlights.
+fn srgb_step(v: f32) -> f32 {
+    if v <= 0.0031308 {
+        return 1.0 / (255.0 * 12.92);
+    }
+    return pow(v, 1.0 - 1.0 / 2.4) * 2.4 / (255.0 * 1.055);
+}
+
+// A dither of half a step either way, so the bands become a boundary that moves
+// pixel by pixel instead of one the eye can follow across the screen.
+//
+// Jorge Jimenez's interleaved gradient noise, which is a hash cheap enough to be
+// free here and spread evenly enough that no pattern shows in it. A function of
+// the pixel and of nothing else -- deliberately, and this is the one thing about
+// it that is not free to change. Rolling it with the frame would look better
+// still, being noise the eye averages away over a few frames rather than a fixed
+// grain, but it would mean a settled still camera no longer draws the same bytes
+// twice. That property is not decoration here: comparing consecutive frames of a
+// motionless world byte for byte is how flicker is found in this renderer, and
+// it is how the three faults before this one were located. A dither that moved
+// would put noise into every one of those comparisons and hide the next fault
+// under it. Static grain is the price and it is worth paying.
+//
+// Applied to all three channels alike so the noise it leaves is a wobble in
+// brightness rather than in colour, which is far less visible at the same
+// amplitude.
+fn dithered(colour: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
+    let noise = fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))));
+    let step = vec3<f32>(srgb_step(colour.r), srgb_step(colour.g), srgb_step(colour.b));
+    return saturate(colour + (noise - 0.5) * step);
+}
+
 // How much of the sky's own distance a block and a pixel may disagree by before
 // the block stops speaking for the pixel.
 //
@@ -584,7 +630,7 @@ fn fs_shade(@builtin(position)clip: vec4<f32>) -> @location(0) vec4<f32> {
         // A sky ray reaches nothing, so as far as the cloud upsample is
         // concerned it is showing whatever is at the end of the table.
         let cloud = cloud_at(pixel, AERIAL_FAR);
-        return vec4<f32>(tonemap(composite(sky, clip.xy, cloud)), 1.0);
+        return vec4<f32>(dithered(tonemap(composite(sky, clip.xy, cloud)), clip.xy), 1.0);
     }
 
     let id = textureLoad(material, pixel, 0).r & MATERIAL_MASK;
@@ -674,7 +720,7 @@ fn fs_shade(@builtin(position)clip: vec4<f32>) -> @location(0) vec4<f32> {
     // layers of one integral, composited in that order.
     let cloud = cloud_at(pixel, along);
     return vec4<f32>(
-        tonemap(composite(leaving * through + haze, clip.xy, cloud)),
+        dithered(tonemap(composite(leaving * through + haze, clip.xy, cloud)), clip.xy),
         1.0,
     );
 }

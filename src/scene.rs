@@ -4100,6 +4100,69 @@ mod tests {
         );
     }
 
+    /// A smooth gradient is dithered rather than banded.
+    ///
+    /// Everything in this renderer is floating point until the very last write,
+    /// and then the whole frame goes into eight bits of sRGB. Two hundred and
+    /// fifty-six levels is plenty for a picture with texture in it and nowhere
+    /// near enough for a smooth one -- and the smoothest thing this program
+    /// draws is a translucent cloud, which is a slab of very nearly one colour
+    /// laid over the ground. A veil of it crosses sixteen levels in five hundred
+    /// pixels, so without a dither the steps between those levels are flat bands
+    /// thirty pixels wide, and flying at the cloud sweeps them across it. That
+    /// is what "the transparency changes as the camera moves" turned out to be:
+    /// not the cloud, which tracks a cold march to a tenth of a per cent under
+    /// any motion measured, but the last three decimal places of it.
+    ///
+    /// Measured as the share of horizontally neighbouring pixels that differ at
+    /// all, which is the direct signature: a banded gradient holds one value for
+    /// a whole run and changes once at the edge of it, a dithered one alternates
+    /// between the two levels either side. Over this scene the undithered frame
+    /// leaves 2.1 per cent of neighbours differing, with runs as long as a whole
+    /// 256-pixel row of one value; dithered it is 49.8 per cent. The bar is a
+    /// quarter, which is twelve times what removing the dither gives and half
+    /// what keeping it does.
+    ///
+    /// Overcast, because it fills the frame with the large smooth areas the
+    /// fault lives in. A fair-weather sky would pass this on its texture alone.
+    #[test]
+    fn a_smooth_gradient_is_dithered_rather_than_banded() {
+        let (heights, materials) = shelf(600.0);
+        let frame = render_under(
+            heights,
+            materials,
+            against_the_shelf,
+            crate::cloud::Preset::Overcast,
+        );
+
+        let mut pairs = 0usize;
+        let mut differ = 0usize;
+        let mut longest = 0usize;
+        for y in 0..SIZE {
+            let mut run = 1usize;
+            for x in 1..SIZE {
+                pairs += 1;
+                if frame.pixel(x - 1, y)[0] == frame.pixel(x, y)[0] {
+                    run += 1;
+                } else {
+                    differ += 1;
+                    longest = longest.max(run);
+                    run = 1;
+                }
+            }
+            longest = longest.max(run);
+        }
+
+        let share = differ as f64 / pairs as f64;
+        assert!(
+            share > 0.25,
+            "only {:.1} per cent of neighbouring pixels differ and one run of \
+             identical ones is {longest} long, which is a banded frame rather \
+             than a dithered one",
+            share * 100.0
+        );
+    }
+
     /// Cloud behind a ridge does not leak across it into the ridge.
     ///
     /// The half-resolution march is one ray per two-by-two block, and a block
