@@ -232,8 +232,109 @@ const MAX_DISTANCE: f32 = 100000.0;
 // that happens to pick such a shift will report a fault as fixed when it is only
 // invisible from that one place. Shift by something off the lattice.
 const STEP_SLOPE: f32 = 0.0025;
-const MIN_STEP: f32 = 30.0;
 const MAX_STEP: f32 = 120.0;
+
+// The floor, which is the step over everything inside `STEP_KNEE` and so over
+// every cloud anything can make out the shape of.
+//
+// It is fifteen metres and it was thirty, and the reason is the same one the
+// ceiling above gives, one scale down. The ceiling is there because a *deck* is
+// two or three kilometres thick however far away it is, so a screen-matched step
+// puts the same four or five samples through it at any distance and the shape it
+// draws is a function of the eye. A *cumulus* is four hundred metres across
+// however far away it is, and a thirty-metre floor put thirteen samples through
+// it whether it stood at forty metres or at two kilometres -- fewer than the
+// ceiling allows a deck. Thirteen samples do not settle an integral either.
+//
+// What that looks like is the fault this was halved for. The samples of one step
+// index lie on a sphere centred on the eye, so where a shell cuts a cloud it
+// draws an arc; and because the shells hang off the eye, *translating* sweeps
+// them through the cloud. Flying at a cloud therefore reshapes it, continuously,
+// and that is a change in the world that only the camera made. It is worse
+// approaching than passing, invisible while turning -- a rotation moves no
+// point's distance from the eye -- and it stops dead when the camera stops.
+//
+// Measured by sliding the sampling lattice half a rung along the ray with the
+// eye, the cloud and the clock all held still, so that the only thing differing
+// between two 3440x1440 frames is where the samples fell. The figure is the share
+// of the frame past two levels of 255 *after a heavy blur*, and the worst blurred
+// pixel: a band that sweeps survives a blur and a per-pixel dither does not, so
+// this is the part of the error that reads as the cloud changing shape rather
+// than as noise. Down the approach to an isolated cumulus, and inside the deck:
+//
+//     1780 m from the cloud   1.20 %  max 10  ->  0.00 %  max 2
+//      980 m                  0.96 %  max 10  ->  0.00 %  max 3
+//      330 m                  2.17 %  max 16  ->  0.00 %  max 3
+//      150 m                  6.99 %  max 15  ->  0.03 %  max 4
+//       40 m                  7.47 %  max 14  ->  0.01 %  max 4
+//     level at 1500 m        56.30 %  max 12  ->  0.00 %  max 1
+//
+// A step of the eye cannot measure this and should not be used to try: two metres
+// of travel is mostly parallax, which is not a fault, and it moves 15.44 per cent
+// of the frame past two levels before and 13.57 after -- as does a march eight
+// times finer again. That number is converging on how much the cloud really does
+// move when the eye does.
+//
+// Three cheaper things were tried first and are recorded so they are not tried
+// again. A steeper arm under the floor alone -- see `NEAR_SLOPE`, which is kept --
+// does nothing at all past its own knee: 2.39 per cent to 2.33 at 1780 m. Widening
+// `EDGE` with the span, so the density cannot swing a whole unit inside one step,
+// makes it *worse* -- 2.33 to 4.48 -- because a softer edge spreads the silhouette
+// over more pixels and every one of them then carries the error. A phase per
+// marched texel, from an ordered four-by-four pattern, so that neighbouring texels
+// do not put their samples on the same shells, is nearly free and does help --
+// 1.20 per cent of coherent error to 0.36 at 1780 m -- but it scatters the error
+// rather than removing it, and three times is not the fifty this needed.
+//
+// What it costs is roughly a doubling of the march and a quarter of the frame:
+// 6.28 ms to 8.22 at forty metres from the cloud, 8.35 to 10.22 flying level
+// inside the deck, 7.08 to 9.47 at the head of the approach, and 7.79 to 9.50 in
+// fair weather -- 159, 120, 141 and 128 fps to 122, 98, 106 and 105. That is the
+// price of the samples and there is no way round it: everything that was cheap has
+// been tried above.
+//
+// Halving it moves three other constants, and all three are checked rather than
+// remembered. `STEP_KNEE` is `MIN_STEP / STEP_SLOPE` and so falls from twelve
+// kilometres to six; `STEP_ROOF_OCTAVES` counts the doublings from there to the
+// ceiling and so goes from two to three; and `MAX_STEPS` has to cover a lattice
+// with more rungs in it. See `the_step_lattice_meets_itself_at_its_ceiling_too`
+// and `a_ray_has_the_steps_to_reach_the_end_of_the_march`.
+//
+// It also hands the detail volume's finest octave to the frame for the first
+// time, which is a gain rather than a cost -- see `resolved`.
+const MIN_STEP: f32 = 15.0;
+
+// The same rule again, steeper, for the last few hundred metres the floor above
+// still flattens.
+//
+// `MIN_STEP` is a cost cap and not a sampling rule, so inside `STEP_KNEE` it is
+// the only thing deciding the step and the sampling is anisotropic by exactly
+// `STEP_KNEE / t`: one at the knee, six at a kilometre, and a hundred and fifty
+// at the forty metres a cloud is when it fills the frame. A sample there is
+// fifteen metres long and six centimetres wide. Halving the floor again to chase
+// that would pay over the whole six kilometres for a fault confined to a few
+// hundred metres; a second arm underneath pays only where it is needed, and
+// leaves the knee, the ceiling and the far lattice exactly where they are.
+//
+// A sixteenth caps the anisotropy at forty-three to one, and reaches `MIN_STEP`
+// at two hundred and forty metres. What it is worth *on top of* the halved floor,
+// by the same blurred slide the floor is measured with -- share of the frame past
+// two levels and the worst blurred pixel:
+//
+//      40 m from the cloud   0.35 %  max 4  ->  0.01 %  max 4
+//     150 m                  0.09 %  max 4  ->  0.03 %  max 4
+//     330 m                  0.01 %  max 4  ->  0.00 %  max 3
+//
+// Thirty-five times at forty metres, nothing past its own knee, and 0.8 ms of the
+// frame. It earns its place at the range the fault was reported at and nowhere
+// else, which is why it is an arm and not another halving.
+//
+// `NEAR_STEP` is the absolute floor, for a ray that starts inside a deck where the
+// proportional rule would ask for nothing. `MIN_STEP / NEAR_STEP` must be a power
+// of two, for the reason `MAX_STEP / MIN_STEP` must be -- see `STEP_ROOF_OCTAVES`.
+// Sixteen, so the near arm is four doublings wide and binds inside fifteen metres.
+const NEAR_SLOPE: f32 = 0.0625;
+const NEAR_STEP: f32 = 0.9375;
 
 // How far apart two blocks' rays may be stopped and still be taken to be
 // looking at the same thing, as a share of the farther of the two.
@@ -306,12 +407,15 @@ const TRUSTED: f32 = 0.5;
 // mountain showed through the gap where the rest of it should have been.
 //
 // A ray that steps the whole hundred kilometres without ever skipping a cell
-// takes 1390 of these under the rule above -- 400 even rungs to the knee, 556
-// geometric to the ceiling and 434 even beyond it -- so 1536 is the bound and
-// not a sample of one. It was 512 against a slope of a hundredth, where the same
-// sum came to 453, and 1024 against a two-hundredth with no ceiling, where it
-// came to 764; every change to the step rule has to be followed here or the
-// fault comes straight back.
+// takes 1712 of these under the rule above -- 16 even rungs to where the near
+// arm's slope overtakes `NEAR_STEP`, 46 up that arm to the near knee, 384 even
+// to the knee, 833 geometric to the ceiling and 433 even beyond it -- so 2048 is
+// the bound and not a sample of one. It was 512 against a slope of a hundredth,
+// where the same sum came to 453, and 1024 against a two-hundredth with no
+// ceiling, where it came to 764; every change to the step rule has to be followed
+// here or the fault comes straight back, which is what
+// `a_ray_has_the_steps_to_reach_the_end_of_the_march` now says rather than this
+// comment alone.
 //
 // Measured against a march given eight times the bound, which is more than any
 // ray can use: 25 views -- five presets over five cameras, level and pitched,
@@ -325,7 +429,7 @@ const TRUSTED: f32 = 0.5;
 // takes a step it was not already going to take -- a ray that stopped on
 // `CUTOFF` or on the ground still stops there, and only the rays that were being
 // cut short take more.
-const MAX_STEPS: u32 = 1536u;
+const MAX_STEPS: u32 = 2048u;
 
 // Below this transmittance the ray has established that nothing behind it will
 // be seen, and stops.
@@ -797,15 +901,24 @@ fn carve(field: f32, coverage: f32) -> f32 {
 // under a five-metre step to 0.79, which is most of the way back to the 1.09 it
 // started at.
 //
-// What it costs is that the finest octave never survives at all. Its cells are
-// twenty-five metres and `MIN_STEP` is thirty, so there is no distance at which
-// the march can resolve it, and a rule that admits as much drops it from the
-// cloud a kilometre off as well as from the cloud at fifty. That is a real loss
-// of edge on near cloud -- 1.5 per cent of the frame moves by more than eight
-// levels -- and it is the honest reading of a volume built finer than anything
-// that reads it. Sharpening the near field again is a matter of lowering
-// `MIN_STEP` towards twelve metres, which is a cost this has not been asked to
-// pay; it is not a matter of pretending the octave was resolved.
+// What this used to cost is that the finest octave never survived anywhere. Its
+// cells are twenty-five metres and `MIN_STEP` was the whole step inside twelve
+// kilometres, so there was no distance at which the march could resolve it, and a
+// rule that admits as much dropped it from the cloud a kilometre off as well as
+// from the cloud at fifty -- a real loss of edge on near cloud, 1.5 per cent of
+// the frame moving by more than eight levels, and the honest reading of a volume
+// built finer than anything that read it.
+//
+// A fifteen-metre floor gives it back nearly everywhere. `resolved(15, 25)` is
+// 0.896, so nine tenths of the finest octave now reaches the frame over the whole
+// six kilometres the floor covers, and inside `NEAR_KNEE` -- where the span falls
+// to a sixteenth of the distance -- all of it does within two hundred metres.
+// That was not what the floor was halved for, and it is the larger part of what
+// the halving buys back: near and middle-distance cloud gets billows it has never
+// had, and the volume is no longer built finer than anything that reads it.
+//
+// The rule is still not a matter of pretending an octave was resolved. Past
+// `STEP_KNEE` the span climbs again and the ramp does what it always did.
 fn resolved(span: f32, wavelength: f32) -> f32 {
     return 1.0 - smoothstep(wavelength * 0.5, wavelength, span);
 }
@@ -1105,14 +1218,17 @@ fn ceiling_at(p: vec3<f32>) -> f32 {
 // The places along a ray the step rule would put a sample, as a lattice of rungs
 // a distance can be rounded onto.
 //
-// The rule is `clamp(STEP_SLOPE * t, MIN_STEP, MAX_STEP)` and both bounds bind,
-// so there are three regimes: even steps of `MIN_STEP` out to `STEP_KNEE`, where
-// the proportional term overtakes the floor; a constant ratio of `1 +
-// STEP_SLOPE` from there to `STEP_ROOF`, where it meets the ceiling; and even
-// steps of `MAX_STEP` beyond that. Each join is a rung of both the arms that
-// meet at it -- `STEP_KNEE` is a whole number of `MIN_STEP`s and `STEP_ROOF` is
-// a whole number of doublings past `STEP_KNEE` -- so the three arms meet without
-// a seam, which is what lets this be a closed form rather than a walk.
+// The rule has two proportional arms and three bounds, and every one of them
+// binds somewhere, so there are five regimes: even steps of `NEAR_STEP` out to
+// `NEAR_BASE`, where the near slope overtakes the absolute floor; a constant
+// ratio of `1 + NEAR_SLOPE` to `NEAR_KNEE`, where that slope reaches `MIN_STEP`;
+// even steps of `MIN_STEP` to `STEP_KNEE`, where the shallower slope overtakes
+// it; a constant ratio of `1 + STEP_SLOPE` to `STEP_ROOF`, where it meets the
+// ceiling; and even steps of `MAX_STEP` beyond that. Each join is a distance both
+// the arms that share it agree on -- each flat arm is a whole number of its own
+// steps long and each geometric arm a whole number of doublings -- so the five
+// meet without a seam, which is what lets this be a closed form rather than a
+// walk. `the_step_lattice_meets_itself_at_every_join` is what says so.
 //
 // It exists so that skipping an empty cell does not move the samples. Without it a
 // skip lands a metre past the
@@ -1143,8 +1259,22 @@ fn ceiling_at(p: vec3<f32>) -> f32 {
 // has been disabled rather than fixed. That is 0.43 ms of the fair-weather march
 // against 0.28 for rounding up, for the same image.
 const STEP_KNEE: f32 = MIN_STEP / STEP_SLOPE;
-// Rungs of the even part, which `STEP_KNEE / MIN_STEP` is by construction.
-const STEP_RUNGS: f32 = 1.0 / STEP_SLOPE;
+// Where the near arm's slope reaches `NEAR_STEP` and where it reaches `MIN_STEP`,
+// which are the two joins below the knee, and the rungs of the even arm they
+// bracket -- `NEAR_BASE / NEAR_STEP` is `1 / NEAR_SLOPE` by construction.
+const NEAR_BASE: f32 = NEAR_STEP / NEAR_SLOPE;
+const NEAR_KNEE: f32 = MIN_STEP / NEAR_SLOPE;
+const NEAR_RUNGS: f32 = 1.0 / NEAR_SLOPE;
+// `log2(1 + NEAR_SLOPE)`, a literal for the reason `STEP_OCTAVE` is, and checked
+// the same way -- see `the_march_counts_the_rungs_of_its_own_lattice_correctly`.
+const NEAR_OCTAVE: f32 = 0.0874628413;
+const NEAR_RUNGS_PER_OCTAVE: f32 = 1.0 / NEAR_OCTAVE;
+// `log2(MIN_STEP / NEAR_STEP)`, whole for the reason `STEP_ROOF_OCTAVES` is.
+const NEAR_OCTAVES: f32 = 4.0;
+const NEAR_KNEE_RUNG: f32 = NEAR_RUNGS + NEAR_OCTAVES * NEAR_RUNGS_PER_OCTAVE;
+// Rungs of the even part, which is `(STEP_KNEE - NEAR_KNEE) / MIN_STEP` long and
+// starts where the near arm leaves off rather than at the eye.
+const STEP_KNEE_RUNG: f32 = NEAR_KNEE_RUNG + (STEP_KNEE - NEAR_KNEE) / MIN_STEP;
 // `log2(1 + STEP_SLOPE)`, and the rungs of the geometric part to a doubling of
 // distance, which is its reciprocal.
 //
@@ -1160,35 +1290,52 @@ const LATTICE_RUNGS_PER_OCTAVE: f32 = 1.0 / STEP_OCTAVE;
 // distance that is past the knee.
 //
 // The count is a literal for the same reason `STEP_OCTAVE` is -- no compile-time
-// logarithm -- and it has to be a whole number, or the third arm would start
-// part way through a rung of the second and the lattice would have a seam in it
-// exactly where the far field is sampled. The test named for meeting at the
-// ceiling is what says the three constants agree, in `src/cloud.rs`.
+// logarithm -- and it has to be a whole number, or the arm past the knee would
+// end part way through a rung and the lattice would have a seam in it exactly
+// where the far field is sampled. The test named for meeting at the ceiling is
+// what says the three constants agree, in `src/cloud.rs`.
+//
+// Three doublings, and it was two: it is `log2(MAX_STEP / MIN_STEP)`, so halving
+// the floor to fifteen metres brought the knee in to six kilometres and left the
+// ceiling where it was. Nothing in the shader can notice that; the test does.
 const STEP_ROOF: f32 = MAX_STEP / STEP_SLOPE;
-const STEP_ROOF_OCTAVES: f32 = 2.0;
-const STEP_ROOF_RUNG: f32 = STEP_RUNGS + STEP_ROOF_OCTAVES * LATTICE_RUNGS_PER_OCTAVE;
+const STEP_ROOF_OCTAVES: f32 = 3.0;
+const STEP_ROOF_RUNG: f32 = STEP_KNEE_RUNG + STEP_ROOF_OCTAVES * LATTICE_RUNGS_PER_OCTAVE;
 
 // Where a distance sits on the lattice, as a rung index that need not be whole.
 fn lattice_rung(t: f32) -> f32 {
+    if t <= NEAR_BASE {
+        return t / NEAR_STEP;
+    }
+    if t <= NEAR_KNEE {
+        return NEAR_RUNGS + log2(t / NEAR_BASE) * NEAR_RUNGS_PER_OCTAVE;
+    }
     if t <= STEP_KNEE {
-        return t / MIN_STEP;
+        return NEAR_KNEE_RUNG + (t - NEAR_KNEE) / MIN_STEP;
     }
     if t <= STEP_ROOF {
-        return STEP_RUNGS + log2(t / STEP_KNEE) * LATTICE_RUNGS_PER_OCTAVE;
+        return STEP_KNEE_RUNG + log2(t / STEP_KNEE) * LATTICE_RUNGS_PER_OCTAVE;
     }
     return STEP_ROOF_RUNG + (t - STEP_ROOF) / MAX_STEP;
 }
 
 // Where a rung is, in metres along the ray. The inverse of the above on whole
-// rungs, and what makes the regimes meet is that rung `STEP_RUNGS` is `STEP_KNEE`
-// under either of the arms that share it and rung `STEP_ROOF_RUNG` is
-// `STEP_ROOF` under either of the arms that share that.
+// rungs, and what makes the regimes meet is that each join is a distance both the
+// arms that share it agree on: `NEAR_BASE` at rung `NEAR_RUNGS`, `NEAR_KNEE` at
+// `NEAR_KNEE_RUNG`, `STEP_KNEE` at `STEP_KNEE_RUNG` and `STEP_ROOF` at
+// `STEP_ROOF_RUNG`.
 fn lattice_at(rung: f32) -> f32 {
-    if rung <= STEP_RUNGS {
-        return rung * MIN_STEP;
+    if rung <= NEAR_RUNGS {
+        return rung * NEAR_STEP;
+    }
+    if rung <= NEAR_KNEE_RUNG {
+        return NEAR_BASE * exp2((rung - NEAR_RUNGS) / NEAR_RUNGS_PER_OCTAVE);
+    }
+    if rung <= STEP_KNEE_RUNG {
+        return NEAR_KNEE + (rung - NEAR_KNEE_RUNG) * MIN_STEP;
     }
     if rung <= STEP_ROOF_RUNG {
-        return STEP_KNEE * exp2((rung - STEP_RUNGS) / LATTICE_RUNGS_PER_OCTAVE);
+        return STEP_KNEE * exp2((rung - STEP_KNEE_RUNG) / LATTICE_RUNGS_PER_OCTAVE);
     }
     return STEP_ROOF + (rung - STEP_ROOF_RUNG) * MAX_STEP;
 }
@@ -1621,7 +1768,13 @@ fn cs_cloud_march(@builtin(global_invocation_id) id: vec3<u32>) {
                 continue;
             }
 
-            let step = min(clamp(STEP_SLOPE * t, MIN_STEP, MAX_STEP), far - t);
+            // Two proportional arms and three flat ones, in one expression: the
+            // steeper near slope until it reaches `MIN_STEP`, `MIN_STEP` until
+            // the shallower one overtakes it, that one to the ceiling, and the
+            // absolute floor and ceiling either end. `lattice_at` walks the same
+            // five regimes and has to keep walking them.
+            let rule = max(STEP_SLOPE * t, min(NEAR_SLOPE * t, MIN_STEP));
+            let step = min(clamp(rule, NEAR_STEP, MAX_STEP), far - t);
             let middle = p + direction * (step * 0.5);
             let extinction = cloud_extinction(middle, step, true);
             if extinction > 0.0 {

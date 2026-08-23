@@ -2103,30 +2103,39 @@ mod tests {
     /// it.
     #[test]
     fn the_march_counts_the_rungs_of_its_own_lattice_correctly() {
-        let slope = f64::from(shader_constant("STEP_SLOPE"));
-        let claimed = f64::from(shader_constant("STEP_OCTAVE"));
-        // In `f64`, and that is not fussiness. Worked in `f32` this reference is
-        // itself wrong by more than the tolerance: 1 + slope rounds, and `log2`
-        // near one divides by the logarithm, so the rounding comes out
-        // multiplied by about `1 / (ln 2 * STEP_OCTAVE)` -- four hundredfold at
-        // a four-hundredth. That reads as 2.3e-5 against a correct literal. At
-        // the two-hundredth this used to be it came to 9.2e-7 and slipped under
-        // a 1e-6 bar, so the check was passing on the size of the slope rather
-        // than on the constant being right.
-        let wanted = (1.0 + slope).log2();
-        assert!(
-            (claimed - wanted).abs() / wanted < 1e-6,
-            "the shader says log2(1 + {slope}) is {claimed}, where it is {wanted}"
-        );
+        // Both proportional arms, because both spell their rung spacing as a
+        // literal and neither would fail to compile if it were wrong.
+        for (slope, octave) in [
+            ("STEP_SLOPE", "STEP_OCTAVE"),
+            ("NEAR_SLOPE", "NEAR_OCTAVE"),
+        ] {
+            // In `f64`, and that is not fussiness. Worked in `f32` this reference
+            // is itself wrong by more than the tolerance: 1 + slope rounds, and
+            // `log2` near one divides by the logarithm, so the rounding comes out
+            // multiplied by about `1 / (ln 2 * STEP_OCTAVE)` -- four hundredfold
+            // at a four-hundredth. That reads as 2.3e-5 against a correct
+            // literal. At the two-hundredth this used to be it came to 9.2e-7 and
+            // slipped under a 1e-6 bar, so the check was passing on the size of
+            // the slope rather than on the constant being right.
+            let slope = f64::from(shader_constant(slope));
+            let claimed = f64::from(shader_constant(octave));
+            let wanted = (1.0 + slope).log2();
+            assert!(
+                (claimed - wanted).abs() / wanted < 1e-6,
+                "the shader says log2(1 + {slope}) is {claimed}, where it is {wanted}"
+            );
+        }
     }
 
-    /// The lattice's two regimes meet, and a rung of it really is a step.
+    /// Every regime of the lattice meets its neighbours, and a rung really is a
+    /// step.
     ///
-    /// `lattice_rung` and `lattice_at` each branch at the knee, and the lattice is
-    /// the places the step rule puts a sample only if the two arms agree there and
-    /// consecutive rungs are one step apart. Where they part, a skip rounds onto a
-    /// lattice offset from the one the near field steps on, and a ray crossing the
-    /// knee jumps or stalls at a fixed distance from the eye -- a ring in the sky
+    /// `lattice_rung` and `lattice_at` branch four times -- two proportional arms
+    /// and three flat ones -- and the lattice is the places the step rule puts a
+    /// sample only if the arms agree at every join and consecutive rungs are one
+    /// step apart within each. Where they part, a skip rounds onto a lattice
+    /// offset from the one the field around it steps on, and a ray crossing the
+    /// join jumps or stalls at a fixed distance from the eye -- a ring in the sky
     /// travelling with the camera, which is the class of fault the lattice was
     /// added to remove.
     ///
@@ -2134,50 +2143,80 @@ mod tests {
     /// way round it: there is no calling a WGSL function from a test, and the
     /// property is about arithmetic rather than about pixels.
     #[test]
-    fn the_step_lattice_meets_itself_at_the_knee() {
+    fn the_step_lattice_meets_itself_at_every_join() {
         let slope = shader_constant("STEP_SLOPE");
         let floor = shader_constant("MIN_STEP");
-        let knee = floor / slope;
-        let rungs = 1.0 / slope;
+        let ceiling = shader_constant("MAX_STEP");
+        let near_slope = shader_constant("NEAR_SLOPE");
+        let near_floor = shader_constant("NEAR_STEP");
 
-        // The knee is `1 / STEP_SLOPE` floors along, whatever the floor is, so
-        // what has to hold is that the slope's reciprocal is a whole number --
-        // otherwise the last rung of the even arm stops short of the knee and the
-        // step across the join is neither a floor nor a proportion.
+        let near_base = near_floor / near_slope;
+        let near_knee = floor / near_slope;
+        let knee = floor / slope;
+        let roof = ceiling / slope;
+        let near_rungs = 1.0 / near_slope;
+
+        // Each flat arm has to be a whole number of its own steps long, or its
+        // last rung stops short of the join and the step across it is neither a
+        // floor nor a proportion. For the innermost that is `1 / NEAR_SLOPE`; for
+        // the even arm between the two knees it is the span over `MIN_STEP`,
+        // which needs `1 / STEP_SLOPE` whole as it always did *and* the near knee
+        // to land on the same lattice.
         assert_eq!(
-            rungs.fract(),
+            near_rungs.fract(),
             0.0,
-            "1/{slope} is not a whole number of rungs"
+            "1/{near_slope} is not a whole number of rungs"
+        );
+        assert_eq!(
+            ((knee - near_knee) / floor).fract(),
+            0.0,
+            "the even arm runs {} m, which is not a whole number of {floor} m steps",
+            knee - near_knee
         );
 
-        // Then the three arms, as `lattice_at` writes them, against the step
-        // rule they are supposed to be the samples of.
-        let ceiling = shader_constant("MAX_STEP");
-        let roof = ceiling / slope;
+        // Then all five arms, as `lattice_at` writes them, against the step rule
+        // they are supposed to be the samples of.
+        let near_per_octave = 1.0 / (1.0 + near_slope).log2();
         let per_octave = 1.0 / (1.0 + slope).log2();
-        let roof_rung = rungs + shader_constant("STEP_ROOF_OCTAVES") * per_octave;
+        let near_knee_rung = near_rungs + shader_constant("NEAR_OCTAVES") * near_per_octave;
+        let knee_rung = near_knee_rung + (knee - near_knee) / floor;
+        let roof_rung = knee_rung + shader_constant("STEP_ROOF_OCTAVES") * per_octave;
         let at = |rung: f32| {
-            if rung <= rungs {
-                rung * floor
+            if rung <= near_rungs {
+                rung * near_floor
+            } else if rung <= near_knee_rung {
+                near_base * ((rung - near_rungs) / near_per_octave).exp2()
+            } else if rung <= knee_rung {
+                near_knee + (rung - near_knee_rung) * floor
             } else if rung <= roof_rung {
-                knee * ((rung - rungs) / per_octave).exp2()
+                knee * ((rung - knee_rung) / per_octave).exp2()
             } else {
                 roof + (rung - roof_rung) * ceiling
             }
         };
         for rung in [
             1.0,
-            rungs - 1.0,
-            rungs,
-            rungs + 1.0,
-            rungs + 200.0,
+            near_rungs - 1.0,
+            near_rungs,
+            near_rungs + 1.0,
+            near_rungs + 20.0,
+            near_knee_rung - 1.0,
+            near_knee_rung,
+            near_knee_rung + 1.0,
+            knee_rung - 1.0,
+            knee_rung,
+            knee_rung + 1.0,
+            knee_rung + 200.0,
             roof_rung - 1.0,
             roof_rung,
             roof_rung + 1.0,
             roof_rung + 200.0,
         ] {
             let here = at(rung);
-            let step = (slope * here).clamp(floor, ceiling);
+            // The rule the march itself walks, in the shape it is written there.
+            let step = (slope * here)
+                .max((near_slope * here).min(floor))
+                .clamp(near_floor, ceiling);
             let taken = at(rung + 1.0) - here;
             assert!(
                 (taken - step).abs() < here * 1e-4 + 1e-3,
@@ -2207,7 +2246,8 @@ mod tests {
     #[test]
     fn the_step_lattice_meets_itself_at_its_ceiling_too() {
         let slope = shader_constant("STEP_SLOPE");
-        let knee = shader_constant("MIN_STEP") / slope;
+        let floor = shader_constant("MIN_STEP");
+        let knee = floor / slope;
         let roof = shader_constant("MAX_STEP") / slope;
         let octaves = shader_constant("STEP_ROOF_OCTAVES");
 
@@ -2223,6 +2263,36 @@ mod tests {
              knee at {knee} m is {}",
             knee * octaves.exp2()
         );
+
+        // The near arm's own joins, which are the same claim at the other end of
+        // the lattice: `NEAR_OCTAVES` is a literal standing in for a logarithm
+        // WGSL cannot take while compiling, and it is `MIN_STEP / NEAR_STEP` that
+        // has to be the power of two it names. A disagreement here puts the seam
+        // inside a few hundred metres of the eye instead of at forty-eight
+        // kilometres -- which is worse, because that is where a cloud is close
+        // enough to read and where this arm was added to stop it shifting.
+        let near_floor = shader_constant("NEAR_STEP");
+        let near_octaves = shader_constant("NEAR_OCTAVES");
+        assert_eq!(
+            near_octaves.fract(),
+            0.0,
+            "the near arm is {near_octaves} doublings wide, which is not whole"
+        );
+        assert_eq!(
+            floor,
+            near_floor * near_octaves.exp2(),
+            "the near arm reaches {floor} m, where {near_octaves} doublings up \
+             from {near_floor} m is {}",
+            near_floor * near_octaves.exp2()
+        );
+        // And it binds nearer than the knee it sits under, or there is no even
+        // arm between the two and the lattice has a different shape from the one
+        // every constant here describes.
+        assert!(
+            floor / shader_constant("NEAR_SLOPE") < knee,
+            "the near arm reaches {} m, past the knee at {knee} m",
+            floor / shader_constant("NEAR_SLOPE")
+        );
         // And it binds inside the march rather than past the end of it, which is
         // the whole point of it binding at all.
         assert!(
@@ -2230,14 +2300,17 @@ mod tests {
             "the ceiling binds at {roof} m, past everything the march can reach"
         );
 
-        // The arithmetic above is this test's own, as the knee's is: what it
-        // pins is that the constants describe a lattice without a seam, not
-        // that the shader walks one. So also demand the third arm is there at
-        // all. Deleting it compiles and leaves the geometric arm running away
-        // past the ceiling, which lands a skip well beyond the rung it should
-        // and drops whatever cloud was in between -- silently, and furthest
-        // away, where it would be taken for the fault this rule was tightened
-        // to fix rather than for a new one.
+        // The arithmetic above is this test's own, as the joins test's is: what
+        // it pins is that the constants describe a lattice without a seam, not
+        // that the shader walks one. So also demand the outer arms are there at
+        // all. Deleting either compiles: without the ceiling arm the geometric
+        // one runs away past the ceiling, which lands a skip well beyond the rung
+        // it should and drops whatever cloud was in between -- silently, and
+        // furthest away, where it would be taken for the fault this rule was
+        // tightened to fix rather than for a new one; without the near arms the
+        // step rule and the lattice disagree over everything inside the near
+        // knee, which is a skip landing off the samples in exactly the near field
+        // that arm was added for.
         let march = include_str!("cloud_march.wgsl");
         for name in ["lattice_rung", "lattice_at"] {
             let start = march.find(&format!("fn {name}(")).expect("no lattice");
@@ -2247,7 +2320,57 @@ mod tests {
                 body.contains("STEP_ROOF"),
                 "{name} has no ceiling arm, so the lattice runs away past {roof} m"
             );
+            assert!(
+                body.contains("NEAR_BASE") && body.contains("NEAR_KNEE"),
+                "{name} has no near arm, so the lattice and the step rule part \
+                 over everything inside {} m",
+                floor / shader_constant("NEAR_SLOPE")
+            );
         }
+    }
+
+    /// A ray is given enough steps to reach the end of the march.
+    ///
+    /// `MAX_STEPS` is the one constant the step rule does not derive, and running
+    /// out of it is silent: the ray keeps whatever transmittance it had reached,
+    /// so what it draws is cloud that thins out and stops at a fixed distance --
+    /// worst along the horizon, where the most of it is, and looking exactly like
+    /// the far field being undersampled rather than being cut off. The comment on
+    /// `MAX_STEPS` says every change to the step rule has to be followed there;
+    /// this is what says whether it was.
+    ///
+    /// The count is the rungs of the lattice, because a ray that never skips a
+    /// cell takes one step per rung. Cheap to satisfy and nothing else costs by
+    /// it -- no ray takes a step it was not going to take -- so the margin is
+    /// generous on purpose.
+    #[test]
+    fn a_ray_has_the_steps_to_reach_the_end_of_the_march() {
+        let slope = shader_constant("STEP_SLOPE");
+        let floor = shader_constant("MIN_STEP");
+        let ceiling = shader_constant("MAX_STEP");
+        let near_slope = shader_constant("NEAR_SLOPE");
+
+        let near_rungs = 1.0 / near_slope;
+        let near_arm = shader_constant("NEAR_OCTAVES") / (1.0 + near_slope).log2();
+        let even = (floor / slope - floor / near_slope) / floor;
+        let arm = shader_constant("STEP_ROOF_OCTAVES") / (1.0 + slope).log2();
+        let beyond =
+            (shader_constant("MAX_DISTANCE") - ceiling / slope) / ceiling;
+        let rungs = near_rungs + near_arm + even + arm + beyond;
+
+        // Spelled `1536u` in the shader, which is not a float literal.
+        let budget: f32 = shader_says("MAX_STEPS")
+            .trim_end_matches('u')
+            .parse()
+            .expect("MAX_STEPS is not a number");
+        assert!(
+            budget >= rungs,
+            "a ray that never skips takes {rungs:.0} steps to reach \
+             {} m -- {near_rungs:.0} even, {near_arm:.0} up the near arm, \
+             {even:.0} even, {arm:.0} geometric and {beyond:.0} beyond the \
+             ceiling -- against a budget of {budget:.0}",
+            shader_constant("MAX_DISTANCE")
+        );
     }
 
     /// Writes a slice of each volume out to look at.
