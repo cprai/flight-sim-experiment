@@ -474,6 +474,36 @@ const LIGHT_SLICES: u32 = 48u;
 // arrives in the uniform, one corner and one texel size apiece.
 const LIGHT_CASCADES: u32 = 3u;
 
+// The longest piece of sun ray one sample of a light column may stand for, in
+// metres, and the most samples that can ask of a slice.
+//
+// A slice is a fixed 250 m of *height*, so the ray it stands for lengthens as
+// the sun sets: `walk.z` is that height over the sun's climb, and `SHEAR_FLOOR`
+// in `src/cloud.rs` caps the climb at 0.15, which makes a slice near dusk a
+// kilometre and two thirds of ray. Reading one point of that is a point sample
+// of a field whose billows are five hundred metres across -- and it does not
+// read as noise, because every column samples at the same heights, so the error
+// takes the same shape in every column of the volume. What it draws is a cloud
+// cut into horizontal slabs with hard edges, over most of the deck by six
+// degrees of elevation.
+//
+// So a slice takes as many samples along its own ray as it needs to keep them
+// this far apart. Four hundred metres is the knee. Against a converged
+// sixteen-sample answer at six degrees, the share of a 960x540 frame more than
+// eight levels out runs 16.1 per cent at one sample, 11.0 at six hundred metres,
+// 6.3 at four hundred and 5.0 at two hundred and fifty, for 1.42, 1.48, 1.96 and
+// 2.17 ms of the light pass.
+//
+// The count is a function of the ray and not of the hour, so nothing pays for
+// this at noon: overhead a slice is 250 m of ray and the two samples below are
+// already finer than this asks for. Two is the floor rather than one because the
+// pair straddles the texel *across* as well, which is what `cell_extinction` is
+// for. Five is the ceiling and cannot bind -- the shear floor makes 1667 m the
+// longest ray a slice can stand for, which is 4.2 of these -- so it bounds the
+// loop rather than shaping the answer.
+const LIGHT_STEP: f32 = 400.0;
+const LIGHT_TAPS: u32 = 5u;
+
 // Where a cascade stops answering for a point and hands over to the one outside
 // it, as a share of its own half-span. The outermost fifth, so the join is six
 // kilometres wide at the innermost cascade and twelve at the next.
@@ -1544,38 +1574,68 @@ fn sky_share(reaching: f32) -> f32 {
 // shape -- and the join travels with the camera, so the shape changes as it is
 // flown at.
 //
-// So average the cell instead of sampling its centre: two points at opposite
-// quarters of it, on a diagonal that swaps with every slice so that a column of
-// forty-eight covers both. Two rather than four because the column is an
-// integral of forty-eight of these and what one slice misses the next supplies
-// -- over the full sweep of a join, four taps on the coarse cascades leave 0.17
-// per cent of the frame swinging by more than thirty-two levels where two leave
-// 0.15, and cost another 1.0 ms for it.
+// So average the cell instead of sampling its centre, and average it in all
+// three of its own directions -- which are not the world's. The cell is a
+// parallelepiped: `across` of ground each way, and one slice *along the sun*,
+// leaning by the shear. So the samples are strung out along that ray at even
+// intervals, and each takes the opposite quarter of the cell across from the one
+// before it, on a diagonal that swaps with every slice so that a column of
+// forty-eight covers both diagonals. `LIGHT_STEP` says how many there are and
+// why; two is its floor.
+//
+// The across half of that is the older half, and two was already enough of it:
+// the column is an integral of forty-eight of these and what one slice misses
+// the next supplies. Over the full sweep of a cascade join, four taps across on
+// the coarse cascades leave 0.17 per cent of the frame swinging by more than
+// thirty-two levels where two leave 0.15, and cost another 1.0 ms for it.
 //
 // Every cascade and not merely the coarse ones, which is 0.16 ms and no special
 // case: the innermost aliases against the truth for the same reason the others
 // alias against it, and filtering it too takes the worst texel of that sweep
 // from 91 levels to 78.
 //
-// Only across. The metres a slice is worth do not change from cascade to
-// cascade: these differ in ground, not in height, and the vertical sample is
-// already band-limited by `metres`.
+// The along half is what a note here used to deny, saying the vertical sample
+// was already band-limited by `metres`. It is not: `metres` is the length a
+// sample stands for and nothing about how far the field is read over. The two
+// agree while the sun is high and part company as it sets, which is what
+// `LIGHT_STEP` exists to close.
 fn cell_extinction(at: vec3<u32>, cascade: u32, shear: vec2<f32>, metres: f32) -> f32 {
     let quarter = light.cascade[cascade].w * 0.25;
     var away = vec3<f32>(quarter, 0.0, quarter);
     if (at.z & 1u) == 1u {
         away = vec3<f32>(quarter, 0.0, -quarter);
     }
+    // One slice of the column as a vector: the height it climbs, and the ground
+    // it crosses getting there. Its length is `metres`.
+    let stride = light.walk.w * vec3<f32>(shear.x, 1.0, shear.y);
     let centre = light_position(at, cascade, shear);
-    return 0.5
-        * (cloud_extinction(centre - away, metres, false)
-            + cloud_extinction(centre + away, metres, false));
+    let taps = light_taps(metres);
+    let span = metres / f32(taps);
+    var sum = 0.0;
+    for (var tap = 0u; tap < taps; tap += 1u) {
+        let along = (f32(tap) + 0.5) / f32(taps) - 0.5;
+        var side = away;
+        if (tap & 1u) == 1u {
+            side = -away;
+        }
+        sum = sum + cloud_extinction(centre + along * stride + side, span, false);
+    }
+    return sum / f32(taps);
+}
+
+// How many samples one slice of a light column is worth. See `LIGHT_STEP`.
+//
+// Clamped as a float and converted after, so that a `metres` of zero -- which is
+// what an unwritten uniform holds -- cannot reach the conversion as something a
+// `u32` has no answer for.
+fn light_taps(metres: f32) -> u32 {
+    return u32(clamp(ceil(metres / LIGHT_STEP), 2.0, f32(LIGHT_TAPS)));
 }
 
 // One column of a light volume, walked from the top down.
 //
-// The cost of the whole technique is here and it is two density samples per
-// texel: a thread owns a column and carries the running integral down it, so
+// The cost of the whole technique is here and it is a handful of density samples
+// per texel: a thread owns a column and carries the running integral down it, so
 // what would be a march per shaded sample becomes a fetch per shaded sample.
 // Structurally `cs_aerial` in `src/sky.wgsl`, which walks the frustum's froxel
 // columns the same way and for the same reason.

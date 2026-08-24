@@ -3850,6 +3850,90 @@ mod tests {
         );
     }
 
+    /// A setting sun does not chop the light volume into slabs.
+    ///
+    /// A slice of a light column stands for a fixed height, so the piece of sun
+    /// ray it stands for lengthens as the sun sets -- a kilometre and two thirds
+    /// of it once `SHEAR_FLOOR` has the lean, against a third of that at
+    /// forty-five degrees. Reading one point of that piece leaves the mean
+    /// alone, because a point sample of a path integral is unbiased. What it
+    /// wrecks is the spread: the sample either lands in a billow or misses it,
+    /// so a column gains its cloud in a few large lumps rather than over the
+    /// path it really crossed -- and every column of the volume lumps at the
+    /// same heights, because they all sample at the same ones. That is not
+    /// noise. It draws a cumulus as a stack of flat slabs with hard edges, over
+    /// most of the deck by six degrees of elevation.
+    ///
+    /// So the measure is peakiness: the mean square of what one slice adds to
+    /// the optical depth over the square of its mean, taken across the band the
+    /// low deck stands in. One is a column gaining the same at every slice, and
+    /// the more of a column's total arrives in the fewest slices the higher it
+    /// climbs.
+    ///
+    /// The claim is that it does not climb as the sun goes down. If anything it
+    /// should fall, because the longer ray a slice stands for near dusk averages
+    /// over more cloud than the short one at noon does. It measures 9.59 at
+    /// forty-five degrees and 10.50 at six, a ratio of 1.095. Reading the slice
+    /// at its centre alone measures 10.0 and 13.7, a ratio of 1.37, and that is
+    /// the fault `LIGHT_STEP` in `src/cloud_march.wgsl` exists to remove.
+    ///
+    /// Six degrees rather than something lower because it is already the worst
+    /// case: the shear floor clamps the lean and the step together, so every sun
+    /// below about eight and a half degrees fills the same volume.
+    #[test]
+    fn a_low_sun_does_not_lump_the_light_volume() {
+        let camera = looking(1500.0, 0.0);
+        let size = glam::UVec2::splat(32);
+        // How much of a column's optical depth arrives in how few of its slices,
+        // over the heights `DECK_SLABS` gives the low deck.
+        let peakiness = |elevation: f32| {
+            let frame = marched_under(
+                Preset::Broken,
+                &camera,
+                size,
+                crate::sky::Sun::from_angles(elevation, 140.0),
+            );
+            let (mut sum, mut square, mut count) = (0.0f64, 0.0f64, 0.0f64);
+            for z in 0..LIGHT_ACROSS {
+                for x in 0..LIGHT_ACROSS {
+                    // The volume holds what a texel blocks; the depth that
+                    // blocked it is what adds along the column. Clamped off one,
+                    // where the logarithm has no answer and the deck is opaque
+                    // anyway.
+                    let depth =
+                        |slice: u32| -(1.0 - f64::from(frame.lit(x, z, slice)).min(0.9999)).ln();
+                    for slice in 0..LIGHT_SLICES - 1 {
+                        let height = (f64::from(slice) + 0.5) * f64::from(CEILING_TOP)
+                            / f64::from(LIGHT_SLICES);
+                        if !(f64::from(DECK_SLABS[LOW_DECK][0])..f64::from(DECK_SLABS[LOW_DECK][1]))
+                            .contains(&height)
+                        {
+                            continue;
+                        }
+                        // Down the column, so the slice below gains on the one
+                        // above it. Floored, because half floats leave a texel
+                        // a ten-thousandth adrift of its neighbour.
+                        let gained = (depth(slice) - depth(slice + 1)).max(0.0);
+                        sum += gained;
+                        square += gained * gained;
+                        count += 1.0;
+                    }
+                }
+            }
+            let mean = sum / count;
+            (square / count) / (mean * mean)
+        };
+        let noon = peakiness(45.0);
+        let dusk = peakiness(6.0);
+        assert!(
+            dusk < noon * 1.2,
+            "a sun six degrees up lumps the light volume {dusk:.1} against the \
+             {noon:.1} of one at forty-five, a ratio of {:.2}, where reading a \
+             slice at its centre alone gives 1.37 and sampling along it 1.10",
+            dusk / noon
+        );
+    }
+
     /// A sun below the horizon puts no direct light in the clouds.
     ///
     /// Not because the volume says so -- it says nothing about where the sun is,
