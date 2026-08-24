@@ -2105,10 +2105,7 @@ mod tests {
     fn the_march_counts_the_rungs_of_its_own_lattice_correctly() {
         // Both proportional arms, because both spell their rung spacing as a
         // literal and neither would fail to compile if it were wrong.
-        for (slope, octave) in [
-            ("STEP_SLOPE", "STEP_OCTAVE"),
-            ("NEAR_SLOPE", "NEAR_OCTAVE"),
-        ] {
+        for (slope, octave) in [("STEP_SLOPE", "STEP_OCTAVE"), ("NEAR_SLOPE", "NEAR_OCTAVE")] {
             // In `f64`, and that is not fussiness. Worked in `f32` this reference
             // is itself wrong by more than the tolerance: 1 + slope rounds, and
             // `log2` near one divides by the logarithm, so the rounding comes out
@@ -2354,8 +2351,7 @@ mod tests {
         let near_arm = shader_constant("NEAR_OCTAVES") / (1.0 + near_slope).log2();
         let even = (floor / slope - floor / near_slope) / floor;
         let arm = shader_constant("STEP_ROOF_OCTAVES") / (1.0 + slope).log2();
-        let beyond =
-            (shader_constant("MAX_DISTANCE") - ceiling / slope) / ceiling;
+        let beyond = (shader_constant("MAX_DISTANCE") - ceiling / slope) / ceiling;
         let rungs = near_rungs + near_arm + even + arm + beyond;
 
         // Spelled `1536u` in the shader, which is not a float literal.

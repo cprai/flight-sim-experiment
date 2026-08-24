@@ -412,8 +412,7 @@ fn bare_height(sample: Sample, ground: Ground, x: f32, y: f32) -> f32 {
     ) - 0.5;
 
     // Rough where it is steep, smooth where the water dropped its load.
-    let texture_metres =
-        TEXTURE_METRES * (0.25 + 1.5 * ground.steepness) * (1.0 - 0.7 * ground.filling);
+    let texture_metres = TEXTURE_METRES * (0.25 + 1.5 * ground.steepness) * (1.0 - 0.7 * ground.filling);
     let rib_metres = RIB_METRES * ground.rockiness * (1.0 - ground.filling);
     let moraine_metres = MORAINE_METRES * ground.filling * (1.0 - ground.steepness);
 
@@ -492,8 +491,7 @@ fn lines_of(sample: Sample, ground: Ground, x: f32, y: f32) -> Lines {
     var lines: Lines;
     lines.span = span;
     lines.treeline = base + span * (TREELINE_SHARE + wobble * LINE_SHARE + sun * ASPECT_SHARE);
-    lines.snowline =
-        base + span * (SNOWLINE_SHARE + wobble * LINE_SHARE * 0.6 + sun * ASPECT_SHARE * 1.2);
+    lines.snowline = base + span * (SNOWLINE_SHARE + wobble * LINE_SHARE * 0.6 + sun * ASPECT_SHARE * 1.2);
     lines.band = clamp((sample.height - base) / max(span, 1.0), 0.0, 1.0);
     lines.mottle = fbm(
         x,
@@ -581,8 +579,7 @@ fn cover_of(sample: Sample, ground: Ground, lines: Lines) -> u32 {
     }
 
     if sample.height > lines.snowline + lines.mottle * lines.span * LINE_SHARE
-        && ground.steepness < ICE_STEEPNESS
-    {
+        && ground.steepness < ICE_STEEPNESS {
         return MAT_GLACIER;
     }
 
@@ -590,8 +587,7 @@ fn cover_of(sample: Sample, ground: Ground, lines: Lines) -> u32 {
     // so they come before the treeline is consulted: a cliff is bare at any
     // altitude.
     let band = lines.span * ROCK_BAND_SHARE;
-    let above_the_trees =
-        noise_smoothstep(lines.treeline - band, lines.treeline + band, sample.height);
+    let above_the_trees = noise_smoothstep(lines.treeline - band, lines.treeline + band, sample.height);
     let bare = noise_lerp(ROCK_THRESHOLD_WOODED, ROCK_THRESHOLD_ALPINE, above_the_trees);
     if ground.rockiness > bare + lines.mottle * 0.10 {
         return MAT_BARE_ROCK;
@@ -654,8 +650,7 @@ fn krummholz(lines: Lines) -> Trees {
 fn trees_of(sample: Sample, ground: Ground, lines: Lines, cover: u32) -> Trees {
     if cover == MAT_FOREST_NEEDLELEAVED
         || cover == MAT_FOREST_BROADLEAVED
-        || cover == MAT_FOREST_MIXED
-    {
+        || cover == MAT_FOREST_MIXED {
         return timber(sample, ground, lines);
     }
     if cover == MAT_SCRUB {
@@ -1102,7 +1097,7 @@ fn stone_baked(centre: vec2<f32>, texel: f32, stone: Rocks) -> Standing {
 }
 
 @compute @workgroup_size(8, 8)
-fn cs_bare(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_bare(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= params.tile_size || id.y >= params.tile_size {
         return;
     }
@@ -1122,7 +1117,7 @@ fn cs_bare(@builtin(global_invocation_id) id: vec3<u32>) {
 // 0..=1, so eight bits each is finer than anything downstream distinguishes,
 // and one buffer keeps the readback to one copy.
 @compute @workgroup_size(8, 8)
-fn cs_cover(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_cover(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= params.tile_size || id.y >= params.tile_size {
         return;
     }
@@ -1151,7 +1146,7 @@ fn cs_cover(@builtin(global_invocation_id) id: vec3<u32>) {
 // walk for the reason the crates take them from one: a texel raised as a tree
 // and painted as a meadow is worse than either of those on its own.
 @compute @workgroup_size(8, 8)
-fn cs_texel(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_texel(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= params.tile_size || id.y >= params.tile_size {
         return;
     }

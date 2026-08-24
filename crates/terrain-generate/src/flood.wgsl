@@ -63,7 +63,7 @@ fn is_edge(x: u32, y: u32) -> bool {
 
 // A surface far above the landscape, which is the only safe cold start.
 @compute @workgroup_size(8, 8)
-fn cs_seed_cold(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_seed_cold(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= params.width || id.y >= params.rows {
         return;
     }
@@ -85,7 +85,7 @@ fn cs_seed_cold(@builtin(global_invocation_id) id: vec3<u32>) {
 // few extra iterations, where trusting the previous surface unadjusted would
 // quietly relax from below a basin's true level and leave it unfilled.
 @compute @workgroup_size(8, 8)
-fn cs_seed_warm(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_seed_warm(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= params.width || id.y >= params.rows {
         return;
     }
@@ -147,7 +147,7 @@ fn ground_at(x: i32, y: i32) -> f32 {
 
 @compute @workgroup_size(16, 16)
 fn cs_fill_tiled(
-    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(workgroup_id)group: vec3<u32>,
     @builtin(local_invocation_index) local: u32,
 ) {
     let origin = vec2<i32>(
@@ -219,7 +219,7 @@ fn cs_fill_tiled(
 }
 
 @compute @workgroup_size(8, 8)
-fn cs_fill(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_fill(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= params.width || id.y >= params.rows {
         return;
     }

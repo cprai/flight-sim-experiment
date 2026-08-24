@@ -214,7 +214,7 @@ fn target_at(p: vec3<f32>) -> vec3<f32> {
 // rotating field rotating. It costs one extra fetch on a kernel that is not
 // what this bake spends its time in.
 @compute @workgroup_size(4, 4, 4)
-fn cs_air_advect(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_air_advect(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= CELLS_X || id.y >= CELLS_Y || id.z >= CELLS_Z {
         return;
     }
@@ -258,7 +258,7 @@ fn neighbour_wind(at: vec3<i32>, here: vec3<f32>) -> vec3<f32> {
 }
 
 @compute @workgroup_size(4, 4, 4)
-fn cs_air_divergence(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_air_divergence(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= CELLS_X || id.y >= CELLS_Y || id.z >= CELLS_Z {
         return;
     }
@@ -354,12 +354,12 @@ fn relax(id: vec3<u32>, colour: u32) {
 }
 
 @compute @workgroup_size(4, 4, 4)
-fn cs_air_red(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_air_red(@builtin(global_invocation_id)id: vec3<u32>) {
     relax(id, 0u);
 }
 
 @compute @workgroup_size(4, 4, 4)
-fn cs_air_black(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_air_black(@builtin(global_invocation_id)id: vec3<u32>) {
     relax(id, 1u);
 }
 
@@ -382,7 +382,7 @@ fn wall_pressure(at: vec3<i32>, here: f32) -> f32 {
 
 // Takes the divergence back out: what is left is the flow that fits.
 @compute @workgroup_size(4, 4, 4)
-fn cs_air_project(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_air_project(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= CELLS_X || id.y >= CELLS_Y || id.z >= CELLS_Z {
         return;
     }
@@ -427,7 +427,7 @@ fn cs_air_project(@builtin(global_invocation_id) id: vec3<u32>) {
 // which is what keeps the offset a perturbation: a steady field integrated
 // forever would stretch a cloud without bound.
 @compute @workgroup_size(4, 4, 4)
-fn cs_air_drift(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_air_drift(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= CELLS_X || id.y >= CELLS_Y || id.z >= CELLS_Z {
         return;
     }

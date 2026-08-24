@@ -328,7 +328,7 @@ fn texel_centre(id: vec3<u32>, size: u32) -> vec3<f32> {
 }
 
 @compute @workgroup_size(4, 4, 4)
-fn cs_cloud_shape(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_cloud_shape(@builtin(global_invocation_id)id: vec3<u32>) {
     if any(id >= vec3<u32>(SHAPE_SIZE)) {
         return;
     }
@@ -379,7 +379,7 @@ fn weather_field(at: vec2<f32>, seed: u32, octaves: u32) -> f32 {
 }
 
 @compute @workgroup_size(8, 8, 1)
-fn cs_cloud_weather(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_cloud_weather(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= WEATHER_SIZE || id.y >= WEATHER_SIZE || id.z >= DECKS {
         return;
     }
@@ -416,7 +416,7 @@ fn cs_cloud_weather(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 @compute @workgroup_size(4, 4, 4)
-fn cs_cloud_detail(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_cloud_detail(@builtin(global_invocation_id)id: vec3<u32>) {
     if any(id >= vec3<u32>(DETAIL_SIZE)) {
         return;
     }

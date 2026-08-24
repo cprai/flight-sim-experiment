@@ -1155,7 +1155,7 @@ fn wrap_texel(at: vec2<i32>) -> vec2<i32> {
 // bound taken over the covered texels alone would be a bound on something the
 // march never asks for.
 @compute @workgroup_size(4, 4, 4)
-fn cs_cloud_ceiling(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_cloud_ceiling(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= CEILING_ACROSS || id.y >= CEILING_SLICES || id.z >= CEILING_ACROSS {
         return;
     }
@@ -1608,7 +1608,7 @@ fn walk_light(id: vec3<u32>, shear: vec2<f32>, metres: f32) {
 }
 
 @compute @workgroup_size(8, 8, 1)
-fn cs_cloud_sun_light(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_cloud_sun_light(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= LIGHT_ACROSS || id.y >= LIGHT_ACROSS || id.z >= LIGHT_CASCADES {
         return;
     }
@@ -1616,7 +1616,7 @@ fn cs_cloud_sun_light(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 @compute @workgroup_size(8, 8, 1)
-fn cs_cloud_sky_light(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_cloud_sky_light(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= LIGHT_ACROSS || id.y >= LIGHT_ACROSS || id.z >= LIGHT_CASCADES {
         return;
     }
@@ -1690,7 +1690,7 @@ fn marched_texel(block: vec2<i32>) -> vec2<i32> {
 // marched now -- and it costs a fetch rather than a march. This dispatch is a
 // quarter the size of the buffer it fills; `cs_cloud_resolve` fills the rest.
 @compute @workgroup_size(8, 8, 1)
-fn cs_cloud_march(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_cloud_march(@builtin(global_invocation_id)id: vec3<u32>) {
     let blocks = textureDimensions(out_cloud);
     if id.x >= blocks.x || id.y >= blocks.y {
         return;
@@ -1861,7 +1861,7 @@ fn cs_cloud_march(@builtin(global_invocation_id) id: vec3<u32>) {
 // wide range that lets a stale answer through is a far smaller fault than a
 // point that replaces this texel with its neighbour.
 @compute @workgroup_size(8, 8, 1)
-fn cs_cloud_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
+fn cs_cloud_resolve(@builtin(global_invocation_id)id: vec3<u32>) {
     let size = vec2<i32>(rotation.at.zw);
     let at = vec2<i32>(id.xy);
     if at.x >= size.x || at.y >= size.y {
@@ -1973,8 +1973,7 @@ fn cs_cloud_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
             // volume at a place no cloud is; the composite refuses to blend one
             // for the same reason.
             let room = (far - near) * SLACK;
-            carried_along =
-                clamp(textureLoad(was_along, texel, 0).r, near - room, far + room);
+            carried_along = clamp(textureLoad(was_along, texel, 0).r, near - room, far + room);
         }
     }
     textureStore(out_cloud, at, carried);
