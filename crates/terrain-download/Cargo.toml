@@ -8,12 +8,12 @@ async-tiff = { version = "0.3", default-features = false, features = ["reqwest"]
 clap = { version = "4.6", features = ["derive"] }
 env_logger = "0.11.11"
 # Only the stream combinators, to keep several range requests in flight at once.
-futures = { version = "0.3.31", default-features = false, features = ["std"] }
-log = "0.4.33"
+futures = { version = "0.3.34", default-features = false, features = ["std"] }
+log = "0.4.34"
 # Geofabrik publishes an .md5 beside every extract; hashing the assembled file
 # is what proves a download resumed across runs is exactly one publication.
 md5 = "0.8.1"
-rayon = "1.11.0"
+rayon = "1.12.0"
 # Default features carry rustls, so there is no system OpenSSL to find. Left on
 # rather than pinned to a TLS backend, so async-tiff's own reqwest dependency
 # unifies with this one instead of building a second stack.

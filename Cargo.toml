@@ -20,15 +20,15 @@ anyhow = "1.0.104"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.6", features = ["derive"] }
 env_logger = "0.11.11"
-glam = "0.33.2"
+glam = "0.33.5"
 glyphon = "0.12"
 half = "2.7.1"
-log = "0.4.33"
+log = "0.4.34"
 png = "0.18.1"
 pollster = "1.0.1"
 terrain-materials = { path = "crates/terrain-materials" }
 terrain-tiles = { path = "crates/terrain-tiles" }
 tiff = { version = "0.11", default-features = false, features = ["deflate"] }
-wgpu = "30.0.0"
+wgpu = "30.0.1"
 wgpu-profiler = "0.28"
 winit = "0.30"
