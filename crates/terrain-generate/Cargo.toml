@@ -6,7 +6,7 @@ edition = "2024"
 anyhow = "1.0.104"
 # The channels cross to the GPU as plain bytes and come back the same way.
 bytemuck = { version = "1.25.2", features = ["derive"] }
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"] }
 env_logger = "0.11.11"
 log = "0.4.34"
 # wgpu's device request and buffer mapping are async and nothing here is; this
