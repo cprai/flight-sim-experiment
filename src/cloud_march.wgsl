@@ -185,7 +185,7 @@ const MAX_DISTANCE: f32 = 100000.0;
 // where they would be for an eye twelve kilometres further back, along the very
 // same rays from the very same point -- so that the sampling changes and nothing
 // else does. That isolates this from perspective, from the reprojection and from
-// the light volumes completely, which the earlier measurement here did not: it
+// the light volume completely, which the earlier measurement here did not: it
 // halved the slope and compared, which answers how much the step *rule* is worth
 // rather than how much a cloud moves when the eye does.
 //
@@ -456,13 +456,13 @@ const CUTOFF: f32 = 1e-6;
 // costs the same as stepping through a solid one.
 const EMPTY: f32 = 1e-4;
 
-// The light volumes' shape. Must match `LIGHT_ACROSS` and `LIGHT_SLICES` in
+// The light volume's shape. Must match `LIGHT_ACROSS` and `LIGHT_SLICES` in
 // `src/cloud.rs`.
 //
-// Two volumes of one shape: how much of the sun reaches a point, and how much
-// of the sky does. Camera-centred over sixty kilometres and twelve up, which
-// puts a texel at 312 m across and 250 m up -- coarse against a cloud and about
-// right for what these hold, which is not the cloud but the shadow of it. A
+// One volume holding two answers: how much of the sun reaches a point, and how
+// much of the sky does. Camera-centred over sixty kilometres and twelve up,
+// which puts a texel at 312 m across and 250 m up -- coarse against a cloud and
+// about right for what it holds, which is not the cloud but the shadow of it. A
 // billow is five texels; the wisp on its edge is none, and the wisp on its edge
 // casts no shadow anybody can see.
 const LIGHT_ACROSS: u32 = 192u;
@@ -531,6 +531,15 @@ const LIGHT_STEP: f32 = 400.0;
 const LIGHT_TAPS: u32 = 5u;
 const LIGHT_NEAR_TAPS: f32 = 4.0;
 const LIGHT_FAR_TAPS: f32 = 2.0;
+
+// Which channel of the light volume holds which walk. See `out_light`.
+//
+// A mask rather than an index, because `reaching` is one function that both the
+// march and the shading hold a copy of and a dynamic index into a vector is the
+// one thing a driver may lower to a scratch array. A dot with a unit vector is
+// a multiply-add either way.
+const SUN_CHANNEL: vec4<f32> = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+const SKY_CHANNEL: vec4<f32> = vec4<f32>(0.0, 1.0, 0.0, 0.0);
 
 // Where a cascade stops answering for a point and hands over to the one outside
 // it, as a share of its own half-span. The outermost fifth, so the join is six
@@ -633,7 +642,7 @@ struct Weather {
     span: vec4<f32>,
 };
 
-// Where the light volumes sit and how their columns lean.
+// Where the light volume sits and how its columns lean.
 //
 // Its own uniform rather than two more fields of the one above, because the
 // shading pass reads this and has no business reading that: where a volume
@@ -693,12 +702,18 @@ struct Rotation {
 @group(3) @binding(7) var out_cloud: texture_storage_2d<rgba16float, write>;
 @group(3) @binding(8) var out_cloud_depth: texture_storage_2d<r32float, write>;
 @group(3) @binding(9) var out_ceiling: texture_storage_3d<r32float, write>;
-// Whichever of the two light volumes is being filled. One binding and one
-// layout for both, because the only thing that differs between them is which
-// way the column walks -- see `cs_cloud_sun_light` and `cs_cloud_sky_light`.
+// The light volume being filled, and the same volume being read.
+//
+// One volume and not two. What reaches a point from the sun and what reaches it
+// from the sky are two walks of the same field over the same lattice, differing
+// only in which way the column leans, so they are two channels of one texel
+// rather than two textures: `r` is the sun's and `g` is the sky's. That halves
+// what the pass writes, which is most of what it costs -- see `walk_light` --
+// and halves what the pair takes in memory. The two spare channels are the
+// format's, not this volume's; see the note beside `CLOUD_FORMAT` in
+// `src/cloud.rs`.
 @group(3) @binding(10) var out_light: texture_storage_3d<rgba16float, write>;
-@group(3) @binding(11) var sun_light: texture_3d<f32>;
-@group(3) @binding(12) var sky_light: texture_3d<f32>;
+@group(3) @binding(11) var light_volume: texture_3d<f32>;
 // Clamped rather than repeating: these do not tile. A point outside reads the
 // nearest column, which is a real transmittance from a real place and the most
 // plausible thing to continue with -- and everything that far out is behind
@@ -1538,6 +1553,7 @@ fn reaching(
     filtering: sampler,
     p: vec3<f32>,
     shear: vec2<f32>,
+    channel: vec4<f32>,
 ) -> f32 {
     var blocked = 0.0;
     var answered = 0.0;
@@ -1556,7 +1572,8 @@ fn reaching(
         let share = min(inside, 1.0 - answered);
         if share > 0.0 {
             let at = vec3<f32>(uvw.xy, stacked_w(uvw.z, cascade));
-            blocked = blocked + share * textureSampleLevel(volume, filtering, at, 0.0).r;
+            let held = textureSampleLevel(volume, filtering, at, 0.0);
+            blocked = blocked + share * dot(held, channel);
             answered = answered + share;
         }
     }
@@ -1572,11 +1589,11 @@ fn reaching(
 // so `light_position` and this are already inverses. See `to_texture` in
 // `src/sky.wgsl` for the case where the correction is needed.
 fn sun_reaching(p: vec3<f32>) -> f32 {
-    return reaching(sun_light, edge_sampler, p, light.walk.xy);
+    return reaching(light_volume, edge_sampler, p, light.walk.xy, SUN_CHANNEL);
 }
 
 fn sky_reaching(p: vec3<f32>) -> f32 {
-    return reaching(sky_light, edge_sampler, p, vec2<f32>(0.0));
+    return reaching(light_volume, edge_sampler, p, vec2<f32>(0.0), SKY_CHANNEL);
 }
 
 // What a point gets of the sky, given how much of it reaches there unscattered.
@@ -1678,14 +1695,21 @@ fn light_taps(metres: f32, cascade: u32) -> u32 {
 // what would be a march per shaded sample becomes a fetch per shaded sample.
 // Structurally `cs_aerial` in `src/sky.wgsl`, which walks the frustum's froxel
 // columns the same way and for the same reason.
-fn walk_light(id: vec3<u32>, shear: vec2<f32>, metres: f32) {
+fn walk_light(id: vec3<u32>) {
     let cascade = id.z;
-    var tau = 0.0;
+    // The sun's column leans and its slice is worth the longer ray that lean
+    // crosses; the sky's stands plumb and a slice is worth its own height.
+    let lean = light.walk.xy;
+    let sun_metres = light.walk.z;
+    let sky_metres = light.walk.w;
+    var sun_tau = 0.0;
+    var sky_tau = 0.0;
     for (var slice = LIGHT_SLICES; slice > 0u; slice -= 1u) {
         let at = vec3<u32>(id.x, id.y, slice - 1u);
-        let extinction = cell_extinction(at, cascade, shear, metres);
-        let crossed = extinction * metres;
-        tau = tau + crossed;
+        let sun_crossed = cell_extinction(at, cascade, lean, sun_metres) * sun_metres;
+        let sky_crossed = cell_extinction(at, cascade, vec2<f32>(0.0), sky_metres) * sky_metres;
+        sun_tau = sun_tau + sun_crossed;
+        sky_tau = sky_tau + sky_crossed;
         // What is *blocked*, not what gets through, and that is not a matter of
         // taste. A frame with no cloud in it has to draw the ground exactly as
         // it drew it before there were clouds, and a volume of ones does not
@@ -1701,27 +1725,22 @@ fn walk_light(id: vec3<u32>, shear: vec2<f32>, metres: f32) {
         textureStore(
             out_light,
             vec3<i32>(i32(at.x), i32(at.y), i32(cascade * LIGHT_SLICES + at.z)),
-            vec4<f32>(1.0 - exp(crossed * 0.5 - tau), 0.0, 0.0, 1.0),
+            vec4<f32>(
+                1.0 - exp(sun_crossed * 0.5 - sun_tau),
+                1.0 - exp(sky_crossed * 0.5 - sky_tau),
+                0.0,
+                1.0,
+            ),
         );
     }
 }
 
 @compute @workgroup_size(8, 8, 1)
-fn cs_cloud_sun_light(@builtin(global_invocation_id)id: vec3<u32>) {
+fn cs_cloud_light(@builtin(global_invocation_id)id: vec3<u32>) {
     if id.x >= LIGHT_ACROSS || id.y >= LIGHT_ACROSS || id.z >= LIGHT_CASCADES {
         return;
     }
-    walk_light(id, light.walk.xy, light.walk.z);
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn cs_cloud_sky_light(@builtin(global_invocation_id)id: vec3<u32>) {
-    if id.x >= LIGHT_ACROSS || id.y >= LIGHT_ACROSS || id.z >= LIGHT_CASCADES {
-        return;
-    }
-    // No lean, and a slice is worth its own height rather than the longer ray a
-    // leaning one crosses.
-    walk_light(id, vec2<f32>(0.0), light.walk.w);
+    walk_light(id);
 }
 
 // How far the ground lets a two-by-two block of pixels see, along the view
@@ -1949,7 +1968,7 @@ fn cs_cloud_march(@builtin(global_invocation_id)id: vec3<u32>) {
 // span is a single point and the clamp returns that point exactly, whatever the
 // filter it came through made of it -- which is what keeps an empty sky exactly
 // empty. A filtered field of ones is not something to take on trust here; see
-// what the light volumes hold, and why, in `src/cloud.rs`.
+// what the light volume holds, and why, in `src/cloud.rs`.
 //
 // Which neighbours are entitled to speak is the whole of the difficulty, and it
 // is the same question the composite's bilateral upsample asks: a marched texel

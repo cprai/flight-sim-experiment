@@ -33,7 +33,7 @@ const AERIAL_FAR: f32 = 100000.0;
 
 const PI: f32 = 3.14159265358979;
 
-// The light volumes' shape. Must match `LIGHT_ACROSS` and `LIGHT_SLICES` in
+// The light volume's shape. Must match `LIGHT_ACROSS` and `LIGHT_SLICES` in
 // `src/cloud.rs`.
 const LIGHT_ACROSS: u32 = 192u;
 const LIGHT_SLICES: u32 = 48u;
@@ -99,7 +99,7 @@ struct Sky {
     sun_tangent: vec4<f32>,
 };
 
-// Where the light volumes stand and how their columns lean. Must match `Light`
+// Where the light volume stands and how its columns lean. Must match `Light`
 // in `src/cloud_march.wgsl` and `LightUniform` in `src/cloud.rs`.
 struct Light {
     cascade: array<vec4<f32>, LIGHT_CASCADES>,
@@ -145,16 +145,20 @@ struct Light {
 @group(3) @binding(2) var cloud_colour: texture_2d<f32>;
 @group(3) @binding(5) var cloud_along: texture_2d<f32>;
 // How much of the sun reaches each point of a coarse world grid, and how much
-// of the sky does. The same two volumes the cloud march lights itself from, read
-// at the ground instead: a cloud's shadow on a mountain and a cloud's shadow on
-// another cloud are the same fact, looked up in the same place.
+// of the sky does, a channel apiece. The same volume the cloud march lights
+// itself from, read at the ground instead: a cloud's shadow on a mountain and a
+// cloud's shadow on another cloud are the same fact, looked up in the same
+// place.
 //
 // Sampled rather than loaded, through the tables' own clamped sampler -- these
 // clamp too, and what is wanted between their texels is exactly what a linear
 // fetch gives. They are not maxima; see `cloud_colour` above for the buffers
 // that are.
-@group(3) @binding(6) var sun_light: texture_3d<f32>;
-@group(3) @binding(7) var sky_light: texture_3d<f32>;
+@group(3) @binding(6) var light_volume: texture_3d<f32>;
+// Which channel holds which walk. Must match `SUN_CHANNEL` and `SKY_CHANNEL` in
+// `src/cloud_march.wgsl`, which says why they are masks and not indices.
+const SUN_CHANNEL: vec4<f32> = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+const SKY_CHANNEL: vec4<f32> = vec4<f32>(0.0, 1.0, 0.0, 0.0);
 @group(3) @binding(8) var<uniform> light: Light;
 
 // The ray through a point on the screen, before it is normalised.
@@ -265,6 +269,7 @@ fn reaching(
     filtering: sampler,
     p: vec3<f32>,
     shear: vec2<f32>,
+    channel: vec4<f32>,
 ) -> f32 {
     var blocked = 0.0;
     var answered = 0.0;
@@ -283,7 +288,8 @@ fn reaching(
         let share = min(inside, 1.0 - answered);
         if share > 0.0 {
             let at = vec3<f32>(uvw.xy, stacked_w(uvw.z, cascade));
-            blocked = blocked + share * textureSampleLevel(volume, filtering, at, 0.0).r;
+            let held = textureSampleLevel(volume, filtering, at, 0.0);
+            blocked = blocked + share * dot(held, channel);
             answered = answered + share;
         }
     }
@@ -296,12 +302,12 @@ fn reaching(
 // there the fields tile and are read through a repeating one, here everything
 // else in the group is a table and the clamped one is already to hand.
 fn sun_reaching(p: vec3<f32>) -> f32 {
-    return reaching(sun_light, lut_sampler, p, light.walk.xy);
+    return reaching(light_volume, lut_sampler, p, light.walk.xy, SUN_CHANNEL);
 }
 
 // Must match `sky_reaching` in `src/cloud_march.wgsl`, likewise.
 fn sky_reaching(p: vec3<f32>) -> f32 {
-    return reaching(sky_light, lut_sampler, p, vec2<f32>(0.0));
+    return reaching(light_volume, lut_sampler, p, vec2<f32>(0.0), SKY_CHANNEL);
 }
 
 // Must match `sky_share` in `src/cloud_march.wgsl`.

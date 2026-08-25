@@ -131,15 +131,16 @@ const LOW_DECK: usize = 1;
 /// high the mountains are.
 const DECK_HUG: [f32; DECKS] = [1.0, 0.0, 0.0, 0.0];
 
-/// Texels across each light volume, and slices up it. Must match `LIGHT_ACROSS`
+/// Texels across the light volume, and slices up it. Must match `LIGHT_ACROSS`
 /// and `LIGHT_SLICES` in `src/cloud_march.wgsl`.
 ///
 /// Over [`LIGHT_EXTENT`] and [`CEILING_TOP`] that is 312 m across and 250 m up
 /// in the innermost cascade, and [`LIGHT_SPREAD`] times as coarse across in each
-/// one outside it. Coarse against a cloud, and about right for what these hold:
+/// one outside it. Coarse against a cloud, and about right for what it holds:
 /// not the cloud but the shadow of it, which is soft by the time it has been
-/// cast through a kilometre of anything. Fourteen megabytes per cascade apiece,
-/// so the pair of them costs eighty-five across [`LIGHT_CASCADES`] cascades.
+/// cast through a kilometre of anything. Fourteen megabytes per cascade, so
+/// forty-two across [`LIGHT_CASCADES`] of them -- the sun's walk and the sky's
+/// share a texel, so there is one volume where there were two.
 pub const LIGHT_ACROSS: u32 = 192;
 pub const LIGHT_SLICES: u32 = 48;
 
@@ -332,7 +333,7 @@ struct WeatherUniform {
     span: [f32; 4],
 }
 
-/// Where the light volumes stand and how their columns lean.
+/// Where the light volume stands and how its columns lean.
 ///
 /// Mirrors `Light` in `src/cloud_march.wgsl` and in `src/shading.wgsl`. Its own
 /// buffer rather than two more fields of [`WeatherUniform`], because the
@@ -363,7 +364,7 @@ struct LightUniform {
 }
 
 impl LightUniform {
-    /// Where the volumes go for an eye and a sun, over a wind's own grid and
+    /// Where the volume goes for an eye and a sun, over a wind's own grid and
     /// however far that wind has carried the weather by now.
     fn at(eye: glam::Vec3, sun: glam::Vec3, air: [f32; 4], carried: glam::Vec3) -> Self {
         let up = CEILING_TOP / LIGHT_SLICES as f32;
@@ -808,31 +809,25 @@ pub struct March {
     #[allow(dead_code, reason = "read through its view")]
     fresh_depth: wgpu::Texture,
     /// How much of the sun reaches each point of a coarse world grid, and how
-    /// much of the sky does. One shape, two leans; see `light_position` in
-    /// `src/cloud_march.wgsl`.
-    #[allow(dead_code, reason = "read through their views")]
-    sun_light: wgpu::Texture,
-    #[allow(dead_code, reason = "read through their views")]
-    sky_light: wgpu::Texture,
+    /// much of the sky does: one lattice, two leans and two channels. See
+    /// `light_position` and `out_light` in `src/cloud_march.wgsl`.
+    #[allow(dead_code, reason = "read through its view")]
+    light_volume: wgpu::Texture,
     colour_view: [wgpu::TextureView; 2],
     depth_view: [wgpu::TextureView; 2],
     fresh_colour_view: wgpu::TextureView,
     fresh_depth_view: wgpu::TextureView,
     ceiling_view: wgpu::TextureView,
-    sun_light_view: wgpu::TextureView,
-    sky_light_view: wgpu::TextureView,
-    /// Where the two volumes stand this frame; see [`LightUniform`]. Read by
-    /// the builds, by the march and by the shading.
+    light_view: wgpu::TextureView,
+    /// Where the volume stands this frame; see [`LightUniform`]. Read by the
+    /// builds, by the march and by the shading.
     light: wgpu::Buffer,
     /// Which quarter this frame marches; see [`RotationUniform`].
     rotation: wgpu::Buffer,
     sampler: wgpu::Sampler,
     edge_sampler: wgpu::Sampler,
     ceiling_group: wgpu::BindGroup,
-    /// One group per volume, against one layout: the only difference between
-    /// the two dispatches is which texture they write and which entry point
-    /// they run.
-    light_groups: [wgpu::BindGroup; 2],
+    light_group: wgpu::BindGroup,
 
     march_layout: wgpu::BindGroupLayout,
     march_group: wgpu::BindGroup,
@@ -842,8 +837,7 @@ pub struct March {
     resolve_layout: wgpu::BindGroupLayout,
     resolve_groups: [wgpu::BindGroup; 2],
     ceiling_pipeline: wgpu::ComputePipeline,
-    sun_light_pipeline: wgpu::ComputePipeline,
-    sky_light_pipeline: wgpu::ComputePipeline,
+    light_pipeline: wgpu::ComputePipeline,
     march_pipeline: wgpu::ComputePipeline,
     resolve_pipeline: wgpu::ComputePipeline,
     /// The half-resolution size every buffer above was built at.
@@ -866,8 +860,9 @@ pub struct March {
 /// which is exactly the split [`March::resize`] has to make.
 struct Lit<'a> {
     ceiling: &'a wgpu::TextureView,
-    sun: &'a wgpu::TextureView,
-    sky: &'a wgpu::TextureView,
+    /// The sun's walk and the sky's, a channel apiece; see `out_light` in
+    /// `src/cloud_march.wgsl`.
+    volume: &'a wgpu::TextureView,
     tiling: &'a wgpu::Sampler,
     edge: &'a wgpu::Sampler,
     light: &'a wgpu::Buffer,
@@ -993,7 +988,7 @@ impl March {
                     height: LIGHT_ACROSS,
                     // The cascades are stacked up the third axis rather than
                     // held as separate textures, which keeps one binding and one
-                    // sampler for the pair of them. What that costs is a clamp
+                    // sampler for all of them. What that costs is a clamp
                     // when the volume is read, so the filter never reaches out
                     // of one cascade's band into the next; see `stacked_w` in
                     // `src/cloud_march.wgsl`.
@@ -1009,17 +1004,17 @@ impl March {
                 view_formats: &[],
             })
         };
-        // `Rgba16Float` for one channel apiece, which is three quarters wasted
-        // and is still the right format: it is the only core format that is
-        // both storage-writable and *filterable*, and these are read between
-        // their texels every time. An eight-bit unorm would fit and would band
-        // -- a shadow gradient across a deck is exactly the smooth ramp that
-        // shows quantisation. See `FORMAT` above for the same wall from the
-        // other side.
-        let sun_light = volume("cloud sun light");
-        let sky_light = volume("cloud sky light");
-        let sun_light_view = sun_light.create_view(&Default::default());
-        let sky_light_view = sky_light.create_view(&Default::default());
+        // `Rgba16Float`, of which this uses two channels: the sun's walk and the
+        // sky's, which were a texture apiece until the writing turned out to be
+        // most of what the pass costs. It is the only core format that is both
+        // storage-writable and *filterable*, and these are read between their
+        // texels every time. An eight-bit unorm would fit and would band -- a
+        // shadow gradient across a deck is exactly the smooth ramp that shows
+        // quantisation. See `FORMAT` above for the same wall from the other
+        // side. The last two channels are still spare, and a format that held
+        // only what is wanted would need a feature this asks for none of.
+        let light_volume = volume("cloud light");
+        let light_view = light_volume.create_view(&Default::default());
 
         // Repeating in every axis. All three fields the march reads tile, and
         // reading them wrapped is the whole reason eight megabytes of noise
@@ -1036,7 +1031,7 @@ impl March {
             ..Default::default()
         });
 
-        // The light volumes do not tile, so they get the other kind. Clamped, so
+        // The light volume does not tile, so it gets the other kind. Clamped, so
         // a point outside reads the nearest column rather than one from the far
         // side of the world.
         let edge_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1166,7 +1161,6 @@ impl March {
                 written(7, CLOUD_FORMAT, wgpu::TextureViewDimension::D2),
                 written(8, DISTANCE_FORMAT, wgpu::TextureViewDimension::D2),
                 sampled(11, wgpu::TextureViewDimension::D3, true),
-                sampled(12, wgpu::TextureViewDimension::D3, true),
                 wgpu::BindGroupLayoutEntry {
                     binding: 13,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -1222,9 +1216,8 @@ impl March {
         });
 
         // Everything a light column needs to know what is in front of it, and
-        // the one texture it writes. The volumes it reads are deliberately
-        // absent: each is bound writable here, and wgpu tracks that across a
-        // whole pass.
+        // the one texture it writes. The volume it reads is deliberately absent:
+        // it is bound writable here, and wgpu tracks that across a whole pass.
         let light_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cloud light layout"),
             entries: &[
@@ -1251,9 +1244,9 @@ impl March {
             ],
         });
         let (shape_view, detail_view, _) = cloud.views();
-        let light_group = |label, into: &wgpu::TextureView| {
+        let light_group = {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
+                label: Some("cloud light group"),
                 layout: &light_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -1278,7 +1271,7 @@ impl March {
                     },
                     wgpu::BindGroupEntry {
                         binding: 10,
-                        resource: wgpu::BindingResource::TextureView(into),
+                        resource: wgpu::BindingResource::TextureView(&light_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 13,
@@ -1299,10 +1292,6 @@ impl March {
                 ],
             })
         };
-        let light_groups = [
-            light_group("cloud sun light group", &sun_light_view),
-            light_group("cloud sky light group", &sky_light_view),
-        ];
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cloud march shader"),
@@ -1334,14 +1323,9 @@ impl March {
         // a point is a fact about the cloud between it and the sun, which is
         // the same fact from anywhere it is looked at. That is the whole reason
         // there is a volume rather than a march per shaded sample.
-        let sun_light_pipeline = pipeline(
-            "cloud sun light",
-            "cs_cloud_sun_light",
-            &[None, None, None, Some(&light_layout)],
-        );
-        let sky_light_pipeline = pipeline(
-            "cloud sky light",
-            "cs_cloud_sky_light",
+        let light_pipeline = pipeline(
+            "cloud light",
+            "cs_cloud_light",
             &[None, None, None, Some(&light_layout)],
         );
         // The march needs all four. Group 2 is the reduced read of the two
@@ -1371,8 +1355,7 @@ impl March {
         let screen = Screen::new(device, size);
         let lit = Lit {
             ceiling: &ceiling_view,
-            sun: &sun_light_view,
-            sky: &sky_light_view,
+            volume: &light_view,
             tiling: &sampler,
             edge: &edge_sampler,
             light: &light,
@@ -1409,8 +1392,7 @@ impl March {
         } = screen;
         Self {
             ceiling,
-            sun_light,
-            sky_light,
+            light_volume,
             colour,
             depth,
             fresh_colour,
@@ -1420,21 +1402,19 @@ impl March {
             fresh_colour_view,
             fresh_depth_view,
             ceiling_view,
-            sun_light_view,
-            sky_light_view,
+            light_view,
             sampler,
             edge_sampler,
             light,
             rotation,
             ceiling_group,
-            light_groups,
+            light_group,
             march_layout,
             march_group,
             resolve_layout,
             resolve_groups,
             ceiling_pipeline,
-            sun_light_pipeline,
-            sky_light_pipeline,
+            light_pipeline,
             march_pipeline,
             resolve_pipeline,
             size,
@@ -1471,8 +1451,7 @@ impl March {
             gbuffer,
             &Lit {
                 ceiling: &self.ceiling_view,
-                sun: &self.sun_light_view,
-                sky: &self.sky_light_view,
+                volume: &self.light_view,
                 tiling: &self.sampler,
                 edge: &self.edge_sampler,
                 light: &self.light,
@@ -1540,8 +1519,7 @@ impl March {
                 // with every thread of it marching.
                 texture(7, &screen.fresh_colour_view),
                 texture(8, &screen.fresh_depth_view),
-                texture(11, lit.sun),
-                texture(12, lit.sky),
+                texture(11, lit.volume),
                 sampler(13, lit.edge),
                 wgpu::BindGroupEntry {
                     binding: 14,
@@ -1607,7 +1585,7 @@ impl March {
         pass.dispatch_workgroups(across, CEILING_SLICES.div_ceil(CEILING_GROUP), across);
     }
 
-    /// Says where the light volumes stand for the frame about to be drawn.
+    /// Says where the light volume stands for the frame about to be drawn.
     ///
     /// Every frame, because the camera moves and the sun may. Separate from
     /// [`Cloud::set_frame`] because it answers a different question with
@@ -1757,26 +1735,22 @@ impl March {
         (self.frame & 1) as usize
     }
 
-    /// Records both light volumes into an already-started compute pass.
+    /// Records the light volume into an already-started compute pass.
     ///
     /// After the ceiling and before the march, though only the second ordering
-    /// is forced: these read the weather and the noise, and the march reads
-    /// these. Both in the one pass, because neither reads what the other writes
-    /// -- one is the sun's own line through the cloud and the other is the
-    /// plumb line, and no column of either crosses a column of the other.
+    /// is forced: this reads the weather and the noise, and the march reads
+    /// this.
+    ///
+    /// One dispatch for both walks. A thread owns a column of one cascade and
+    /// carries the sun's integral and the sky's down it together, which is what
+    /// lets one texel hold both -- and the two walks share the loop, the index
+    /// arithmetic and, above all, the store.
     pub fn draw_light(&self, pass: &mut wgpu::ComputePass<'_>) {
         let across = LIGHT_ACROSS.div_ceil(MARCH_GROUP);
-        for (pipeline, group) in [
-            (&self.sun_light_pipeline, &self.light_groups[0]),
-            (&self.sky_light_pipeline, &self.light_groups[1]),
-        ] {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(3, group, &[]);
-            // One layer of the dispatch per cascade: a thread owns a column of
-            // one of them and walks it, which is the same work the single
-            // volume was, once per cascade.
-            pass.dispatch_workgroups(across, across, LIGHT_CASCADES);
-        }
+        pass.set_pipeline(&self.light_pipeline);
+        pass.set_bind_group(3, &self.light_group, &[]);
+        // One layer of the dispatch per cascade.
+        pass.dispatch_workgroups(across, across, LIGHT_CASCADES);
     }
 
     /// Records the march. The caller has set group 0 to the camera.
@@ -1811,8 +1785,8 @@ impl March {
     }
 
     /// Everything the shading reads of the clouds: the half-resolution buffers
-    /// the composite upsamples, and the two light volumes the ground is
-    /// shadowed out of.
+    /// the composite upsamples, and the light volume the ground is shadowed out
+    /// of.
     ///
     /// Both of the alternating pair, because the shading is built once and the
     /// alternation is per frame; which one is read is [`March::parity`], handed
@@ -1821,8 +1795,7 @@ impl March {
         crate::deferred::Clouds {
             colour: [&self.colour_view[0], &self.colour_view[1]],
             along: [&self.depth_view[0], &self.depth_view[1]],
-            sun: &self.sun_light_view,
-            sky: &self.sky_light_view,
+            volume: &self.light_view,
             light: &self.light,
         }
     }
@@ -1845,7 +1818,7 @@ impl March {
             &self.colour[self.parity()],
             &self.depth[self.parity()],
             &self.ceiling,
-            &self.sun_light,
+            &self.light_volume,
         )
     }
 
@@ -2728,9 +2701,11 @@ mod tests {
         size: glam::UVec2,
         /// The ceiling cache, indexed `(x, slice, z)`.
         ceiling: Vec<f32>,
-        /// How much of the sun reaches each texel of the light volumes, indexed
-        /// `(x, z, slice)` within a cascade and the cascades stacked up the last
-        /// axis, exactly as the texture holds them.
+        /// How much of the sun each texel of the light volume blocks: the `r`
+        /// channel, which is the sun's walk. The `g` beside it is the sky's and
+        /// nothing below reads it. Indexed `(x, z, slice)` within a cascade,
+        /// the cascades stacked up the last axis, exactly as the texture holds
+        /// them.
         sun_light: Vec<f32>,
         /// Where each cascade of that stands, as [`LightUniform::cascade`].
         cascades: [[f32; 4]; LIGHT_CASCADES as usize],
@@ -4525,11 +4500,12 @@ mod tests {
         for (name, value) in [("CEILING_TOP", CEILING_TOP), ("WEATHER_TILE", WEATHER_TILE)] {
             assert_eq!(shader_constant(name), value, "{name} differs");
         }
-        // One cubic kernel -- the ceiling -- and four flat ones: the march, the
-        // resolve that fills in around it, and the two light columns, which are
-        // one kernel written twice because only their lean differs.
+        // One cubic kernel -- the ceiling -- and three flat ones: the march, the
+        // resolve that fills in around it, and the light columns, which are one
+        // kernel because the sun's walk and the sky's are two channels of one
+        // texel rather than two textures.
         let source = include_str!("cloud_march.wgsl");
-        for (group, flat, count) in [(CEILING_GROUP, CEILING_GROUP, 1), (MARCH_GROUP, 1, 4)] {
+        for (group, flat, count) in [(CEILING_GROUP, CEILING_GROUP, 1), (MARCH_GROUP, 1, 3)] {
             assert_eq!(
                 source
                     .matches(&format!(

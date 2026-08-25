@@ -236,17 +236,18 @@ pub fn bind_storage(
 
 /// What the shading reads of the clouds.
 ///
-/// The half-resolution buffers the march left, and the two light volumes it lit
+/// The half-resolution buffers the march left, and the light volume it lit
 /// itself from -- which the ground is lit from too, out of the same texels.
-/// A bundle rather than five parameters because they always travel together and
-/// two of them are rebuilt on resize while three are not.
+/// A bundle rather than four parameters because they always travel together and
+/// two of them are rebuilt on resize while two are not.
 pub struct Clouds<'a> {
     /// Both of the alternating pair the march resolves into; see
     /// [`crate::cloud::March::parity`], which says which one a frame wrote.
     pub colour: [&'a wgpu::TextureView; 2],
     pub along: [&'a wgpu::TextureView; 2],
-    pub sun: &'a wgpu::TextureView,
-    pub sky: &'a wgpu::TextureView,
+    /// The sun's walk and the sky's, in one texel apiece; see `out_light` in
+    /// `src/cloud_march.wgsl`.
+    pub volume: &'a wgpu::TextureView,
     pub light: &'a wgpu::Buffer,
 }
 
@@ -331,12 +332,11 @@ impl Shading {
                 entry(3, unfiltered),
                 entry(4, unfiltered),
                 entry(5, unfiltered),
-                // The two cloud light volumes and where they stand. Filterable,
-                // unlike everything above them: these are a smooth field being
-                // read between its texels rather than a raster whose texels
-                // mean particular ground.
+                // The cloud light volume and where it stands. Filterable,
+                // unlike everything above it: this is a smooth field being read
+                // between its texels rather than a raster whose texels mean
+                // particular ground.
                 entry(6, volume),
-                entry(7, volume),
                 entry(
                     8,
                     wgpu::BindingType::Buffer {
@@ -430,8 +430,7 @@ impl Shading {
                     entry(3, wgpu::BindingResource::TextureView(&gbuffer.depth)),
                     entry(4, wgpu::BindingResource::TextureView(&gbuffer.normal)),
                     entry(5, wgpu::BindingResource::TextureView(cloud.along[parity])),
-                    entry(6, wgpu::BindingResource::TextureView(cloud.sun)),
-                    entry(7, wgpu::BindingResource::TextureView(cloud.sky)),
+                    entry(6, wgpu::BindingResource::TextureView(cloud.volume)),
                     entry(8, cloud.light.as_entire_binding()),
                 ],
             })
