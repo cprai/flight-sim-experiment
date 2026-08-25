@@ -1631,6 +1631,53 @@ impl March {
         queue.write_buffer(&self.light, 0, bytemuck::bytes_of(&placed));
     }
 
+    /// The same, with the lattice lifted off sea level by `floor` metres.
+    ///
+    /// Only a test asks for this, and it asks for one thing: that where the
+    /// slices happen to fall is not something the frame can see. A cell of a
+    /// light column is read at a handful of points, so what it holds is an
+    /// estimate -- and because every column of the volume samples at the same
+    /// heights, an estimate that is wrong is wrong right across a horizontal
+    /// plane of the world. Standing the whole lattice half a slice higher draws
+    /// the same sky from a different set of samples, so what changes between the
+    /// two frames is the error and nothing else. See
+    /// `LIGHT_NEAR_TAPS` in `src/cloud_march.wgsl` and
+    /// `where_the_slices_fall_is_not_something_the_frame_can_see`.
+    ///
+    /// The corner moves along the lean as the floor rises, which is what keeps
+    /// the columns on the *same rays*: without it the volume would be lit along
+    /// a different set of sun rays as well, and the comparison would be of two
+    /// scenes rather than of two samplings of one.
+    #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "set_frame's own list, and one more saying where to stand it"
+    )]
+    pub fn set_frame_from(
+        &self,
+        queue: &wgpu::Queue,
+        eye: glam::Vec3,
+        sun: glam::Vec3,
+        air: &crate::air::Air,
+        wind: crate::air::Wind,
+        elapsed: std::time::Duration,
+        floor: f32,
+    ) {
+        let mut placed = LightUniform::at(
+            eye,
+            sun,
+            air.bounds(),
+            LightUniform::carried_by(wind, elapsed),
+        );
+        let lean = glam::Vec2::new(placed.walk[0], placed.walk[1]);
+        for cascade in &mut placed.cascade {
+            cascade[0] += lean.x * floor;
+            cascade[1] += lean.y * floor;
+            cascade[2] = floor;
+        }
+        queue.write_buffer(&self.light, 0, bytemuck::bytes_of(&placed));
+    }
+
     /// Says which quarter of the buffer this frame marches.
     ///
     /// `frame` is [`crate::scene::Scene`]'s own frame counter, which it already
@@ -2839,6 +2886,23 @@ mod tests {
         elapsed: std::time::Duration,
         ground: Option<&[f32]>,
     ) -> Marched {
+        marched_lit_from(preset, cameras, size, sun, wind, elapsed, ground, 0.0)
+    }
+
+    /// The same, with the light lattice standing somewhere other than sea level.
+    ///
+    /// See [`March::set_frame_from`], which is the only reason this exists.
+    #[allow(clippy::too_many_arguments, reason = "one test wants a terrain too")]
+    fn marched_lit_from(
+        preset: Preset,
+        cameras: &[&crate::camera::Camera],
+        size: glam::UVec2,
+        sun: crate::sky::Sun,
+        wind: crate::air::Wind,
+        elapsed: std::time::Duration,
+        ground: Option<&[f32]>,
+        floor: f32,
+    ) -> Marched {
         let camera = cameras[0];
         let (device, queue) = crate::headless::device().expect("no headless device");
         let (camera_buffer, camera_layout, camera_group) =
@@ -2891,7 +2955,15 @@ mod tests {
                     cameras[frame.saturating_sub(1)],
                 )),
             );
-            march.set_frame(&queue, aim.position, sun.direction, &air, wind, elapsed);
+            march.set_frame_from(
+                &queue,
+                aim.position,
+                sun.direction,
+                &air,
+                wind,
+                elapsed,
+                floor,
+            );
             march.set_rotation(&queue, frame as u32);
 
             let mut encoder = device.create_command_encoder(&Default::default());
@@ -3847,6 +3919,114 @@ mod tests {
             "a coarse cascade sits {gap:.4} from the mean of the fine one under \
              it, where averaging its cell holds it to 0.0355 and sampling the \
              middle of it gives 0.0503"
+        );
+    }
+
+    /// Where the slices fall is not something the frame can see.
+    ///
+    /// A cell of a light column is read at a handful of points, so what it holds
+    /// is an estimate. Because every column of the volume samples at the same
+    /// heights, an estimate that is out is out right across a horizontal plane
+    /// of the world -- so the error does not scatter, it lays a band of shading
+    /// over whatever cloud stands at that height. The band is the fault; the
+    /// noise behind it is only how the band gets there.
+    ///
+    /// So lift the whole lattice half a slice, along the same rays, and draw the
+    /// same sky again. Nothing about the world has changed and nothing about
+    /// which sun rays were walked; only the heights the samples were taken at.
+    /// Whatever moves between the two frames is the error, and where it moves is
+    /// where the band was.
+    ///
+    /// Measured as the share of the near cloud whose light moves by more than
+    /// eight levels of the eight-bit frame it is bound for. Two samples to a
+    /// cell measures 26.3 per cent of it; the four `LIGHT_NEAR_TAPS` gives the
+    /// innermost cascade measures 12.2, and six measures 12.0 -- so four is
+    /// where the curve flattens and the bound below sits between four and two
+    /// with room on each side.
+    ///
+    /// It does not go to nothing and is not asked to. Moving the lattice also
+    /// moves the points the volume is *read between*, and a linear read of an
+    /// exponential is wrong between its samples however well each one was taken.
+    /// That floor is the slice count's to answer for and not the tap count's; it
+    /// is what is left at six taps, and it is why the claim here is that the
+    /// bands halve rather than that they go away.
+    ///
+    /// Over `overcast` from five kilometres up, which is the sky that fills the
+    /// volume and puts thick cloud at every height the slices cut through.
+    ///
+    /// The transmittance is checked to be untouched rather than merely small,
+    /// which is not a nicety: the volumes light the cloud and take nothing out
+    /// of the view ray, so a lattice that moved the cloud's own opacity would
+    /// mean the march had started reading them for something they do not say.
+    #[test]
+    fn where_the_slices_fall_is_not_something_the_frame_can_see() {
+        let camera = looking(5000.0, -10.0);
+        let size = glam::UVec2::splat(96);
+        let sun = crate::sky::Sun::from_angles(20.0, 140.0);
+        let draw = |floor: f32| {
+            marched_lit_from(
+                Preset::Overcast,
+                &[&camera; ROTATION.len()],
+                size,
+                sun,
+                crate::air::Wind::default(),
+                std::time::Duration::ZERO,
+                None,
+                floor,
+            )
+        };
+        let sat = draw(0.0);
+        // Half a slice, which is the furthest the lattice can be moved: a whole
+        // one is the lattice it started on.
+        let lifted = draw(CEILING_TOP / LIGHT_SLICES as f32 * 0.5);
+        // A plain daylight sky standing behind the cloud, so that a wisp is
+        // judged the way the frame will judge it -- against what is behind it --
+        // rather than against black, where the tonemap's toe turns a hundredth
+        // of nothing into a dozen levels.
+        const BEHIND: f32 = 0.02;
+        let mut moved = 0u32;
+        let mut looked = 0u32;
+        let mut worst = 0.0f32;
+        let mut opacity = 0.0f32;
+        for (at, (a, b)) in sat.colour.iter().zip(lifted.colour.iter()).enumerate() {
+            opacity = opacity.max((a[3] - b[3]).abs());
+            // Cloud the innermost cascade answers for, and enough of it to see
+            // the shading on. Further out the cascades take over, and they are
+            // deliberately left at two samples -- see `LIGHT_FAR_TAPS`.
+            if a[3] > 0.5 || sat.depth[at] > LIGHT_EXTENT * 0.25 {
+                continue;
+            }
+            looked += 1;
+            let levels = |texel: &[f32; 4]| {
+                let lit = glam::Vec3::new(texel[0], texel[1], texel[2]);
+                crate::sky::tonemap(lit + glam::Vec3::splat(BEHIND) * texel[3]) * 255.0
+            };
+            let gap = (levels(a) - levels(b)).abs().max_element();
+            worst = worst.max(gap);
+            if gap > 8.0 {
+                moved += 1;
+            }
+        }
+        assert!(
+            opacity == 0.0,
+            "moving the light lattice moved the cloud's own transmittance by \
+             {opacity}, which is not something it lights"
+        );
+        // Enough of the frame for the share below to mean anything, and a
+        // reading that is not all noise: a sky with no cloud near enough to
+        // shade would pass this test by having nothing in it.
+        assert!(
+            looked > 1000,
+            "only {looked} texels of the buffer held near cloud, which is too \
+             few to say anything about"
+        );
+        let share = f64::from(moved) * 100.0 / f64::from(looked);
+        assert!(
+            share < 18.0,
+            "lifting the light lattice half a slice moved {share:.2} per cent of \
+             the near cloud by more than eight levels, and the worst of it by \
+             {worst:.0} -- where four samples to a cell hold it to 12.2 per cent \
+             and two let it to 26.3"
         );
     }
 

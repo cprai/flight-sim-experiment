@@ -474,8 +474,9 @@ const LIGHT_SLICES: u32 = 48u;
 // arrives in the uniform, one corner and one texel size apiece.
 const LIGHT_CASCADES: u32 = 3u;
 
-// The longest piece of sun ray one sample of a light column may stand for, in
-// metres, and the most samples that can ask of a slice.
+// How finely a cell of a light column is read: the longest piece of sun ray one
+// sample may stand for, the most samples a slice may take, and the fewest it
+// takes in the innermost cascade and in the ones outside it.
 //
 // A slice is a fixed 250 m of *height*, so the ray it stands for lengthens as
 // the sun sets: `walk.z` is that height over the sun's climb, and `SHEAR_FLOOR`
@@ -494,15 +495,42 @@ const LIGHT_CASCADES: u32 = 3u;
 // 6.3 at four hundred and 5.0 at two hundred and fifty, for 1.42, 1.48, 1.96 and
 // 2.17 ms of the light pass.
 //
-// The count is a function of the ray and not of the hour, so nothing pays for
-// this at noon: overhead a slice is 250 m of ray and the two samples below are
-// already finer than this asks for. Two is the floor rather than one because the
-// pair straddles the texel *across* as well, which is what `cell_extinction` is
-// for. Five is the ceiling and cannot bind -- the shear floor makes 1667 m the
+// Five is the ceiling and cannot bind -- the shear floor makes 1667 m the
 // longest ray a slice can stand for, which is 4.2 of these -- so it bounds the
 // loop rather than shaping the answer.
+//
+// The two floors below are the other half of the count, and they are not about
+// the ray at all. A cell is `across` of ground each way as well as a slice of
+// ray, and the shortest ray -- a sun overhead -- still leaves a cell 312 m
+// square in the innermost cascade against a field with five-hundred-metre
+// billows in it. Two samples of that is a *noisy* estimate of what the cell
+// holds, and the noise is not scattered: every column of the volume samples at
+// the same heights, so a slice's error is the same kind of error right across
+// the volume, and what it draws is a horizontal band of shading laid over the
+// cloud at that height.
+//
+// The measure of it is whether the answer depends on where the lattice happens
+// to sit. Lifting the volume half a slice, along the same rays, should change
+// nothing anybody can see; at two samples it moves 8.45 per cent of a 960x540
+// frame by more than eight levels, which is the band moving. Four takes that to
+// 4.41 per cent, six to 3.96 and eight to 3.63 -- so four is the knee and the
+// rest of the curve is not worth buying. Measured over `broken` weather from
+// four kilometres up, looking three degrees down at a sun twenty degrees up and
+// dead ahead, which puts a deck across the middle of the frame at every distance
+// the cascades hand over at.
+//
+// Only the innermost cascade, which is where the whole of the gain is: four
+// everywhere takes it to 3.34 per cent instead of 4.41 but costs 1.02 ms of the
+// light pass where this costs 0.30. The cascades outside carry ground that is
+// far away, small on the screen and already softened by a hundred kilometres of
+// haze -- and `cell_extinction` below has its own older measurement saying four
+// taps across the coarse cascades buy nothing. That measurement was of a
+// different fault, the join between two cascades, and the two agree: samples
+// spent out there are wasted, and samples spent in close are not.
 const LIGHT_STEP: f32 = 400.0;
 const LIGHT_TAPS: u32 = 5u;
+const LIGHT_NEAR_TAPS: f32 = 4.0;
+const LIGHT_FAR_TAPS: f32 = 2.0;
 
 // Where a cascade stops answering for a point and hands over to the one outside
 // it, as a share of its own half-span. The outermost fifth, so the join is six
@@ -1581,18 +1609,23 @@ fn sky_share(reaching: f32) -> f32 {
 // intervals, and each takes the opposite quarter of the cell across from the one
 // before it, on a diagonal that swaps with every slice so that a column of
 // forty-eight covers both diagonals. `LIGHT_STEP` says how many there are and
-// why; two is its floor.
+// why.
 //
-// The across half of that is the older half, and two was already enough of it:
-// the column is an integral of forty-eight of these and what one slice misses
-// the next supplies. Over the full sweep of a cascade join, four taps across on
-// the coarse cascades leave 0.17 per cent of the frame swinging by more than
-// thirty-two levels where two leave 0.15, and cost another 1.0 ms for it.
+// Two of them was the whole of this once, on the reasoning that the column is an
+// integral of forty-eight of these and what one slice misses the next supplies.
+// That holds where a cell is small on the screen and not where it is large, and
+// the measurement that fixed it at two was of a different fault: over the full
+// sweep of a cascade join, four taps across on the coarse cascades leave 0.17
+// per cent of the frame swinging by more than thirty-two levels where two leave
+// 0.15, and cost another 1.0 ms for it. That is still true of the coarse
+// cascades and is why they still take two. What it does not answer is what a
+// slice's own noise does to the cloud in front of the camera, which is
+// `LIGHT_NEAR_TAPS`.
 //
-// Every cascade and not merely the coarse ones, which is 0.16 ms and no special
-// case: the innermost aliases against the truth for the same reason the others
-// alias against it, and filtering it too takes the worst texel of that sweep
-// from 91 levels to 78.
+// Every cascade and not merely the coarse ones, which is 0.16 ms: the innermost
+// aliases against the truth for the same reason the others alias against it, and
+// filtering it too takes the worst texel of that sweep from 91 levels to 78. It
+// is only *how many* samples a cascade is worth that differs between them.
 //
 // The along half is what a note here used to deny, saying the vertical sample
 // was already band-limited by `metres`. It is not: `metres` is the length a
@@ -1609,7 +1642,7 @@ fn cell_extinction(at: vec3<u32>, cascade: u32, shear: vec2<f32>, metres: f32) -
     // it crosses getting there. Its length is `metres`.
     let stride = light.walk.w * vec3<f32>(shear.x, 1.0, shear.y);
     let centre = light_position(at, cascade, shear);
-    let taps = light_taps(metres);
+    let taps = light_taps(metres, cascade);
     let span = metres / f32(taps);
     var sum = 0.0;
     for (var tap = 0u; tap < taps; tap += 1u) {
@@ -1625,11 +1658,17 @@ fn cell_extinction(at: vec3<u32>, cascade: u32, shear: vec2<f32>, metres: f32) -
 
 // How many samples one slice of a light column is worth. See `LIGHT_STEP`.
 //
+// The ray decides how many it *needs*; the cascade decides how few it may have.
+//
 // Clamped as a float and converted after, so that a `metres` of zero -- which is
 // what an unwritten uniform holds -- cannot reach the conversion as something a
 // `u32` has no answer for.
-fn light_taps(metres: f32) -> u32 {
-    return u32(clamp(ceil(metres / LIGHT_STEP), 2.0, f32(LIGHT_TAPS)));
+fn light_taps(metres: f32, cascade: u32) -> u32 {
+    var fewest = LIGHT_FAR_TAPS;
+    if cascade == 0u {
+        fewest = LIGHT_NEAR_TAPS;
+    }
+    return u32(clamp(ceil(metres / LIGHT_STEP), fewest, f32(LIGHT_TAPS)));
 }
 
 // One column of a light volume, walked from the top down.
