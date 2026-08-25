@@ -289,12 +289,19 @@ fn reaching(
         if share > 0.0 {
             let at = vec3<f32>(uvw.xy, stacked_w(uvw.z, cascade));
             let held = textureSampleLevel(volume, filtering, at, 0.0);
-            blocked = blocked + share * dot(held, channel);
+            blocked = blocked + share * (1.0 - exp(-dot(held, channel)));
             answered = answered + share;
         }
     }
     // What is blocked, so an unanswered share leaves the light alone and an
     // empty volume returns exactly one. See `walk_light`.
+    //
+    // Exponentiated per cascade rather than once over the sum, so a hand-over
+    // still blends two transmittances rather than two depths. Averaging depth
+    // across a join would be a geometric mean of what the two cascades say, and
+    // what they stand for is ground side by side rather than cloud one behind
+    // the other -- see `a_coarse_cascade_holds_what_the_fine_one_averages_to`,
+    // which is written in the share and would not survive the swap.
     return 1.0 - blocked;
 }
 

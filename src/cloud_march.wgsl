@@ -1573,12 +1573,19 @@ fn reaching(
         if share > 0.0 {
             let at = vec3<f32>(uvw.xy, stacked_w(uvw.z, cascade));
             let held = textureSampleLevel(volume, filtering, at, 0.0);
-            blocked = blocked + share * dot(held, channel);
+            blocked = blocked + share * (1.0 - exp(-dot(held, channel)));
             answered = answered + share;
         }
     }
     // What is blocked, so an unanswered share leaves the light alone and an
     // empty volume returns exactly one. See `walk_light`.
+    //
+    // Exponentiated per cascade rather than once over the sum, so a hand-over
+    // still blends two transmittances rather than two depths. Averaging depth
+    // across a join would be a geometric mean of what the two cascades say, and
+    // what they stand for is ground side by side rather than cloud one behind
+    // the other -- see `a_coarse_cascade_holds_what_the_fine_one_averages_to`,
+    // which is written in the share and would not survive the swap.
     return 1.0 - blocked;
 }
 
@@ -1710,14 +1717,35 @@ fn walk_light(id: vec3<u32>) {
         let sky_crossed = cell_extinction(at, cascade, vec2<f32>(0.0), sky_metres) * sky_metres;
         sun_tau = sun_tau + sun_crossed;
         sky_tau = sky_tau + sky_crossed;
-        // What is *blocked*, not what gets through, and that is not a matter of
-        // taste. A frame with no cloud in it has to draw the ground exactly as
-        // it drew it before there were clouds, and a volume of ones does not
-        // filter back to one: the hardware's weights are worth about sixteen
-        // bits, so eight identical texels of 1.0 come back a hundred-thousandth
-        // short, and a per-cent-of-a-per-cent on the sunlight moves the odd byte
-        // of a frame that was supposed to be untouched. Zeroes filter to zero
-        // whatever the weights are worth.
+        // The optical *depth* to here, not the share of the sun it stops. The
+        // difference is what a linear filter does between two texels, and it is
+        // the whole of why a low sun used to lay stripes across a cumulus.
+        //
+        // Transmittance falls off exponentially along the ray and the hardware
+        // reads between texels in a straight line, so what it reconstructs is
+        // the chord of a curve: exact where the samples are, too bright
+        // everywhere between them, and worst where the curve bends hardest. A
+        // slice is a fixed height, so the ray it stands for grows as the sun
+        // sets -- 1667 m of it once `SHEAR_FLOOR` has the lean -- and 1667 m of
+        // cumulus is an optical depth of thirty. The curve then falls from lit
+        // to black inside one slice, the chord across it is a straight ramp with
+        // a corner at each end, and every column of the volume has its corners
+        // at the same heights. That is the band: a cumulus drawn as a stack of
+        // flat plates, and no amount of sampling touches it -- twenty samples to
+        // a cell leaves it exactly where four did.
+        //
+        // Depth adds along the ray instead of saturating across it, so a
+        // straight line between two texels is the right answer wherever the
+        // cloud between them is even, and the reconstruction is `exp` of it.
+        // See `reaching`.
+        //
+        // A frame with no cloud in it still has to draw the ground exactly as it
+        // drew it before there were clouds, which is why this is not the
+        // transmittance itself: a volume of ones does not filter back to one,
+        // since the hardware's weights are worth about sixteen bits and eight
+        // identical texels of 1.0 come back a hundred-thousandth short. Zeroes
+        // filter to zero whatever the weights are worth, and an empty sky is a
+        // volume of zero depth.
         //
         // Stored for the texel's own centre, so half of its own cell is not yet
         // in front of it. Without that the volume reads half a cell dark
@@ -1726,8 +1754,8 @@ fn walk_light(id: vec3<u32>) {
             out_light,
             vec3<i32>(i32(at.x), i32(at.y), i32(cascade * LIGHT_SLICES + at.z)),
             vec4<f32>(
-                1.0 - exp(sun_crossed * 0.5 - sun_tau),
-                1.0 - exp(sky_crossed * 0.5 - sky_tau),
+                sun_tau - sun_crossed * 0.5,
+                sky_tau - sky_crossed * 0.5,
                 0.0,
                 1.0,
             ),

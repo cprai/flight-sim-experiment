@@ -1008,11 +1008,16 @@ impl March {
         // sky's, which were a texture apiece until the writing turned out to be
         // most of what the pass costs. It is the only core format that is both
         // storage-writable and *filterable*, and these are read between their
-        // texels every time. An eight-bit unorm would fit and would band -- a
-        // shadow gradient across a deck is exactly the smooth ramp that shows
-        // quantisation. See `FORMAT` above for the same wall from the other
-        // side. The last two channels are still spare, and a format that held
-        // only what is wanted would need a feature this asks for none of.
+        // texels every time. The last two channels are still spare, and a format
+        // that held only what is wanted would need a feature this asks for none
+        // of.
+        //
+        // Float rather than a unorm, and not only to spare the quantisation an
+        // eight-bit shadow gradient would show: what these hold is an optical
+        // depth, which has no upper end to normalise against. See `walk_light`
+        // in `src/cloud_march.wgsl`, which says why the depth and not the share
+        // of the sun it stands for. See `FORMAT` above for the same wall from
+        // the other side.
         let light_volume = volume("cloud light");
         let light_view = light_volume.create_view(&Default::default());
 
@@ -2701,11 +2706,11 @@ mod tests {
         size: glam::UVec2,
         /// The ceiling cache, indexed `(x, slice, z)`.
         ceiling: Vec<f32>,
-        /// How much of the sun each texel of the light volume blocks: the `r`
-        /// channel, which is the sun's walk. The `g` beside it is the sky's and
-        /// nothing below reads it. Indexed `(x, z, slice)` within a cascade,
-        /// the cascades stacked up the last axis, exactly as the texture holds
-        /// them.
+        /// The optical depth between each texel of the light volume and the
+        /// sun: the `r` channel, which is the sun's walk. The `g` beside it is
+        /// the sky's and nothing below reads it. Indexed `(x, z, slice)` within
+        /// a cascade, the cascades stacked up the last axis, exactly as the
+        /// texture holds them.
         sun_light: Vec<f32>,
         /// Where each cascade of that stands, as [`LightUniform::cascade`].
         cascades: [[f32; 4]; LIGHT_CASCADES as usize],
@@ -2724,13 +2729,23 @@ mod tests {
             self.ceiling[((z * CEILING_SLICES + slice) * across + x) as usize]
         }
 
-        /// How much of the sun reaches one texel of the innermost light cascade.
+        /// How much of the sun one texel of the innermost light cascade blocks.
         fn lit(&self, x: u32, z: u32, slice: u32) -> f32 {
             self.lit_in(0, x, z, slice)
         }
 
         /// The same, in whichever cascade is asked for.
+        ///
+        /// The volume holds the optical depth rather than the share it stands
+        /// for -- see `walk_light` in `src/cloud_march.wgsl` for why -- so this
+        /// is the share, which is what the tests below are written in and what
+        /// the march arrives at once it has read between the texels.
         fn lit_in(&self, cascade: u32, x: u32, z: u32, slice: u32) -> f32 {
+            1.0 - (-self.depth_at(cascade, x, z, slice)).exp()
+        }
+
+        /// The optical depth one texel of a light cascade holds, as stored.
+        fn depth_at(&self, cascade: u32, x: u32, z: u32, slice: u32) -> f32 {
             let up = cascade * LIGHT_SLICES + slice;
             self.sun_light[((up * LIGHT_ACROSS + z) * LIGHT_ACROSS + x) as usize]
         }
@@ -3913,18 +3928,16 @@ mod tests {
     /// where the band was.
     ///
     /// Measured as the share of the near cloud whose light moves by more than
-    /// eight levels of the eight-bit frame it is bound for. Two samples to a
-    /// cell measures 26.3 per cent of it; the four `LIGHT_NEAR_TAPS` gives the
-    /// innermost cascade measures 12.2, and six measures 12.0 -- so four is
-    /// where the curve flattens and the bound below sits between four and two
-    /// with room on each side.
-    ///
-    /// It does not go to nothing and is not asked to. Moving the lattice also
-    /// moves the points the volume is *read between*, and a linear read of an
-    /// exponential is wrong between its samples however well each one was taken.
-    /// That floor is the slice count's to answer for and not the tap count's; it
-    /// is what is left at six taps, and it is why the claim here is that the
-    /// bands halve rather than that they go away.
+    /// eight levels of the eight-bit frame it is bound for. There are two
+    /// levers on it and this has been walked down both. How well a cell is
+    /// sampled is the first: two samples to a cell measures 26.3 per cent of the
+    /// near cloud, the four `LIGHT_NEAR_TAPS` gives the innermost cascade
+    /// measures 12.2, and six measures 12.0, so four is where that curve
+    /// flattens. What the volume *stores* is the second and the larger: holding
+    /// the transmittance and letting a linear filter read between two texels of
+    /// it measures 12.2, and holding the optical depth instead measures 3.0.
+    /// See `walk_light` in `src/cloud_march.wgsl` for why the second is worth
+    /// four times the first.
     ///
     /// Over `overcast` from five kilometres up, which is the sky that fills the
     /// volume and puts thick cloud at every height the slices cut through.
@@ -3997,11 +4010,12 @@ mod tests {
         );
         let share = f64::from(moved) * 100.0 / f64::from(looked);
         assert!(
-            share < 18.0,
+            share < 6.0,
             "lifting the light lattice half a slice moved {share:.2} per cent of \
              the near cloud by more than eight levels, and the worst of it by \
-             {worst:.0} -- where four samples to a cell hold it to 12.2 per cent \
-             and two let it to 26.3"
+             {worst:.0} -- where storing the depth holds it to 3.0 per cent, \
+             storing the transmittance let it to 12.2, and sampling a cell twice \
+             instead of four times let it to 26.3"
         );
     }
 
@@ -4027,10 +4041,10 @@ mod tests {
     ///
     /// The claim is that it does not climb as the sun goes down. If anything it
     /// should fall, because the longer ray a slice stands for near dusk averages
-    /// over more cloud than the short one at noon does. It measures 9.59 at
-    /// forty-five degrees and 10.50 at six, a ratio of 1.095. Reading the slice
-    /// at its centre alone measures 10.0 and 13.7, a ratio of 1.37, and that is
-    /// the fault `LIGHT_STEP` in `src/cloud_march.wgsl` exists to remove.
+    /// over more cloud than the short one at noon does. It measures 10.98 at
+    /// forty-five degrees and 12.26 at six, a ratio of 1.116. Reading the slice
+    /// at its centre alone gives a ratio of 1.37, and that is the fault
+    /// `LIGHT_STEP` in `src/cloud_march.wgsl` exists to remove.
     ///
     /// Six degrees rather than something lower because it is already the worst
     /// case: the shear floor clamps the lean and the step together, so every sun
@@ -4051,8 +4065,9 @@ mod tests {
             let (mut sum, mut square, mut count) = (0.0f64, 0.0f64, 0.0f64);
             for z in 0..LIGHT_ACROSS {
                 for x in 0..LIGHT_ACROSS {
-                    // The volume holds what a texel blocks; the depth that
-                    // blocked it is what adds along the column. Clamped off one,
+                    // Recovered from the share rather than read as the depth
+                    // the volume now holds, so that what this measures is what
+                    // it measured before the storage changed. Clamped off one,
                     // where the logarithm has no answer and the deck is opaque
                     // anyway.
                     let depth =
@@ -4080,11 +4095,15 @@ mod tests {
         };
         let noon = peakiness(45.0);
         let dusk = peakiness(6.0);
+        eprintln!(
+            "PROBE lump noon {noon:.2} dusk {dusk:.2} ratio {:.3}",
+            dusk / noon
+        );
         assert!(
             dusk < noon * 1.2,
             "a sun six degrees up lumps the light volume {dusk:.1} against the \
              {noon:.1} of one at forty-five, a ratio of {:.2}, where reading a \
-             slice at its centre alone gives 1.37 and sampling along it 1.10",
+             slice at its centre alone gives 1.37 and sampling along it 1.12",
             dusk / noon
         );
     }
