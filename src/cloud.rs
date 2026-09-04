@@ -134,15 +134,49 @@ const DECK_HUG: [f32; DECKS] = [1.0, 0.0, 0.0, 0.0];
 /// Texels across the light volume, and slices up it. Must match `LIGHT_ACROSS`
 /// and `LIGHT_SLICES` in `src/cloud_march.wgsl`.
 ///
-/// Over [`LIGHT_EXTENT`] and [`CEILING_TOP`] that is 312 m across and 250 m up
+/// Over [`LIGHT_EXTENT`] and [`CEILING_TOP`] that is 312 m across and 62.5 m up
 /// in the innermost cascade, and [`LIGHT_SPREAD`] times as coarse across in each
-/// one outside it. Coarse against a cloud, and about right for what it holds:
-/// not the cloud but the shadow of it, which is soft by the time it has been
-/// cast through a kilometre of anything. Fourteen megabytes per cascade, so
-/// forty-two across [`LIGHT_CASCADES`] of them -- the sun's walk and the sky's
-/// share a texel, so there is one volume where there were two.
+/// one outside it. Coarse across against a cloud, and about right for what it
+/// holds: not the cloud but the shadow of it, which is soft by the time it has
+/// been cast through a kilometre of anything. Fifty-seven megabytes per
+/// cascade, so a hundred and seventy across [`LIGHT_CASCADES`] of them -- the
+/// sun's walk and the sky's share a texel, so there is one volume where there
+/// were two.
+///
+/// The slices are four times finer than the texels are wide, and it is the
+/// setting sun that wants them so. A column of the volume leans along the sun,
+/// so a slice of fixed height stands for a piece of ray that lengthens as the
+/// sun drops: at ten degrees a 250 m slice was 1440 m of it, and 1440 m of
+/// cumulus is an optical depth far past black. A texel centred in clear air
+/// then holds no depth at all and the texel one slice below it holds a depth
+/// that is already opaque, and the filter reads a straight line between them,
+/// so the whole of the lit-to-dark transition lands just under the clear
+/// texel's centre wherever the cloud's top really is inside that slice. Every
+/// cloud's sunlit skin is snapped to one of the slice heights, every column
+/// shares those heights, and what that draws is a dark horizontal band across
+/// every cumulus in the sky, at every slice the deck cuts through. Forty-eight
+/// slices banded a sun at ten degrees plainly and one at forty-five not at all,
+/// which is the ray a slice stands for going from 354 m to 1440.
+///
+/// It is not something the samples could have bought: the texel's own depth is
+/// right, and what is wrong is what the filter does between two right answers.
+/// Storing the depth rather than the share of the sun (see `walk_light` in
+/// `src/cloud_march.wgsl`) is what made the plates soft. What removes them is
+/// that the march no longer reads the volume at the point it is lighting: it
+/// walks the two slices of ray ahead of the point itself and reads the volume
+/// over the second of them, so the skin comes from the field and only the
+/// shadow behind it from the slices -- see `reaching_walked` there. Shorter
+/// slices then decide how much of what is left depends on where the lattice
+/// sits. Lifting the lattice half a slice moves 3.00 per cent of the near cloud
+/// of an overcast sky by more than eight levels at forty-eight slices, 0.35 at
+/// ninety-six and nothing at all at 192, for frames of 8.70, 7.14 and 7.61 ms
+/// over `fair` at a ten-degree sun -- the coarse counts walk a longer ray to
+/// reach their second slice, which is what the march pays for what the light
+/// pass saves. Against a march straight at the sun the three are within half a
+/// per cent of each other. Memory and a couple of milliseconds were judged
+/// worth the lattice not showing, which is what 192 buys.
 pub const LIGHT_ACROSS: u32 = 192;
-pub const LIGHT_SLICES: u32 = 48;
+pub const LIGHT_SLICES: u32 = 192;
 
 /// How much world the innermost light cascade spans horizontally, in metres.
 ///
@@ -3937,7 +3971,16 @@ mod tests {
     /// the transmittance and letting a linear filter read between two texels of
     /// it measures 12.2, and holding the optical depth instead measures 3.0.
     /// See `walk_light` in `src/cloud_march.wgsl` for why the second is worth
-    /// four times the first.
+    /// four times the first. How the march reads the volume takes the rest:
+    /// walking the ray ahead of the point and spreading the hand-over to the
+    /// volume over a whole slice (`reaching_walked` in `src/cloud_march.wgsl`)
+    /// leaves nothing for the lattice to move at 62.5 m slices, and 0.35 per
+    /// cent at 125 m and 3.00 at 250. Those last two are not the 3.0 the
+    /// straight read measured at 250 m: the walk lifts the lid off what the
+    /// lattice can touch, since with the slices read straight the skin of a
+    /// cloud was black at every lattice phase but a sliver, and pixels that
+    /// are black both ways do not move. Walked, the skin is lit, and the slice
+    /// count is what decides whether the lattice shows in it.
     ///
     /// Over `overcast` from five kilometres up, which is the sky that fills the
     /// volume and puts thick cloud at every height the slices cut through.
@@ -4009,13 +4052,15 @@ mod tests {
              few to say anything about"
         );
         let share = f64::from(moved) * 100.0 / f64::from(looked);
+        eprintln!("PROBE slices moved {share:.2} per cent of {looked}, worst {worst:.0}");
         assert!(
             share < 6.0,
             "lifting the light lattice half a slice moved {share:.2} per cent of \
              the near cloud by more than eight levels, and the worst of it by \
-             {worst:.0} -- where storing the depth holds it to 3.0 per cent, \
-             storing the transmittance let it to 12.2, and sampling a cell twice \
-             instead of four times let it to 26.3"
+             {worst:.0} -- where 62.5 m slices walked hold it to nothing, 250 m \
+             slices storing the depth held it to 3.0, storing the transmittance \
+             let it to 12.2, and sampling a cell twice instead of four times let \
+             it to 26.3"
         );
     }
 
@@ -4041,10 +4086,19 @@ mod tests {
     ///
     /// The claim is that it does not climb as the sun goes down. If anything it
     /// should fall, because the longer ray a slice stands for near dusk averages
-    /// over more cloud than the short one at noon does. It measures 10.98 at
-    /// forty-five degrees and 12.26 at six, a ratio of 1.116. Reading the slice
-    /// at its centre alone gives a ratio of 1.37, and that is the fault
-    /// `LIGHT_STEP` in `src/cloud_march.wgsl` exists to remove.
+    /// over more cloud than the short one at noon does -- and it does fall: it
+    /// measures 6.95 at forty-five degrees and 6.48 at six, a ratio of 0.93.
+    /// Reading the slice at its centre alone gave a ratio of 1.37, and that is
+    /// the fault `LIGHT_STEP` in `src/cloud_march.wgsl` exists to remove.
+    ///
+    /// Taken on the optical depth the volume holds. It was once recovered from
+    /// the share of the sun a texel blocked, through a logarithm clamped where
+    /// the share reached one, and that clamp made the statistic answer for the
+    /// slices rather than the sun: it truncated every gain past a depth of
+    /// nine, which at 250 m a slice was every gain of either sun, and at 62.5 m
+    /// only the dusk ones -- so the measure read 1.12 at the coarse slices and
+    /// 1.57 at the fine, for a volume that had by the untruncated measure got
+    /// *less* lumpy at dusk, 0.85 to 0.93.
     ///
     /// Six degrees rather than something lower because it is already the worst
     /// case: the shear floor clamps the lean and the step together, so every sun
@@ -4065,13 +4119,9 @@ mod tests {
             let (mut sum, mut square, mut count) = (0.0f64, 0.0f64, 0.0f64);
             for z in 0..LIGHT_ACROSS {
                 for x in 0..LIGHT_ACROSS {
-                    // Recovered from the share rather than read as the depth
-                    // the volume now holds, so that what this measures is what
-                    // it measured before the storage changed. Clamped off one,
-                    // where the logarithm has no answer and the deck is opaque
-                    // anyway.
-                    let depth =
-                        |slice: u32| -(1.0 - f64::from(frame.lit(x, z, slice)).min(0.9999)).ln();
+                    // The depth itself, uncapped: see above for what capping
+                    // it at the share's saturation did to the measure.
+                    let depth = |slice: u32| f64::from(frame.depth_at(0, x, z, slice));
                     for slice in 0..LIGHT_SLICES - 1 {
                         let height = (f64::from(slice) + 0.5) * f64::from(CEILING_TOP)
                             / f64::from(LIGHT_SLICES);
@@ -4103,7 +4153,7 @@ mod tests {
             dusk < noon * 1.2,
             "a sun six degrees up lumps the light volume {dusk:.1} against the \
              {noon:.1} of one at forty-five, a ratio of {:.2}, where reading a \
-             slice at its centre alone gives 1.37 and sampling along it 1.12",
+             slice at its centre alone gives 1.37 and sampling along it 0.93",
             dusk / noon
         );
     }
@@ -4583,9 +4633,11 @@ mod tests {
             // where it lands in the sky.
             //
             // `sun_reaching` and `sky_reaching` are deliberately not in this
-            // list: they differ by one word, the sampler, because the march
-            // reads three tiling fields through a repeating one and the shading
-            // has the tables' clamped one already to hand. That is exactly why
+            // list. They differ by the sampler, because the march reads three
+            // tiling fields through a repeating one and the shading has the
+            // tables' clamped one already to hand -- and the march's walk the
+            // ray ahead of the point before they read (`reaching_walked`),
+            // which the ground has no field to walk. That is exactly why
             // `reaching` takes the texture and the sampler as parameters -- so
             // that the part which must not differ can be one function and be
             // compared here.

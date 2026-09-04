@@ -461,12 +461,13 @@ const EMPTY: f32 = 1e-4;
 //
 // One volume holding two answers: how much of the sun reaches a point, and how
 // much of the sky does. Camera-centred over sixty kilometres and twelve up,
-// which puts a texel at 312 m across and 250 m up -- coarse against a cloud and
-// about right for what it holds, which is not the cloud but the shadow of it. A
-// billow is five texels; the wisp on its edge is none, and the wisp on its edge
-// casts no shadow anybody can see.
+// which puts a texel at 312 m across and 62.5 m up -- coarse across against a
+// cloud and about right for what it holds, which is not the cloud but the
+// shadow of it. A billow is five texels; the wisp on its edge is none, and the
+// wisp on its edge casts no shadow anybody can see. Why the slices are so much
+// finer than the texels are wide is under `LIGHT_SLICES` in `src/cloud.rs`.
 const LIGHT_ACROSS: u32 = 192u;
-const LIGHT_SLICES: u32 = 48u;
+const LIGHT_SLICES: u32 = 192u;
 
 // Cascades of each light volume. Must match `LIGHT_CASCADES` in `src/cloud.rs`,
 // which says why there is more than one. How much wider each is than the one
@@ -478,15 +479,15 @@ const LIGHT_CASCADES: u32 = 3u;
 // sample may stand for, the most samples a slice may take, and the fewest it
 // takes in the innermost cascade and in the ones outside it.
 //
-// A slice is a fixed 250 m of *height*, so the ray it stands for lengthens as
+// A slice is a fixed 62.5 m of *height*, so the ray it stands for lengthens as
 // the sun sets: `walk.z` is that height over the sun's climb, and `SHEAR_FLOOR`
-// in `src/cloud.rs` caps the climb at 0.15, which makes a slice near dusk a
-// kilometre and two thirds of ray. Reading one point of that is a point sample
-// of a field whose billows are five hundred metres across -- and it does not
-// read as noise, because every column samples at the same heights, so the error
-// takes the same shape in every column of the volume. What it draws is a cloud
-// cut into horizontal slabs with hard edges, over most of the deck by six
-// degrees of elevation.
+// in `src/cloud.rs` caps the climb at 0.15, which makes a slice near dusk 417 m
+// of ray. When a slice was 250 m of height that was a kilometre and two thirds,
+// and reading one point of it was a point sample of a field whose billows are
+// five hundred metres across -- and it did not read as noise, because every
+// column samples at the same heights, so the error took the same shape in every
+// column of the volume. What it drew was a cloud cut into horizontal slabs with
+// hard edges, over most of the deck by six degrees of elevation.
 //
 // So a slice takes as many samples along its own ray as it needs to keep them
 // this far apart. Four hundred metres is the knee. Against a converged
@@ -495,9 +496,10 @@ const LIGHT_CASCADES: u32 = 3u;
 // 6.3 at four hundred and 5.0 at two hundred and fifty, for 1.42, 1.48, 1.96 and
 // 2.17 ms of the light pass.
 //
-// Five is the ceiling and cannot bind -- the shear floor makes 1667 m the
-// longest ray a slice can stand for, which is 4.2 of these -- so it bounds the
-// loop rather than shaping the answer.
+// Five is the ceiling and cannot bind -- the shear floor makes 417 m the
+// longest ray a slice can stand for, which is barely one of these, so the
+// floors below decide the count at every hour -- and it bounds the loop rather
+// than shaping the answer.
 //
 // The two floors below are the other half of the count, and they are not about
 // the ray at all. A cell is `across` of ground each way as well as a slice of
@@ -1589,18 +1591,112 @@ fn reaching(
     return 1.0 - blocked;
 }
 
-// How much of the sun reaches a point, and how much of the sky does.
+// How much of the sun reaches a point, and how much of the sky does: the first
+// slice of ray walked, and the volume read over the second.
 //
-// No half-texel correction and none wanted: a texel of these stands for the
+// A texel of the volume holds the depth to its own centre, and the filter draws
+// a straight line between two of them. Between a texel in clear air and the one
+// below it inside a cloud that line is wrong in a way no slice count fixes: the
+// depth it reconstructs climbs from the clear texel's centre downward, wherever
+// the cloud's top really is inside that slice, so every cloud's sunlit skin is
+// pinned to the slice heights and the sky is banded at every one of them. The
+// error is in the *vertical* filter, because the vertical is the direction the
+// depth accumulates along, and it is the cloud *below* the read point within
+// its slice that the filter wrongly puts in front of it.
+//
+// So the volume is not read at the point. The ray sunward of it is walked for
+// two slices, integrating the field the light pass integrates, and the volume
+// is read along the second of them, at `HANDOVER_READS` points a quarter of a
+// slice apart, each read taking the walk up to itself and the volume beyond;
+// the depth at the point is the mean of those. The skin, which is where the
+// light is, the walk resolves and the volume never could. What the filter
+// still gets wrong at each read point is the cloud below it in its own slice,
+// which the walk just crossed: at one read that is a sawtooth in where the
+// read point stands between two centres, and it is what the reads are spread
+// for. Four of them a quarter of a slice apart cover exactly one period of it,
+// so what survives is its mean over the slice, which slides with the point
+// rather than resetting at every centre. It is a blur of the shadow behind the
+// point by up to a slice, which is what the volume's resolution always was.
+//
+// Three other shapes were built first, and each is worse; the record is here
+// so the next reader does not rebuild them. One read one slice out, through the
+// filter, leaves that sawtooth whole: a thin bright line above every slice
+// centre on every front-lit cloud in the middle distance. Walking up to the
+// centre above the point and reading exactly there puts a seam at every
+// centre, because the walk and the volume never quite agree about a slice's
+// cloud. Walking the slice the point stands in and splitting the volume's own
+// depth for it by the walked share on either side is continuous and counts
+// nothing twice, and stripes the same far cloud harder than any of them: the
+// share it scales is a blurred depth over an exact ray, and the ratio changes
+// with the slice.
+//
+// It is not only the bands. Which cascade answers for a point is the whole of
+// what the camera decides about the lighting, and two cascades disagree most
+// about exactly the skin this walks: sweeping the volumes past a still camera
+// over twenty-four kilometres moved 2.38 per cent of a `broken` frame by more
+// than eight levels read straight from 250 m slices and 1.67 from 62.5 m ones,
+// against 0.50 with a walk -- and nothing by more than thirty-two where 0.063
+// and 0.019 had. See a4a7836 "fix(cloud): stop the cascades reshaping far
+// cloud" for that detector.
+//
+// The walk is taken at `LOCAL_STEP` and capped at `LOCAL_TAPS`, which is the
+// count at the shear floor, where two slices are 833 m of ray; the cap bounds
+// the loop and never shapes the answer. The count follows the ray and not the
+// point, so it is the same for every sample of a frame, and the samples stand
+// at fixed shares of the walk from the point, so nothing about them is pinned
+// to the lattice either.
+//
+// The reads are averaged as depths rather than transmittances, because what
+// they differ by -- the cloud the filter counts twice -- adds to the depth, and
+// a mean of depths is what takes a sawtooth in it to its mean. Each read's own
+// depth is `reaching`'s, so a cascade hand-over is still a blend of
+// transmittances.
+//
+// No half-texel correction on the reads and none wanted: a texel stands for the
 // point at its own centre rather than for a sample of a function over a range,
-// so `light_position` and this are already inverses. See `to_texture` in
-// `src/sky.wgsl` for the case where the correction is needed.
+// so `light_position` and `light_uvw` are already inverses. See `to_texture`
+// in `src/sky.wgsl` for the case where the correction is needed.
+const LOCAL_STEP: f32 = 200.0;
+const LOCAL_TAPS: u32 = 5u;
+const HANDOVER_READS: u32 = 4u;
+
+fn depth_of(reaching: f32) -> f32 {
+    return -log(max(reaching, 1e-30));
+}
+
+fn reaching_walked(p: vec3<f32>, shear: vec2<f32>, channel: vec4<f32>) -> f32 {
+    // Two slices of the column, as a vector from the point.
+    let walk = 2.0 * light.walk.w * vec3<f32>(shear.x, 1.0, shear.y);
+    let metres = length(walk);
+    let taps = u32(clamp(ceil(metres / LOCAL_STEP), 1.0, f32(LOCAL_TAPS)));
+    let span = metres / f32(taps);
+    var crossed = array<f32, LOCAL_TAPS>();
+    for (var tap = 0u; tap < taps; tap += 1u) {
+        let at = (f32(tap) + 0.5) / f32(taps);
+        crossed[tap] = cloud_extinction(p + at * walk, span, false) * span;
+    }
+    var depth = 0.0;
+    for (var read = 0u; read < HANDOVER_READS; read += 1u) {
+        // Where along the walk this read stands: in the second half of it.
+        let along = 0.5 + 0.5 * (f32(read) + 0.5) / f32(HANDOVER_READS);
+        var walked = 0.0;
+        for (var tap = 0u; tap < taps; tap += 1u) {
+            let portion = saturate((along - f32(tap) / f32(taps)) * f32(taps));
+            walked = walked + crossed[tap] * portion;
+        }
+        let at = p + along * walk;
+        let beyond = reaching(light_volume, edge_sampler, at, shear, channel);
+        depth = depth + walked + depth_of(beyond);
+    }
+    return exp(-depth / f32(HANDOVER_READS));
+}
+
 fn sun_reaching(p: vec3<f32>) -> f32 {
-    return reaching(light_volume, edge_sampler, p, light.walk.xy, SUN_CHANNEL);
+    return reaching_walked(p, light.walk.xy, SUN_CHANNEL);
 }
 
 fn sky_reaching(p: vec3<f32>) -> f32 {
-    return reaching(light_volume, edge_sampler, p, vec2<f32>(0.0), SKY_CHANNEL);
+    return reaching_walked(p, vec2<f32>(0.0), SKY_CHANNEL);
 }
 
 // What a point gets of the sky, given how much of it reaches there unscattered.
@@ -1631,12 +1727,12 @@ fn sky_share(reaching: f32) -> f32 {
 // parallelepiped: `across` of ground each way, and one slice *along the sun*,
 // leaning by the shear. So the samples are strung out along that ray at even
 // intervals, and each takes the opposite quarter of the cell across from the one
-// before it, on a diagonal that swaps with every slice so that a column of
-// forty-eight covers both diagonals. `LIGHT_STEP` says how many there are and
-// why.
+// before it, on a diagonal that swaps with every slice so that a column
+// covers both diagonals. `LIGHT_STEP` says how many there are and why.
 //
-// Two of them was the whole of this once, on the reasoning that the column is an
-// integral of forty-eight of these and what one slice misses the next supplies.
+// Two of them was the whole of this once, on the reasoning that the column is
+// an integral of `LIGHT_SLICES` of these and what one slice misses the next
+// supplies.
 // That holds where a cell is small on the screen and not where it is large, and
 // the measurement that fixed it at two was of a different fault: over the full
 // sweep of a cascade join, four taps across on the coarse cascades leave 0.17
@@ -1726,13 +1822,14 @@ fn walk_light(id: vec3<u32>) {
         // the chord of a curve: exact where the samples are, too bright
         // everywhere between them, and worst where the curve bends hardest. A
         // slice is a fixed height, so the ray it stands for grows as the sun
-        // sets -- 1667 m of it once `SHEAR_FLOOR` has the lean -- and 1667 m of
-        // cumulus is an optical depth of thirty. The curve then falls from lit
-        // to black inside one slice, the chord across it is a straight ramp with
-        // a corner at each end, and every column of the volume has its corners
-        // at the same heights. That is the band: a cumulus drawn as a stack of
-        // flat plates, and no amount of sampling touches it -- twenty samples to
-        // a cell leaves it exactly where four did.
+        // sets -- 1667 m of it once `SHEAR_FLOOR` had the lean, when a slice
+        // was 250 m of height -- and 1667 m of cumulus is an optical depth of
+        // thirty. The curve then falls from lit to black inside one slice, the
+        // chord across it is a straight ramp with a corner at each end, and
+        // every column of the volume has its corners at the same heights. That
+        // is the band: a cumulus drawn as a stack of flat plates, and no amount
+        // of sampling touches it -- twenty samples to a cell leaves it exactly
+        // where four did.
         //
         // Depth adds along the ray instead of saturating across it, so a
         // straight line between two texels is the right answer wherever the
@@ -1924,11 +2021,12 @@ fn cs_cloud_march(@builtin(global_invocation_id)id: vec3<u32>) {
             let middle = p + direction * (step * 0.5);
             let extinction = cloud_extinction(middle, step, true);
             if extinction > 0.0 {
-                // Two fetches, where this was a five-step march towards the sun
-                // and a flat constant for the sky. The second is what gives a
-                // cloud an inside: without it every part of a deck too deep for
-                // the sun to reach sits at exactly the same ambient, and a deck
-                // seen from below is cotton wool.
+                // A short walk and a few fetches apiece, where this was a
+                // five-step march towards the sun and a flat constant for the
+                // sky. The second is what gives a cloud an inside: without it
+                // every part of a deck too deep for the sun to reach sits at
+                // exactly the same ambient, and a deck seen from below is
+                // cotton wool.
                 // What the air has left of the sun, at this sample's own
                 // altitude rather than the eye's. Both halves of that matter at
                 // dusk and only then: the air reddens a cloud at one kilometre

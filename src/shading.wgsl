@@ -36,7 +36,7 @@ const PI: f32 = 3.14159265358979;
 // The light volume's shape. Must match `LIGHT_ACROSS` and `LIGHT_SLICES` in
 // `src/cloud.rs`.
 const LIGHT_ACROSS: u32 = 192u;
-const LIGHT_SLICES: u32 = 48u;
+const LIGHT_SLICES: u32 = 192u;
 
 // Cascades of each light volume. Must match `LIGHT_CASCADES` in `src/cloud.rs`,
 // which says why there is more than one.
