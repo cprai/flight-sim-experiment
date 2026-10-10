@@ -1,21 +1,20 @@
 ---
 name: git-commit-message
-description: Rules for composing Conventional Commit messages that obey the 50/72 rule and carry a detailed body — why the change was made, alternatives rejected, evidence, and references — because this project's git history is its living design record rather than comments and docs files. Use whenever a commit message is written, proposed, or reviewed, and whenever a commit is about to be made — including after any code change and when the user asks "what should I commit this as". The agent commits, but only after staging exactly what the message describes, verifying the staged diff against the message, and getting a yes to a per-commit AskUserQuestion. Never pushes.
+description: Rules for composing Conventional Commit messages that obey the 50/72 rule and carry a detailed body — why the change was made, alternatives rejected, evidence, and references — because this project's git history is its living design record rather than comments and docs files. Use whenever a commit message is written, proposed, or reviewed, and whenever a commit is about to be made — including after any code change and when the user asks "what should I commit this as". The agent commits on its own, without asking, but only after staging exactly what the message describes and verifying the staged diff against the message. Never pushes on its own.
 ---
 
 # Git Commit Messages
 
-## Hard rules: never push, and every commit is user-approved
+## Hard rules: commit on your own, never push on your own
 
-**Never run `git push`, under any circumstances — not even when asked.** Publishing
-history is the user's action alone. Do not rewrite existing history either: no
-`git commit --amend`, no rebase, no reset of committed work.
+**Never run `git push` on your own.** Publishing history is the user's action
+alone. Do not rewrite existing history either: no `git commit --amend`, no rebase,
+no reset of committed work.
 
-**`git commit` is allowed, but only through the loop below, and only after the user
-answers "yes" to an AskUserQuestion asked immediately before that specific commit.**
-One question per commit — never batch approvals, never ask before the staging is
-done, never commit on anything other than an explicit yes. On "no", revise per the
-user's feedback and ask again, or stop.
+**`git commit` is allowed without asking the user, but only through the loop
+below.** No approval question is needed; the loop's staging and verification steps
+are what keep each commit honest, so never skip them. Commit when a logically
+complete change is done — not half-done or broken work just to have a commit.
 
 Staging inspection (`git status`, `git diff`, `git diff --staged`, `git log`) is
 fine and encouraged at any time — it is how you learn what the message should say.
@@ -35,13 +34,12 @@ run the whole loop for the first commit, then again for the next, and so on.
 2. **Compose the message** by the rules in the rest of this skill.
 3. **Verify the staged diff against the message** — see the next section. Fix the
    staging or the message until they match; do not proceed while they disagree.
-4. **Display the message** in a fenced code block, then **ask a yes/no
-   AskUserQuestion**: commit with this message, yes or no?
-5. **Commit** with exactly the displayed message, only after the yes.
+4. **Commit** with exactly the verified message, then tell the user the resulting
+   short SHA and subject so they know what was recorded.
 
 ### Verify staged against message — both directions
 
-Before asking for approval, re-read `git diff --staged` and
+Before committing, re-read `git diff --staged` and
 `git diff --staged --stat` and check:
 
 - **Message → diff:** every factual claim in the message is true of the staged
@@ -356,7 +354,7 @@ Co-authored-by: Claude Opus 5 <claude@anthropic.com>
 ```
 Invented address. The email is always `noreply@anthropic.com`.
 
-Before you display the message, read the last line back and check it against this
+Before you commit, read the last line back and check it against this
 shape: `Co-authored-by:` + space + `Claude` + space + your display name + space +
 `<noreply@anthropic.com>` + end of line. One `<`, one `>`, both around the email, and
 no other bracket or parenthesis on the line.
@@ -448,7 +446,7 @@ BREAKING-CHANGE: /v1/telemetry is gone, use /v2/telemetry
 Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
 ```
 
-## Checklist before asking to commit
+## Checklist before committing
 
 - [ ] Subject ≤ 50 chars, imperative, lowercase, no period
 - [ ] Valid type; scope only if it helps
@@ -482,7 +480,5 @@ Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
       the message does not explain, nothing claimed that the diff does not show,
       no other change's churn riding along
 - [ ] Partial staging was used where only part of a file belongs in this commit
-- [ ] The message was displayed and the user answered yes to this commit's own
-      AskUserQuestion — one question per commit, asked right before it
 - [ ] You did not run `git push`, `git commit --amend`, or anything else that
       rewrites or publishes history

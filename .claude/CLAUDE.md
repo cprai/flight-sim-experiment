@@ -2,19 +2,14 @@
 
 ## Commits
 
-**The agent commits; the user approves every commit.** Creating commits with
-`git commit` is allowed — but only through the workflow below, and each individual
-commit must be approved by the user immediately beforehand. **Never run `git push`,
-under any circumstances — not even when asked.** Publishing history is the user's
-action alone. Do not rewrite existing history either: no `git commit --amend`, no
+**The agent commits on its own; it never pushes.** Creating commits with
+`git commit` is allowed without asking the user first — but only through the
+workflow below, so every commit is well-scoped and carries an accurate message.
+Commit when a logically complete change is done; do not leave finished work
+uncommitted, and do not commit half-done or broken work just to have a commit.
+**Never run `git push` on your own.** Publishing history is the user's action
+alone. Do not rewrite existing history either: no `git commit --amend`, no
 rebase, no reset of committed work.
-
-**The gate: a yes/no question right before every commit.** Immediately before each
-`git commit`, display the full commit message and ask the user for approval with an
-AskUserQuestion (yes/no). Commit only on an explicit "yes". On "no", revise per the
-user's feedback and ask again, or stop. Never batch approvals: one question per
-commit, asked after that commit's changes are staged, never before the staging is
-done or for several commits at once.
 
 **Workflow for each commit:**
 
@@ -35,14 +30,14 @@ done or for several commits at once.
    message. No unmentioned functional changes, no other change's churn (lockfiles,
    formatting) riding along, no staged file the message does not explain. Fix the
    staging or the message until they match.
-4. **Ask the yes/no AskUserQuestion**, showing the message.
-5. **Commit** with that exact message — only after the "yes".
+4. **Commit** with that exact message, then show the user the resulting short SHA
+   and subject so they know what was recorded.
 
 **Splitting work across commits.** When the session's changes are logically several
 commits, run the full loop above once per commit: stage the first commit's hunks,
-verify, ask, commit; then stage the next commit's hunks, verify, ask, commit; and
-so on. Partial staging is what makes the split honest — never lump unrelated
-changes into one commit because they landed in the same file.
+verify, commit; then stage the next commit's hunks, verify, commit; and so on.
+Partial staging is what makes the split honest — never lump unrelated changes into
+one commit because they landed in the same file.
 
 **The git history is this project's design record.** Write detailed bodies: why the
 change was made, alternatives rejected and why, constraints, evidence, and
