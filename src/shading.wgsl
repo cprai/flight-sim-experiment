@@ -161,6 +161,24 @@ const SUN_CHANNEL: vec4<f32> = vec4<f32>(1.0, 0.0, 0.0, 0.0);
 const SKY_CHANNEL: vec4<f32> = vec4<f32>(0.0, 1.0, 0.0, 0.0);
 @group(3) @binding(8) var<uniform> light: Light;
 
+// The terrain's shadow, as the height above which each point of the ground's
+// lattice sees the sun, and where its cascades stand. Swept by
+// `cs_shadow_sweep` in `src/terrain.wgsl`, which says what the field is; the
+// struct and the two constants must match the ones there.
+const SHADOW_ACROSS: u32 = 1024u;
+const SHADOW_CASCADES: u32 = 6u;
+struct Shadow {
+    cascade: array<vec4<f32>, SHADOW_CASCADES>,
+    sun: vec4<f32>,
+    bounds: vec4<f32>,
+};
+// Loaded rather than sampled: each of four taps is compared with the point
+// before any blending, and a blend of shadow heights across a ridge's edge would
+// be a height nothing stands at. Integers because a texel is an `f32` and two
+// half floats; see `shadow_texel`.
+@group(3) @binding(9) var shadow_field: texture_2d_array<u32>;
+@group(3) @binding(10) var<uniform> shadow: Shadow;
+
 // The ray through a point on the screen, before it is normalised.
 //
 // Must match `ndc_of` and `ray_raw_at` in `src/terrain.wgsl`, character for
@@ -320,6 +338,106 @@ fn sky_reaching(p: vec3<f32>) -> f32 {
 // Must match `sky_share` in `src/cloud_march.wgsl`.
 fn sky_share(reaching: f32) -> f32 {
     return 1.0 - (1.0 - BOUNCED) * (1.0 - reaching);
+}
+
+// Where a cascade of the terrain's shadow starts handing a point over to the
+// one outside it, and where the outermost starts giving up, as shares of the
+// way from its middle to its edge. The same pair `reaching` uses, for the same
+// reasons: a join is a blend rather than a step, and the outermost has nothing
+// to blend into.
+const SHADOW_EDGE: f32 = 0.8;
+const SHADOW_FADE: f32 = 0.9;
+// The thinnest a penumbra is taken to be, in metres of height. The disc's own
+// penumbra from an occluder one texel away is centimetres; this only keeps the
+// comparison below from dividing by nothing.
+const SHADOW_SOFTEST: f32 = 0.05;
+
+// One texel of the terrain's shadow: the shadow height, the distance back to
+// the occluder in metres, and how far the texel's own ground clears the shadow.
+// See `out_shadow` in `src/terrain.wgsl` for why it is packed the way it is.
+//
+// Must match `shadow_texel` everywhere else the field is read; see
+// `the_shadow_reads_the_same_everywhere` in `src/shadow.rs`.
+fn shadow_texel(at: vec2<i32>, cascade: u32) -> vec3<f32> {
+    let held = textureLoad(shadow_field, at, i32(cascade), 0).rg;
+    let halves = unpack2x16float(held.y);
+    return vec3<f32>(bitcast<f32>(held.x), halves.x * 1000.0, halves.y);
+}
+
+// How much of the sun one cascade of the terrain's shadow lets through at
+// lattice coordinates `w`: to a point at height `y`, or to the ground itself.
+//
+// Each of the four texels around the point is asked on its own, and the
+// answers are blended -- not the heights, which across the edge of a ridge's
+// shadow blend to a height nothing stands at. Each answer is a ramp rather than
+// a step, as wide as the penumbra the sun's disc casts from as far away as that
+// texel's occluder: a shadow from the next ridge over is sharp and one from a
+// mountain twenty kilometres off is soft.
+//
+// The ground is asked differently from a point in the air. A point in the air
+// is where it is, and is compared with the shadow height. The ground is asked
+// by its own clearance at each texel -- how far the ground the field was swept
+// over stands above the shadow there -- and not by the height of the ground the
+// march drew, which from far enough away is a coarser level whose surface need
+// not be the field's: on a steep slope the two stand hundreds of metres apart,
+// and the drawn one would read as buried in its own shadow. Blending the
+// texels' own answers is the field's shadow on the field's own ground, which is
+// all a field this coarse can say about the ground anyway; the relief finer
+// than its texels is lit by the cosine.
+//
+// Must match `shadow_tap` everywhere else the field is read.
+fn shadow_tap(cascade: u32, w: vec2<f32>, y: f32, ground: bool) -> f32 {
+    let low = vec2<i32>(floor(w));
+    let f = w - vec2<f32>(low);
+    let last = vec2<i32>(i32(SHADOW_ACROSS) - 1);
+    var clear = vec4<f32>(0.0);
+    for (var corner = 0u; corner < 4u; corner += 1u) {
+        let offset = vec2<i32>(i32(corner & 1u), i32(corner >> 1u));
+        let held = shadow_texel(clamp(low + offset, vec2<i32>(0), last), cascade);
+        var above = y - held.x;
+        if ground {
+            above = held.z;
+        }
+        let width = max(held.y * shadow.sun.w, SHADOW_SOFTEST);
+        clear[corner] = saturate(above / width + 0.5);
+    }
+    return mix(mix(clear.x, clear.y, f.x), mix(clear.z, clear.w, f.x), f.y);
+}
+
+// How much of the sun the terrain lets through to a point, over every cascade
+// of its shadow -- or, with `ground`, to the ground under it.
+//
+// One above the highest ground anywhere: nothing up there can be in the
+// terrain's shadow, which is most of the sky and so most of what the cloud and
+// the air ask. Below it, the cascades answer innermost first exactly as the
+// light volume's do in `reaching`, and what none of them answers for is lit.
+//
+// Must match `sun_clear` everywhere else the field is read.
+fn sun_clear(p: vec3<f32>, ground: bool) -> f32 {
+    if p.y > shadow.bounds.x && !ground {
+        return 1.0;
+    }
+    var clear = 0.0;
+    var answered = 0.0;
+    for (var cascade = 0u; cascade < SHADOW_CASCADES; cascade += 1u) {
+        if answered >= 1.0 {
+            break;
+        }
+        let origin = shadow.cascade[cascade];
+        let w = (p.xz - origin.xy) / origin.zw;
+        let out = abs(w / f32(SHADOW_ACROSS - 1u) - vec2<f32>(0.5)) * 2.0;
+        var edge = SHADOW_EDGE;
+        if cascade + 1u == SHADOW_CASCADES {
+            edge = SHADOW_FADE;
+        }
+        let inside = 1.0 - smoothstep(edge, 1.0, max(out.x, out.y));
+        let share = min(inside, 1.0 - answered);
+        if share > 0.0 {
+            clear = clear + share * shadow_tap(cascade, w, p.y, ground);
+            answered = answered + share;
+        }
+    }
+    return clear + (1.0 - answered);
 }
 
 // The zenith angle of the horizon. Must match `horizon_zenith` in
@@ -681,12 +799,16 @@ fn fs_shade(@builtin(position)clip: vec4<f32>) -> @location(0) vec4<f32> {
     // traversal: a cloud's shadow on a mountain and a cloud's shadow on another
     // cloud are one fact, and it was integrated once.
     //
-    // Still no shadow from the terrain itself. A slope facing the sun is bright
-    // whatever ridge stands between it and the sun, so the relief that brings
-    // out is local and a mountain does not yet darken the valley behind it.
+    // ... and by the terrain itself, which is the shadow a mountain casts into
+    // the valley behind it. Read off the same field the cloud and the air are,
+    // so a ridge's shadow on the valley floor, on the fog pooled in it and in
+    // the haze above it is one shadow -- asked as the ground, which is lit by
+    // where the field's own ground stands rather than where this pixel's does.
+    // See `shadow_tap`.
     let direct = sample_transmittance(radius, sun_mu)
         * max(dot(surface, sky.sun.xyz), 0.0)
-        * sun_reaching(ground);
+        * sun_reaching(ground)
+        * sun_clear(ground, true);
 
     // ... and the sky itself, which is what `AMBIENT` was standing in for. The
     // multiple-scattering table already *is* the sky's isotropic radiance, so

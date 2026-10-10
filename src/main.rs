@@ -11,6 +11,7 @@ mod profile;
 mod renderer;
 mod reproject;
 mod scene;
+mod shadow;
 mod sky;
 mod terrain;
 

@@ -88,6 +88,14 @@ pub const ATMOSPHERE: &str = "atmosphere";
 /// and which part of it went where.
 pub const CLOUD: &str = "cloud";
 
+/// The scope [`crate::scene::Scene::draw`] opens around the passes that work
+/// out how the world is lit before anything is drawn in it.
+///
+/// Beside [`ATMOSPHERE`] and [`CLOUD`], for the reason they are scopes: a group
+/// of passes that belong together, so the readout says what the lighting costs
+/// altogether and which part of it went where.
+pub const LIGHTING: &str = "lighting";
+
 /// The terrain's own submissions, in the order the GPU runs them.
 const TERRAIN_SCOPES: [&str; 2] = [DETAIL, MAXIMA];
 

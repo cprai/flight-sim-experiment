@@ -2762,3 +2762,386 @@ fn cs_march(@builtin(global_invocation_id)id: vec3<u32>) {
     }
     atomicAdd(&tally.wrote, 1u);
 }
+
+// ---------------------------------------------------------------------------
+// The terrain's shadow, as a height.
+//
+// Under a sun far enough away to be a direction, a heightfield's shadow is not
+// a set of shadowed points but a surface: a point is in sunlight exactly when it
+// stands above
+//
+//     H(p) = max over d > 0 of  h(p + d a) - d tan(elevation),
+//
+// where `a` is the horizontal direction towards the sun. Everything about the
+// terrain's shadow is that one field. The ground is lit where its own height
+// clears it; a cloud is lit where its sample clears it; and the air between the
+// eye and a mountain is lit where the ray clears it, which is what draws a shaft
+// -- three readers of one fact, rather than a shadow map for the ground, a
+// second for the clouds and a march towards the sun for the air.
+//
+// Exact for a heightfield at any elevation, which a sun-space shadow map is not:
+// at five degrees a light-space box is nearly edge-on to the ground and spends
+// almost all of its texels on nothing. This lives on the ground's own lattice,
+// so a texel covers the same ground however low the sun gets. And it is a fact
+// about the world and the sun, never the camera: nothing here knows which way
+// the eye is looking, only where it is, which is what decides how much
+// resolution each place gets.
+//
+// Held as cascades centred on the eye, each on the lattice of one terrain level
+// and twice the span of the one inside it -- the same arrangement the cloud's
+// light volume uses, for the same reasons. See `src/shadow.rs` for where they
+// stand.
+//
+// Built by sweeping lines across a cascade away from the sun. Along one line the
+// shadow falls by the same `drop` for every texel crossed, so with
+//
+//     g_j = h_j + j drop
+//
+// the shadow height at step `i` is `max_{j < i} g_j - i drop`: an exclusive
+// prefix maximum, which a workgroup computes in parallel rather than one thread
+// walking the whole line. Exclusive, so a texel never shadows itself; what a
+// slope does to its own light is the cosine's business and not this field's,
+// and counting it here would put acne on every sunlit face.
+//
+// Flat, as the march is. The planet's curvature would lower a distant occluder
+// by d^2 / 2R, which is real -- 1.3 km at 130 km -- and would also be a shadow
+// on ground the march draws as level, so the two would disagree about what is
+// in front of what.
+
+const SHADOW_ACROSS: u32 = 1024u;
+const SHADOW_CASCADES: u32 = 6u;
+const SWEEP_GROUP: u32 = 256u;
+// Texels of one line each thread of a sweep owns.
+const SWEEP_RUN: u32 = 4u;
+
+// Where the cascades stand and what the sun is doing, as every reader of the
+// field needs it.
+struct Shadow {
+    // World XZ of each cascade's texel (0, 0), and the metres between texels
+    // along X and Z. A texel stands for the lattice point at its corner, which
+    // is where the terrain's own height samples are.
+    cascade: array<vec4<f32>, SHADOW_CASCADES>,
+    // The horizontal unit vector towards the sun, the tangent of its elevation,
+    // and how many metres of penumbra each metre of distance to the occluder
+    // makes. See `sun_clear`.
+    sun: vec4<f32>,
+    // The highest ground anywhere, above which nothing can be in the terrain's
+    // shadow; the rest is padding.
+    bounds: vec4<f32>,
+};
+
+// One cascade's sweep: which lines to walk and how a step along one moves.
+struct Sweep {
+    cascade: u32,
+    // The terrain level the heights are read from. The cascade's own, unless
+    // the chain stops short of it.
+    level: u32,
+    // Which texture axis a line advances along one texel per step: 0 for X, 1
+    // for Z. Whichever the sun leans along more, so the other moves by at most
+    // a texel a step and no texel is skipped.
+    major: u32,
+    // The minor intercept of the first workgroup's line.
+    first: i32,
+    // Which way along the major axis is away from the sun.
+    forward: i32,
+    // Minor texels crossed per major texel.
+    slope: f32,
+    // Metres of ground one step along a line covers.
+    step: f32,
+    // How far the shadow falls over that step.
+    drop: f32,
+    // How many lines the sweep walks, from `first`.
+    lines: i32,
+    padding0: u32,
+    padding1: u32,
+    padding2: u32,
+};
+
+@group(3) @binding(12) var<uniform> shadow: Shadow;
+@group(3) @binding(13) var<uniform> sweep: Sweep;
+// One texel of the field is two words. The first is the shadow height, as the
+// bits of an `f32`: it is compared with points in the air, and a half float's
+// two-metre steps at three thousand metres would be acne on every slope it
+// grazes. The second is two half floats: the distance back to the occluder in
+// kilometres, which sets the penumbra and wants only its first three figures,
+// and how far the texel's own ground clears the shadow height, which is what
+// the ground itself is lit by and wants precision only near zero. See
+// `shadow_texel` for the reading of it.
+@group(3) @binding(14) var out_shadow: texture_storage_2d<rg32uint, write>;
+// The next cascade out, already swept: what stands upstream of this one.
+@group(3) @binding(15) var outer_shadow: texture_2d<u32>;
+// Every line of one cascade's sweep, a line after a line, each `SHADOW_ACROSS`
+// steps long: the shadow height and the distance to the occluder at every step.
+//
+// The sweep writes here rather than into the texture because a line is a column
+// of the texture as often as it is a row, and a workgroup storing a thousand
+// texels down a column was three quarters of what the whole sweep cost. A line
+// is contiguous here, and `cs_shadow_resolve` reads it back a square at a time,
+// which both ends of the copy can do quickly.
+@group(3) @binding(16) var<storage, read_write> swept_lines: array<vec2<f32>>;
+
+// The ground's height at a world position, off one level's bilinear patches --
+// the same surface the march meets -- or far below everything where there is no
+// ground to cast a shadow.
+//
+// A line steps one whole texel along its major axis, and a cascade's texels are
+// its level's own, so along that axis every sample sits exactly on the lattice
+// and the patch is a straight line between two heights rather than a square
+// between four. Rounded rather than floored there, so a coordinate a hair short
+// of a lattice line is not taken for the far side of the texel before it. Only
+// a cascade past the end of the chain, reading a coarser level than its own
+// texels, needs the whole patch.
+// A height off the resident chain at any of its levels, clamped to the level's
+// own texels.
+//
+// Not `height_at`, because that goes through `slot`, which clamps to the range
+// the uniform advertises -- and the uniform advertises only the levels from the
+// march's current base up. A camera high enough to give up the finest levels
+// leaves their entries empty, though every texel of them is still resident,
+// and the shadow wants them whatever the march is doing: the ground in the
+// shadow of a ridge is the same ground at any altitude.
+fn lattice_height(level: u32, cell: vec2<i32>) -> f32 {
+    let size = vec2<i32>(textureDimensions(heights, mip(level)));
+    return textureLoad(heights, clamp(cell, vec2<i32>(0), size - vec2<i32>(1)), mip(level)).r;
+}
+
+fn shadow_ground(level: u32, world: vec2<f32>) -> f32 {
+    if any(world < terrain.data_min) || any(world > terrain.data_max) {
+        return -NEVER;
+    }
+    let w = (world - terrain.origin) / terrain.metres_per_texel / f32(1u << level);
+    if level != terrain.resident_base + sweep.cascade {
+        let cell = vec2<i32>(floor(w));
+        let corner = vec4<f32>(
+            lattice_height(level, cell),
+            lattice_height(level, cell + vec2<i32>(1, 0)),
+            lattice_height(level, cell + vec2<i32>(0, 1)),
+            lattice_height(level, cell + vec2<i32>(1, 1)),
+        );
+        if lowest(corner) < NODATA_BELOW {
+            return -NEVER;
+        }
+        return surface(corner, w - vec2<f32>(cell));
+    }
+    var cell: vec2<i32>;
+    var next: vec2<i32>;
+    var f: f32;
+    if sweep.major == 0u {
+        cell = vec2<i32>(i32(round(w.x)), i32(floor(w.y)));
+        next = cell + vec2<i32>(0, 1);
+        f = w.y - f32(cell.y);
+    } else {
+        cell = vec2<i32>(i32(floor(w.x)), i32(round(w.y)));
+        next = cell + vec2<i32>(1, 0);
+        f = w.x - f32(cell.x);
+    }
+    let a = lattice_height(level, cell);
+    let b = lattice_height(level, next);
+    if min(a, b) < NODATA_BELOW {
+        return -NEVER;
+    }
+    return mix(a, b, f);
+}
+
+// Texel coordinates of step `i` along a line, as a major and a minor index,
+// turned into the texture's own X and Z.
+fn sweep_axes(major: f32, minor: f32) -> vec2<f32> {
+    if sweep.major == 0u {
+        return vec2<f32>(major, minor);
+    }
+    return vec2<f32>(minor, major);
+}
+
+fn sweep_major(i: i32) -> i32 {
+    if sweep.forward > 0 {
+        return i;
+    }
+    return i32(SHADOW_ACROSS) - 1 - i;
+}
+
+// Where step `i` along line `line` stands in the world. Fractional across the
+// line, because the line is a straight ray towards the sun and not a staircase
+// of texels.
+fn sweep_world(i: i32, line: i32) -> vec2<f32> {
+    let origin = shadow.cascade[sweep.cascade];
+    let minor = f32(line) + f32(i) * sweep.slope;
+    return origin.xy + sweep_axes(f32(sweep_major(i)), minor) * origin.zw;
+}
+
+// The shadow height and occluder distance, in metres, one texel of the outer
+// cascade holds.
+fn outer_texel(at: vec2<i32>) -> vec2<f32> {
+    let held = textureLoad(outer_shadow, at, 0).rg;
+    return vec2<f32>(bitcast<f32>(held.x), unpack2x16float(held.y).x * 1000.0);
+}
+
+// The outer cascade's shadow height and occluder distance at a world point,
+// bilinear between its texels. Clamped at the edges, which an outer cascade
+// twice the span of this one never reaches.
+fn outer_at(world: vec2<f32>) -> vec2<f32> {
+    let origin = shadow.cascade[sweep.cascade + 1u];
+    let w = (world - origin.xy) / origin.zw;
+    let low = vec2<i32>(floor(w));
+    let f = w - vec2<f32>(low);
+    let last = vec2<i32>(i32(SHADOW_ACROSS) - 1);
+    let a = outer_texel(clamp(low, vec2<i32>(0), last));
+    let b = outer_texel(clamp(low + vec2<i32>(1, 0), vec2<i32>(0), last));
+    let c = outer_texel(clamp(low + vec2<i32>(0, 1), vec2<i32>(0), last));
+    let d = outer_texel(clamp(low + vec2<i32>(1, 1), vec2<i32>(0), last));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+var<workgroup> scan_value: array<f32, SWEEP_GROUP>;
+var<workgroup> scan_index: array<i32, SWEEP_GROUP>;
+// What everything upstream of the line's first texel casts onto the texel
+// before it, and how far away that is.
+var<workgroup> seed: vec2<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn cs_shadow_sweep(
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(local_invocation_index) thread: u32,
+) {
+    let line = sweep.first + i32(group.x);
+
+    // The texel one step upstream of the cascade: the ground there, and the
+    // shadow the next cascade out says falls on it. The larger of the two is
+    // what the rest of the world casts into this cascade along this line, so
+    // the cascade inherits every occluder outside it without walking to it.
+    // The outermost has nothing outside it -- it spans more than the whole
+    // raster from anywhere on it -- so nothing casts into it.
+    if thread == 0u {
+        let at = sweep_world(-1, line);
+        var upstream = vec2<f32>(shadow_ground(sweep.level, at), 0.0);
+        if sweep.cascade + 1u < SHADOW_CASCADES {
+            let outer = outer_at(at);
+            if outer.x > upstream.x {
+                upstream = outer;
+            }
+        }
+        seed = upstream;
+    }
+
+    // Each thread's run of the line, and the highest of it.
+    var g: array<f32, SWEEP_RUN>;
+    var best = -NEVER;
+    var best_at = -2;
+    for (var r = 0u; r < SWEEP_RUN; r += 1u) {
+        let i = i32(thread * SWEEP_RUN + r);
+        g[r] = shadow_ground(sweep.level, sweep_world(i, line)) + f32(i) * sweep.drop;
+        if g[r] > best {
+            best = g[r];
+            best_at = i;
+        }
+    }
+    scan_value[thread] = best;
+    scan_index[thread] = best_at;
+    workgroupBarrier();
+
+    // Hillis and Steele over the runs' maxima, carrying where each came from so
+    // the distance to the occluder survives the reduction.
+    for (var offset = 1u; offset < SWEEP_GROUP; offset <<= 1u) {
+        var v = scan_value[thread];
+        var j = scan_index[thread];
+        if thread >= offset && scan_value[thread - offset] > v {
+            v = scan_value[thread - offset];
+            j = scan_index[thread - offset];
+        }
+        workgroupBarrier();
+        scan_value[thread] = v;
+        scan_index[thread] = j;
+        workgroupBarrier();
+    }
+
+    // What stands upstream of this thread's run: the seed, at step -1, and
+    // every run before this one.
+    var running = seed.x - sweep.drop;
+    var running_at = -1;
+    if thread > 0u && scan_value[thread - 1u] > running {
+        running = scan_value[thread - 1u];
+        running_at = scan_index[thread - 1u];
+    }
+
+    let row = u32(group.x) * SHADOW_ACROSS;
+    for (var r = 0u; r < SWEEP_RUN; r += 1u) {
+        let i = i32(thread * SWEEP_RUN + r);
+        var held = vec2<f32>(-NEVER, 0.0);
+        if running > -0.5 * NEVER {
+            var distance = f32(i - running_at) * sweep.step;
+            if running_at < 0 {
+                distance = seed.y + f32(i + 1) * sweep.step;
+            }
+            held = vec2<f32>(running - f32(i) * sweep.drop, distance);
+        }
+        swept_lines[row + u32(i)] = held;
+        if g[r] > running {
+            running = g[r];
+            running_at = i;
+        }
+    }
+}
+
+// One line's answer at one step, as a shadow height and an occluder distance.
+fn swept_at(line: i32, i: i32) -> vec2<f32> {
+    let index = clamp(line - sweep.first, 0, sweep.lines - 1);
+    return swept_lines[u32(index) * SHADOW_ACROSS + u32(i)];
+}
+
+// Each texel of a cascade from the two lines either side of it.
+//
+// A line is a straight ray towards the sun and a texel is a point of the
+// terrain's lattice, so the two seldom meet: at a given step the lines stand at
+// fractional positions across the minor axis and the texel falls between two of
+// them. Taking the nearer one stands the shadow up to half a texel to one side,
+// which is a few metres of ground and, across the edge of a hill's shadow where
+// the field climbs steeply sideways, tens of metres of height. Interpolating
+// across the line is exact wherever the field is straight across it.
+//
+// A square of texels a workgroup rather than a line, because that is the shape
+// a texture is stored in.
+@compute @workgroup_size(16, 16, 1)
+fn cs_shadow_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= SHADOW_ACROSS || id.y >= SHADOW_ACROSS {
+        return;
+    }
+    // Threads laid along the lines rather than along the texture's rows, so a
+    // workgroup reads sixteen runs of sixteen consecutive steps. Its texels are
+    // still a sixteen-texel square whichever way round that is.
+    let major = i32(id.x);
+    let minor = i32(id.y);
+    let texel = vec2<i32>(sweep_axes(f32(major), f32(minor)));
+    let i = sweep_major(major);
+    // Where across the minor axis this texel stands, counted in lines.
+    let across = f32(minor) - f32(i) * sweep.slope;
+    let below = i32(floor(across));
+    let f = across - f32(below);
+    let a = swept_at(below, i);
+    let b = swept_at(below + 1, i);
+    // A line along which nothing stands upstream holds no height at all, and a
+    // blend with one is nothing in particular. Where only one side has a shadow
+    // the nearer side is the answer.
+    var held: vec2<f32>;
+    if a.x > -0.5 * NEVER && b.x > -0.5 * NEVER {
+        held = mix(a, b, f);
+    } else if f < 0.5 {
+        held = a;
+    } else {
+        held = b;
+    }
+    // How far this texel's own ground clears the shadow, which is what lights
+    // the ground: the ground the field was swept over, at the texel the field
+    // stands at, so the two agree by construction about where the surface is.
+    // The ground the march draws need not -- from far enough away it is a
+    // coarser level, whose surface on a steep slope stands hundreds of metres
+    // off this one, and compared against the field directly it would read as
+    // buried in its own shadow. Clamped into what a half float holds.
+    let origin = shadow.cascade[sweep.cascade];
+    let ground = shadow_ground(sweep.level, origin.xy + vec2<f32>(texel) * origin.zw);
+    let clearance = clamp(ground - held.x, -60000.0, 60000.0);
+    let kilometres = min(held.y / 1000.0, 60000.0);
+    textureStore(
+        out_shadow,
+        texel,
+        vec4<u32>(bitcast<u32>(held.x), pack2x16float(vec2<f32>(kilometres, clearance)), 0u, 0u),
+    );
+}

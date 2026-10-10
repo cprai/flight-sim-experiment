@@ -120,6 +120,8 @@ pub struct Scene {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     terrain: Terrain,
+    /// The terrain's shadow, as a height, swept along the sun every frame.
+    shadow: crate::shadow::Shadow,
     /// Screen-sized; rebuilt by [`Scene::resize`], never mid-frame.
     gbuffer: GBuffer,
     /// How the march reaches the G-buffer, and the layout it was built against.
@@ -337,6 +339,7 @@ impl Scene {
             &gbuffer,
             &air,
         );
+        let shadow = crate::shadow::Shadow::new(device, &terrain);
         let shading = Shading::new(
             device,
             format,
@@ -345,6 +348,7 @@ impl Scene {
             sky.layout(),
             sky.tables_layout(),
             march.views(),
+            &shadow,
         );
         Self {
             camera,
@@ -358,6 +362,7 @@ impl Scene {
             camera_buffer,
             camera_bind_group,
             terrain,
+            shadow,
             gbuffer,
             storage_layout,
             storage_bind_group,
@@ -408,7 +413,7 @@ impl Scene {
         self.march
             .resize(device, &self.cloud, &self.gbuffer, &self.air);
         self.shading
-            .rebind(device, &self.gbuffer, self.march.views());
+            .rebind(device, &self.gbuffer, self.march.views(), &self.shadow);
         self.terrain.resize(viewport);
         self.camera.aspect = viewport.x as f32 / viewport.y.max(1) as f32;
     }
@@ -493,6 +498,15 @@ impl Scene {
         // written by the time the frame encoder resolves the query set.
         self.terrain
             .update(device, queue, self.camera.position, &self.profiler);
+        // After the terrain, because the first of those updates is the one that
+        // reads the chain in, and with it the ceiling nothing can stand in the
+        // terrain's shadow above.
+        self.shadow.set_frame(
+            queue,
+            self.camera.position,
+            self.sun.direction,
+            self.terrain.ceiling(),
+        );
         // After the terrain, because the first of those updates is the one that
         // reads the chain in, and the wind is solved around the ground that
         // reading produces. Once, on its own encoder, and unprofiled -- the
@@ -662,6 +676,27 @@ impl Scene {
                 let mut pass = atmosphere.scoped_compute_pass("aerial");
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 self.sky.draw_aerial(&mut pass);
+            }
+        }
+
+        {
+            // The terrain's shadow, before anything that is lit by it. It
+            // depends on nothing this frame draws -- only on where the eye is,
+            // where the sun is, and the ground -- so it could sit anywhere
+            // ahead of its readers.
+            //
+            // A pass per cascade, outermost first: each one inherits what the
+            // one outside it says is cast into it, and a pass boundary is what
+            // makes that visible.
+            let mut lighting = gpu.scope(crate::profile::LIGHTING);
+            let mut shadow = lighting.scope("shadow");
+            for k in (0..crate::shadow::SHADOW_CASCADES).rev() {
+                {
+                    let mut pass = shadow.scoped_compute_pass(format!("sweep-{k}"));
+                    self.shadow.draw_sweep(&mut pass, &self.terrain, k);
+                }
+                let mut pass = shadow.scoped_compute_pass(format!("resolve-{k}"));
+                self.shadow.draw_resolve(&mut pass, &self.terrain, k);
             }
         }
 
@@ -5363,5 +5398,288 @@ mod tests {
 
         let coverage = arrived.expect("the reader never delivered a coverage in 16 frames");
         assert_eq!(coverage.total(), SIZE * SIZE, "{coverage:?}");
+    }
+
+    /// A round hill in the middle of the test raster, six hundred metres high.
+    fn round_hill() -> Vec<f32> {
+        let mut heights = Vec::with_capacity((RASTER * RASTER) as usize);
+        let middle = (RASTER as f32 - 1.0) * 0.5;
+        for row in 0..RASTER {
+            for col in 0..RASTER {
+                let r = Vec2::new(col as f32 - middle, row as f32 - middle) * METRES_PER_TEXEL as f32;
+                heights.push(600.0 * (-r.length_squared() / (2.0 * 400.0 * 400.0)).exp());
+            }
+        }
+        heights
+    }
+
+    /// Sweeps the terrain's shadow over `heights` under `sun`, and reads the
+    /// innermost cascade back with the world position of its texel (0, 0).
+    ///
+    /// Each texel comes back unpacked: the shadow height, the distance to the
+    /// occluder in metres, and how far the texel's own ground clears the shadow.
+    fn swept_shadow(heights: Vec<f32>, sun: crate::sky::Sun) -> (Vec<[f32; 3]>, Vec2, f32) {
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut scene = test_scene(&device, format, test_residency(), heights, flat_ground());
+        scene.sun = sun;
+        // High enough to give up the finest level, which the march then no
+        // longer advertises -- and which the shadow has to go on reading, since
+        // the ground in a ridge's shadow is the same ground at any altitude.
+        scene.camera.position = Vec3::new(0.0, 20000.0, 0.0);
+        scene.update(&device, &queue, crate::headless::STEP);
+        assert!(
+            scene.terrain.base_level() > 0,
+            "the camera is low enough to keep every level, so this does not test reading one \
+             the march has given up"
+        );
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen target"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let n = crate::shadow::SHADOW_ACROSS;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow readback"),
+            size: u64::from(n * n * 8),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let profiler = crate::profile::profiler(&device, false);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut gpu = profiler.scope("gpu", &mut encoder);
+            scene.draw(&mut gpu, &view);
+        }
+        encoder.copy_texture_to_buffer(
+            scene.shadow.texture().as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(n * 8),
+                    rows_per_image: Some(n),
+                },
+            },
+            wgpu::Extent3d {
+                width: n,
+                height: n,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll failed");
+        let texels = bytemuck::cast_slice::<u8, [u32; 2]>(
+            &readback.get_mapped_range(..).expect("buffer not mapped"),
+        )
+        .iter()
+        .map(|&[height, halves]| {
+            let half = |bits: u32| half::f16::from_bits(bits as u16).to_f32();
+            [f32::from_bits(height), half(halves) * 1000.0, half(halves >> 16)]
+        })
+        .collect::<Vec<_>>();
+        let (origin, metres, base, _) = scene.terrain.lattice();
+        let eye = scene.camera.position;
+        let texel = metres.x * (1u32 << base) as f32;
+        let centre = origin + ((Vec2::new(eye.x, eye.z) - origin) / texel).round() * texel;
+        let corner = centre - texel * (n / 2) as f32;
+        (texels, corner, texel)
+    }
+
+    /// The test raster's bilinear surface at a world point, where it has one.
+    fn raster_ground(heights: &[f32], p: Vec2) -> Option<f32> {
+        let first = glam::DVec2::from(placement().world_of_texel(0, 0.0, 0.0)).as_vec2();
+        let w = (p - first) / METRES_PER_TEXEL as f32;
+        let last = (RASTER - 1) as f32;
+        if w.x < 0.0 || w.y < 0.0 || w.x > last || w.y > last {
+            return None;
+        }
+        let cell = w.floor().min(Vec2::splat(last - 1.0));
+        let f = w - cell;
+        let index = |x: f32, y: f32| heights[(y as u32 * RASTER + x as u32) as usize];
+        let top = index(cell.x, cell.y) * (1.0 - f.x) + index(cell.x + 1.0, cell.y) * f.x;
+        let bottom =
+            index(cell.x, cell.y + 1.0) * (1.0 - f.x) + index(cell.x + 1.0, cell.y + 1.0) * f.x;
+        Some(top * (1.0 - f.y) + bottom * f.y)
+    }
+
+    /// The height above which a point at `at` sees the sun, by walking towards
+    /// it over the raster's surface a metre at a time -- starting from the
+    /// ground at `at` itself, since nothing below that is a point in the air.
+    fn shadow_by_walking(heights: &[f32], at: Vec2, sun: Vec3) -> f32 {
+        let toward = Vec2::new(sun.x, sun.z).normalize();
+        let tan = sun.y / Vec2::new(sun.x, sun.z).length();
+        let mut highest = f32::NEG_INFINITY;
+        let mut d = 0.0;
+        while d < 6000.0 {
+            if let Some(h) = raster_ground(heights, at + toward * d) {
+                highest = highest.max(h - d * tan);
+            }
+            d += 1.0;
+        }
+        highest
+    }
+
+    #[test]
+    fn the_shadow_height_is_what_walking_towards_the_sun_finds() {
+        // A round hill under a sun off every axis, and a plane under one exactly
+        // on the diagonal, where the sweep's two axes tie and its lines lean a
+        // whole texel a step.
+        for (heights, azimuth, elevation) in [
+            (round_hill(), 30.0, 5.0),
+            (round_hill(), 30.0, 20.0),
+            (round_hill(), 30.0, 60.0),
+            (tilted_plane(-1.0), 45.0, 45.0),
+            (tilted_plane(1.0), 45.0, 10.0),
+        ] {
+            let sun = crate::sky::Sun::from_angles(elevation, azimuth);
+            let (texels, corner, texel) = swept_shadow(heights.clone(), sun);
+            let n = crate::shadow::SHADOW_ACROSS as usize;
+            let (lo, hi) = placement().data_bounds();
+            let mut compared = 0;
+            let mut worst = 0.0f32;
+            for z in 0..n {
+                for x in 0..n {
+                    let at = corner + Vec2::new(x as f32, z as f32) * texel;
+                    if at.x < lo.0 as f32 || at.y < lo.1 as f32 || at.x > hi.0 as f32 || at.y > hi.1 as f32 {
+                        continue;
+                    }
+                    let walked = shadow_by_walking(&heights, at, sun.direction);
+                    // The sweep is exclusive -- a texel never shadows itself --
+                    // so on a slope facing the sun it holds something below the
+                    // ground where the walk, which starts at the ground, holds
+                    // the ground. Every point in the air is lit by both alike.
+                    let own = raster_ground(&heights, at).unwrap_or(0.0);
+                    let swept = texels[z * n + x][0].max(own);
+                    compared += 1;
+                    worst = worst.max((walked - swept).abs());
+                }
+            }
+            assert!(compared > 10_000, "only {compared} texels on the raster");
+            // Measured at 2.17 m at five degrees, 1.92 at twenty and nothing at
+            // sixty. What is left is the sweep stepping a texel at a time where
+            // the walk steps a metre, and the field being interpolated straight
+            // across between two lines where the hill curves.
+            assert!(
+                worst < 3.0,
+                "at {elevation} degrees the sweep is {worst} m from the walk"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hill_shadows_the_ground_behind_it_and_not_in_front() {
+        let heights = round_hill();
+        // A sun low in the east: the hill's shadow lies to its west.
+        let sun = crate::sky::Sun::from_angles(10.0, 90.0);
+        let (texels, corner, texel) = swept_shadow(heights, sun);
+        let n = crate::shadow::SHADOW_ACROSS as usize;
+        let read = |world: Vec2| {
+            let at = ((world - corner) / texel).round();
+            texels[at.y as usize * n + at.x as usize]
+        };
+        // Six hundred metres of hill at ten degrees reaches out over three
+        // kilometres; a kilometre west of the summit is deep in it, and the
+        // ground there is at a few metres.
+        let behind = read(Vec2::new(-1000.0, 0.0));
+        assert!(behind[0] > 300.0, "behind the hill: {behind:?}");
+        // The distance back to what casts it is about the kilometre.
+        assert!((behind[1] - 1000.0).abs() < 300.0, "{behind:?}");
+        // And a kilometre east of it, towards the sun, nothing stands upstream.
+        let before = read(Vec2::new(1000.0, 0.0));
+        assert!(before[0] < 50.0, "before the hill: {before:?}");
+        // The ground's own clearance says the same thing from the ground's side:
+        // buried by hundreds of metres behind, clear in front.
+        assert!(behind[2] < -250.0, "behind the hill: {behind:?}");
+        assert!(before[2] > 0.0, "before the hill: {before:?}");
+    }
+
+    /// Mean light leaving a five-by-five patch of the frame around a world
+    /// point, decoded out of sRGB so that a ratio of two of these is a ratio of
+    /// light rather than of bytes.
+    fn brightness_at(frame: &Frame, camera: &Camera, world: Vec3) -> f32 {
+        let (x, y) = to_pixels(camera.view_projection(), world, SIZE, SIZE);
+        let (x, y) = (x.round() as i32, y.round() as i32);
+        let linear = |byte: u8| {
+            let c = f32::from(byte) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let mut total = 0.0;
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                let pixel = frame.pixel((x + dx) as u32, (y + dy) as u32);
+                total += linear(pixel[0]) + linear(pixel[1]) + linear(pixel[2]);
+            }
+        }
+        total / (25.0 * 3.0)
+    }
+
+    /// The flat ground behind a hill, away from a low sun, lies in the hill's
+    /// shadow; the same flat ground on the sun's side of it does not.
+    ///
+    /// Both patches are level, of one material and under one sky, so nothing
+    /// tells them apart but what stands between each and the sun. Before the
+    /// terrain cast shadows they came out the same to the byte.
+    #[test]
+    fn a_hill_shadows_the_flat_ground_behind_it() {
+        let mut camera = None;
+        let frame = render_sunlit(
+            test_residency(),
+            round_hill(),
+            flat_ground(),
+            |c| {
+                // Low enough that the air between the eye and the ground is a
+                // small part of what the patches send it, and high enough to see
+                // both of them.
+                c.position = Vec3::new(0.0, 3500.0, 0.0);
+                c.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+                camera = Some(*c);
+            },
+            &[],
+            // Fifteen degrees up in the east: six hundred metres of hill throws
+            // its shadow over two kilometres west. High enough that the sun
+            // rather than the sky is most of what lights level ground.
+            crate::sky::Sun::from_angles(15.0, 90.0),
+        );
+        let camera = camera.expect("camera captured");
+        // A kilometre and a half out, where the hill has fallen to under a metre
+        // and its slope to a two-hundredth, so the two patches face the same way.
+        let behind = brightness_at(&frame, &camera, Vec3::new(-1500.0, 0.0, 0.0));
+        let before = brightness_at(&frame, &camera, Vec3::new(1500.0, 0.0, 0.0));
+        // Off to one side the ground is out of the shadow again, and should be
+        // as bright as the ground before the hill.
+        let beside = brightness_at(&frame, &camera, Vec3::new(-1500.0, 0.0, 1500.0));
+        println!("behind {behind:.4}, before {before:.4}, beside {beside:.4}");
+        // Measured at 0.0326 behind against 0.0724 before and 0.0746 beside: the
+        // sun is a little more than half of what lights level ground at fifteen
+        // degrees, and the shadow takes all of it.
+        assert!(
+            before > 1.8 * behind,
+            "the ground behind the hill is {behind:.4} against {before:.4} before it, \
+             which is no shadow"
+        );
+        assert!(
+            (beside - before).abs() < 0.05 * before,
+            "the ground beside the shadow is {beside:.4} against {before:.4}: the shadow \
+             is wider than the hill"
+        );
+        assert!(behind > 0.1 * before, "the shadow is black; the sky should still light it");
     }
 }

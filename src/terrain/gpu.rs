@@ -306,6 +306,16 @@ pub struct Terrain {
     detail_material_texture: wgpu::Texture,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// What group 1 holds, and the module every terrain entry point lives in.
+    ///
+    /// Kept past construction for the passes that light the world rather than
+    /// draw it: they need the heights the march reads, read the way the march
+    /// reads them, and the only spelling of that is in `src/terrain.wgsl`. So
+    /// their entry points live there too and are built against this layout by
+    /// [`Terrain::pipeline`], rather than each module carrying a copy of the
+    /// level arithmetic that could drift from the one that draws.
+    layout: wgpu::BindGroupLayout,
+    shader: wgpu::ShaderModule,
     /// Fills one rectangle of one generated level.
     generate: wgpu::ComputePipeline,
     /// Group 1 for [`Terrain::generate`], which is the terrain *without* the
@@ -1141,6 +1151,8 @@ impl Terrain {
             detail_material_texture,
             uniform,
             bind_group,
+            layout,
+            shader,
             generate,
             generate_terrain_group,
             generate_bind_group,
@@ -1159,6 +1171,41 @@ impl Terrain {
             risk,
             reach,
         }
+    }
+
+    /// Builds a pipeline for an entry point of `src/terrain.wgsl` that some other
+    /// module owns, with the terrain as group 1 and the caller's own groups
+    /// around it.
+    ///
+    /// Group 1 is the terrain's in every pipeline this shader has, so a caller
+    /// says only what it puts in the other three; the dispatch then sets
+    /// [`Terrain::bind_group`] at 1 beside its own.
+    pub fn pipeline(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        entry_point: &str,
+        groups: [Option<&wgpu::BindGroupLayout>; 3],
+    ) -> wgpu::ComputePipeline {
+        let [zero, two, three] = groups;
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(label),
+            bind_group_layouts: &[zero, Some(&self.layout), two, three],
+            immediate_size: 0,
+        });
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&layout),
+            module: &self.shader,
+            entry_point: Some(entry_point),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    }
+
+    /// The terrain's group 1, for a pass built by [`Terrain::pipeline`].
+    pub fn bind_group(&self) -> &wgpu::BindGroup {
+        &self.bind_group
     }
 
     /// Follows the render target to a new size.
@@ -1241,6 +1288,23 @@ impl Terrain {
         UVec2::new(
             (self.base_size.x >> mip).max(1),
             (self.base_size.y >> mip).max(1),
+        )
+    }
+
+    /// Where the terrain's texel lattice stands, for a pass that has to put its
+    /// own texels on it: the world XZ of level 0's texel (0, 0), the metres one
+    /// level-0 texel covers along X and Z, the level mip zero holds, and how many
+    /// mips the chain has.
+    pub fn lattice(&self) -> (Vec2, Vec2, u32, u32) {
+        let (x, z) = self.placement.world_of_texel(0, 0.0, 0.0);
+        (
+            Vec2::new(x as f32, z as f32),
+            Vec2::new(
+                self.placement.metres_per_texel_x as f32,
+                self.placement.metres_per_texel_z as f32,
+            ),
+            self.resident_base,
+            self.mips,
         )
     }
 

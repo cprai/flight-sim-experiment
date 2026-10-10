@@ -278,6 +278,7 @@ impl Shading {
         sky_layout: &wgpu::BindGroupLayout,
         tables_layout: &wgpu::BindGroupLayout,
         cloud: Clouds<'_>,
+        shadow: &crate::shadow::Shadow,
     ) -> Self {
         // Uploaded once: the table is a pure function of the material enum,
         // so nothing ever rewrites it.
@@ -345,9 +346,28 @@ impl Shading {
                         min_binding_size: None,
                     },
                 ),
+                // The terrain's shadow and where its cascades stand. Loaded
+                // rather than sampled, for the reason the cloud buffers are:
+                // what is between two texels is a comparison, not a blend.
+                entry(
+                    9,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                ),
+                entry(
+                    10,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
             ],
         });
-        let bind_groups = Self::bind(device, &layout, &palette, gbuffer, cloud);
+        let bind_groups = Self::bind(device, &layout, &palette, gbuffer, cloud, shadow);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shading shader"),
@@ -407,8 +427,14 @@ impl Shading {
     ///
     /// Both follow the frame's size, so both are gone by the time this is
     /// called and both have to be named again.
-    pub fn rebind(&mut self, device: &wgpu::Device, gbuffer: &GBuffer, cloud: Clouds<'_>) {
-        self.bind_groups = Self::bind(device, &self.layout, &self.palette, gbuffer, cloud);
+    pub fn rebind(
+        &mut self,
+        device: &wgpu::Device,
+        gbuffer: &GBuffer,
+        cloud: Clouds<'_>,
+        shadow: &crate::shadow::Shadow,
+    ) {
+        self.bind_groups = Self::bind(device, &self.layout, &self.palette, gbuffer, cloud, shadow);
     }
 
     fn bind(
@@ -417,6 +443,7 @@ impl Shading {
         palette: &wgpu::Buffer,
         gbuffer: &GBuffer,
         cloud: Clouds<'_>,
+        shadow: &crate::shadow::Shadow,
     ) -> [wgpu::BindGroup; 2] {
         let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
         std::array::from_fn(|parity| {
@@ -432,6 +459,8 @@ impl Shading {
                     entry(5, wgpu::BindingResource::TextureView(cloud.along[parity])),
                     entry(6, wgpu::BindingResource::TextureView(cloud.volume)),
                     entry(8, cloud.light.as_entire_binding()),
+                    entry(9, wgpu::BindingResource::TextureView(shadow.view())),
+                    entry(10, shadow.buffer().as_entire_binding()),
                 ],
             })
         })
