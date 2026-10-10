@@ -200,6 +200,52 @@ impl ShadowUniform {
     }
 }
 
+/// What a pass reads the field through: the cascades, and where they stand.
+#[derive(Clone, Copy)]
+pub struct Field<'a> {
+    pub view: &'a wgpu::TextureView,
+    pub uniform: &'a wgpu::Buffer,
+}
+
+/// A field that shades nothing, for the tests of passes that read one but have
+/// no terrain to sweep it from: a ceiling below everything, so every point is
+/// above it and lit.
+#[cfg(test)]
+pub fn unshadowed(device: &wgpu::Device) -> (wgpu::TextureView, wgpu::Buffer) {
+    use wgpu::util::DeviceExt;
+    let view = device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("no terrain shadow"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: SHADOW_CASCADES,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SHADOW_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+    let uniform = ShadowUniform::at(Vec3::ZERO, Vec3::Y, Lattice {
+        origin: Vec2::ZERO,
+        metres: Vec2::ONE,
+        resident_base: 0,
+        mips: 1,
+    }, f32::MIN);
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("no terrain shadow uniform"),
+        contents: bytemuck::bytes_of(&uniform),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    (view, buffer)
+}
+
 /// The swept field and everything that sweeps it.
 pub struct Shadow {
     #[allow(dead_code, reason = "read by the tests that check what was swept")]
@@ -440,15 +486,12 @@ impl Shadow {
         pass.dispatch_workgroups(groups, groups, 1);
     }
 
-    /// Every cascade of the field, as a two-dimensional array.
-    pub fn view(&self) -> &wgpu::TextureView {
-        &self.view
-    }
-
-    /// Where the cascades stand and what the sun is doing, as the readers of
-    /// [`Shadow::view`] need it.
-    pub fn buffer(&self) -> &wgpu::Buffer {
-        &self.uniform
+    /// The field as the passes that read it want it.
+    pub fn field(&self) -> Field<'_> {
+        Field {
+            view: &self.view,
+            uniform: &self.uniform,
+        }
     }
 
     #[cfg(test)]
@@ -488,6 +531,70 @@ mod tests {
             shader_says("SWEEP_RUN"),
             format!("{}u", SHADOW_ACROSS / SWEEP_GROUP)
         );
+    }
+
+    /// Every shader that reads the field, as source.
+    const READERS: [(&str, &str); 2] = [
+        ("src/shading.wgsl", include_str!("shading.wgsl")),
+        ("src/cloud_march.wgsl", include_str!("cloud_march.wgsl")),
+    ];
+
+    /// Source from `from` up to the next line that starts with a closing brace,
+    /// with comments dropped and whitespace normalised.
+    fn block(source: &str, from: &str) -> String {
+        let start = source
+            .find(from)
+            .unwrap_or_else(|| panic!("no `{from}`"));
+        let end = source[start..].find("\n}").expect("unterminated");
+        source[start..start + end]
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The ground, the cloud and the air read one shadow, and only read it as
+    /// one if they read it the same way: which cascade answers, how two blend
+    /// where they meet, how wide a penumbra is and how a texel is unpacked all
+    /// have to agree, or a mountain's shadow lands in one place on the valley
+    /// floor and another in the fog lying on it.
+    ///
+    /// Bodies are compared with whitespace normalised; comments may differ.
+    #[test]
+    fn the_shadow_reads_the_same_everywhere() {
+        let terrain = include_str!("terrain.wgsl");
+        let (first_name, first) = READERS[0];
+        for (name, source) in READERS {
+            for function in ["fn shadow_texel(", "fn shadow_tap(", "fn sun_clear("] {
+                assert_eq!(
+                    block(source, function),
+                    block(first, function),
+                    "{function} differs between {name} and {first_name}"
+                );
+            }
+            for constant in [
+                "SHADOW_ACROSS",
+                "SHADOW_CASCADES",
+                "SHADOW_EDGE",
+                "SHADOW_FADE",
+                "SHADOW_SOFTEST",
+            ] {
+                let line = |text: &str| {
+                    text.lines()
+                        .find(|line| line.starts_with(&format!("const {constant}:")))
+                        .map(str::to_string)
+                };
+                assert_eq!(line(source), line(first), "{constant} in {name}");
+            }
+            // The layout of the uniform, against the one the sweep fills it in
+            // for.
+            assert_eq!(
+                block(source, "struct Shadow {"),
+                block(terrain, "struct Shadow {"),
+                "the Shadow struct in {name} is not the one in src/terrain.wgsl"
+            );
+        }
     }
 
     #[test]

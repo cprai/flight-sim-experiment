@@ -904,6 +904,8 @@ struct Lit<'a> {
     drift: &'a wgpu::TextureView,
     /// The ground the wind was solved around, for the deck that rides it.
     ground: &'a wgpu::TextureView,
+    /// The terrain's shadow, which a cloud below a summit can be in.
+    shadow: crate::shadow::Field<'a>,
 }
 
 /// Everything the march keeps at the size of the frame, which a resize throws
@@ -985,6 +987,7 @@ impl March {
         cloud: &Cloud,
         gbuffer: &crate::deferred::GBuffer,
         air: &crate::air::Air,
+        shadow: crate::shadow::Field<'_>,
     ) -> Self {
         let (_, drift, ground) = air.views();
         // A deck reaching above the cache is a deck the march never finds: the
@@ -1213,6 +1216,22 @@ impl March {
                     ..uniform
                 },
                 sampled(21, wgpu::TextureViewDimension::D2, true),
+                // The terrain's shadow: loaded, never filtered, since every
+                // reader compares four taps before it blends them.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 22,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 23,
+                    ..uniform
+                },
             ],
         });
 
@@ -1400,6 +1419,7 @@ impl March {
             light: &light,
             drift,
             ground,
+            shadow,
         };
         let march_group = Self::bind(
             device,
@@ -1479,6 +1499,7 @@ impl March {
         cloud: &Cloud,
         gbuffer: &crate::deferred::GBuffer,
         air: &crate::air::Air,
+        shadow: crate::shadow::Field<'_>,
     ) {
         let (_, drift, ground) = air.views();
         self.size = half_of(gbuffer.size);
@@ -1496,6 +1517,7 @@ impl March {
                 light: &self.light,
                 drift,
                 ground,
+                shadow,
             },
             &screen,
             &self.rotation,
@@ -1570,6 +1592,11 @@ impl March {
                     resource: rotation.as_entire_binding(),
                 },
                 texture(21, lit.ground),
+                texture(22, lit.shadow.view),
+                wgpu::BindGroupEntry {
+                    binding: 23,
+                    resource: lit.shadow.uniform.as_entire_binding(),
+                },
             ],
         })
     }
@@ -2956,6 +2983,7 @@ mod tests {
         if let Some(heights) = ground {
             air.assume_ground(&queue, glam::Vec2::splat(GROUND_EXTENT), heights);
         }
+        let (shadow_view, shadow_uniform) = crate::shadow::unshadowed(&device);
         let mut march = March::new(
             &device,
             &camera_layout,
@@ -2964,6 +2992,10 @@ mod tests {
             &cloud,
             &gbuffer,
             &air,
+            crate::shadow::Field {
+                view: &shadow_view,
+                uniform: &shadow_uniform,
+            },
         );
 
         let blocks = half_of(march.size());

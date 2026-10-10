@@ -329,6 +329,8 @@ impl Scene {
         let sky = crate::sky::Sky::new(device, camera_layout);
         let cloud = crate::cloud::Cloud::new(device);
         let air = crate::air::Air::new(device);
+        // Before the march and the shading, which are both lit by it.
+        let shadow = crate::shadow::Shadow::new(device, &terrain);
         // Before the shading, which now reads what it leaves.
         let march = crate::cloud::March::new(
             device,
@@ -338,8 +340,8 @@ impl Scene {
             &cloud,
             &gbuffer,
             &air,
+            shadow.field(),
         );
-        let shadow = crate::shadow::Shadow::new(device, &terrain);
         let shading = Shading::new(
             device,
             format,
@@ -348,7 +350,7 @@ impl Scene {
             sky.layout(),
             sky.tables_layout(),
             march.views(),
-            &shadow,
+            shadow.field(),
         );
         Self {
             camera,
@@ -411,9 +413,9 @@ impl Scene {
         // reads the depth of the G-buffer just rebuilt above. Before the
         // shading, which reads the buffers this throws away and remakes.
         self.march
-            .resize(device, &self.cloud, &self.gbuffer, &self.air);
+            .resize(device, &self.cloud, &self.gbuffer, &self.air, self.shadow.field());
         self.shading
-            .rebind(device, &self.gbuffer, self.march.views(), &self.shadow);
+            .rebind(device, &self.gbuffer, self.march.views(), self.shadow.field());
         self.terrain.resize(viewport);
         self.camera.aspect = viewport.x as f32 / viewport.y.max(1) as f32;
     }
@@ -5681,5 +5683,66 @@ mod tests {
              is wider than the hill"
         );
         assert!(behind > 0.1 * before, "the shadow is black; the sky should still light it");
+    }
+
+    /// A wall of ridge running north and south through the middle of the test
+    /// raster, three and a half kilometres high: far above the fog, so a sun
+    /// in the east puts the fog on its western side in its shadow.
+    fn tall_ridge() -> Vec<f32> {
+        let middle = (RASTER as f32 - 1.0) * 0.5;
+        (0..RASTER * RASTER)
+            .map(|index| {
+                let x = ((index % RASTER) as f32 - middle) * METRES_PER_TEXEL as f32;
+                3500.0 * (-x * x / (2.0 * 250.0 * 250.0)).exp()
+            })
+            .collect()
+    }
+
+    /// Cloud in a mountain's shadow is in its shadow.
+    ///
+    /// The deck is the same in both frames -- nothing about the overcast deck
+    /// depends on the ground -- so what changes between them at a point on its
+    /// top is the ridge alone. Behind it, away from an eight degree sun, the
+    /// deck darkens; in front of it, nothing does.
+    #[test]
+    fn cloud_behind_a_ridge_lies_in_its_shadow() {
+        let sun = crate::sky::Sun::from_angles(20.0, 90.0);
+        let mut camera = None;
+        let mut view = |heights| {
+            render_over(
+                test_residency(),
+                heights,
+                flat_ground(),
+                |c: &mut Camera| {
+                    c.position = Vec3::new(0.0, 4500.0, 0.0);
+                    c.orientation = Camera::from_yaw_pitch_roll(0.0, -90f32.to_radians(), 0.0);
+                    camera = Some(*c);
+                },
+                &[],
+                sun,
+                placement(),
+                crate::cloud::Preset::Fog,
+                None,
+            )
+        };
+        let flat = view(vec![0.0; (RASTER * RASTER) as usize]);
+        let ridged = view(tall_ridge());
+        let camera = camera.expect("camera captured");
+        // On the deck's top, a kilometre and a half either side of the crest.
+        let at = |x: f32| Vec3::new(x, 1000.0, 0.0);
+        let behind = brightness_at(&ridged, &camera, at(-1500.0)) / brightness_at(&flat, &camera, at(-1500.0));
+        let before = brightness_at(&ridged, &camera, at(1500.0)) / brightness_at(&flat, &camera, at(1500.0));
+        println!("behind the ridge {behind:.3} of the open deck, before it {before:.3}");
+        // Measured at 0.762, which is to the byte what the same fog sends with
+        // the direct sun taken out of the march altogether: the ridge takes all
+        // of it. The rest of what fog sends is the sky's, which is most of it.
+        assert!(
+            behind < 0.85,
+            "the deck behind the ridge kept {behind:.3} of its light, which is no shadow"
+        );
+        assert!(
+            (before - 1.0).abs() < 0.05,
+            "the deck on the sun's side of the ridge changed by {before:.3}"
+        );
     }
 }

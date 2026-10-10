@@ -278,7 +278,7 @@ impl Shading {
         sky_layout: &wgpu::BindGroupLayout,
         tables_layout: &wgpu::BindGroupLayout,
         cloud: Clouds<'_>,
-        shadow: &crate::shadow::Shadow,
+        shadow: crate::shadow::Field<'_>,
     ) -> Self {
         // Uploaded once: the table is a pure function of the material enum,
         // so nothing ever rewrites it.
@@ -432,7 +432,7 @@ impl Shading {
         device: &wgpu::Device,
         gbuffer: &GBuffer,
         cloud: Clouds<'_>,
-        shadow: &crate::shadow::Shadow,
+        shadow: crate::shadow::Field<'_>,
     ) {
         self.bind_groups = Self::bind(device, &self.layout, &self.palette, gbuffer, cloud, shadow);
     }
@@ -443,7 +443,7 @@ impl Shading {
         palette: &wgpu::Buffer,
         gbuffer: &GBuffer,
         cloud: Clouds<'_>,
-        shadow: &crate::shadow::Shadow,
+        shadow: crate::shadow::Field<'_>,
     ) -> [wgpu::BindGroup; 2] {
         let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
         std::array::from_fn(|parity| {
@@ -459,8 +459,8 @@ impl Shading {
                     entry(5, wgpu::BindingResource::TextureView(cloud.along[parity])),
                     entry(6, wgpu::BindingResource::TextureView(cloud.volume)),
                     entry(8, cloud.light.as_entire_binding()),
-                    entry(9, wgpu::BindingResource::TextureView(shadow.view())),
-                    entry(10, shadow.buffer().as_entire_binding()),
+                    entry(9, wgpu::BindingResource::TextureView(shadow.view)),
+                    entry(10, shadow.uniform.as_entire_binding()),
                 ],
             })
         })
