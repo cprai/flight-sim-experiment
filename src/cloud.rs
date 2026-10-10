@@ -1085,6 +1085,9 @@ struct Lit<'a> {
     ground: &'a wgpu::TextureView,
     /// The terrain's shadow, which a cloud below a summit can be in.
     shadow: crate::shadow::Field<'a>,
+    /// The light the world sends to itself, which the underside of a deck
+    /// over bright ground is lit by.
+    probes: crate::probe::Field<'a>,
 }
 
 /// Everything the march keeps at the size of the frame, which a resize throws
@@ -1167,6 +1170,7 @@ impl March {
         gbuffer: &crate::deferred::GBuffer,
         air: &crate::air::Air,
         shadow: crate::shadow::Field<'_>,
+        probes: crate::probe::Field<'_>,
     ) -> Self {
         let (_, drift, ground) = air.views();
         // A deck reaching above the cache is a deck the march never finds: the
@@ -1411,6 +1415,13 @@ impl March {
                     binding: 23,
                     ..uniform
                 },
+                // The irradiance probes, filtered between them, and where they
+                // stand.
+                sampled(24, wgpu::TextureViewDimension::D3, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 25,
+                    ..uniform
+                },
             ],
         });
 
@@ -1599,6 +1610,7 @@ impl March {
             drift,
             ground,
             shadow,
+            probes,
         };
         let march_group = Self::bind(
             device,
@@ -1679,6 +1691,7 @@ impl March {
         gbuffer: &crate::deferred::GBuffer,
         air: &crate::air::Air,
         shadow: crate::shadow::Field<'_>,
+        probes: crate::probe::Field<'_>,
     ) {
         let (_, drift, ground) = air.views();
         self.size = half_of(gbuffer.size);
@@ -1697,6 +1710,7 @@ impl March {
                 drift,
                 ground,
                 shadow,
+                probes,
             },
             &screen,
             &self.rotation,
@@ -1775,6 +1789,11 @@ impl March {
                 wgpu::BindGroupEntry {
                     binding: 23,
                     resource: lit.shadow.uniform.as_entire_binding(),
+                },
+                texture(24, lit.probes.view),
+                wgpu::BindGroupEntry {
+                    binding: 25,
+                    resource: lit.probes.uniform.as_entire_binding(),
                 },
             ],
         })
@@ -3192,6 +3211,7 @@ mod tests {
             air.assume_ground(&queue, glam::Vec2::splat(GROUND_EXTENT), heights);
         }
         let (shadow_view, shadow_uniform) = crate::shadow::unshadowed(&device);
+        let (probe_view, probe_uniform) = crate::probe::unlit(&device);
         let mut march = March::new(
             &device,
             &camera_layout,
@@ -3203,6 +3223,10 @@ mod tests {
             crate::shadow::Field {
                 view: &shadow_view,
                 uniform: &shadow_uniform,
+            },
+            crate::probe::Field {
+                view: &probe_view,
+                uniform: &probe_uniform,
             },
         );
 

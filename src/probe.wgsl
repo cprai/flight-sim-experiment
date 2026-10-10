@@ -524,9 +524,13 @@ fn probe_irradiance(field: texture_3d<f32>, filtering: sampler, p: vec3<f32>, n:
     return vec4<f32>(sum, answered);
 }
 
-// The light arriving at `p` averaged over every direction, and in `a` how much
-// of the point the cascades answered for: band zero alone, one fetch a cascade.
-fn probe_radiance(field: texture_3d<f32>, filtering: sampler, p: vec3<f32>) -> vec4<f32> {
+// The light arriving at `p` from below, averaged over the lower half of every
+// direction, and in `a` how much of the point the cascades answered for.
+//
+// What the ground sends up: band zero less half of band one's vertical part,
+// which is the mean of two bands of harmonics over a hemisphere. Two of the
+// three texels a cascade, the third holding nothing vertical.
+fn probe_upwelling(field: texture_3d<f32>, filtering: sampler, p: vec3<f32>) -> vec4<f32> {
     var sum = vec3<f32>(0.0);
     var answered = 0.0;
     for (var cascade = 0u; cascade < PROBE_CASCADES; cascade += 1u) {
@@ -537,7 +541,9 @@ fn probe_radiance(field: texture_3d<f32>, filtering: sampler, p: vec3<f32>) -> v
         let share = min(probe_share(g, cascade), 1.0 - answered);
         if share > 0.0 {
             let a = textureSampleLevel(field, filtering, probe_uvw(g, cascade, 0u), 0.0);
-            sum = sum + share * max(SH_0 * a.rgb, vec3<f32>(0.0));
+            let c = textureSampleLevel(field, filtering, probe_uvw(g, cascade, 2u), 0.0);
+            let up = SH_0 * a.rgb - 0.5 * SH_1 * c.rgb;
+            sum = sum + share * max(up, vec3<f32>(0.0));
             answered = answered + share;
         }
     }

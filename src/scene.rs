@@ -336,6 +336,9 @@ impl Scene {
         let air = crate::air::Air::new(device);
         // Before the march and the shading, which are both lit by it.
         let shadow = crate::shadow::Shadow::new(device, &terrain);
+        // The probes the march and the shading are lit by, before the passes
+        // that write them, which read what the march leaves.
+        let probe_store = crate::probe::Store::new(device);
         // Before the shading, which now reads what it leaves.
         let march = crate::cloud::March::new(
             device,
@@ -346,6 +349,7 @@ impl Scene {
             &gbuffer,
             &air,
             shadow.field(),
+            probe_store.field(),
         );
         // After the march, whose cloud buffer says where on each ray the
         // cloud is, and before the shading, which reads what it leaves.
@@ -362,6 +366,7 @@ impl Scene {
         let probes = crate::probe::Probes::new(
             device,
             &terrain,
+            probe_store,
             crate::probe::Lit {
                 sky: &sky,
                 palette: &palette,
@@ -445,7 +450,14 @@ impl Scene {
         // reads the depth of the G-buffer just rebuilt above. Before the
         // shading, which reads the buffers this throws away and remakes.
         self.march
-            .resize(device, &self.cloud, &self.gbuffer, &self.air, self.shadow.field());
+            .resize(
+                device,
+                &self.cloud,
+                &self.gbuffer,
+                &self.air,
+                self.shadow.field(),
+                self.probes.field(),
+            );
         self.shafts
             .resize(device, &self.gbuffer, self.march.views(), self.shadow.field());
         self.shading.rebind(
@@ -851,6 +863,14 @@ impl Scene {
                 self.march.draw_light(&mut pass);
             }
             {
+                // After the light volume, which lights what the probes' rays
+                // meet, and before the march and the shading, which are lit by
+                // the probes. Inside the cloud's scope because that is where the
+                // order puts it; its own scope inside, so its rows are its own.
+                let mut probes = cloud.scope(crate::profile::PROBES);
+                self.probes.draw(&mut probes, &self.terrain, &self.sky);
+            }
+            {
                 let mut pass = cloud.scoped_compute_pass("cloud-march");
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 self.march.draw(&mut pass, &self.sky);
@@ -864,13 +884,6 @@ impl Scene {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 self.march.draw_resolve(&mut pass);
             }
-        }
-
-        {
-            // After the cloud's light volume, which lights what the probes'
-            // rays meet, and before the shading, which is lit by the probes.
-            let mut probes = gpu.scope(crate::profile::PROBES);
-            self.probes.draw(&mut probes, &self.terrain, &self.sky);
         }
 
         self.draw_shafts(gpu);
@@ -6199,6 +6212,52 @@ mod tests {
         assert!(
             snow.y > 3.0 * lake.y,
             "a snowfield sends {snow} up to what is over it against a lake's {lake}"
+        );
+    }
+
+    /// The underside of a deck over a snowfield is lit by the snow, and over a
+    /// lake it is not.
+    ///
+    /// Seen from below and looking straight up, so every pixel is the deck's
+    /// base and nothing else: the same overcast deck in both frames, the same
+    /// sun, and the ground under it painted glacier in one and lake in the
+    /// other. What the base gets from below is what the irradiance probes say
+    /// the ground sends up, so only they can tell the two apart.
+    #[test]
+    fn a_deck_over_snow_is_lit_from_below_and_one_over_a_lake_is_not() {
+        let base = |material| {
+            let frame = render_under(
+                vec![0.0; (RASTER * RASTER) as usize],
+                vec![material; (RASTER * RASTER) as usize],
+                |camera: &mut Camera| {
+                    camera.position = Vec3::new(0.0, 300.0, 0.0);
+                    camera.orientation = Camera::from_yaw_pitch_roll(0.0, 89f32.to_radians(), 0.0);
+                },
+                crate::cloud::Preset::Overcast,
+            );
+            // In light rather than in bytes, so the ratio is a ratio of light.
+            let linear = |byte: u8| f64::from(terrain_tiles::srgb_to_linear(byte));
+            let mut lit = 0.0f64;
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    let pixel = frame.pixel(x, y);
+                    lit += linear(pixel[0]) + linear(pixel[1]) + linear(pixel[2]);
+                }
+            }
+            lit / f64::from(SIZE * SIZE * 3)
+        };
+        let glacier = MaterialId(Material::Glacier.id() as u16);
+        let (snow, lake) = (base(glacier), base(LAKE));
+        println!("a deck's base over snow {snow:.4}, over a lake {lake:.4}");
+        // Under a deck the ground gets little sun, so what the snow sends up is
+        // a modest share of what lights the base: measured at 0.0621 against
+        // 0.0557. Before the probes it was none at all, and the two came out the
+        // same to the byte at 0.0829 -- brighter than either, because the old
+        // stand-in lit the base from below as brightly as from above, and under
+        // an overcast sky the ground is dim.
+        assert!(
+            snow > lake * 1.05,
+            "the base of a deck over snow is {snow:.4} against {lake:.4} over a lake"
         );
     }
 }

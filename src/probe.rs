@@ -136,8 +136,20 @@ pub struct Lit<'a> {
     pub shadow: crate::shadow::Field<'a>,
 }
 
-impl Probes {
-    pub fn new(device: &wgpu::Device, terrain: &Terrain, lit: Lit<'_>) -> Self {
+/// The probes themselves and where they stand, made before anything that reads
+/// or writes them -- the cloud march reads them, and the passes that write them
+/// read the cloud's light volume, so neither can be made first if this belongs
+/// to either.
+pub struct Store {
+    current: wgpu::Texture,
+    current_view: wgpu::TextureView,
+    next: wgpu::Texture,
+    next_view: wgpu::TextureView,
+    uniform: wgpu::Buffer,
+}
+
+impl Store {
+    pub fn new(device: &wgpu::Device) -> Self {
         let texture = |label| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -167,6 +179,33 @@ impl Probes {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        Self {
+            current,
+            current_view,
+            next,
+            next_view,
+            uniform,
+        }
+    }
+
+    /// What the readers of the probes bind: the probes, and where they stand.
+    pub fn field(&self) -> Field<'_> {
+        Field {
+            view: &self.current_view,
+            uniform: &self.uniform,
+        }
+    }
+}
+
+impl Probes {
+    pub fn new(device: &wgpu::Device, terrain: &Terrain, store: Store, lit: Lit<'_>) -> Self {
+        let Store {
+            current,
+            current_view,
+            next,
+            next_view,
+            uniform,
+        } = store;
         let phases: Vec<wgpu::Buffer> = (0..PROBE_PHASES)
             .map(|phase| {
                 use wgpu::util::DeviceExt;
@@ -447,6 +486,40 @@ impl Probes {
     }
 }
 
+/// Probes that answer for nowhere, for the tests of passes that read them but
+/// have no terrain to trace them over: every cascade stands a world away, so
+/// no point falls in one and every reader takes its stand-in.
+#[cfg(test)]
+pub fn unlit(device: &wgpu::Device) -> (wgpu::TextureView, wgpu::Buffer) {
+    use wgpu::util::DeviceExt;
+    let view = device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("no probes"),
+            size: wgpu::Extent3d {
+                width: 3,
+                height: 1,
+                depth_or_array_layers: PROBE_CASCADES,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: PROBE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default());
+    let far = [[1.0e9, 1.0e9, 1.0e9, 1.0]; PROBE_CASCADES as usize];
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("no probe uniform"),
+        contents: bytemuck::bytes_of(&ProbeUniform {
+            cascade: far,
+            was: far,
+        }),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    (view, buffer)
+}
+
 /// What a pass reads the probes through.
 #[derive(Clone, Copy)]
 pub struct Field<'a> {
@@ -520,7 +593,7 @@ mod tests {
             "fn probe_uvw(",
             "fn probe_share(",
             "fn probe_irradiance(",
-            "fn probe_radiance(",
+            "fn probe_upwelling(",
         ] {
             assert_eq!(
                 block(probe, function),
@@ -530,6 +603,19 @@ mod tests {
         }
         for name in ["PROBE_EDGE", "PROBE_FADE", "SH_0", "SH_1", "PROBE_ACROSS", "PROBE_CASCADES"] {
             assert_eq!(constant(probe, name), constant(shading, name), "{name}");
+        }
+        // ... and the cloud march, which reads band zero of them.
+        let march = include_str!("cloud_march.wgsl");
+        assert_eq!(block(march, "struct Probes {"), block(terrain, "struct Probes {"));
+        for function in ["fn probe_grid(", "fn probe_uvw(", "fn probe_share(", "fn probe_upwelling("] {
+            assert_eq!(
+                block(march, function),
+                block(shading, function),
+                "{function} differs between src/cloud_march.wgsl and src/shading.wgsl"
+            );
+        }
+        for name in ["PROBE_EDGE", "PROBE_FADE", "SH_0", "SH_1", "PROBE_ACROSS", "PROBE_CASCADES"] {
+            assert_eq!(constant(march, name), constant(shading, name), "{name}");
         }
     }
 

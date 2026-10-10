@@ -786,6 +786,22 @@ struct Shadow {
 };
 @group(3) @binding(22) var shadow_field: texture_2d_array<u32>;
 @group(3) @binding(23) var<uniform> shadow: Shadow;
+// The irradiance probes: the light the world sends to itself, which is what a
+// deck over a snowfield is lit from underneath by. See `src/probe.wgsl`; the
+// constants and the struct must match the ones there.
+const PROBE_ACROSS: u32 = 32u;
+const PROBE_CASCADES: u32 = 8u;
+const SH_0: f32 = 0.282095;
+const SH_1: f32 = 0.488603;
+struct Probes {
+    // Per cascade: the corner of the lattice in the world, and the metres
+    // between probes. Probe `i` stands at `corner + (i + 0.5) * spacing`.
+    cascade: array<vec4<f32>, PROBE_CASCADES>,
+    // The same, as last frame had it.
+    was: array<vec4<f32>, PROBE_CASCADES>,
+};
+@group(3) @binding(24) var probe_field: texture_3d<f32>;
+@group(3) @binding(25) var<uniform> probes: Probes;
 
 // The ray through a point on the screen, before it is normalised. Must match
 // `ray_raw_at` in `src/shading.wgsl` and `src/terrain.wgsl`, character for
@@ -1854,6 +1870,103 @@ fn sun_clear(p: vec3<f32>, ground: bool) -> f32 {
     return clear + (1.0 - answered);
 }
 
+// Where a cascade of probes starts handing a point over to the one outside it,
+// and where the outermost gives up, as shares of the way from its middle to its
+// edge -- the same pair, for the same reasons, as `CASCADE_EDGE` and
+// `CASCADE_FADE` for the light volume. Must match everywhere the probes are read;
+// see `the_probes_read_the_same_everywhere` in `src/probe.rs`.
+const PROBE_EDGE: f32 = 0.8;
+const PROBE_FADE: f32 = 0.9;
+
+// Where a world point falls among one cascade's probes, counted in spacings
+// from the cascade's corner, so probe `i` stands at `i + 0.5`.
+fn probe_grid(p: vec3<f32>, cascade: u32) -> vec3<f32> {
+    let corner = probes.cascade[cascade];
+    return (p - corner.xyz) / corner.w;
+}
+
+// The texture coordinate of one block of the probes around `g` in a cascade,
+// held half a texel in from every side of the block and the cascade, which is
+// where a linear filter stops reaching into the next block or the next cascade.
+fn probe_uvw(g: vec3<f32>, cascade: u32, block: u32) -> vec3<f32> {
+    let n = f32(PROBE_ACROSS);
+    let inside = clamp(g, vec3<f32>(0.5), vec3<f32>(n - 0.5));
+    return vec3<f32>(
+        (f32(block) * n + inside.x) / (3.0 * n),
+        inside.y / n,
+        (f32(cascade) * n + inside.z) / (n * f32(PROBE_CASCADES)),
+    );
+}
+
+// How much of a point a cascade answers for: all of it inside, handing over to
+// the next one out across its outermost fifth, and giving up across the
+// outermost tenth of the widest.
+fn probe_share(g: vec3<f32>, cascade: u32) -> f32 {
+    let out = abs(g / f32(PROBE_ACROSS) - vec3<f32>(0.5)) * 2.0;
+    var edge = PROBE_EDGE;
+    if cascade + 1u == PROBE_CASCADES {
+        edge = PROBE_FADE;
+    }
+    return 1.0 - smoothstep(edge, 1.0, max(max(out.x, out.y), out.z));
+}
+
+// The irradiance the probes say arrives at a surface at `p` facing `n`, and in
+// `a` how much of the point the cascades answered for -- which is all of it
+// within sixty-five kilometres of the eye and nothing past them.
+//
+// Read half a spacing out along the normal, so a surface takes its light from
+// the probes in front of it rather than from the ones standing in the hill
+// behind it. Irradiance from the first two bands of radiance is Ramamoorthi
+// and Hanrahan's: band zero times pi, band one times two pi over three. Clamped
+// at zero, which two bands of a light that is all on one side can dip below.
+fn probe_irradiance(field: texture_3d<f32>, filtering: sampler, p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
+    var sum = vec3<f32>(0.0);
+    var answered = 0.0;
+    for (var cascade = 0u; cascade < PROBE_CASCADES; cascade += 1u) {
+        if answered >= 1.0 {
+            break;
+        }
+        let g = probe_grid(p + n * (0.5 * probes.cascade[cascade].w), cascade);
+        let share = min(probe_share(g, cascade), 1.0 - answered);
+        if share > 0.0 {
+            let a = textureSampleLevel(field, filtering, probe_uvw(g, cascade, 0u), 0.0);
+            let b = textureSampleLevel(field, filtering, probe_uvw(g, cascade, 1u), 0.0);
+            let c = textureSampleLevel(field, filtering, probe_uvw(g, cascade, 2u), 0.0);
+            let along = b.rgb * n.x + c.rgb * n.y + vec3<f32>(a.w, b.w, c.w) * n.z;
+            let e = PI * SH_0 * a.rgb + (2.0 * PI / 3.0) * SH_1 * along;
+            sum = sum + share * max(e, vec3<f32>(0.0));
+            answered = answered + share;
+        }
+    }
+    return vec4<f32>(sum, answered);
+}
+
+// The light arriving at `p` from below, averaged over the lower half of every
+// direction, and in `a` how much of the point the cascades answered for.
+//
+// What the ground sends up: band zero less half of band one's vertical part,
+// which is the mean of two bands of harmonics over a hemisphere. Two of the
+// three texels a cascade, the third holding nothing vertical.
+fn probe_upwelling(field: texture_3d<f32>, filtering: sampler, p: vec3<f32>) -> vec4<f32> {
+    var sum = vec3<f32>(0.0);
+    var answered = 0.0;
+    for (var cascade = 0u; cascade < PROBE_CASCADES; cascade += 1u) {
+        if answered >= 1.0 {
+            break;
+        }
+        let g = probe_grid(p, cascade);
+        let share = min(probe_share(g, cascade), 1.0 - answered);
+        if share > 0.0 {
+            let a = textureSampleLevel(field, filtering, probe_uvw(g, cascade, 0u), 0.0);
+            let c = textureSampleLevel(field, filtering, probe_uvw(g, cascade, 2u), 0.0);
+            let up = SH_0 * a.rgb - 0.5 * SH_1 * c.rgb;
+            sum = sum + share * max(up, vec3<f32>(0.0));
+            answered = answered + share;
+        }
+    }
+    return vec4<f32>(sum, answered);
+}
+
 // What a light texel's own cell holds, rather than what the point at its centre
 // does.
 //
@@ -2182,7 +2295,10 @@ fn cs_cloud_march(@builtin(global_invocation_id)id: vec3<u32>) {
         let cos_theta = dot(direction, sky.sun.xyz);
         let radius = max(length(eye + vec3<f32>(0.0, GROUND_RADIUS, 0.0)), GROUND_RADIUS);
         let sun_mu = dot(sky.up.xyz, sky.sun.xyz);
-        let ambient = sample_multiscatter(radius, sun_mu);
+        // The light arriving from every side as the old stand-in had it. Half
+        // of it is replaced by what the probes say the ground sends up, nearer
+        // in than the widest cascade; see `probe_upwelling`.
+        let open = sample_multiscatter(radius, sun_mu);
 
         for (var taken = 0u; taken < MAX_STEPS; taken += 1u) {
             if t >= far || transmitted < CUTOFF {
@@ -2250,6 +2366,19 @@ fn cs_cloud_march(@builtin(global_invocation_id)id: vec3<u32>) {
                 // because every octave of the scattering below starts from sun
                 // that reached the cloud, and in a mountain's shadow none did.
                 sunlight = sunlight * sun_clear(middle, false);
+                // ... and everything else arriving at this sample. The upper half
+                // of it is the stand-in as it was -- which is not only the sky
+                // but, through `BOUNCED`, the light scattered through the cloud
+                // itself, white rather than sky blue, and the deck's look was set
+                // by eye against it. The lower half is what the ground under the
+                // sample sends up, which is what the probes around it hold: the
+                // underside of a deck over a snowfield glowing, and over a dark
+                // forest not. Taking the whole of it from the probes instead was
+                // tried, and turned every deck's base the blue of the sky the
+                // probes see, half as bright. Dimmed by the cloud over the sample,
+                // which the probes leave out, as the rest is.
+                let below = probe_upwelling(probe_field, edge_sampler, middle);
+                let ambient = 0.5 * open + 0.5 * (below.rgb + (1.0 - below.a) * open);
                 let lit_by_sky = sky_share(sky_reaching(middle));
                 let source = sunlit(sun_reaching(middle), cos_theta, sunlight)
                     + ambient * lit_by_sky;
