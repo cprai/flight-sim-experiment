@@ -221,6 +221,24 @@ struct Shadow {
 @group(3) @binding(12) var shafts_near: texture_2d<f32>;
 @group(3) @binding(13) var shafts_share: texture_2d<f32>;
 
+// The irradiance probes: the light the world sends to itself, in cascades on
+// the eye. See `src/probe.wgsl` for what they hold and `probe_irradiance` for
+// how they are read. The constants and the struct must match the ones there.
+const PROBE_ACROSS: u32 = 32u;
+const PROBE_CASCADES: u32 = 8u;
+const SH_0: f32 = 0.282095;
+const SH_1: f32 = 0.488603;
+struct Probes {
+    // Per cascade: the corner of the lattice in the world, and the metres
+    // between probes. Probe `i` stands at `corner + (i + 0.5) * spacing`.
+    cascade: array<vec4<f32>, PROBE_CASCADES>,
+    // The same, as last frame had it.
+    was: array<vec4<f32>, PROBE_CASCADES>,
+};
+@group(3) @binding(14) var probe_field: texture_3d<f32>;
+@group(3) @binding(15) var<uniform> probes: Probes;
+
+
 // The ray through a point on the screen, before it is normalised.
 //
 // Must match `ndc_of` and `ray_raw_at` in `src/terrain.wgsl`, character for
@@ -477,6 +495,97 @@ fn sun_clear(p: vec3<f32>, ground: bool) -> f32 {
         }
     }
     return clear + (1.0 - answered);
+}
+
+// Where a cascade of probes starts handing a point over to the one outside it,
+// and where the outermost gives up, as shares of the way from its middle to its
+// edge -- the same pair, for the same reasons, as `CASCADE_EDGE` and
+// `CASCADE_FADE` for the light volume. Must match everywhere the probes are read;
+// see `the_probes_read_the_same_everywhere` in `src/probe.rs`.
+const PROBE_EDGE: f32 = 0.8;
+const PROBE_FADE: f32 = 0.9;
+
+// Where a world point falls among one cascade's probes, counted in spacings
+// from the cascade's corner, so probe `i` stands at `i + 0.5`.
+fn probe_grid(p: vec3<f32>, cascade: u32) -> vec3<f32> {
+    let corner = probes.cascade[cascade];
+    return (p - corner.xyz) / corner.w;
+}
+
+// The texture coordinate of one block of the probes around `g` in a cascade,
+// held half a texel in from every side of the block and the cascade, which is
+// where a linear filter stops reaching into the next block or the next cascade.
+fn probe_uvw(g: vec3<f32>, cascade: u32, block: u32) -> vec3<f32> {
+    let n = f32(PROBE_ACROSS);
+    let inside = clamp(g, vec3<f32>(0.5), vec3<f32>(n - 0.5));
+    return vec3<f32>(
+        (f32(block) * n + inside.x) / (3.0 * n),
+        inside.y / n,
+        (f32(cascade) * n + inside.z) / (n * f32(PROBE_CASCADES)),
+    );
+}
+
+// How much of a point a cascade answers for: all of it inside, handing over to
+// the next one out across its outermost fifth, and giving up across the
+// outermost tenth of the widest.
+fn probe_share(g: vec3<f32>, cascade: u32) -> f32 {
+    let out = abs(g / f32(PROBE_ACROSS) - vec3<f32>(0.5)) * 2.0;
+    var edge = PROBE_EDGE;
+    if cascade + 1u == PROBE_CASCADES {
+        edge = PROBE_FADE;
+    }
+    return 1.0 - smoothstep(edge, 1.0, max(max(out.x, out.y), out.z));
+}
+
+// The irradiance the probes say arrives at a surface at `p` facing `n`, and in
+// `a` how much of the point the cascades answered for -- which is all of it
+// within sixty-five kilometres of the eye and nothing past them.
+//
+// Read half a spacing out along the normal, so a surface takes its light from
+// the probes in front of it rather than from the ones standing in the hill
+// behind it. Irradiance from the first two bands of radiance is Ramamoorthi
+// and Hanrahan's: band zero times pi, band one times two pi over three. Clamped
+// at zero, which two bands of a light that is all on one side can dip below.
+fn probe_irradiance(field: texture_3d<f32>, filtering: sampler, p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
+    var sum = vec3<f32>(0.0);
+    var answered = 0.0;
+    for (var cascade = 0u; cascade < PROBE_CASCADES; cascade += 1u) {
+        if answered >= 1.0 {
+            break;
+        }
+        let g = probe_grid(p + n * (0.5 * probes.cascade[cascade].w), cascade);
+        let share = min(probe_share(g, cascade), 1.0 - answered);
+        if share > 0.0 {
+            let a = textureSampleLevel(field, filtering, probe_uvw(g, cascade, 0u), 0.0);
+            let b = textureSampleLevel(field, filtering, probe_uvw(g, cascade, 1u), 0.0);
+            let c = textureSampleLevel(field, filtering, probe_uvw(g, cascade, 2u), 0.0);
+            let along = b.rgb * n.x + c.rgb * n.y + vec3<f32>(a.w, b.w, c.w) * n.z;
+            let e = PI * SH_0 * a.rgb + (2.0 * PI / 3.0) * SH_1 * along;
+            sum = sum + share * max(e, vec3<f32>(0.0));
+            answered = answered + share;
+        }
+    }
+    return vec4<f32>(sum, answered);
+}
+
+// The light arriving at `p` averaged over every direction, and in `a` how much
+// of the point the cascades answered for: band zero alone, one fetch a cascade.
+fn probe_radiance(field: texture_3d<f32>, filtering: sampler, p: vec3<f32>) -> vec4<f32> {
+    var sum = vec3<f32>(0.0);
+    var answered = 0.0;
+    for (var cascade = 0u; cascade < PROBE_CASCADES; cascade += 1u) {
+        if answered >= 1.0 {
+            break;
+        }
+        let g = probe_grid(p, cascade);
+        let share = min(probe_share(g, cascade), 1.0 - answered);
+        if share > 0.0 {
+            let a = textureSampleLevel(field, filtering, probe_uvw(g, cascade, 0u), 0.0);
+            sum = sum + share * max(SH_0 * a.rgb, vec3<f32>(0.0));
+            answered = answered + share;
+        }
+    }
+    return vec4<f32>(sum, answered);
 }
 
 // The zenith angle of the horizon. Must match `horizon_zenith` in
@@ -885,22 +994,27 @@ fn fs_shade(@builtin(position)clip: vec4<f32>) -> @location(0) vec4<f32> {
         * sun_reaching(ground)
         * sun_clear(ground, true);
 
-    // ... and the sky itself, which is what `AMBIENT` was standing in for. The
-    // multiple-scattering table already *is* the sky's isotropic radiance, so
-    // the irradiance onto a surface facing straight up is `pi` times it. The
-    // wrap term takes that down for a slope that faces the ground rather than
-    // the dome -- a cliff sees half a sky, not a whole one. Not a fifth table:
-    // a proper irradiance table would be a whole extra precompute for a
-    // difference the haze in front of it will shortly dominate.
+    // ... and everything else that arrives: the sky the terrain lets this patch
+    // see, and the light the terrain around it sends back -- the warm fill a
+    // sunlit slope throws into the valley in its shadow, and the dark of a
+    // gully that sees a strip of sky. That is what the irradiance probes hold,
+    // read off the cascades around this point. See `src/probe.wgsl`.
+    //
+    // Past the widest cascade, sixty-five kilometres out, the old stand-in
+    // takes over: the multiple-scattering table, which *is* the sky's isotropic
+    // radiance, times `pi` for a surface facing straight up and a wrap term for
+    // one that faces the ground rather than the dome. Out there the haze in
+    // front of the ground has the last word anyway.
     //
     // Dimmed by the cloud overhead as well, and that half is not optional:
     // taking the sun away and leaving the sky at full strength gives an
     // overcast landscape that is bright and flat rather than dim, which looks
-    // less like weather than like the sun having been switched off.
-    let ambient = sample_multiscatter(radius, sun_mu)
-        * PI
-        * (0.5 + 0.5 * dot(surface, up))
-        * sky_share(sky_reaching(ground));
+    // less like weather than like the sun having been switched off. The probes
+    // hold the light with that left out, so it is applied here, by the cloud
+    // over this point.
+    let probed = probe_irradiance(probe_field, lut_sampler, ground, surface);
+    let open = sample_multiscatter(radius, sun_mu) * PI * (0.5 + 0.5 * dot(surface, up));
+    let ambient = (probed.rgb + (1.0 - probed.a) * open) * sky_share(sky_reaching(ground));
 
     // A Lambertian surface scatters what lands on it over a hemisphere, which
     // is the `1 / pi`. The palette is stored linearised and is an albedo now

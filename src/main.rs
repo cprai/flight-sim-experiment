@@ -7,6 +7,7 @@ mod headless;
 mod hud;
 mod memory;
 mod palette;
+mod probe;
 mod profile;
 mod renderer;
 mod reproject;

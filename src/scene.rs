@@ -175,6 +175,8 @@ pub struct Scene {
     /// The sun's light taken back out of air in the shadow of the terrain or
     /// a cloud. Screen-sized, so rebuilt by [`Scene::resize`].
     shafts: crate::shafts::Shafts,
+    /// The light the world sends to itself, in cascades of probes on the eye.
+    probes: crate::probe::Probes,
     shading: Shading,
     /// What the last camera upload cost, zero unless a run asked to be timed.
     camera_span: std::time::Duration,
@@ -356,6 +358,17 @@ impl Scene {
             march.views(),
             shadow.field(),
         );
+        let palette = crate::deferred::palette(device);
+        let probes = crate::probe::Probes::new(
+            device,
+            &terrain,
+            crate::probe::Lit {
+                sky: &sky,
+                palette: &palette,
+                clouds: march.views(),
+                shadow: shadow.field(),
+            },
+        );
         let shading = Shading::new(
             device,
             format,
@@ -363,9 +376,11 @@ impl Scene {
             camera_layout,
             sky.layout(),
             sky.tables_layout(),
+            &palette,
             march.views(),
             shadow.field(),
             shafts.lost(),
+            probes.field(),
         );
         Self {
             camera,
@@ -399,6 +414,7 @@ impl Scene {
             was_eye: camera.position,
             was_camera: camera,
             shafts,
+            probes,
             shading,
             camera_span: std::time::Duration::ZERO,
             profiler: crate::profile::profiler(device, false),
@@ -438,6 +454,7 @@ impl Scene {
             self.march.views(),
             self.shadow.field(),
             self.shafts.lost(),
+            self.probes.field(),
         );
         self.terrain.resize(viewport);
         self.camera.aspect = viewport.x as f32 / viewport.y.max(1) as f32;
@@ -532,6 +549,7 @@ impl Scene {
             self.sun.direction,
             self.terrain.ceiling(),
         );
+        self.probes.set_frame(queue, self.camera.position);
         // After the terrain, because the first of those updates is the one that
         // reads the chain in, and the wind is solved around the ground that
         // reading produces. Once, on its own encoder, and unprofiled -- the
@@ -846,6 +864,13 @@ impl Scene {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 self.march.draw_resolve(&mut pass);
             }
+        }
+
+        {
+            // After the cloud's light volume, which lights what the probes'
+            // rays meet, and before the shading, which is lit by the probes.
+            let mut probes = gpu.scope(crate::profile::PROBES);
+            self.probes.draw(&mut probes, &self.terrain, &self.sky);
         }
 
         self.draw_shafts(gpu);
@@ -1465,6 +1490,11 @@ mod tests {
             scene.update(&device, &queue, crate::headless::STEP);
         }
         scene.camera.position = destination;
+        // The probes come round once in sixty-four frames, so a flight leaves the
+        // ones it has just reached untraced until they do; this frame is drawn
+        // as a renderer that had stood here that long would draw it. See
+        // `Probes::prime`.
+        scene.probes.prime();
         scene.update(&device, &queue, crate::headless::STEP);
 
         // `SIZE * 4` is already a multiple of the 256-byte copy alignment, and
@@ -2047,11 +2077,17 @@ mod tests {
                     .to_array()
                     .map(terrain_tiles::linear_to_srgb);
                 let got = frame.pixel(x, y);
+                // Five counts rather than the three rounding needs, because the
+                // two references are not quite the same light as the checkerboard:
+                // the ground lights the ground beside it, and a field of glacier
+                // or of canopy sends back more or less than a field of every
+                // material does. Measured at four at worst, and over three at
+                // nine of 54756 pixels.
                 assert!(
                     got[..3]
                         .iter()
                         .zip(want)
-                        .all(|(&got, want)| got.abs_diff(want) <= 3),
+                        .all(|(&got, want)| got.abs_diff(want) <= 5),
                     "material {:#06x} at ({x}, {y}) drew as {got:?}, not {want:?}",
                     id.0
                 );
@@ -3514,14 +3550,18 @@ mod tests {
             "the ground should dim as the sun sets: {high:.4} at 60 degrees, \
              {low:.4} at 6, {dusk:.4} at -4"
         );
-        // Measured rather than guessed. Reading the transmittance table takes
-        // red against blue from 1.34 to 2.21 as the sun drops, a factor of
-        // 1.65; replacing that lookup with the constant it averages leaves the
+        // Measured rather than guessed. Reading the transmittance table took
+        // red against blue from 1.34 to 2.21 as the sun dropped, a factor of
+        // 1.65; replacing that lookup with the constant it averages left the
         // sky and the haze as the only things that redden, and the same
-        // measurement gives 1.24 to 1.40, a factor of 1.13. The threshold sits
-        // between, so this fails if the sun stops arriving through the air.
+        // measurement gave 1.24 to 1.40, a factor of 1.13. Lit by the probes,
+        // whose sky is the whole sky-view table rather than the dimmer
+        // multiple-scattering stand-in, level ground under a low sun takes more
+        // of its light from the blue sky than it did, and the factor is 1.30 to
+        // 1.71, or 1.32. The threshold sits between that and 1.13, so this
+        // still fails if the sun stops arriving through the air.
         assert!(
-            low_warmth > 1.4 * high_warmth,
+            low_warmth > 1.22 * high_warmth,
             "dropping the sun from 60 degrees to 6 moved red against blue only \
              from {high_warmth:.3} to {low_warmth:.3}, which is a cosine \
              dimming the light rather than the air reddening it"
@@ -5720,9 +5760,10 @@ mod tests {
         // as bright as the ground before the hill.
         let beside = brightness_at(&frame, &camera, Vec3::new(-1500.0, 0.0, 1500.0));
         println!("behind {behind:.4}, before {before:.4}, beside {beside:.4}");
-        // Measured at 0.0326 behind against 0.0724 before and 0.0746 beside: the
+        // Measured at 0.0295 behind against 0.0702 before and 0.0724 beside: the
         // sun is a little more than half of what lights level ground at fifteen
-        // degrees, and the shadow takes all of it.
+        // degrees, and the shadow takes all of it. (0.0326, 0.0724 and 0.0746
+        // before the irradiance probes, whose sky the hill hides a little of.)
         assert!(
             before > 1.8 * behind,
             "the ground behind the hill is {behind:.4} against {before:.4} before it, \
@@ -5983,5 +6024,181 @@ mod tests {
                 .count();
             assert_eq!(lost, 0, "{lost} halves of clear, unshadowed air lost light");
         }
+    }
+
+    /// Every probe after one frame over `heights` painted `materials` under
+    /// `sun`, from an eye at `eye`: four halves a texel, three texels a probe,
+    /// laid out as the texture holds them. And where each cascade stood.
+    fn probes_after(
+        heights: Vec<f32>,
+        materials: Vec<MaterialId>,
+        sun: crate::sky::Sun,
+        eye: Vec3,
+    ) -> (Vec<[f32; 4]>, [[f32; 4]; crate::probe::PROBE_CASCADES as usize]) {
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut scene = test_scene(&device, format, test_residency(), heights, materials);
+        scene.sun = sun;
+        scene.camera.position = eye;
+        scene.update(&device, &queue, crate::headless::STEP);
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen target"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let profiler = crate::profile::profiler(&device, false);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut gpu = profiler.scope("gpu", &mut encoder);
+            scene.draw(&mut gpu, &view);
+        }
+        let texture = scene.probes.texture();
+        let size = texture.size();
+        let row = size.width * 8;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("probe readback"),
+            size: u64::from(row * size.height * size.depth_or_array_layers),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(size.height),
+                },
+            },
+            size,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll failed");
+        let texels = buffer
+            .get_mapped_range(..)
+            .expect("buffer not mapped")
+            .chunks_exact(8)
+            .map(|texel| {
+                std::array::from_fn(|c| {
+                    half::f16::from_le_bytes([texel[2 * c], texel[2 * c + 1]]).to_f32()
+                })
+            })
+            .collect();
+        (texels, crate::probe::ProbeUniform::cascades(eye))
+    }
+
+    /// The irradiance onto a surface facing `n` that the probe of `cascade`
+    /// nearest `at` holds, from its two bands of harmonics -- the CPU twin of
+    /// `probe_irradiance` in `src/probe.wgsl`, at one probe.
+    fn probe_irradiance_at(
+        probes: &(Vec<[f32; 4]>, [[f32; 4]; crate::probe::PROBE_CASCADES as usize]),
+        cascade: usize,
+        at: Vec3,
+        n: Vec3,
+    ) -> Vec3 {
+        let across = crate::probe::PROBE_ACROSS as usize;
+        let corner = probes.1[cascade];
+        let index = ((at - Vec3::new(corner[0], corner[1], corner[2])) / corner[3] - 0.5)
+            .round()
+            .as_ivec3();
+        assert!(
+            index.min_element() >= 0 && index.max_element() < across as i32,
+            "{at} is outside cascade {cascade}"
+        );
+        let texel = |block: usize| {
+            let x = block * across + index.x as usize;
+            let z = cascade * across + index.z as usize;
+            probes.0[(z * across + index.y as usize) * 3 * across + x]
+        };
+        let (a, b, c) = (texel(0), texel(1), texel(2));
+        let pi = std::f32::consts::PI;
+        let along = Vec3::new(b[0], b[1], b[2]) * n.x
+            + Vec3::new(c[0], c[1], c[2]) * n.y
+            + Vec3::new(a[3], b[3], c[3]) * n.z;
+        (pi * 0.282095 * Vec3::new(a[0], a[1], a[2]) + (2.0 * pi / 3.0) * 0.488603 * along)
+            .max(Vec3::ZERO)
+    }
+
+    /// A probe at the bottom of a narrow trench sees a strip of sky, and one the
+    /// same height over the open plain sees all of it.
+    ///
+    /// Under a sun overhead, over ground painted lake -- dark enough that what
+    /// the trench's walls send back is a small part of what reaches either
+    /// probe -- so what is left to tell them apart is how much of the sky the
+    /// terrain lets each see. A trench a hundred and twenty metres across and two
+    /// hundred deep leaves a probe twenty-four metres off its floor a strip of
+    /// sky thirty-eight degrees wide.
+    #[test]
+    fn a_narrow_trench_sees_less_sky_than_the_plain() {
+        let trench = |x: f32| x.abs() < 60.0;
+        let middle = (RASTER as f32 - 1.0) * 0.5;
+        let heights = (0..RASTER * RASTER)
+            .map(|index| {
+                let x = ((index % RASTER) as f32 - middle) * METRES_PER_TEXEL as f32;
+                if trench(x) { -200.0 } else { 0.0 }
+            })
+            .collect();
+        let probes = probes_after(
+            heights,
+            vec![LAKE; (RASTER * RASTER) as usize],
+            crate::sky::Sun::from_angles(89.0, 0.0),
+            Vec3::new(0.0, -100.0, 0.0),
+        );
+        let deep = probe_irradiance_at(&probes, 0, Vec3::new(0.0, -176.0, 0.0), Vec3::Y);
+        let open = probe_irradiance_at(&probes, 1, Vec3::new(400.0, 24.0, 0.0), Vec3::Y);
+        let share = deep.y / open.y;
+        println!("in the trench {deep}, on the plain {open}, a share of {share:.3}");
+        // Measured at 0.42 with a hundred and twenty-eight rays a probe.
+        assert!(open.y > 0.0, "the open plain's probe holds no light at all");
+        assert!(
+            share < 0.6,
+            "a probe at the bottom of a narrow trench gets {share:.3} of the sky the open \
+             plain does"
+        );
+    }
+
+    /// Bright ground lights what is above it from below, and dark ground does
+    /// not.
+    ///
+    /// The bounce the probes are for, seen from its receiving end: a probe a
+    /// little over a snowfield, asked how much light arrives at a surface
+    /// facing down, against the same probe over a lake. Under the default sun
+    /// both grounds are lit alike, so what tells them apart is what they send
+    /// back.
+    #[test]
+    fn bright_ground_lights_what_is_over_it_and_dark_ground_does_not() {
+        let below = |material| {
+            let probes = probes_after(
+                vec![0.0; (RASTER * RASTER) as usize],
+                vec![material; (RASTER * RASTER) as usize],
+                crate::sky::Sun::default(),
+                Vec3::new(0.0, 100.0, 0.0),
+            );
+            probe_irradiance_at(&probes, 0, Vec3::new(0.0, 24.0, 0.0), -Vec3::Y)
+        };
+        let glacier = MaterialId(Material::Glacier.id() as u16);
+        let (snow, lake) = (below(glacier), below(LAKE));
+        println!("from below over snow {snow}, over a lake {lake}");
+        // Measured at 0.66 against 0.078 in green. The lake's is mostly sky:
+        // two bands of harmonics cannot keep the bright half of a sphere out of
+        // the dark half altogether.
+        assert!(
+            snow.y > 3.0 * lake.y,
+            "a snowfield sends {snow} up to what is over it against a lake's {lake}"
+        );
     }
 }

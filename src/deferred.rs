@@ -251,6 +251,21 @@ pub struct Clouds<'a> {
     pub light: &'a wgpu::Buffer,
 }
 
+/// The albedo of every material, as the uniform the shaders index by id.
+///
+/// Uploaded once: the table is a pure function of the material enum, so nothing
+/// ever rewrites it. Built by the scene rather than by the shading because the
+/// shading is no longer its only reader -- what the ground sends back to the
+/// sky and to the ground beside it is the same albedo the eye sees, and the
+/// probes read it to light what their rays meet.
+pub fn palette(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("material palette"),
+        contents: bytemuck::cast_slice(&crate::palette::build()),
+        usage: wgpu::BufferUsages::UNIFORM,
+    })
+}
+
 /// The pass that turns the G-buffer into the image.
 pub struct Shading {
     layout: wgpu::BindGroupLayout,
@@ -277,17 +292,13 @@ impl Shading {
         camera_layout: &wgpu::BindGroupLayout,
         sky_layout: &wgpu::BindGroupLayout,
         tables_layout: &wgpu::BindGroupLayout,
+        palette: &wgpu::Buffer,
         cloud: Clouds<'_>,
         shadow: crate::shadow::Field<'_>,
         lost: crate::shafts::Lost<'_>,
+        probes: crate::probe::Field<'_>,
     ) -> Self {
-        // Uploaded once: the table is a pure function of the material enum,
-        // so nothing ever rewrites it.
-        let palette = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("material palette"),
-            contents: bytemuck::cast_slice(&crate::palette::build()),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let palette = palette.clone();
 
         let texture = |sample_type| wgpu::BindingType::Texture {
             sample_type,
@@ -371,9 +382,21 @@ impl Shading {
                 entry(11, unfiltered),
                 entry(12, unfiltered),
                 entry(13, unfiltered),
+                // The irradiance probes and where they stand. Filterable: a
+                // smooth field read between its probes, like the light volume.
+                entry(14, volume),
+                entry(
+                    15,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
             ],
         });
-        let bind_groups = Self::bind(device, &layout, &palette, gbuffer, cloud, shadow, lost);
+        let bind_groups =
+            Self::bind(device, &layout, &palette, gbuffer, cloud, shadow, lost, probes);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shading shader"),
@@ -440,9 +463,18 @@ impl Shading {
         cloud: Clouds<'_>,
         shadow: crate::shadow::Field<'_>,
         lost: crate::shafts::Lost<'_>,
+        probes: crate::probe::Field<'_>,
     ) {
-        self.bind_groups =
-            Self::bind(device, &self.layout, &self.palette, gbuffer, cloud, shadow, lost);
+        self.bind_groups = Self::bind(
+            device,
+            &self.layout,
+            &self.palette,
+            gbuffer,
+            cloud,
+            shadow,
+            lost,
+            probes,
+        );
     }
 
     fn bind(
@@ -453,6 +485,7 @@ impl Shading {
         cloud: Clouds<'_>,
         shadow: crate::shadow::Field<'_>,
         lost: crate::shafts::Lost<'_>,
+        probes: crate::probe::Field<'_>,
     ) -> [wgpu::BindGroup; 2] {
         let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
         std::array::from_fn(|parity| {
@@ -473,6 +506,8 @@ impl Shading {
                     entry(11, wgpu::BindingResource::TextureView(lost.far)),
                     entry(12, wgpu::BindingResource::TextureView(lost.near)),
                     entry(13, wgpu::BindingResource::TextureView(lost.share)),
+                    entry(14, wgpu::BindingResource::TextureView(probes.view)),
+                    entry(15, probes.uniform.as_entire_binding()),
                 ],
             })
         })

@@ -96,6 +96,10 @@ pub const CLOUD: &str = "cloud";
 /// altogether and which part of it went where.
 pub const LIGHTING: &str = "lighting";
 
+/// The scope [`crate::scene::Scene::draw`] opens around the irradiance
+/// probes' passes: the shift, the rays and their light, and the copy.
+pub const PROBES: &str = "probes";
+
 /// The scope [`crate::scene::Scene::draw`] opens around the march that takes
 /// the sun's light back out of shadowed air, and the blur after it.
 pub const SHAFTS: &str = "shafts";

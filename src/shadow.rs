@@ -534,10 +534,11 @@ mod tests {
     }
 
     /// Every shader that reads the field, as source.
-    const READERS: [(&str, &str); 3] = [
+    const READERS: [(&str, &str); 4] = [
         ("src/shading.wgsl", include_str!("shading.wgsl")),
         ("src/cloud_march.wgsl", include_str!("cloud_march.wgsl")),
         ("src/shafts.wgsl", include_str!("shafts.wgsl")),
+        ("src/probe.wgsl", include_str!("probe.wgsl")),
     ];
 
     /// Source from `from` up to the next line that starts with a closing brace,

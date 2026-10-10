@@ -471,6 +471,18 @@ struct Hit {
     w: vec2<f32>,
 };
 
+// The finest level a march may descend to, and how many texels it may cross
+// before giving up.
+//
+// The uniform's `base_level` and `march_steps` are what a pixel's ray wants, and
+// `cs_march` copies them in. Private rather than read from the uniform inside
+// `march` so that a ray cast for lighting rather than for a pixel can stop at a
+// coarser level and spend a smaller budget: a probe tens of metres across has
+// no use for the metre-wide crowns of the generated levels, and descending into
+// them would cost it most of its budget for an answer it then averages away.
+var<private> march_finest: u32 = 0u;
+var<private> march_budget: u32 = 0u;
+
 // Walks `dir` from the eye until it meets the ground.
 //
 // The march works throughout in *level-0 texel* coordinates, so a level is
@@ -517,14 +529,14 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
     // that recorded, the descent below would take the ray straight back to the
     // level it just left and the two would trade places at one `t` until the
     // step budget ran out.
-    var finest = terrain.base_level;
+    var finest = march_finest;
     // Whether the last thing the ray crossed was ground nothing is known about.
     // A ray that drops through a hole comes up against the underside of the
     // ground beside it, and has to be told apart from one that merely grazed a
     // surface it was above the whole way.
     var hole = false;
 
-    for (var step = 0u; step < terrain.march_steps; step += 1u) {
+    for (var step = 0u; step < march_budget; step += 1u) {
         if t >= limit {
             return out;
         }
@@ -584,7 +596,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
             t = exit + nudge;
             moved = true;
             level = min(level + 1u, coarsest);
-            finest = terrain.base_level;
+            finest = march_finest;
             continue;
         }
 
@@ -645,7 +657,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
             t = exit + nudge;
             moved = true;
             level = min(level + 1u, coarsest);
-            finest = terrain.base_level;
+            finest = march_finest;
             continue;
         }
 
@@ -684,7 +696,7 @@ fn march(eye: vec3<f32>, dir: vec3<f32>) -> Hit {
             t = exit + nudge;
             moved = true;
             level = min(level + 1u, coarsest);
-            finest = terrain.base_level;
+            finest = march_finest;
             continue;
         }
 
@@ -2751,6 +2763,8 @@ fn cs_march(@builtin(global_invocation_id)id: vec3<u32>) {
     }
     let packed = holes[at];
     let pixel = vec2<u32>(packed & 0xffffu, packed >> 16u);
+    march_finest = terrain.base_level;
+    march_budget = terrain.march_steps;
     store(pixel, ground_at(pixel));
     // Diagnostics, and only paid for by the rays that failed: on a healthy
     // frame almost nothing reaches either of these.
@@ -3144,4 +3158,210 @@ fn cs_shadow_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
         texel,
         vec4<u32>(bitcast<u32>(held.x), pack2x16float(vec2<f32>(kilometres, clearance)), 0u, 0u),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Irradiance probes: the rays.
+//
+// A lattice of points in cascades around the eye, each of which works out the
+// light arriving at it from every direction -- the sky where a ray escapes, and
+// the ground it meets where one does not, lit by the sun and by the probes
+// themselves. That is the light the terrain sends to itself and to the cloud:
+// the warm fill a sunlit slope throws into the valley in its shadow, the sky a
+// narrow valley does not see, and the glow of a snowfield on the underside of a
+// deck. See `src/probe.rs` for where the cascades stand and `src/probe.wgsl` for
+// what is done with what the rays find.
+//
+// The rays are here and the light is not, because the rays need the heights
+// and the march, which live in this file, and the light needs the sky's tables,
+// the cloud's light volume and the terrain's shadow, which do not. Between the
+// two passes is a buffer of what each ray met.
+
+const PROBE_ACROSS: u32 = 32u;
+const PROBE_CASCADES: u32 = 8u;
+const PROBE_RAYS: u32 = 128u;
+// How the lattice is split across the frames that update it: one residue of
+// the world's own probe index modulo four on each axis per frame, so every
+// probe is traced once every sixty-four frames, wherever the camera is
+// pointing. See `PROBE_PHASES` in `src/probe.rs` for why so seldom.
+const PROBE_PHASES: u32 = 64u;
+// How many texels a probe ray may cross before it gives up. Ample for a ray
+// marched at a texel half a probe's spacing; see `cs_probe_rays`.
+const PROBE_BUDGET: u32 = 96u;
+// The highest anything reads a probe: the top of the cloud's light volume,
+// `CEILING_TOP` in `src/cloud.rs`. See `cs_probe_rays`.
+const PROBE_TOP: f32 = 12000.0;
+
+// Where the probe cascades stand. Must match `Probes` in `src/probe.wgsl` and
+// `ProbeUniform` in `src/probe.rs`.
+struct Probes {
+    // Per cascade: the corner of the lattice in the world, and the metres
+    // between probes. Probe `i` stands at `corner + (i + 0.5) * spacing`.
+    cascade: array<vec4<f32>, PROBE_CASCADES>,
+    // The same, as last frame had it.
+    was: array<vec4<f32>, PROBE_CASCADES>,
+};
+
+// Which residue of the world lattice a pass updates.
+struct Phase {
+    at: vec4<u32>,
+};
+
+@group(3) @binding(20) var<uniform> probes: Probes;
+@group(3) @binding(21) var<uniform> phase: Phase;
+// What each ray met: the distance to it (or `NEVER`), its material id, its
+// normal packed octahedrally into two snorm halves, and the height the ray left
+// from, for a probe lifted out of the ground.
+@group(3) @binding(22) var<storage, read_write> probe_hits: array<vec4<u32>>;
+
+// The probe a workgroup of a probe pass stands for: the `slot`th of the probes
+// of `cascade` whose world index has this pass's residue. Must match
+// `probe_of` in `src/probe.wgsl`.
+fn probe_of(slot: u32, cascade: u32) -> vec3<u32> {
+    let corner = probes.cascade[cascade];
+    let first = vec3<i32>(round(corner.xyz / corner.w));
+    let reduced = vec3<u32>(slot % 8u, (slot / 8u) % 8u, slot / 64u);
+    let residue = vec3<i32>(phase.at.xyz);
+    let shift = vec3<u32>(((residue - first) % 4 + 4) % 4);
+    return reduced * 4u + shift;
+}
+
+// Where a probe stands, and its index in the world's own lattice at its
+// cascade's spacing. Must match `probe_centre` in `src/probe.wgsl`.
+fn probe_centre(index: vec3<u32>, cascade: u32) -> vec3<f32> {
+    let corner = probes.cascade[cascade];
+    return corner.xyz + (vec3<f32>(index) + 0.5) * corner.w;
+}
+
+fn probe_world(index: vec3<u32>, cascade: u32) -> vec3<i32> {
+    let corner = probes.cascade[cascade];
+    return vec3<i32>(round(corner.xyz / corner.w)) + vec3<i32>(index);
+}
+
+// The `ray`th of a probe's directions: a spherical Fibonacci set, turned by a
+// rotation drawn for each probe from where it stands in the world. Must match
+// `probe_direction` in `src/probe.wgsl`.
+//
+// Drawn once and kept, not drawn afresh at every update. Fresh draws would
+// average towards the true answer over the updates -- and in the meantime every
+// update would change every probe it touched, so a still camera's light would
+// never settle and the frame would shimmer by a count wherever a probe lit it.
+// A fixed draw per probe is a fixed error per probe instead, different from
+// its neighbours', which the filter between them averages away in space rather
+// than in time. A still camera then sees a still frame.
+fn probe_direction(world: vec3<i32>, cascade: u32, ray: u32) -> vec3<f32> {
+    let golden = 2.39996323;
+    let z = 1.0 - (2.0 * f32(ray) + 1.0) / f32(PROBE_RAYS);
+    let r = sqrt(max(1.0 - z * z, 0.0));
+    let a = f32(ray) * golden;
+    let d = vec3<f32>(r * cos(a), z, r * sin(a));
+    // A uniformly random rotation from three hashes, as a unit quaternion.
+    let seed = cascade * 0x85ebca6bu;
+    let h0 = f32(noise_hash(world.x, world.z, seed ^ u32(world.y)) >> 8u) / 16777216.0;
+    let h1 = f32(noise_hash(world.z, world.y, seed ^ 0x68e31da4u) >> 8u) / 16777216.0;
+    let h2 = f32(noise_hash(world.y, world.x, seed ^ 0xb5297a4du) >> 8u) / 16777216.0;
+    let s1 = sqrt(1.0 - h0);
+    let s2 = sqrt(h0);
+    let q = vec4<f32>(
+        s1 * sin(6.28318531 * h1),
+        s1 * cos(6.28318531 * h1),
+        s2 * sin(6.28318531 * h2),
+        s2 * cos(6.28318531 * h2),
+    );
+    let t = 2.0 * cross(q.xyz, d);
+    return d + q.w * t + cross(q.xyz, t);
+}
+
+// A unit vector folded onto the octahedron and packed into two snorm halves.
+fn pack_normal(n: vec3<f32>) -> u32 {
+    let l1 = abs(n.x) + abs(n.y) + abs(n.z);
+    var p = n.xz / l1;
+    if n.y < 0.0 {
+        p = (1.0 - abs(p.yx)) * select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
+    }
+    return pack2x16snorm(p);
+}
+
+// The ground's height at a world position, off one resident level's bilinear
+// patches, or `None`-ish far below where there is no ground.
+fn probe_ground(level: u32, world: vec2<f32>) -> f32 {
+    if any(world < terrain.data_min) || any(world > terrain.data_max) {
+        return -NEVER;
+    }
+    let w = (world - terrain.origin) / terrain.metres_per_texel / f32(1u << level);
+    let cell = vec2<i32>(floor(w));
+    let corner = vec4<f32>(
+        lattice_height(level, cell),
+        lattice_height(level, cell + vec2<i32>(1, 0)),
+        lattice_height(level, cell + vec2<i32>(0, 1)),
+        lattice_height(level, cell + vec2<i32>(1, 1)),
+    );
+    if lowest(corner) < NODATA_BELOW {
+        return -NEVER;
+    }
+    return surface(corner, w - vec2<f32>(cell));
+}
+
+// One ray of one probe.
+//
+// Marched over the same heights the eye's rays are, but stopping at the level
+// whose texels are half a probe's spacing: a probe sixty-four metres from its
+// neighbours has no use for the metre-wide crowns of the generated levels, and
+// descending into them would spend its budget on detail it then averages away.
+// Never finer than the march's own base, which is the finest the uniform
+// advertises.
+//
+// A probe that stands inside the ground is lifted out of it to a quarter of a
+// spacing above, which is where the ground it is buried under is lit from:
+// what it would see from inside is the underside of a hill, and that is black.
+@compute @workgroup_size(128, 1, 1)
+fn cs_probe_rays(
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(local_invocation_index) ray: u32,
+) {
+    let cascade = group.y;
+    let index = probe_of(group.x, cascade);
+    let spacing = probes.cascade[cascade].w;
+    let coarsest = terrain.level_count - 1u;
+    let wanted = u32(max(round(log2(spacing * 0.5 / terrain.metres_per_texel.x)), 0.0));
+    let level = clamp(max(wanted, terrain.resident_base), terrain.base_level, coarsest);
+    march_finest = max(level, terrain.base_level);
+    march_budget = PROBE_BUDGET;
+
+    var origin = probe_centre(index, cascade);
+    let ground = probe_ground(level, origin.xz);
+    let entry = (cascade * (PROBE_ACROSS * PROBE_ACROSS * PROBE_ACROSS / PROBE_PHASES) + group.x) * PROBE_RAYS + ray;
+    // Nothing reads a probe buried deeper than a spacing and a half -- the
+    // ground reads the ones half a spacing above it, and a filter reaches one
+    // spacing -- nor one above everything the cloud can be. The cascades are
+    // cubes about the eye, so from high up most of an outer one is one or the
+    // other; they are met at once and black, rather than lifted and traced.
+    if origin.y < ground - 1.5 * spacing || origin.y > PROBE_TOP + 1.5 * spacing {
+        probe_hits[entry] = vec4<u32>(bitcast<u32>(0.0), 0xffffffffu, 0u, bitcast<u32>(origin.y));
+        return;
+    }
+    origin.y = max(origin.y, ground + 0.25 * spacing);
+    let dir = probe_direction(probe_world(index, cascade), cascade, ray);
+
+    var met = vec4<u32>(bitcast<u32>(NEVER), 0u, 0u, bitcast<u32>(origin.y));
+    let hit = march(origin, dir);
+    let inside = all(hit.position.xz >= terrain.data_min) && all(hit.position.xz <= terrain.data_max);
+    if hit.found && inside {
+        let cell = vec2<i32>(floor(hit.w + 0.5));
+        var material: u32;
+        if hit.level < terrain.resident_base {
+            material = textureLoad(detail_materials, slot(hit.level, cell), i32(hit.level), 0).r;
+        } else {
+            material = textureLoad(materials, slot(hit.level, cell), mip(hit.level)).r;
+        }
+        met.x = bitcast<u32>(distance(origin, hit.position));
+        met.y = material;
+        met.z = pack_normal(normal_at(hit.level, hit.w));
+    } else if hit.abandoned {
+        // Still inside the ground after the lift, which a cliff overhanging a
+        // probe can do. Met at once, and black.
+        met.x = bitcast<u32>(0.0);
+        met.y = 0xffffffffu;
+    }
+    probe_hits[entry] = met;
 }
