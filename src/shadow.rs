@@ -267,6 +267,36 @@ pub struct Shadow {
     /// How many lines each cascade's sweep is this frame.
     lines: [u32; SHADOW_CASCADES as usize],
     lattice: Lattice,
+    /// Where the cascades were last placed.
+    placed: Option<ShadowUniform>,
+    /// Which cascades have to be swept again before they are next read: any
+    /// placed somewhere new, under a new sun, or inside one that was. Gathered
+    /// over every update since the last frame was drawn, because a scene is
+    /// settled by updating it without drawing, and cleared by the draw. A cell
+    /// because drawing is done through a shared reference.
+    stale: std::cell::Cell<[bool; SHADOW_CASCADES as usize]>,
+}
+
+/// Which cascades going from `was` to `now` leaves holding the wrong field.
+///
+/// A cascade that has not moved, under the same sun and over the same ground,
+/// holds exactly what sweeping it again would write: the field is a fact about
+/// the world and the sun, and neither has changed. So only a cascade the camera
+/// has carried a texel, and every cascade inside it -- each inherits what the
+/// one outside it says is cast into it -- needs its sweep. The innermost moves
+/// with every eight metres of flight; the outermost, every two hundred and
+/// fifty-six; and a still camera under a still sun sweeps nothing at all.
+fn stale(was: Option<&ShadowUniform>, now: &ShadowUniform) -> [bool; SHADOW_CASCADES as usize] {
+    let Some(was) = was else {
+        return [true; SHADOW_CASCADES as usize];
+    };
+    let mut outer = was.sun != now.sun || was.bounds != now.bounds;
+    let mut out = [false; SHADOW_CASCADES as usize];
+    for k in (0..SHADOW_CASCADES as usize).rev() {
+        outer = outer || was.cascade[k] != now.cascade[k];
+        out[k] = outer;
+    }
+    out
 }
 
 impl Shadow {
@@ -452,17 +482,37 @@ impl Shadow {
             scratch,
             lines: [0; SHADOW_CASCADES as usize],
             lattice: Lattice::of(terrain),
+            placed: None,
+            stale: std::cell::Cell::new([true; SHADOW_CASCADES as usize]),
         }
     }
 
     /// Places the cascades on the eye and lays the sweeps along the sun.
     pub fn set_frame(&mut self, queue: &wgpu::Queue, eye: Vec3, sun: Vec3, ceiling: f32) {
         let uniform = ShadowUniform::at(eye, sun, self.lattice, ceiling);
+        let now = stale(self.placed.as_ref(), &uniform);
+        let mut pending = self.stale.get();
+        for (pending, now) in pending.iter_mut().zip(now) {
+            *pending |= now;
+        }
+        self.stale.set(pending);
+        self.placed = Some(uniform);
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
         for (k, (sweep, lines)) in uniform.sweeps(self.lattice).into_iter().enumerate() {
             queue.write_buffer(&self.sweep_uniforms[k], 0, bytemuck::bytes_of(&sweep));
             self.lines[k] = lines;
         }
+    }
+
+    /// Whether cascade `k` has to be swept this frame. See [`stale`].
+    pub fn is_stale(&self, k: u32) -> bool {
+        self.stale.get()[k as usize]
+    }
+
+    /// Says every stale cascade has been swept, once the frame has recorded
+    /// their passes.
+    pub fn swept(&self) {
+        self.stale.set([false; SHADOW_CASCADES as usize]);
     }
 
     /// Records the sweep of cascade `k` along its lines, into a pass of its own.
@@ -597,6 +647,27 @@ mod tests {
                 "the Shadow struct in {name} is not the one in src/terrain.wgsl"
             );
         }
+    }
+
+    /// A still camera under a still sun sweeps nothing; a step of the innermost
+    /// texel sweeps the innermost cascade alone; a step across a coarse
+    /// cascade's texel sweeps it and everything inside it; and a sun that moves
+    /// sweeps everything.
+    #[test]
+    fn only_what_moved_is_swept_again() {
+        let sun = Vec3::new(0.3, 0.2, -0.9).normalize();
+        let at = |eye: Vec3, sun: Vec3| ShadowUniform::at(eye, sun, lattice(), 3000.0);
+        // A quarter of the innermost texel off the lattice, so a half-texel step
+        // crosses the innermost cascade's snap and no other's.
+        let here = at(Vec3::new(2.0, 500.0, 2.0), sun);
+        assert_eq!(stale(None, &here), [true; 6], "nothing swept yet");
+        assert_eq!(stale(Some(&here), &here), [false; 6]);
+        let step = at(Vec3::new(6.0, 500.0, 2.0), sun);
+        assert_eq!(stale(Some(&here), &step), [true, false, false, false, false, false]);
+        let far = at(Vec3::new(2.0 + 256.0, 500.0, 2.0), sun);
+        assert_eq!(stale(Some(&here), &far), [true; 6]);
+        let turned = at(Vec3::new(2.0, 500.0, 2.0), Vec3::new(0.31, 0.2, -0.9).normalize());
+        assert_eq!(stale(Some(&here), &turned), [true; 6]);
     }
 
     #[test]

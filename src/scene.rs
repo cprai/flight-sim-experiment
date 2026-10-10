@@ -745,7 +745,14 @@ impl Scene {
             // makes that visible.
             let mut lighting = gpu.scope(crate::profile::LIGHTING);
             let mut shadow = lighting.scope("shadow");
+            //
+            // Only the cascades that have moved, or are under a new sun, or sit
+            // inside one that has: the rest hold what sweeping them again would
+            // write. See `stale` in `src/shadow.rs`.
             for k in (0..crate::shadow::SHADOW_CASCADES).rev() {
+                if !self.shadow.is_stale(k) {
+                    continue;
+                }
                 {
                     let mut pass = shadow.scoped_compute_pass(format!("sweep-{k}"));
                     self.shadow.draw_sweep(&mut pass, &self.terrain, k);
@@ -753,6 +760,7 @@ impl Scene {
                 let mut pass = shadow.scoped_compute_pass(format!("resolve-{k}"));
                 self.shadow.draw_resolve(&mut pass, &self.terrain, k);
             }
+            self.shadow.swept();
         }
 
         {
