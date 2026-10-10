@@ -1,15 +1,15 @@
 ---
 name: git-commit-message
-description: Rules for composing Conventional Commit messages that obey the 50/72 rule and carry a detailed body — why the change was made, alternatives rejected, evidence, and references — because this project's git history is its living design record rather than comments and docs files. Use whenever a commit message is written, proposed, or reviewed, and whenever a commit is about to be made — including after any code change and when the user asks "what should I commit this as". The agent commits on its own, without asking, but only after staging exactly what the message describes and verifying the staged diff against the message. Never pushes on its own.
+description: Rules for composing Conventional Commit messages that obey the 50/72 rule and carry a detailed body — why the change was made, alternatives rejected, evidence, and references — because this project's git history is its living design record rather than comments and docs files. Use whenever a commit message is written, proposed, or reviewed, and whenever a commit is about to be made — including after any code change and when the user asks "what should I commit this as". The agent commits on its own, without asking, but only after staging exactly what the message describes and verifying the staged diff against the message. Never pushes, even when asked.
 ---
 
 # Git Commit Messages
 
-## Hard rules: commit on your own, never push on your own
+## Hard rules: commit on your own, never push
 
-**Never run `git push` on your own.** Publishing history is the user's action
-alone. Do not rewrite existing history either: no `git commit --amend`, no rebase,
-no reset of committed work.
+**Never run `git push`, under any circumstances — not even when asked.** Publishing
+history is the user's action alone. Do not rewrite existing history either: no
+`git commit --amend`, no rebase, no reset of committed work.
 
 **`git commit` is allowed without asking the user, but only through the loop
 below.** No approval question is needed; the loop's staging and verification steps

@@ -7,9 +7,9 @@
 workflow below, so every commit is well-scoped and carries an accurate message.
 Commit when a logically complete change is done; do not leave finished work
 uncommitted, and do not commit half-done or broken work just to have a commit.
-**Never run `git push` on your own.** Publishing history is the user's action
-alone. Do not rewrite existing history either: no `git commit --amend`, no
-rebase, no reset of committed work.
+**Never run `git push`, under any circumstances — not even when asked.**
+Publishing history is the user's action alone. Do not rewrite existing history
+either: no `git commit --amend`, no rebase, no reset of committed work.
 
 **Workflow for each commit:**
 
