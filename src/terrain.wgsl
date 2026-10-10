@@ -2866,7 +2866,10 @@ struct Sweep {
     drop: f32,
     // How many lines the sweep walks, from `first`.
     lines: i32,
-    padding0: u32,
+    // Where across the minor axis the lines stand at step 0, past their
+    // integer intercepts: what keeps them on lines laid across the whole
+    // lattice, so they do not slide over the ground when the cascade moves.
+    phase: f32,
     padding1: u32,
     padding2: u32,
 };
@@ -2978,7 +2981,7 @@ fn sweep_major(i: i32) -> i32 {
 // of texels.
 fn sweep_world(i: i32, line: i32) -> vec2<f32> {
     let origin = shadow.cascade[sweep.cascade];
-    let minor = f32(line) + f32(i) * sweep.slope;
+    let minor = f32(line) + sweep.phase + f32(i) * sweep.slope;
     return origin.xy + sweep_axes(f32(sweep_major(i)), minor) * origin.zw;
 }
 
@@ -3126,7 +3129,7 @@ fn cs_shadow_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     let texel = vec2<i32>(sweep_axes(f32(major), f32(minor)));
     let i = sweep_major(major);
     // Where across the minor axis this texel stands, counted in lines.
-    let across = f32(minor) - f32(i) * sweep.slope;
+    let across = f32(minor) - f32(i) * sweep.slope - sweep.phase;
     let below = i32(floor(across));
     let f = across - f32(below);
     let a = swept_at(below, i);

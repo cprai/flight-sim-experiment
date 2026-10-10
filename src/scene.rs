@@ -5533,6 +5533,15 @@ mod tests {
     /// Each texel comes back unpacked: the shadow height, the distance to the
     /// occluder in metres, and how far the texel's own ground clears the shadow.
     fn swept_shadow(heights: Vec<f32>, sun: crate::sky::Sun) -> (Vec<[f32; 3]>, Vec2, f32) {
+        swept_shadow_from(heights, sun, Vec2::ZERO)
+    }
+
+    /// [`swept_shadow`] with the eye over `eye` rather than over the middle.
+    fn swept_shadow_from(
+        heights: Vec<f32>,
+        sun: crate::sky::Sun,
+        eye: Vec2,
+    ) -> (Vec<[f32; 3]>, Vec2, f32) {
         let (device, queue) = test_device();
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let mut scene = test_scene(&device, format, test_residency(), heights, flat_ground());
@@ -5540,7 +5549,7 @@ mod tests {
         // High enough to give up the finest level, which the march then no
         // longer advertises -- and which the shadow has to go on reading, since
         // the ground in a ridge's shadow is the same ground at any altitude.
-        scene.camera.position = Vec3::new(0.0, 20000.0, 0.0);
+        scene.camera.position = Vec3::new(eye.x, 20000.0, eye.y);
         scene.update(&device, &queue, crate::headless::STEP);
         assert!(
             scene.terrain.base_level() > 0,
@@ -5690,6 +5699,56 @@ mod tests {
             assert!(
                 worst < 3.0,
                 "at {elevation} degrees the sweep is {worst} m from the walk"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shadow_stands_still_while_the_camera_moves() {
+        // A move of a few texels and a fraction carries the innermost cascade
+        // to a new place on the lattice. The field is a fact about the ground
+        // and the sun, so every texel the two placements share has to hold
+        // what it held -- which it did not while each line was laid from the
+        // cascade's own edge, and slid across the ground with every move.
+        for (heights, azimuth, elevation) in [
+            (round_hill(), 30.0, 5.0),
+            (round_hill(), 200.0, 12.0),
+            (tilted_plane(1.0), 45.0, 10.0),
+        ] {
+            let sun = crate::sky::Sun::from_angles(elevation, azimuth);
+            let (here, corner, texel) = swept_shadow_from(heights.clone(), sun, Vec2::ZERO);
+            let moved_by = Vec2::new(5.3, -2.6) * texel;
+            let (there, moved, _) = swept_shadow_from(heights.clone(), sun, moved_by);
+            let shift = ((moved - corner) / texel).round();
+            assert_ne!(shift, Vec2::ZERO, "the cascade did not move");
+            let n = crate::shadow::SHADOW_ACROSS as i32;
+            let mut compared = 0;
+            let mut worst = 0.0f32;
+            for z in 0..n {
+                for x in 0..n {
+                    let (u, v) = (x - shift.x as i32, z - shift.y as i32);
+                    if u < 0 || v < 0 || u >= n || v >= n {
+                        continue;
+                    }
+                    let a = here[(z * n + x) as usize][0];
+                    let b = there[(v * n + u) as usize][0];
+                    // Where nothing stands upstream, neither holds a height.
+                    if a < -1e20 || b < -1e20 {
+                        assert!(a < -1e20 && b < -1e20, "only one placement shadows {x}, {z}");
+                        continue;
+                    }
+                    compared += 1;
+                    worst = worst.max((a - b).abs());
+                }
+            }
+            assert!(compared > 10_000, "only {compared} texels shadowed in both");
+            // Measured at 1.9 mm, which is rounding: the same world point
+            // reached from two corners. Laid from the cascade's edge it was
+            // 3.8 m on this smooth hill, and texels at the edge of its shadow
+            // were in it from one placement and out of it from the other.
+            assert!(
+                worst < 0.05,
+                "at {elevation} degrees from {azimuth} the field moved {worst} m with the camera"
             );
         }
     }

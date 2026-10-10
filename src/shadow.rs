@@ -83,7 +83,8 @@ struct SweepUniform {
     step: f32,
     drop: f32,
     lines: i32,
-    padding: [u32; 3],
+    phase: f32,
+    padding: [u32; 2],
 }
 
 /// Where the terrain's texels stand, as [`Terrain::lattice`] gives it.
@@ -174,26 +175,48 @@ impl ShadowUniform {
             // One texel along the major axis, and what that is along the line.
             let step = texel[major] / toward[major].abs().max(1e-12);
             let slope = away[minor] / away[major].abs().max(1e-12);
-            // Every line starts at an integer minor intercept on the upstream
-            // edge and stands at `line + i * slope` at step `i`. A texel is
-            // resolved from the two lines either side of it, so the intercepts
-            // have to run over every pair that brackets some texel at some step:
-            // from the line below the lowest intercept a texel can have to the
-            // line above the highest. See `cs_shadow_resolve`.
+            let forward = if away[major] >= 0.0 { 1 } else { -1 };
+            // Every line stands at `line + phase + i * slope` across the minor
+            // axis at step `i`, for an integer `line`. The phase is what keeps
+            // the lines where they were in the world when the cascade moves: a
+            // line is one of a family laid across the terrain's whole lattice,
+            // at integer intercepts on its zeroth major column, and the phase is
+            // where that family crosses the cascade's first step. Counted in
+            // doubles from the cascade's corner on the lattice, which is an
+            // integer, because the product runs to thousands of texels. Lines
+            // laid from the cascade's own edge instead would slide sideways
+            // over the ground with every move of it, and the field between
+            // them with them.
+            let corner = (Vec2::new(self.cascade[k as usize][0], self.cascade[k as usize][1])
+                - lattice.origin)
+                / texel;
+            let column = f64::from(corner[major].round());
+            let first_column = if forward > 0 {
+                column
+            } else {
+                column + f64::from(SHADOW_ACROSS - 1)
+            };
+            let phase =
+                (f64::from(slope) * f64::from(forward) * first_column).rem_euclid(1.0) as f32;
+            // A texel is resolved from the two lines either side of it, so the
+            // intercepts have to run over every pair that brackets some texel at
+            // some step: from the line below the lowest intercept a texel can
+            // have to the line above the highest. See `cs_shadow_resolve`.
             let reach = ((SHADOW_ACROSS - 1) as f32 * slope.abs()).ceil() as i32;
-            let first = if slope >= 0.0 { -reach - 1 } else { -1 };
-            let lines = SHADOW_ACROSS + reach as u32 + 2;
+            let first = if slope >= 0.0 { -reach - 2 } else { -2 };
+            let lines = SHADOW_ACROSS + reach as u32 + 3;
             let sweep = SweepUniform {
                 cascade: k,
                 level: lattice.level(k),
                 major: major as u32,
                 first,
-                forward: if away[major] >= 0.0 { 1 } else { -1 },
+                forward,
                 slope,
                 step,
                 drop: step * tan,
                 lines: lines as i32,
-                padding: [0; 3],
+                phase,
+                padding: [0; 2],
             };
             (sweep, lines)
         })
@@ -705,7 +728,7 @@ mod tests {
                 // at the corners of the cascade, at its first and last steps.
                 for minor in [0, n - 1] {
                     for i in [0, n - 1] {
-                        let across = minor as f32 - i as f32 * sweep.slope;
+                        let across = minor as f32 - i as f32 * sweep.slope - sweep.phase;
                         let below = across.floor() as i32;
                         assert!(
                             below >= sweep.first && below + 1 <= last,
