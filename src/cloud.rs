@@ -71,7 +71,7 @@ pub const CEILING_SLICES: u32 = 24;
 ///
 /// Above the highest deck, so a ray that climbs out of the grid has left every
 /// cloud behind rather than merely left the table.
-const CEILING_TOP: f32 = 12000.0;
+pub const CEILING_TOP: f32 = 12000.0;
 
 /// How much world one tile of the weather map covers, in metres. Must match
 /// `WEATHER_TILE` in `src/cloud_march.wgsl`.
@@ -1905,7 +1905,7 @@ impl March {
 ///
 /// Rounded up, so a viewport with an odd side still has a half-resolution texel
 /// standing over its last column rather than one short of it.
-fn half_of(viewport: glam::UVec2) -> glam::UVec2 {
+pub fn half_of(viewport: glam::UVec2) -> glam::UVec2 {
     ((viewport + glam::UVec2::ONE) / 2).max(glam::UVec2::ONE)
 }
 

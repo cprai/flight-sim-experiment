@@ -12,6 +12,7 @@ mod renderer;
 mod reproject;
 mod scene;
 mod shadow;
+mod shafts;
 mod sky;
 mod terrain;
 

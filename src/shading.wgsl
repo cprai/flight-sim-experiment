@@ -179,6 +179,15 @@ struct Shadow {
 @group(3) @binding(9) var shadow_field: texture_2d_array<u32>;
 @group(3) @binding(10) var<uniform> shadow: Shadow;
 
+// The sun's light the aerial volume counted and the terrain or a cloud kept out
+// of the air, per two-by-two block of the frame. See `src/shafts.wgsl`: what
+// the block's ray lost out to its farthest pixel and out to its nearest, each
+// with in `a` how far that pixel is in kilometres, and the share of the far
+// one that was lost in front of the cloud.
+@group(3) @binding(11) var shafts_far: texture_2d<f32>;
+@group(3) @binding(12) var shafts_near: texture_2d<f32>;
+@group(3) @binding(13) var shafts_share: texture_2d<f32>;
+
 // The ray through a point on the screen, before it is normalised.
 //
 // Must match `ndc_of` and `ray_raw_at` in `src/terrain.wgsl`, character for
@@ -698,6 +707,26 @@ fn cloud_at(pixel: vec2<i32>, along: f32) -> Cloud {
     return out;
 }
 
+// The light a pixel's air never had, and how much of it was in front of the
+// cloud on its ray.
+//
+// One block's answer, since a block is two pixels across and a shaft is
+// hundreds. What varies inside a block is how far each pixel reaches: across a
+// silhouette one pixel is ridge and the next is sky forty kilometres beyond it,
+// and the air in front of the two is very different air. So the march kept the
+// light lost out to the block's nearest pixel as well as its farthest, and a
+// pixel takes the share between them its own distance says. Along the view
+// axis, as `along` is everywhere in this pass.
+fn shafts_at(pixel: vec2<i32>, along: f32) -> vec4<f32> {
+    let block = pixel / 2;
+    let far = textureLoad(shafts_far, block, 0);
+    let near = textureLoad(shafts_near, block, 0);
+    let share = textureLoad(shafts_share, block, 0).r;
+    let span = max((far.a - near.a) * 1000.0, 1e-3);
+    let between = saturate((along - near.a * 1000.0) / span);
+    return vec4<f32>(mix(near.rgb, far.rgb, between), share);
+}
+
 // The cloud put in front of what was already there.
 //
 // Everything the frame had is radiance measured at the eye, so it already
@@ -716,7 +745,15 @@ fn cloud_at(pixel: vec2<i32>, along: f32) -> Cloud {
 // are built by different marches over the same air and disagree by a hair near
 // the horizon, where `background` can come out a shade under the haze that is
 // supposed to be part of it.
-fn composite(background: vec3<f32>, screen: vec2<f32>, cloud: Cloud) -> vec3<f32> {
+//
+// `lost` is the light the shafts took out of the air in front of the cloud,
+// which the haze read here still counts.
+fn composite(
+    background: vec3<f32>,
+    screen: vec2<f32>,
+    cloud: Cloud,
+    lost: vec3<f32>,
+) -> vec3<f32> {
     // A pixel with nothing in front of it takes the path it always took, to the
     // last bit. That is what lets a clear sky be checked against the frames this
     // pass drew before there were clouds in it.
@@ -727,7 +764,10 @@ fn composite(background: vec3<f32>, screen: vec2<f32>, cloud: Cloud) -> vec3<f32
         screen / vec2<f32>(textureDimensions(depth)),
         aerial_depth(cloud.along),
     );
-    let haze = textureSampleLevel(aerial_scatter_lut, lut_sampler, uvw, 0.0).rgb;
+    let haze = max(
+        textureSampleLevel(aerial_scatter_lut, lut_sampler, uvw, 0.0).rgb - lost,
+        vec3<f32>(0.0),
+    );
     let through = max(
         textureSampleLevel(aerial_transmit_lut, lut_sampler, uvw, 0.0).rgb,
         vec3<f32>(1e-4),
@@ -757,11 +797,16 @@ fn fs_shade(@builtin(position)clip: vec4<f32>) -> @location(0) vec4<f32> {
     // a fact about a *direction*, and a direction is all this needs.
     if textureLoad(depth, pixel, 0).r == 0.0 {
         let towards = normalize(ray_raw_at(clip.xy));
-        let sky = sample_skyview(towards) + sun_disc(towards);
+        // ... less the sunlight the sky-view table counted in air that a
+        // mountain or a cloud keeps in shadow, which is a god ray seen from its
+        // dark side.
+        let shafts = shafts_at(pixel, AERIAL_FAR);
+        let sky = max(sample_skyview(towards) - shafts.rgb, vec3<f32>(0.0)) + sun_disc(towards);
         // A sky ray reaches nothing, so as far as the cloud upsample is
         // concerned it is showing whatever is at the end of the table.
         let cloud = cloud_at(pixel, AERIAL_FAR);
-        return vec4<f32>(dithered(tonemap(composite(sky, clip.xy, cloud)), clip.xy), 1.0);
+        let shaded = composite(sky, clip.xy, cloud, shafts.rgb * shafts.a);
+        return vec4<f32>(dithered(tonemap(shaded), clip.xy), 1.0);
     }
 
     let id = textureLoad(material, pixel, 0).r & MATERIAL_MASK;
@@ -853,9 +898,13 @@ fn fs_shade(@builtin(position)clip: vec4<f32>) -> @location(0) vec4<f32> {
     // ... and then whatever cloud stands between the eye and all of that. The
     // ground, the air in front of it and the cloud in front of that are three
     // layers of one integral, composited in that order.
+    // ... less what the aerial volume counted of the sun in air the terrain or
+    // a cloud keeps it out of. See `src/shafts.wgsl`.
+    let shafts = shafts_at(pixel, along);
+    let background = max(leaving * through + haze - shafts.rgb, vec3<f32>(0.0));
     let cloud = cloud_at(pixel, along);
     return vec4<f32>(
-        dithered(tonemap(composite(leaving * through + haze, clip.xy, cloud)), clip.xy),
+        dithered(tonemap(composite(background, clip.xy, cloud, shafts.rgb * shafts.a)), clip.xy),
         1.0,
     );
 }

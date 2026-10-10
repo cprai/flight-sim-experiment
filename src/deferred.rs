@@ -279,6 +279,7 @@ impl Shading {
         tables_layout: &wgpu::BindGroupLayout,
         cloud: Clouds<'_>,
         shadow: crate::shadow::Field<'_>,
+        lost: crate::shafts::Lost<'_>,
     ) -> Self {
         // Uploaded once: the table is a pure function of the material enum,
         // so nothing ever rewrites it.
@@ -365,9 +366,14 @@ impl Shading {
                         min_binding_size: None,
                     },
                 ),
+                // The light the shafts took out of the air, a block of the
+                // frame a texel. Loaded, one texel a pixel.
+                entry(11, unfiltered),
+                entry(12, unfiltered),
+                entry(13, unfiltered),
             ],
         });
-        let bind_groups = Self::bind(device, &layout, &palette, gbuffer, cloud, shadow);
+        let bind_groups = Self::bind(device, &layout, &palette, gbuffer, cloud, shadow, lost);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shading shader"),
@@ -433,8 +439,10 @@ impl Shading {
         gbuffer: &GBuffer,
         cloud: Clouds<'_>,
         shadow: crate::shadow::Field<'_>,
+        lost: crate::shafts::Lost<'_>,
     ) {
-        self.bind_groups = Self::bind(device, &self.layout, &self.palette, gbuffer, cloud, shadow);
+        self.bind_groups =
+            Self::bind(device, &self.layout, &self.palette, gbuffer, cloud, shadow, lost);
     }
 
     fn bind(
@@ -444,6 +452,7 @@ impl Shading {
         gbuffer: &GBuffer,
         cloud: Clouds<'_>,
         shadow: crate::shadow::Field<'_>,
+        lost: crate::shafts::Lost<'_>,
     ) -> [wgpu::BindGroup; 2] {
         let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
         std::array::from_fn(|parity| {
@@ -461,6 +470,9 @@ impl Shading {
                     entry(8, cloud.light.as_entire_binding()),
                     entry(9, wgpu::BindingResource::TextureView(shadow.view)),
                     entry(10, shadow.uniform.as_entire_binding()),
+                    entry(11, wgpu::BindingResource::TextureView(lost.far)),
+                    entry(12, wgpu::BindingResource::TextureView(lost.near)),
+                    entry(13, wgpu::BindingResource::TextureView(lost.share)),
                 ],
             })
         })

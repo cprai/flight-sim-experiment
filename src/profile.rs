@@ -96,6 +96,10 @@ pub const CLOUD: &str = "cloud";
 /// altogether and which part of it went where.
 pub const LIGHTING: &str = "lighting";
 
+/// The scope [`crate::scene::Scene::draw`] opens around the march that takes
+/// the sun's light back out of shadowed air, and the blur after it.
+pub const SHAFTS: &str = "shafts";
+
 /// The terrain's own submissions, in the order the GPU runs them.
 const TERRAIN_SCOPES: [&str; 2] = [DETAIL, MAXIMA];
 

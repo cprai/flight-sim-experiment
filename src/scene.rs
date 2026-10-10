@@ -172,6 +172,9 @@ pub struct Scene {
     was_eye: glam::Vec3,
     /// The projection that drew what is now the history, for motion vectors.
     was_camera: Camera,
+    /// The sun's light taken back out of air in the shadow of the terrain or
+    /// a cloud. Screen-sized, so rebuilt by [`Scene::resize`].
+    shafts: crate::shafts::Shafts,
     shading: Shading,
     /// What the last camera upload cost, zero unless a run asked to be timed.
     camera_span: std::time::Duration,
@@ -342,6 +345,17 @@ impl Scene {
             &air,
             shadow.field(),
         );
+        // After the march, whose cloud buffer says where on each ray the
+        // cloud is, and before the shading, which reads what it leaves.
+        let shafts = crate::shafts::Shafts::new(
+            device,
+            camera_layout,
+            sky.layout(),
+            sky.sun_tables_layout(),
+            &gbuffer,
+            march.views(),
+            shadow.field(),
+        );
         let shading = Shading::new(
             device,
             format,
@@ -351,6 +365,7 @@ impl Scene {
             sky.tables_layout(),
             march.views(),
             shadow.field(),
+            shafts.lost(),
         );
         Self {
             camera,
@@ -383,6 +398,7 @@ impl Scene {
             was_basis: camera.ray_basis(),
             was_eye: camera.position,
             was_camera: camera,
+            shafts,
             shading,
             camera_span: std::time::Duration::ZERO,
             profiler: crate::profile::profiler(device, false),
@@ -414,8 +430,15 @@ impl Scene {
         // shading, which reads the buffers this throws away and remakes.
         self.march
             .resize(device, &self.cloud, &self.gbuffer, &self.air, self.shadow.field());
-        self.shading
-            .rebind(device, &self.gbuffer, self.march.views(), self.shadow.field());
+        self.shafts
+            .resize(device, &self.gbuffer, self.march.views(), self.shadow.field());
+        self.shading.rebind(
+            device,
+            &self.gbuffer,
+            self.march.views(),
+            self.shadow.field(),
+            self.shafts.lost(),
+        );
         self.terrain.resize(viewport);
         self.camera.aspect = viewport.x as f32 / viewport.y.max(1) as f32;
     }
@@ -825,6 +848,8 @@ impl Scene {
             }
         }
 
+        self.draw_shafts(gpu);
+
         // The clear never survives -- the shading pass writes every pixel --
         // but an interrupted frame showing sky beats one showing garbage.
         let mut pass = gpu.scoped_render_pass(
@@ -840,6 +865,23 @@ impl Scene {
         );
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         self.shading.draw(&mut pass, &self.sky, self.march.parity());
+    }
+
+    /// Records the shafts: the march over this frame's depth and cloud, and the
+    /// blur after it.
+    ///
+    /// After the cloud resolve, because the march reads where on each ray the
+    /// cloud is, and a scope of its own beside the cloud's so the readout says
+    /// what the shafts cost.
+    fn draw_shafts(&self, gpu: &mut wgpu_profiler::Scope<'_, wgpu::CommandEncoder>) {
+        let mut shafts = gpu.scope(crate::profile::SHAFTS);
+        {
+            let mut pass = shafts.scoped_compute_pass("shafts-march");
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            self.shafts.draw(&mut pass, &self.sky, self.march.parity());
+        }
+        let mut pass = shafts.scoped_compute_pass("shafts-blur");
+        self.shafts.draw_blur(&mut pass);
     }
 
     /// Marches out the rest of the cloud rotation over the frame just drawn,
@@ -906,6 +948,15 @@ impl Scene {
         }
 
         let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            self.shafts.draw(&mut pass, &self.sky, self.march.parity());
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            self.shafts.draw_blur(&mut pass);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shading pass"),
@@ -5744,5 +5795,193 @@ mod tests {
             (before - 1.0).abs() < 0.05,
             "the deck on the sun's side of the ridge changed by {before:.3}"
         );
+    }
+
+    /// A single narrow peak in the middle of the test raster, two and a half
+    /// kilometres high.
+    fn lone_peak() -> Vec<f32> {
+        let middle = (RASTER as f32 - 1.0) * 0.5;
+        (0..RASTER * RASTER)
+            .map(|index| {
+                let r = Vec2::new((index % RASTER) as f32 - middle, (index / RASTER) as f32 - middle)
+                    * METRES_PER_TEXEL as f32;
+                2500.0 * (-r.length_squared() / (2.0 * 300.0 * 300.0)).exp()
+            })
+            .collect()
+    }
+
+    /// Looking at a low sun just behind a peak, the air between the eye and the
+    /// peak is in the peak's shadow, and the sky seen through it is darker for
+    /// it -- a god ray seen from inside its dark side. Sky looking away from
+    /// the peak hardly changes.
+    ///
+    /// The eye is twenty kilometres west of the peak and three hundred metres
+    /// up, under a sun five degrees up in the east: the peak stands six degrees
+    /// above the eye, so it hides the sun, and its shadow is still seven hundred
+    /// metres deep where the eye is.
+    #[test]
+    fn the_sky_behind_a_peak_is_darkened_by_its_shadow() {
+        let sun = crate::sky::Sun::from_angles(5.0, 90.0);
+        let mut camera = None;
+        let mut view = |heights| {
+            render_sunlit(
+                test_residency(),
+                heights,
+                flat_ground(),
+                |c: &mut Camera| {
+                    c.position = Vec3::new(-20000.0, 300.0, 0.0);
+                    c.orientation =
+                        Camera::from_yaw_pitch_roll(90f32.to_radians(), 6f32.to_radians(), 0.0);
+                    camera = Some(*c);
+                },
+                &[],
+                sun,
+            )
+        };
+        let open = view(vec![0.0; (RASTER * RASTER) as usize]);
+        let peaked = view(lone_peak());
+        let camera = camera.expect("camera captured");
+        let looking = |elevation: f32, bearing: f32| {
+            let (e, b) = (elevation.to_radians(), bearing.to_radians());
+            camera.position + Vec3::new(b.sin() * e.cos(), e.sin(), -b.cos() * e.cos()) * 1000.0
+        };
+        // Just over the summit, which stands at six and a quarter degrees.
+        let over = looking(7.5, 90.0);
+        let darker = brightness_at(&peaked, &camera, over) / brightness_at(&open, &camera, over);
+        // Thirty degrees round to the north, where the ray leaves the peak's
+        // shadow within a kilometre or so of the eye. Not untouched -- the eye
+        // itself stands in the shadow, so every ray starts in it -- but nearly.
+        let aside = looking(7.5, 60.0);
+        let beside = brightness_at(&peaked, &camera, aside) / brightness_at(&open, &camera, aside);
+        println!("over the peak the sky keeps {darker:.3} of its light, aside {beside:.3}");
+        // Measured at 0.723 over the peak.
+        assert!(
+            darker < 0.85,
+            "the sky just over the peak kept {darker:.3} of its light, through twenty \
+             kilometres of the peak's shadow"
+        );
+        assert!(
+            beside > 0.98,
+            "sky away from the peak's shadow kept only {beside:.3} of its light"
+        );
+    }
+
+    /// The shafts' blurred pair after one frame over `heights` under `sun`,
+    /// unpacked from half floats: each texel's far half and near half.
+    fn shafts_after(heights: Vec<f32>, sun: crate::sky::Sun, aim: impl FnOnce(&mut Camera)) -> Vec<[f32; 8]> {
+        let (device, queue) = test_device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut scene = test_scene(&device, format, test_residency(), heights, flat_ground());
+        scene.sun = sun;
+        aim(&mut scene.camera);
+        scene.update(&device, &queue, crate::headless::STEP);
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen target"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let profiler = crate::profile::profiler(&device, false);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut gpu = profiler.scope("gpu", &mut encoder);
+            scene.draw(&mut gpu, &view);
+        }
+        let (far, near, size) = scene.shafts.textures();
+        let row = (size.x * 8).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback = |texture: &wgpu::Texture, encoder: &mut wgpu::CommandEncoder| {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("shafts readback"),
+                size: u64::from(row * size.y),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                texture.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row),
+                        rows_per_image: Some(size.y),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: size.x,
+                    height: size.y,
+                    depth_or_array_layers: 1,
+                },
+            );
+            buffer
+        };
+        let far_buffer = readback(far, &mut encoder);
+        let near_buffer = readback(near, &mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
+        for buffer in [&far_buffer, &near_buffer] {
+            buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("buffer map failed"));
+        }
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll failed");
+        let halves = |buffer: &wgpu::Buffer| -> Vec<[f32; 4]> {
+            let bytes = buffer.get_mapped_range(..).expect("buffer not mapped").to_vec();
+            (0..size.y)
+                .flat_map(|y| {
+                    let bytes = &bytes;
+                    (0..size.x).map(move |x| {
+                        let at = (y * row + x * 8) as usize;
+                        std::array::from_fn(|c| {
+                            half::f16::from_le_bytes([bytes[at + 2 * c], bytes[at + 2 * c + 1]])
+                                .to_f32()
+                        })
+                    })
+                })
+                .collect()
+        };
+        let (far, near) = (halves(&far_buffer), halves(&near_buffer));
+        far.iter()
+            .zip(&near)
+            .map(|(f, n)| [f[0], f[1], f[2], f[3], n[0], n[1], n[2], n[3]])
+            .collect()
+    }
+
+    /// Where nothing stands between the air and the sun, the shafts take out
+    /// exactly nothing -- not a little, nothing -- so the frame is the one drawn
+    /// before there were any shafts.
+    ///
+    /// Flat ground under the default sun and a clear sky: the terrain's shadow
+    /// lies under the ground everywhere and there is no cloud, so every sample
+    /// of every ray is lit. Anything but zero here would be the correction
+    /// leaking into air it has no business in.
+    ///
+    /// Twice: looking out over the ground, and straight down from high enough
+    /// that the corners of the frame look past the edge of the data -- sky rays
+    /// that point down, which once ran on under the ground into the terrain's
+    /// shadow and darkened those corners to black.
+    #[test]
+    fn air_with_nothing_in_front_of_the_sun_loses_nothing() {
+        let looks: [fn(&mut Camera); 2] = [low_and_looking_out, over_the_checkerboard];
+        for look in looks {
+            let texels = shafts_after(
+                vec![0.0; (RASTER * RASTER) as usize],
+                crate::sky::Sun::default(),
+                look,
+            );
+            let lost = texels
+                .iter()
+                .filter(|t| t[0] != 0.0 || t[1] != 0.0 || t[2] != 0.0)
+                .chain(texels.iter().filter(|t| t[4] != 0.0 || t[5] != 0.0 || t[6] != 0.0))
+                .count();
+            assert_eq!(lost, 0, "{lost} halves of clear, unshadowed air lost light");
+        }
     }
 }
