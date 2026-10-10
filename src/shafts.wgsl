@@ -55,6 +55,10 @@ const LIGHT_CASCADES: u32 = 3u;
 const CASCADE_EDGE: f32 = 0.8;
 const CASCADE_FADE: f32 = 0.9;
 const SUN_CHANNEL: vec4<f32> = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+// Where each walk's frames start in `Light::frames`. Must match `SUN_FRAMES`
+// and `SKY_FRAMES` in `src/cloud_march.wgsl`.
+const SUN_FRAMES: u32 = 0u;
+const SKY_FRAMES: u32 = 3u;
 
 // The terrain's shadow. Must match `src/terrain.wgsl`.
 const SHADOW_ACROSS: u32 = 1024u;
@@ -96,9 +100,38 @@ struct Sky {
     sun_tangent: vec4<f32>,
 };
 
+// One cascade of one light volume. Must match `Frame` in `src/cloud_march.wgsl`.
+struct Frame {
+    // World to texture: each row dotted with `(p, 1)`.
+    to_texture: array<vec4<f32>, 3>,
+    // Texture to world, the same way round.
+    to_world: array<vec4<f32>, 3>,
+    // One slice of a column as a vector in the world, and its length.
+    slice: vec4<f32>,
+    // Which texture axes a cascade hands over at past its edge (one), and
+    // which it holds its nearest texel along (zero). See `beyond_light`.
+    fade: vec4<f32>,
+};
+
 struct Light {
+    // The sky's plumb lattice, which its frames are built from: per cascade the
+    // near corner in x and z, the height of the lowest slice, and the metres a
+    // texel covers across. Read by the tests rather than by anything here.
     cascade: array<vec4<f32>, LIGHT_CASCADES>,
+    // The metres of height one plumb slice is worth, in `w`.
     walk: vec4<f32>,
+    // Where the baked wind's own grid stands: its near corner in x and z, then
+    // how much world it covers in each. Zero-sized until the wind has been
+    // solved, which is what says there is no field to read yet.
+    air: vec4<f32>,
+    // How far the weather has been carried by the mean wind since the world
+    // started, in metres. Folded into one tile of the map, so a long flight
+    // cannot walk it out of the range an `f32` holds a lattice index in.
+    carried: vec4<f32>,
+    // The sun's cascades, then the sky's. A texel's red channel is a point of
+    // the sun's lattice and its green a point of the sky's: one texture, two
+    // lattices, which coincide while the sun's columns climb. See `out_light`.
+    frames: array<Frame, 6>,
 };
 
 struct Shadow {
@@ -228,14 +261,10 @@ fn mie_phase(cos_theta: f32) -> f32 {
     return (1.0 - gg) / (4.0 * PI * denominator * sqrt(max(denominator, 1e-8)));
 }
 
-fn light_uvw(p: vec3<f32>, shear: vec2<f32>, cascade: u32) -> vec3<f32> {
-    let origin = light.cascade[cascade];
-    let climbed = p.y - origin.z;
-    let flat = p.xz - origin.xy - climbed * shear;
-    return vec3<f32>(
-        flat / (origin.w * f32(LIGHT_ACROSS)),
-        climbed / (light.walk.w * f32(LIGHT_SLICES)),
-    );
+fn light_uvw(p: vec3<f32>, frame: u32) -> vec3<f32> {
+    let q = vec4<f32>(p, 1.0);
+    let forward = light.frames[frame].to_texture;
+    return vec3<f32>(dot(forward[0], q), dot(forward[1], q), dot(forward[2], q));
 }
 
 fn stacked_w(w: f32, cascade: u32) -> f32 {
@@ -244,16 +273,16 @@ fn stacked_w(w: f32, cascade: u32) -> f32 {
     return (f32(cascade) * slices + inside) / (slices * f32(LIGHT_CASCADES));
 }
 
-fn beyond_light(uvw: vec3<f32>) -> f32 {
-    let out = abs(uvw.xy - vec2<f32>(0.5)) * 2.0;
-    return max(out.x, out.y);
+fn beyond_light(uvw: vec3<f32>, fade: vec3<f32>) -> f32 {
+    let out = abs(uvw - vec3<f32>(0.5)) * 2.0 * fade;
+    return max(max(out.x, out.y), out.z);
 }
 
 fn reaching(
     volume: texture_3d<f32>,
     filtering: sampler,
     p: vec3<f32>,
-    shear: vec2<f32>,
+    frames: u32,
     channel: vec4<f32>,
 ) -> f32 {
     var blocked = 0.0;
@@ -262,14 +291,15 @@ fn reaching(
         if answered >= 1.0 {
             break;
         }
-        let uvw = light_uvw(p, shear, cascade);
+        let frame = frames + cascade;
+        let uvw = light_uvw(p, frame);
         // The widest one is not handing over to anything, so it holds on to its
         // own edge for longer. See `CASCADE_FADE`.
         var edge = CASCADE_EDGE;
         if cascade + 1u == LIGHT_CASCADES {
             edge = CASCADE_FADE;
         }
-        let inside = 1.0 - smoothstep(edge, 1.0, beyond_light(uvw));
+        let inside = 1.0 - smoothstep(edge, 1.0, beyond_light(uvw, light.frames[frame].fade.xyz));
         let share = min(inside, 1.0 - answered);
         if share > 0.0 {
             let at = vec3<f32>(uvw.xy, stacked_w(uvw.z, cascade));
@@ -294,7 +324,7 @@ fn reaching(
 // `src/shading.wgsl` reads it: the volume alone, without the march's walk of
 // the field ahead of the point, which is a skin a shaft has no use for.
 fn sun_reaching(p: vec3<f32>) -> f32 {
-    return reaching(light_volume, lut_sampler, p, light.walk.xy, SUN_CHANNEL);
+    return reaching(light_volume, lut_sampler, p, SUN_FRAMES, SUN_CHANNEL);
 }
 
 // Where a cascade of the terrain's shadow starts handing a point over to the

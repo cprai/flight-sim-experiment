@@ -221,17 +221,24 @@ const LIGHT_EXTENT: f32 = 60_000.0;
 pub const LIGHT_CASCADES: u32 = 3;
 const LIGHT_SPREAD: f32 = 2.0;
 
-/// The lowest the sun may be taken to be when the volume's columns are leaned
-/// along it.
+/// How high the sun has to stand for the sun's light volume to be plumb-major:
+/// columns that climb the sky, leaning along the sun, a slice of height at a
+/// time. Below it the volume turns on its side. See [`SunFrame`].
 ///
-/// The lean is `sun.xz / sun.y`, which runs away as the sun sets: at one degree
-/// a column crossing twelve kilometres of height would cross seven hundred of
-/// ground. Floored at about eight and a half degrees, below which the shadows
-/// are geometrically wrong and it does not matter, because what they are
-/// shadowing has by then been taken out by the air instead -- the transmittance
-/// table has the direct sun at a fraction of a per cent there. It also keeps a
-/// sun below the horizon from putting an infinity in the uniform.
-const SHEAR_FLOOR: f32 = 0.15;
+/// The lean of a climbing column is `sun.xz / sun.y`, which runs away as the sun
+/// sets: at one degree a column crossing twelve kilometres of height would cross
+/// seven hundred of ground. This used to be a floor on the lean instead -- the
+/// sun taken to stand no lower than about eight and a half degrees, below which
+/// the volume's shadows were geometrically wrong -- on the argument that what
+/// they shadowed had by then been taken out by the air. It had not: the
+/// transmittance table still has a fifth of the sun reaching a deck at five
+/// degrees, and the last light of the day on a cloud is exactly the light that
+/// was being put in the wrong place.
+///
+/// So at the same sine, the columns stop climbing and start running along the
+/// ground instead. The two layouts agree at the switch about everything but
+/// where their samples fall; see `the_two_layouts_agree_where_they_meet`.
+const PLUMB_FROM: f32 = 0.15;
 
 /// The format the half-resolution cloud buffer is held in.
 ///
@@ -367,66 +374,238 @@ struct WeatherUniform {
     span: [f32; 4],
 }
 
-/// Where the light volume stands and how its columns lean.
+/// One cascade of one light volume, as an affine lattice in the world: where a
+/// world point falls in the texture, where a texel stands in the world, and
+/// which way a column runs.
 ///
-/// Mirrors `Light` in `src/cloud_march.wgsl` and in `src/shading.wgsl`. Its own
-/// buffer rather than two more fields of [`WeatherUniform`], because the
-/// shading pass reads this and has no business reading that: where a volume
-/// stands is a fact about the camera and the sun, and what is in it is a fact
-/// about the weather. The shading would otherwise have to declare every deck's
-/// cover ramp to reach past them.
+/// Mirrors `Frame` in `src/cloud_march.wgsl`, `src/shading.wgsl` and
+/// `src/shafts.wgsl`. Every reader of the volume goes through these and nothing
+/// else, which is what lets the sun's volume change its whole shape with the
+/// sun's height without a reader knowing: the texture's first two axes are
+/// always across a column and the third always along it, top to bottom being
+/// towards the sun to away from it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct SunFrame {
+    /// World to texture: each row dotted with `(p, 1)` gives one coordinate in
+    /// `0..1` across the cascade.
+    to_texture: [[f32; 4]; 3],
+    /// Texture to world, the same way round.
+    to_world: [[f32; 4]; 3],
+    /// One slice of a column -- a step of a texel along the third axis -- as a
+    /// vector in the world, and how many metres long it is.
+    slice: [f32; 4],
+    /// Which texture axes a cascade hands over at when a point strays past
+    /// them (one), and which it holds on to its nearest texel along (zero).
+    fade: [f32; 4],
+}
+
+impl SunFrame {
+    /// The frame whose world-to-texture rows are `rows`, with one slice
+    /// `slice` long.
+    fn from_rows(rows: [glam::DVec4; 3], fade: [f32; 3]) -> Self {
+        let forward = glam::DMat4::from_cols(rows[0], rows[1], rows[2], glam::DVec4::W).transpose();
+        let back = forward.inverse();
+        let row = |m: &glam::DMat4, r: usize| m.row(r).as_vec4().to_array();
+        let along = back.col(2).truncate() / f64::from(LIGHT_SLICES);
+        Self {
+            to_texture: [row(&forward, 0), row(&forward, 1), row(&forward, 2)],
+            to_world: [row(&back, 0), row(&back, 1), row(&back, 2)],
+            slice: along.as_vec3().extend(along.length() as f32).to_array(),
+            fade: [fade[0], fade[1], fade[2], 0.0],
+        }
+    }
+
+    /// Where a world point falls in the texture.
+    #[cfg(test)]
+    fn texture_of(&self, p: glam::Vec3) -> glam::Vec3 {
+        let q = p.extend(1.0);
+        glam::Vec3::new(
+            glam::Vec4::from(self.to_texture[0]).dot(q),
+            glam::Vec4::from(self.to_texture[1]).dot(q),
+            glam::Vec4::from(self.to_texture[2]).dot(q),
+        )
+    }
+
+    /// Where the middle of a texel stands in the world.
+    #[cfg(test)]
+    fn world_of(&self, x: u32, y: u32, slice: u32) -> glam::Vec3 {
+        let uvw = (glam::Vec3::new(x as f32, y as f32, slice as f32) + 0.5)
+            / glam::Vec3::new(LIGHT_ACROSS as f32, LIGHT_ACROSS as f32, LIGHT_SLICES as f32);
+        let q = uvw.extend(1.0);
+        glam::Vec3::new(
+            glam::Vec4::from(self.to_world[0]).dot(q),
+            glam::Vec4::from(self.to_world[1]).dot(q),
+            glam::Vec4::from(self.to_world[2]).dot(q),
+        )
+    }
+}
+
+/// Where the light volume stands and how its columns run.
+///
+/// Mirrors `Light` in `src/cloud_march.wgsl`, `src/shading.wgsl` and
+/// `src/shafts.wgsl`. Its own buffer rather than two more fields of
+/// [`WeatherUniform`], because the shading pass reads this and has no business
+/// reading that: where a volume stands is a fact about the camera and the sun,
+/// and what is in it is a fact about the weather.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct LightUniform {
     /// One per cascade, innermost first: the near corner in x and z, the height
-    /// of the lowest slice, and the metres one texel covers across.
+    /// of the lowest slice, and the metres one texel covers across. The sky's
+    /// plumb lattice, which the sky's frames are built from and the tests read;
+    /// the shaders read only the frames.
     ///
     /// Each is snapped to its *own* texel, which is what lets the coarse ones
     /// stand as still in the world as the fine one does. A cascade snapped to a
     /// neighbour's grid would slide by the difference every time the camera
     /// crossed one of its own texels.
     cascade: [[f32; 4]; LIGHT_CASCADES as usize],
-    /// How far a sun column leans per metre it climbs, then the metres of ray
-    /// one slice is worth towards the sun, then the metres of height one slice
-    /// is worth -- which is what the same slice is worth straight up.
+    /// The metres of height one plumb slice is worth, in `w`; the rest spare.
     walk: [f32; 4],
     /// Where the baked wind's grid stands; see [`crate::air::Air::bounds`].
     air: [f32; 4],
     /// How far the mean wind has carried the weather since the world started,
     /// in metres.
     carried: [f32; 4],
+    /// The sun's cascades and then the sky's, as lattices in the world. The
+    /// two walks share a texel of one texture but not its place in the world:
+    /// a texel's red channel is a point on a sun ray and its green a point on a
+    /// plumb line, which coincide while the sun's columns climb and part when
+    /// they run along the ground. See [`SunFrame`] and `out_light` in
+    /// `src/cloud_march.wgsl`.
+    frames: [SunFrame; 2 * LIGHT_CASCADES as usize],
 }
 
 impl LightUniform {
     /// Where the volume goes for an eye and a sun, over a wind's own grid and
     /// however far that wind has carried the weather by now.
     fn at(eye: glam::Vec3, sun: glam::Vec3, air: [f32; 4], carried: glam::Vec3) -> Self {
+        Self::stood(eye, sun, air, carried, 0.0)
+    }
+
+    /// The same, with every lattice moved a share `floor / slice` of a slice
+    /// along its own columns -- the plumb ones lifted off sea level by `floor`
+    /// metres, and the sun's moved the same share of a slice along its rays.
+    ///
+    /// Nought for every frame but a test's; see [`March::set_frame_from`].
+    fn stood(
+        eye: glam::Vec3,
+        sun: glam::Vec3,
+        air: [f32; 4],
+        carried: glam::Vec3,
+        floor: f32,
+    ) -> Self {
         let up = CEILING_TOP / LIGHT_SLICES as f32;
+        let across_n = LIGHT_ACROSS as f64;
+        let slices_n = LIGHT_SLICES as f64;
         // Each cascade centred on the eye and then snapped to a whole texel of
         // its own. Both halves matter: centred, so the resolution is spent where
         // the camera is, and snapped, so the lattice stands still in the world
         // while the camera moves across it. A volume that slid with the eye
         // would put a cloud's shadow in a slightly different place every frame,
         // which reads as the whole sky crawling.
-        let cascade = std::array::from_fn(|level| {
-            let extent = LIGHT_EXTENT * LIGHT_SPREAD.powi(level as i32);
-            let across = extent / LIGHT_ACROSS as f32;
+        let extent = |level: usize| LIGHT_EXTENT * LIGHT_SPREAD.powi(level as i32);
+        let cascade: [[f32; 4]; LIGHT_CASCADES as usize] = std::array::from_fn(|level| {
+            let across = extent(level) / LIGHT_ACROSS as f32;
             let centre = (glam::Vec2::new(eye.x, eye.z) / across).round() * across;
-            let corner = centre - extent * 0.5;
-            [corner.x, corner.y, 0.0, across]
+            let corner = centre - extent(level) * 0.5;
+            [corner.x, corner.y, floor, across]
         });
-        // The sun's own lean, floored so a setting sun cannot run it away or a
-        // set one invert it. See [`SHEAR_FLOOR`].
-        let climb = sun.y.max(SHEAR_FLOOR);
-        let lean = glam::Vec2::new(sun.x, sun.z) / climb;
+
+        // A plumb-major lattice over `cascade`, its columns leaning `lean` for
+        // every metre they climb: the sun's while it is high enough, and the
+        // sky's, which leans not at all.
+        //
+        // The corner moves along the lean with the floor, which is what keeps
+        // the columns on the *same rays* when a test lifts the lattice.
+        let climbing = |level: usize, lean: glam::DVec2| {
+            let [cx, cz, floor, across] = cascade[level].map(f64::from);
+            let span = across * across_n;
+            let height = f64::from(up) * slices_n;
+            let x = glam::DVec4::new(1.0, -lean.x, 0.0, -cx + floor * lean.x) / span;
+            let z = glam::DVec4::new(0.0, -lean.y, 1.0, -cz + floor * lean.y) / span;
+            let y = glam::DVec4::new(0.0, 1.0, 0.0, -floor) / height;
+            SunFrame::from_rows([x, z, y], [1.0, 1.0, 0.0])
+        };
+
+        let sky: [SunFrame; LIGHT_CASCADES as usize] =
+            std::array::from_fn(|level| climbing(level, glam::DVec2::ZERO));
+        let flat = glam::Vec2::new(sun.x, sun.z);
+        let sun_frames: [SunFrame; LIGHT_CASCADES as usize] = if sun.y >= PLUMB_FROM {
+            let lean = (flat / sun.y).as_dvec2();
+            std::array::from_fn(|level| climbing(level, lean))
+        } else {
+            std::array::from_fn(|level| Self::running(eye, sun, extent(level), floor / up))
+        };
+        let mut frames = [SunFrame::default(); 2 * LIGHT_CASCADES as usize];
+        frames[..LIGHT_CASCADES as usize].copy_from_slice(&sun_frames);
+        frames[LIGHT_CASCADES as usize..].copy_from_slice(&sky);
         Self {
             cascade,
-            // A slice of height is a longer piece of a leaning ray than of a
-            // plumb one, by exactly the sun's climb.
-            walk: [lean.x, lean.y, up / climb, up],
+            walk: [0.0, 0.0, 0.0, up],
             air,
             carried: [carried.x, carried.y, carried.z, 0.0],
+            frames,
         }
+    }
+
+    /// One cascade of the sun's volume laid on its side, for a sun too low for
+    /// its columns to climb.
+    ///
+    /// The shear-warp transpose of the climbing layout: there a column is
+    /// indexed by where its ray meets the ground and walked up through slices
+    /// of height; here it is indexed by where its ray crosses a vertical plane
+    /// and walked along the sun's horizontal bearing through slices of ground.
+    /// In the sun's own horizontal frame -- `u` towards it, `v` across -- the
+    /// texture's axes are `v`, the ray's height `h = y - u tan(e)` where it
+    /// would cross `u = 0`, and `u`. A column of fixed `(v, h)` is then exactly
+    /// a sun ray, so walking it from the sunward end accumulates exactly the
+    /// cloud between each point and the sun, as a climbing column does.
+    ///
+    /// The cascade spans `extent` along and across the sun's bearing, centred
+    /// on the eye and snapped to its own texel in that frame, so the lattice
+    /// stands still in the world while the camera moves and turns only when the
+    /// sun's bearing does -- which is a fact about the world. The span of `h`
+    /// is every ray that crosses the slab of sky the volume covers inside the
+    /// cascade, `CEILING_TOP + extent tan(e)`, which is 13 km at one degree and
+    /// 21 km at the switch for the innermost cascade: 70 to 110 m a texel, where
+    /// a climbing slice is 62.5 m of height. Along the ray a slice is a texel of
+    /// ground, 312 m in the innermost cascade, where a climbing slice at the
+    /// switch is 420 m of ray and was 1667 m when slices were taller.
+    ///
+    /// The span of `h` is snapped to whole steps of its own, counted from
+    /// `u = 0`, for the same reason the rest is: a lattice whose heights were
+    /// measured from wherever the cascade happened to start would slide up and
+    /// down as the camera crossed texels along the bearing.
+    ///
+    /// `shift` moves the slices that share of a slice along the rays, for the
+    /// test that asks whether where they fall can be seen.
+    fn running(eye: glam::Vec3, sun: glam::Vec3, extent: f32, shift: f32) -> SunFrame {
+        let flat = glam::Vec2::new(sun.x, sun.z).as_dvec2();
+        let toward = if flat.length() > 1e-9 {
+            flat.normalize()
+        } else {
+            glam::DVec2::X
+        };
+        let side = glam::DVec2::new(-toward.y, toward.x);
+        // A sun under the horizon is lighting nothing through the air; it is
+        // taken as level rather than let the rays dip below the volume.
+        let tan = f64::from(sun.y).max(0.0) / flat.length().max(1e-9);
+        let extent = f64::from(extent);
+        let texel = extent / f64::from(LIGHT_SLICES);
+        let eye = glam::DVec2::new(f64::from(eye.x), f64::from(eye.z));
+        let u_mid = (eye.dot(toward) / texel).round() * texel;
+        let v_mid = (eye.dot(side) / texel).round() * texel;
+        let (u_low, v_low) = (u_mid - extent * 0.5 + shift as f64 * texel, v_mid - extent * 0.5);
+        let rows = f64::from(LIGHT_ACROSS);
+        let step = (f64::from(CEILING_TOP) + extent * tan) / (rows - 1.0);
+        let h_low = ((-(u_low + extent) * tan) / step).floor() * step;
+        let height = step * rows;
+        let x = glam::DVec4::new(side.x, 0.0, side.y, -v_low) / extent;
+        let y = glam::DVec4::new(-toward.x * tan, 1.0, -toward.y * tan, -h_low) / height;
+        let z = glam::DVec4::new(toward.x, 0.0, toward.y, -u_low) / extent;
+        SunFrame::from_rows([x, y, z], [1.0, 0.0, 1.0])
     }
 
     /// How far the mean wind has carried the weather by now, in metres.
@@ -1707,18 +1886,13 @@ impl March {
         elapsed: std::time::Duration,
         floor: f32,
     ) {
-        let mut placed = LightUniform::at(
+        let placed = LightUniform::stood(
             eye,
             sun,
             air.bounds(),
             LightUniform::carried_by(wind, elapsed),
+            floor,
         );
-        let lean = glam::Vec2::new(placed.walk[0], placed.walk[1]);
-        for cascade in &mut placed.cascade {
-            cascade[0] += lean.x * floor;
-            cascade[1] += lean.y * floor;
-            cascade[2] = floor;
-        }
         queue.write_buffer(&self.light, 0, bytemuck::bytes_of(&placed));
     }
 
@@ -2775,6 +2949,9 @@ mod tests {
         sun_light: Vec<f32>,
         /// Where each cascade of that stands, as [`LightUniform::cascade`].
         cascades: [[f32; 4]; LIGHT_CASCADES as usize],
+        /// The sun's frames the volume was walked over: where each of its
+        /// texels stands in the world, for a sun of any height.
+        sun_frames: [SunFrame; LIGHT_CASCADES as usize],
         /// The weather the cache was built from, one layer per deck.
         weather: Vec<Volume>,
         /// What each frame of the rotation actually marched, one entry per
@@ -2803,6 +2980,37 @@ mod tests {
         /// the march arrives at once it has read between the texels.
         fn lit_in(&self, cascade: u32, x: u32, z: u32, slice: u32) -> f32 {
             1.0 - (-self.depth_at(cascade, x, z, slice)).exp()
+        }
+
+        /// The optical depth the sun's walk holds at a texture coordinate of
+        /// one cascade, read between texels as the hardware reads it: linear
+        /// in all three axes, clamped half a texel in from every edge.
+        fn depth_through(&self, cascade: u32, uvw: glam::Vec3) -> f32 {
+            let size = glam::Vec3::new(
+                LIGHT_ACROSS as f32,
+                LIGHT_ACROSS as f32,
+                LIGHT_SLICES as f32,
+            );
+            let at = (uvw * size).clamp(glam::Vec3::splat(0.5), size - 0.5) - 0.5;
+            let low = at.floor();
+            let f = at - low;
+            let tap = |dx: u32, dy: u32, dz: u32| {
+                self.depth_at(
+                    cascade,
+                    (low.x as u32 + dx).min(LIGHT_ACROSS - 1),
+                    (low.y as u32 + dy).min(LIGHT_ACROSS - 1),
+                    (low.z as u32 + dz).min(LIGHT_SLICES - 1),
+                )
+            };
+            let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+            let plane = |dz: u32| {
+                lerp(
+                    lerp(tap(0, 0, dz), tap(1, 0, dz), f.x),
+                    lerp(tap(0, 1, dz), tap(1, 1, dz), f.x),
+                    f.y,
+                )
+            };
+            lerp(plane(0), plane(1), f.z)
         }
 
         /// The optical depth one texel of a light cascade holds, as stored.
@@ -3115,6 +3323,17 @@ mod tests {
             // -- so this is the same placement the pass was given.
             cascades: LightUniform::at(camera.position, glam::Vec3::Y, [0.0; 4], glam::Vec3::ZERO)
                 .cascade,
+            // The last camera's, which is the one the volume was last placed on.
+            sun_frames: {
+                let placed = LightUniform::stood(
+                    cameras[cameras.len() - 1].position,
+                    sun.direction,
+                    [0.0; 4],
+                    glam::Vec3::ZERO,
+                    floor,
+                );
+                std::array::from_fn(|c| placed.frames[c])
+            },
             // Read back from this very run rather than rebuilt beside it: the
             // field is deterministic, so a second build would give the same
             // bytes -- but then the oracle would be checking the cache against a
@@ -3837,13 +4056,24 @@ mod tests {
     /// `walk_light` for why an empty sky has to come back as an exact zero.
     /// Measured over an overcast sky, which is the one that fills it: the
     /// highest slice blocks almost nothing and the lowest almost everything.
+    ///
+    /// Under a sun at forty-five degrees, whose columns climb the sky, and one at
+    /// three, whose columns run along the ground: "down" is away from the sun in
+    /// both, and the walk does not know which it is in.
     #[test]
     fn the_light_volume_blocks_more_the_further_down_a_deck_it_goes() {
-        let frame = marched(
-            Preset::Overcast,
-            &looking(1500.0, 0.0),
-            glam::UVec2::splat(32),
-        );
+        for elevation in [45.0, 3.0] {
+            let frame = marched_under(
+                Preset::Overcast,
+                &looking(1500.0, 0.0),
+                glam::UVec2::splat(32),
+                crate::sky::Sun::from_angles(elevation, 45.0),
+            );
+            blocks_more_down_each_column(&frame);
+        }
+    }
+
+    fn blocks_more_down_each_column(frame: &Marched) {
         let mut worst: f32 = 0.0;
         let mut most: f32 = 0.0;
         let mut least: f32 = 1.0;
@@ -4099,9 +4329,10 @@ mod tests {
     /// A setting sun does not chop the light volume into slabs.
     ///
     /// A slice of a light column stands for a fixed height, so the piece of sun
-    /// ray it stands for lengthens as the sun sets -- a kilometre and two thirds
-    /// of it once `SHEAR_FLOOR` has the lean, against a third of that at
-    /// forty-five degrees. Reading one point of that piece leaves the mean
+    /// ray it stands for lengthens as the sun sets -- 413 m of it just above
+    /// `PLUMB_FROM`, where the columns stop climbing, against 88 m at forty-five
+    /// degrees, and it was a kilometre and two thirds when slices were 250 m
+    /// tall. Reading one point of that piece leaves the mean
     /// alone, because a point sample of a path integral is unbiased. What it
     /// wrecks is the spread: the sample either lands in a billow or misses it,
     /// so a column gains its cloud in a few large lumps rather than over the
@@ -4119,7 +4350,7 @@ mod tests {
     /// The claim is that it does not climb as the sun goes down. If anything it
     /// should fall, because the longer ray a slice stands for near dusk averages
     /// over more cloud than the short one at noon does -- and it does fall: it
-    /// measures 6.95 at forty-five degrees and 6.48 at six, a ratio of 0.93.
+    /// measures 6.95 at forty-five degrees and 6.49 at 8.7, a ratio of 0.93.
     /// Reading the slice at its centre alone gave a ratio of 1.37, and that is
     /// the fault `LIGHT_STEP` in `src/cloud_march.wgsl` exists to remove.
     ///
@@ -4132,9 +4363,10 @@ mod tests {
     /// 1.57 at the fine, for a volume that had by the untruncated measure got
     /// *less* lumpy at dusk, 0.85 to 0.93.
     ///
-    /// Six degrees rather than something lower because it is already the worst
-    /// case: the shear floor clamps the lean and the step together, so every sun
-    /// below about eight and a half degrees fills the same volume.
+    /// 8.7 degrees because it is the worst case for a climbing column, and the
+    /// lowest sun that still has one: below `PLUMB_FROM` the sun's volume lies
+    /// on its side and its slices are ground rather than height. That layout
+    /// has its own test against this one, `the_two_layouts_agree_where_they_meet`.
     #[test]
     fn a_low_sun_does_not_lump_the_light_volume() {
         let camera = looking(1500.0, 0.0);
@@ -4176,14 +4408,17 @@ mod tests {
             (square / count) / (mean * mean)
         };
         let noon = peakiness(45.0);
-        let dusk = peakiness(6.0);
+        // Just above `PLUMB_FROM`, where a climbing slice stands for the most
+        // ray it ever does; below it the volume lies on its side, its slices
+        // are ground rather than height, and this measure has nothing to say.
+        let dusk = peakiness(8.7);
         eprintln!(
             "PROBE lump noon {noon:.2} dusk {dusk:.2} ratio {:.3}",
             dusk / noon
         );
         assert!(
             dusk < noon * 1.2,
-            "a sun six degrees up lumps the light volume {dusk:.1} against the \
+            "a sun 8.7 degrees up lumps the light volume {dusk:.1} against the \
              {noon:.1} of one at forty-five, a ratio of {:.2}, where reading a \
              slice at its centre alone gives 1.37 and sampling along it 0.93",
             dusk / noon
@@ -4418,6 +4653,235 @@ mod tests {
         }
     }
 
+    /// Every column of the sun's volume is a ray towards the sun, walked from the
+    /// sunward end, and every column of the sky's is a plumb line walked down --
+    /// at every height of the sun, either side of [`PLUMB_FROM`] where the sun's
+    /// columns stop climbing and start running along the ground.
+    ///
+    /// The whole of what the walk relies on: it accumulates the cloud between a
+    /// texel and the sun by adding up the texels before it in its own column, so
+    /// a column that strayed off the sun's line would be adding up the wrong
+    /// cloud and nothing downstream could tell. And a frame whose two halves did
+    /// not invert each other would put a texel's answer somewhere other than
+    /// where it was worked out.
+    #[test]
+    fn every_sun_column_is_a_ray_towards_the_sun() {
+        let size = glam::Vec3::new(LIGHT_ACROSS as f32, LIGHT_ACROSS as f32, LIGHT_SLICES as f32);
+        for elevation in [0.5, 1.0, 3.0, 6.0, 8.6, 8.7, 20.0, 45.0, 80.0] {
+            for azimuth in [0.0, 37.0, 140.0, 250.0, 315.0] {
+                let sun = crate::sky::Sun::from_angles(elevation, azimuth).direction;
+                let placed = LightUniform::at(
+                    glam::Vec3::new(1234.0, 2000.0, -567.0),
+                    sun,
+                    [0.0; 4],
+                    glam::Vec3::ZERO,
+                );
+                for (index, frame) in placed.frames.iter().enumerate() {
+                    let towards = if index < LIGHT_CASCADES as usize {
+                        sun
+                    } else {
+                        glam::Vec3::Y
+                    };
+                    for texel in [[0, 0, 0], [10, 100, 50], [191, 191, 191], [96, 40, 180]] {
+                        let p = frame.world_of(texel[0], texel[1], texel[2]);
+                        let back = frame.texture_of(p);
+                        let want = (glam::UVec3::from(texel).as_vec3() + 0.5) / size;
+                        assert!(
+                            (back - want).abs().max_element() < 1e-4,
+                            "frame {index} at {elevation} degrees, {azimuth} round: texel \
+                             {texel:?} stands at {p} and comes back as {}",
+                            back * size
+                        );
+                    }
+                    let step = frame.world_of(50, 60, 11) - frame.world_of(50, 60, 10);
+                    assert!(
+                        step.normalize().dot(towards) > 0.99999,
+                        "frame {index} at {elevation} degrees, {azimuth} round: a column \
+                         runs along {} rather than towards {towards}",
+                        step.normalize()
+                    );
+                    let slice = glam::Vec4::from(frame.slice);
+                    assert!((slice.truncate() - step).length() < 1e-2 * step.length());
+                    assert!((slice.w - step.length()).abs() < 1e-2 * step.length());
+                }
+            }
+        }
+    }
+
+    /// A low sun's volume stands as still in the world as a high one's does.
+    ///
+    /// Laid on its side the lattice lives in the sun's horizontal frame, so it is
+    /// snapped there: an eye moving less than a texel leaves every texel where it
+    /// was, and one moving a whole texel along the sun's bearing or across it
+    /// moves the lattice by that texel and nothing else. The heights of its rays
+    /// are counted from a fixed line in the world, so moving along the bearing
+    /// cannot slide them up or down by a fraction of a step either: a world
+    /// point keeps its place in the lattice to a whole number of steps.
+    #[test]
+    fn a_low_sun_volume_stands_still_while_the_camera_moves() {
+        let sun = crate::sky::Sun::from_angles(4.0, 140.0).direction;
+        let toward = glam::Vec3::new(sun.x, 0.0, sun.z).normalize();
+        let side = glam::Vec3::new(-toward.z, 0.0, toward.x);
+        let finest = LIGHT_EXTENT / LIGHT_SLICES as f32;
+        // A fifth of the finest texel into every cascade's own, so the moves
+        // below stay well clear of where a snap would flip.
+        let eye = (toward + side) * 0.2 * finest + glam::Vec3::Y * 2000.0;
+        let point = glam::Vec3::new(5000.0, 1500.0, -2000.0);
+        let place = |eye: glam::Vec3| {
+            LightUniform::at(eye, sun, [0.0; 4], glam::Vec3::ZERO).frames
+        };
+        let size = glam::Vec3::new(LIGHT_ACROSS as f32, LIGHT_ACROSS as f32, LIGHT_SLICES as f32);
+        let here = place(eye);
+        let near = place(eye + (toward - side) * 0.1 * finest + glam::Vec3::Y * 700.0);
+        for level in 0..LIGHT_CASCADES as usize {
+            assert_eq!(
+                here[level].texture_of(point),
+                near[level].texture_of(point),
+                "cascade {level} slid with the eye"
+            );
+            let texel = finest * LIGHT_SPREAD.powi(level as i32);
+            for (axis, step) in [(2usize, toward), (0usize, side)] {
+                let moved = place(eye + step * texel)[level].texture_of(point) * size;
+                let was = here[level].texture_of(point) * size;
+                let shift = moved - was;
+                assert!(
+                    (shift[axis] + 1.0).abs() < 1e-3,
+                    "cascade {level} moved {} texels along axis {axis} for a texel of eye",
+                    -shift[axis]
+                );
+                for other in 0..3 {
+                    if other != axis {
+                        assert!(
+                            (shift[other] - shift[other].round()).abs() < 1e-3,
+                            "cascade {level} slid {} of a texel along axis {other}",
+                            shift[other]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Under a low sun, too, nothing the march can reach and no cloud it can see
+    /// falls outside the widest cascade.
+    ///
+    /// The case the floor on the lean used to give up: a climbing column leaning
+    /// along a sun two degrees up crosses three hundred kilometres of ground on
+    /// its way through the volume, so a cloud high above the far end of the
+    /// march un-sheared to somewhere no cascade reached, and was lit as though
+    /// nothing stood between it and the sun. Laid on its side the volume spans
+    /// the march along and across the bearing, and every ray that crosses the
+    /// sky it covers at any height.
+    #[test]
+    fn a_low_sun_volume_covers_everything_the_march_can_reach() {
+        let edge = shader_constant("CASCADE_FADE");
+        let reach = shader_constant("MAX_DISTANCE");
+        for azimuth in [0.0, 37.0, 140.0, 250.0] {
+            let sun = crate::sky::Sun::from_angles(2.0, azimuth).direction;
+            let placed = LightUniform::at(
+                glam::Vec3::new(0.0, 2000.0, 0.0),
+                sun,
+                [0.0; 4],
+                glam::Vec3::ZERO,
+            );
+            let outer = placed.frames[LIGHT_CASCADES as usize - 1];
+            for turn in 0..16 {
+                let angle = std::f32::consts::TAU * turn as f32 / 16.0;
+                for height in [0.0, 3000.0, 8000.0, CEILING_TOP - 1.0] {
+                    let far = glam::Vec3::new(angle.cos() * reach, height, angle.sin() * reach);
+                    let uvw = outer.texture_of(far);
+                    let fade = glam::Vec4::from(outer.fade).truncate();
+                    let beyond = ((uvw - 0.5).abs() * 2.0 * fade).max_element();
+                    assert!(
+                        beyond < edge,
+                        "a ray's end {angle:.2} round at {height} m reads {beyond:.3} of \
+                         the way out of the widest cascade under a sun {azimuth} round"
+                    );
+                    assert!(
+                        (0.0..=1.0).contains(&uvw.y),
+                        "a point {angle:.2} round at {height} m is off the rays the \
+                         widest cascade holds: {uvw}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Either side of [`PLUMB_FROM`] the two layouts of the sun's volume read
+    /// the same deck alike.
+    ///
+    /// Moving the sun a hundredth of a degree changes almost nothing about the
+    /// shadows in the sky, and moving it across the switch changes the whole
+    /// shape of the volume that holds them -- so what differs between the two
+    /// reads here is what the layouts disagree about, which is where their
+    /// samples fall and how finely. Read at points through the low deck, over
+    /// the ground the innermost cascade covers, the way the march reads it.
+    #[test]
+    fn the_two_layouts_agree_where_they_meet() {
+        let camera = looking(1500.0, 0.0);
+        let size = glam::UVec2::splat(32);
+        let switch = PLUMB_FROM.asin().to_degrees();
+        let read = |elevation: f32| {
+            marched_under(
+                Preset::Broken,
+                &camera,
+                size,
+                crate::sky::Sun::from_angles(elevation, 140.0),
+            )
+        };
+        let (climbing, lying) = (read(switch + 0.01), read(switch - 0.01));
+        // On average over each height, through the deck and in the clear air
+        // under and over it: what the sun's light amounts to there, which is
+        // what a shaft and a shadow on the ground are made of. Laid on its side,
+        // a column once started at its cascade's sunward edge and left out the
+        // cloud beyond it, and three kilometres up read 0.73 against 0.42 here.
+        for height in [200.0, 900.0, 1700.0, 2500.0, 3000.0, 4000.0, 6000.0] {
+            let (mut a, mut b, mut n) = (0.0f64, 0.0f64, 0.0f64);
+            for iz in -20..=20 {
+                for ix in -20..=20 {
+                    let p = camera.position * glam::Vec3::new(1.0, 0.0, 1.0)
+                        + glam::Vec3::new(ix as f32 * 700.0, height, iz as f32 * 700.0);
+                    let through = |frame: &Marched| {
+                        f64::from((-frame.depth_through(0, frame.sun_frames[0].texture_of(p))).exp())
+                    };
+                    a += through(&climbing);
+                    b += through(&lying);
+                    n += 1.0;
+                }
+            }
+            let (a, b) = (a / n, b / n);
+            assert!(
+                (a - b).abs() < 0.05,
+                "at {height} m the climbing layout lets {a:.4} of the sun through and the \
+                 one on its side {b:.4}"
+            );
+        }
+        let (mut apart, mut count, mut far_apart) = (0.0f64, 0.0f64, 0.0f64);
+        for iz in -20..=20 {
+            for ix in -20..=20 {
+                for height in [900.0, 1300.0, 1700.0, 2100.0, 2500.0] {
+                    let p = camera.position * glam::Vec3::new(1.0, 0.0, 1.0)
+                        + glam::Vec3::new(ix as f32 * 700.0, height, iz as f32 * 700.0);
+                    let through = |frame: &Marched| {
+                        (-frame.depth_through(0, frame.sun_frames[0].texture_of(p))).exp()
+                    };
+                    let gap = f64::from((through(&climbing) - through(&lying)).abs());
+                    apart += gap;
+                    far_apart += f64::from(gap > 0.25);
+                    count += 1.0;
+                }
+            }
+        }
+        let (mean, share) = (apart / count, far_apart / count);
+        // Measured at 0.0244 and 3.11 per cent: what is left is where two lattices
+        // of different shape put their samples across a cloud's skin. Rendered,
+        // it moves 1.97 per cent of a 640x360 frame of `broken` by more than
+        // eight levels as the sun crosses the switch, where moving it the same
+        // hundredth of a degree on one side moves 0.05.
+        assert!(mean < 0.035, "the two layouts read the deck {mean:.4} apart on average");
+        assert!(share < 0.05, "{:.2}% of the deck reads a quarter apart", share * 100.0);
+    }
+
     /// Nothing the march can reach falls outside the widest cascade.
     ///
     /// The property the cascades were added for, and the one the single volume
@@ -4434,10 +4898,10 @@ mod tests {
     ///
     /// Under a sun overhead, which is what bounds the *march*. A leaning sun
     /// shears the columns and a high point un-shears to somewhere further out
-    /// still -- as far as `SHEAR_FLOOR` allows, eighty kilometres at the top of
-    /// the volume -- and that is deliberately not covered: the sun that leans a
-    /// column that far is one the air has already taken out. See `beyond_light`
-    /// in `src/cloud_march.wgsl`.
+    /// still -- as far as [`PLUMB_FROM`] lets them lean, eighty kilometres at the
+    /// top of the volume -- and that is what the hand-over fades over. Below it
+    /// the volume lies on its side and covers the march outright; see
+    /// `a_low_sun_volume_covers_everything_the_march_can_reach`.
     #[test]
     fn nothing_the_march_can_reach_falls_outside_the_cascades() {
         let outer = LIGHT_EXTENT * LIGHT_SPREAD.powi(LIGHT_CASCADES as i32 - 1);

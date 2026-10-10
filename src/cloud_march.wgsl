@@ -479,10 +479,12 @@ const LIGHT_CASCADES: u32 = 3u;
 // sample may stand for, the most samples a slice may take, and the fewest it
 // takes in the innermost cascade and in the ones outside it.
 //
-// A slice is a fixed 62.5 m of *height*, so the ray it stands for lengthens as
-// the sun sets: `walk.z` is that height over the sun's climb, and `SHEAR_FLOOR`
-// in `src/cloud.rs` caps the climb at 0.15, which makes a slice near dusk 417 m
-// of ray. When a slice was 250 m of height that was a kilometre and two thirds,
+// A climbing slice is a fixed 62.5 m of *height*, so the ray it stands for
+// lengthens as the sun sets: it is that height over the sun's climb, and below
+// a climb of 0.15 (`PLUMB_FROM` in `src/cloud.rs`) the volume lies on its side
+// instead, which makes 417 m of ray the most a climbing slice is ever worth. A
+// slice of a volume on its side is a texel of ground, 312 m of it and a
+// sixtieth more of ray in the innermost cascade. When a slice was 250 m of height that was a kilometre and two thirds,
 // and reading one point of it was a point sample of a field whose billows are
 // five hundred metres across -- and it did not read as noise, because every
 // column samples at the same heights, so the error took the same shape in every
@@ -496,10 +498,11 @@ const LIGHT_CASCADES: u32 = 3u;
 // 6.3 at four hundred and 5.0 at two hundred and fifty, for 1.42, 1.48, 1.96 and
 // 2.17 ms of the light pass.
 //
-// Five is the ceiling and cannot bind -- the shear floor makes 417 m the
-// longest ray a slice can stand for, which is barely one of these, so the
-// floors below decide the count at every hour -- and it bounds the loop rather
-// than shaping the answer.
+// Five is the ceiling and cannot bind. The longest slice anywhere is in the
+// widest cascade of a volume on its side, 1250 m of ground and four of these;
+// 417 m is the longest a climbing slice can stand for, barely one, so there the
+// floors below decide the count. It bounds the loop rather than shaping the
+// answer.
 //
 // The two floors below are the other half of the count, and they are not about
 // the ray at all. A cell is `across` of ground each way as well as a slice of
@@ -542,6 +545,10 @@ const LIGHT_FAR_TAPS: f32 = 2.0;
 // a multiply-add either way.
 const SUN_CHANNEL: vec4<f32> = vec4<f32>(1.0, 0.0, 0.0, 0.0);
 const SKY_CHANNEL: vec4<f32> = vec4<f32>(0.0, 1.0, 0.0, 0.0);
+// Where each walk's frames start in `Light::frames`: the sun's cascades first,
+// then the sky's.
+const SUN_FRAMES: u32 = 0u;
+const SKY_FRAMES: u32 = 3u;
 
 // Where a cascade stops answering for a point and hands over to the one outside
 // it, as a share of its own half-span. The outermost fifth, so the join is six
@@ -644,21 +651,40 @@ struct Weather {
     span: vec4<f32>,
 };
 
-// Where the light volume sits and how its columns lean.
+// One cascade of one light volume, as an affine lattice in the world. Mirrors
+// `SunFrame` in `src/cloud.rs`, which says how each is built.
 //
-// Its own uniform rather than two more fields of the one above, because the
+// The texture's first two axes are across a column and the third is along it,
+// top to bottom being from towards the light to away from it. What that column
+// is in the world is the frame's business alone: a plumb line for the sky, a
+// sun ray climbing the sky for a sun high enough, and a sun ray running along
+// the ground for one too low to climb. Every reader goes through these and
+// nothing else, so none of them knows which.
+struct Frame {
+    // World to texture: each row dotted with `(p, 1)`.
+    to_texture: array<vec4<f32>, 3>,
+    // Texture to world, the same way round.
+    to_world: array<vec4<f32>, 3>,
+    // One slice of a column as a vector in the world, and its length.
+    slice: vec4<f32>,
+    // Which texture axes a cascade hands over at past its edge (one), and
+    // which it holds its nearest texel along (zero). See `beyond_light`.
+    fade: vec4<f32>,
+};
+
+// Where the light volume sits and how its columns run.
+//
+// Its own uniform rather than more fields of the one above, because the
 // shading pass reads this and has no business reading that: where a volume
 // stands is a fact about the camera and the sun, and what is in it is a fact
 // about the weather. Mirrors `LightUniform` in `src/cloud.rs` and `Light` in
-// `src/shading.wgsl`.
+// `src/shading.wgsl` and `src/shafts.wgsl`.
 struct Light {
-    // One per cascade, innermost first: the near corner in x and z, the height
-    // of the lowest slice, and the metres one texel covers across.
+    // The sky's plumb lattice, which its frames are built from: per cascade the
+    // near corner in x and z, the height of the lowest slice, and the metres a
+    // texel covers across. Read by the tests rather than by anything here.
     cascade: array<vec4<f32>, LIGHT_CASCADES>,
-    // How far a sun column drifts horizontally per metre it climbs, then the
-    // metres of ray one slice is worth walking towards the sun, then the metres
-    // of height one slice is worth -- which is what the same slice is worth
-    // walking straight up.
+    // The metres of height one plumb slice is worth, in `w`.
     walk: vec4<f32>,
     // Where the baked wind's own grid stands: its near corner in x and z, then
     // how much world it covers in each. Zero-sized until the wind has been
@@ -668,6 +694,10 @@ struct Light {
     // started, in metres. Folded into one tile of the map, so a long flight
     // cannot walk it out of the range an `f32` holds a lattice index in.
     carried: vec4<f32>,
+    // The sun's cascades, then the sky's. A texel's red channel is a point of
+    // the sun's lattice and its green a point of the sky's: one texture, two
+    // lattices, which coincide while the sun's columns climb. See `out_light`.
+    frames: array<Frame, 6>,
 };
 
 // Which quarter of the resolved buffer this frame actually marches.
@@ -1478,35 +1508,34 @@ fn sunlit(through: f32, cos_theta: f32, sunlight: vec3<f32>) -> vec3<f32> {
 
 // Where a light volume's texel sits in the world.
 //
-// The whole of the shear. A column of the volume -- one `(x, z)`, every slice --
-// is a straight line in the world that leans by `shear` for every metre it
-// climbs. Give it the sun's own lean and the column *is* a sun ray, so walking
-// it top to bottom accumulates exactly the cloud between each point and the
-// sun, once, in one pass. Give it no lean and the column is a plumb line, and
-// the same walk accumulates the cloud between each point and the sky.
+// The whole of the shear, which now lives in the frame. A column of the volume
+// -- one `(x, y)` of the texture, every slice -- is a straight line in the
+// world. Make it a sun ray and walking it from the sunward end accumulates
+// exactly the cloud between each point and the sun, once, in one pass. Make it
+// a plumb line and the same walk accumulates the cloud between each point and
+// the sky.
 //
-// Indexed by world x and z rather than by anything in the sun's frame, so a
-// texel covers the same ground however low the sun gets. A sun-space box
-// degenerates exactly where it is most wanted: at five degrees its own plane is
-// nearly vertical, which puts a hundred and fifty metres of resolution across
-// the two and a half kilometres a cloud deck occupies -- seventeen useful texels
-// over the whole interesting half of the sun's arc.
-fn light_position(at: vec3<u32>, cascade: u32, shear: vec2<f32>) -> vec3<f32> {
-    let origin = light.cascade[cascade];
-    let climbed = (f32(at.z) + 0.5) * light.walk.w;
-    let flat = origin.xy + (vec2<f32>(at.xy) + 0.5) * origin.w + climbed * shear;
-    return vec3<f32>(flat.x, origin.z + climbed, flat.y);
+// A climbing sun column is indexed by world x and z rather than by anything in
+// the sun's frame, so a texel covers the same ground however low the sun gets.
+// A sun-space box degenerates exactly where it is most wanted: at five degrees
+// its own plane is nearly vertical, which puts a hundred and fifty metres of
+// resolution across the two and a half kilometres a cloud deck occupies --
+// seventeen useful texels over the whole interesting half of the sun's arc.
+// Below `PLUMB_FROM` in `src/cloud.rs` the climbing columns would lean too far
+// to hold, and the sun's frames turn on their side instead; see `running` in
+// `src/cloud.rs`. Nothing here knows which.
+fn light_position(at: vec3<u32>, frame: u32) -> vec3<f32> {
+    let uvw = (vec3<f32>(at) + 0.5) / vec3<f32>(f32(LIGHT_ACROSS), f32(LIGHT_ACROSS), f32(LIGHT_SLICES));
+    let q = vec4<f32>(uvw, 1.0);
+    let back = light.frames[frame].to_world;
+    return vec3<f32>(dot(back[0], q), dot(back[1], q), dot(back[2], q));
 }
 
 // The same mapping backwards: where a world point sits in one cascade.
-fn light_uvw(p: vec3<f32>, shear: vec2<f32>, cascade: u32) -> vec3<f32> {
-    let origin = light.cascade[cascade];
-    let climbed = p.y - origin.z;
-    let flat = p.xz - origin.xy - climbed * shear;
-    return vec3<f32>(
-        flat / (origin.w * f32(LIGHT_ACROSS)),
-        climbed / (light.walk.w * f32(LIGHT_SLICES)),
-    );
+fn light_uvw(p: vec3<f32>, frame: u32) -> vec3<f32> {
+    let q = vec4<f32>(p, 1.0);
+    let forward = light.frames[frame].to_texture;
+    return vec3<f32>(dot(forward[0], q), dot(forward[1], q), dot(forward[2], q));
 }
 
 // A cascade's own vertical coordinate, in the stacked volume that holds them all.
@@ -1539,14 +1568,16 @@ fn stacked_w(w: f32, cascade: u32) -> f32 {
 // the march or under a sun leaning so far that the air has already taken it out,
 // and the fade is smooth where the clamp was a staircase.
 //
-// Across only, and that is the point of the `.xy`. The volume's floor is sea
-// level and its ceiling is above every deck, so a point outside it vertically
-// wants the nearest slice and not a fade -- and the ground, which is the whole
-// reason any of this is read twice, sits *on* the floor. Fading there was worth
-// a whole commit's effort producing no shadow at all on any terrain.
-fn beyond_light(uvw: vec3<f32>) -> f32 {
-    let out = abs(uvw.xy - vec2<f32>(0.5)) * 2.0;
-    return max(out.x, out.y);
+// Across the ground only, and that is the point of `fade`. The volume's floor
+// is sea level and its ceiling is above every deck, so a point outside it
+// vertically wants the nearest texel and not a fade -- and the ground, which is
+// the whole reason any of this is read twice, sits *on* the floor. Fading there
+// was worth a whole commit's effort producing no shadow at all on any terrain.
+// Which texture axes are across the ground depends on the frame: the first two
+// for a climbing one, the first and the third for one laid on its side.
+fn beyond_light(uvw: vec3<f32>, fade: vec3<f32>) -> f32 {
+    let out = abs(uvw - vec3<f32>(0.5)) * 2.0 * fade;
+    return max(max(out.x, out.y), out.z);
 }
 
 // How much of a light volume reaches a point, over all the cascades it has.
@@ -1568,7 +1599,7 @@ fn reaching(
     volume: texture_3d<f32>,
     filtering: sampler,
     p: vec3<f32>,
-    shear: vec2<f32>,
+    frames: u32,
     channel: vec4<f32>,
 ) -> f32 {
     var blocked = 0.0;
@@ -1577,14 +1608,15 @@ fn reaching(
         if answered >= 1.0 {
             break;
         }
-        let uvw = light_uvw(p, shear, cascade);
+        let frame = frames + cascade;
+        let uvw = light_uvw(p, frame);
         // The widest one is not handing over to anything, so it holds on to its
         // own edge for longer. See `CASCADE_FADE`.
         var edge = CASCADE_EDGE;
         if cascade + 1u == LIGHT_CASCADES {
             edge = CASCADE_FADE;
         }
-        let inside = 1.0 - smoothstep(edge, 1.0, beyond_light(uvw));
+        let inside = 1.0 - smoothstep(edge, 1.0, beyond_light(uvw, light.frames[frame].fade.xyz));
         let share = min(inside, 1.0 - answered);
         if share > 0.0 {
             let at = vec3<f32>(uvw.xy, stacked_w(uvw.z, cascade));
@@ -1654,8 +1686,9 @@ fn reaching(
 // cloud" for that detector.
 //
 // The walk is taken at `LOCAL_STEP` and capped at `LOCAL_TAPS`, which is the
-// count at the shear floor, where two slices are 833 m of ray; the cap bounds
-// the loop and never shapes the answer. The count follows the ray and not the
+// count just above `PLUMB_FROM` in `src/cloud.rs`, where two climbing slices
+// are 833 m of ray; two slices of a volume on its side are 625 m. The cap
+// bounds the loop and never shapes the answer. The count follows the ray and not the
 // point, so it is the same for every sample of a frame, and the samples stand
 // at fixed shares of the walk from the point, so nothing about them is pinned
 // to the lattice either.
@@ -1678,9 +1711,9 @@ fn depth_of(reaching: f32) -> f32 {
     return -log(max(reaching, 1e-30));
 }
 
-fn reaching_walked(p: vec3<f32>, shear: vec2<f32>, channel: vec4<f32>) -> f32 {
-    // Two slices of the column, as a vector from the point.
-    let walk = 2.0 * light.walk.w * vec3<f32>(shear.x, 1.0, shear.y);
+fn reaching_walked(p: vec3<f32>, frames: u32, channel: vec4<f32>) -> f32 {
+    // Two slices of the innermost cascade's column, as a vector from the point.
+    let walk = 2.0 * light.frames[frames].slice.xyz;
     let metres = length(walk);
     let taps = u32(clamp(ceil(metres / LOCAL_STEP), 1.0, f32(LOCAL_TAPS)));
     let span = metres / f32(taps);
@@ -1699,18 +1732,18 @@ fn reaching_walked(p: vec3<f32>, shear: vec2<f32>, channel: vec4<f32>) -> f32 {
             walked = walked + crossed[tap] * portion;
         }
         let at = p + along * walk;
-        let beyond = reaching(light_volume, edge_sampler, at, shear, channel);
+        let beyond = reaching(light_volume, edge_sampler, at, frames, channel);
         depth = depth + walked + depth_of(beyond);
     }
     return exp(-depth / f32(HANDOVER_READS));
 }
 
 fn sun_reaching(p: vec3<f32>) -> f32 {
-    return reaching_walked(p, light.walk.xy, SUN_CHANNEL);
+    return reaching_walked(p, SUN_FRAMES, SUN_CHANNEL);
 }
 
 fn sky_reaching(p: vec3<f32>) -> f32 {
-    return reaching_walked(p, vec2<f32>(0.0), SKY_CHANNEL);
+    return reaching_walked(p, SKY_FRAMES, SKY_CHANNEL);
 }
 
 // What a point gets of the sky, given how much of it reaches there unscattered.
@@ -1866,16 +1899,21 @@ fn sun_clear(p: vec3<f32>, ground: bool) -> f32 {
 // sample stands for and nothing about how far the field is read over. The two
 // agree while the sun is high and part company as it sets, which is what
 // `LIGHT_STEP` exists to close.
-fn cell_extinction(at: vec3<u32>, cascade: u32, shear: vec2<f32>, metres: f32) -> f32 {
-    let quarter = light.cascade[cascade].w * 0.25;
-    var away = vec3<f32>(quarter, 0.0, quarter);
+fn cell_extinction(at: vec3<u32>, cascade: u32, frame: u32, metres: f32) -> f32 {
+    // A quarter of a texel along each of the two axes across the column, as
+    // vectors in the world: for a climbing column, a quarter of the texel's
+    // ground each way; for one on its side, a quarter across the bearing and a
+    // quarter of the step in height between neighbouring rays.
+    let back = light.frames[frame].to_world;
+    let across = vec3<f32>(back[0].x, back[1].x, back[2].x) * (0.25 / f32(LIGHT_ACROSS));
+    let down = vec3<f32>(back[0].y, back[1].y, back[2].y) * (0.25 / f32(LIGHT_ACROSS));
+    var away = across + down;
     if (at.z & 1u) == 1u {
-        away = vec3<f32>(quarter, 0.0, -quarter);
+        away = across - down;
     }
-    // One slice of the column as a vector: the height it climbs, and the ground
-    // it crosses getting there. Its length is `metres`.
-    let stride = light.walk.w * vec3<f32>(shear.x, 1.0, shear.y);
-    let centre = light_position(at, cascade, shear);
+    // One slice of the column as a vector. Its length is `metres`.
+    let stride = light.frames[frame].slice.xyz;
+    let centre = light_position(at, frame);
     let taps = light_taps(metres, cascade);
     let span = metres / f32(taps);
     var sum = 0.0;
@@ -1905,6 +1943,50 @@ fn light_taps(metres: f32, cascade: u32) -> u32 {
     return u32(clamp(ceil(metres / LIGHT_STEP), fewest, f32(LIGHT_TAPS)));
 }
 
+// How much cloud stands on a sun ray beyond the sunward end of its column.
+//
+// A climbing column starts at the top of the volume, above every deck, so
+// nothing is beyond it. A column laid on its side starts at the sunward edge of
+// its cascade -- thirty kilometres from the eye in the innermost -- and a ray
+// that is three kilometres up there does not clear the decks for another sixty
+// at a sun eight degrees up, or two hundred at three. Walked from its own end,
+// such a column left all of that out, and the air and the cloud under the decks
+// came out lit by a sun the decks upstream had hidden: at the switch the deck
+// read 0.73 of the sun at three kilometres where the climbing layout, whose
+// columns are whole, read 0.42.
+//
+// So the column starts from what lies beyond it: the ray walked from where it
+// climbs out of the highest cloud back to the column's end, in a few long
+// steps. Long, because what they cross is far away, and what it sends back is
+// a shadow on everything downstream, which is soft by then; and read at the
+// detail that length deserves. Written in terms of the column and nothing else,
+// so a climbing column, whose end is already above the cloud, walks none of it.
+//
+// No further than `UPSTREAM_REACH`. A ray from a kilometre up under a sun half
+// a degree high clears ten kilometres of height a thousand kilometres away,
+// and long before that the air between has taken out everything the cloud
+// could have.
+const UPSTREAM_STEPS: u32 = 16u;
+const UPSTREAM_REACH: f32 = 200000.0;
+
+fn beyond_column(id: vec2<u32>, frame: u32) -> f32 {
+    let slice = light.frames[frame].slice;
+    let towards = slice.xyz / max(slice.w, 1e-6);
+    let end = light_position(vec3<u32>(id, LIGHT_SLICES - 1u), frame) + 0.5 * slice.xyz;
+    let top = cloud.span.y;
+    if towards.y <= 0.0 || end.y >= top {
+        return 0.0;
+    }
+    let metres = min((top - end.y) / towards.y, UPSTREAM_REACH);
+    let step = metres / f32(UPSTREAM_STEPS);
+    var tau = 0.0;
+    for (var k = 0u; k < UPSTREAM_STEPS; k += 1u) {
+        let at = end + towards * ((f32(k) + 0.5) * step);
+        tau = tau + cloud_extinction(at, step, false) * step;
+    }
+    return tau;
+}
+
 // One column of a light volume, walked from the top down.
 //
 // The cost of the whole technique is here and it is a handful of density samples
@@ -1915,16 +1997,18 @@ fn light_taps(metres: f32, cascade: u32) -> u32 {
 fn walk_light(id: vec3<u32>) {
     let cascade = id.z;
     // The sun's column leans and its slice is worth the longer ray that lean
-    // crosses; the sky's stands plumb and a slice is worth its own height.
-    let lean = light.walk.xy;
-    let sun_metres = light.walk.z;
-    let sky_metres = light.walk.w;
-    var sun_tau = 0.0;
+    // crosses, or runs along the ground and its slice is worth a texel of that;
+    // the sky's stands plumb and a slice is worth its own height.
+    let sun = SUN_FRAMES + cascade;
+    let sky = SKY_FRAMES + cascade;
+    let sun_metres = light.frames[sun].slice.w;
+    let sky_metres = light.frames[sky].slice.w;
+    var sun_tau = beyond_column(id.xy, sun);
     var sky_tau = 0.0;
     for (var slice = LIGHT_SLICES; slice > 0u; slice -= 1u) {
         let at = vec3<u32>(id.x, id.y, slice - 1u);
-        let sun_crossed = cell_extinction(at, cascade, lean, sun_metres) * sun_metres;
-        let sky_crossed = cell_extinction(at, cascade, vec2<f32>(0.0), sky_metres) * sky_metres;
+        let sun_crossed = cell_extinction(at, cascade, sun, sun_metres) * sun_metres;
+        let sky_crossed = cell_extinction(at, cascade, sky, sky_metres) * sky_metres;
         sun_tau = sun_tau + sun_crossed;
         sky_tau = sky_tau + sky_crossed;
         // The optical *depth* to here, not the share of the sun it stops. The
@@ -1936,7 +2020,7 @@ fn walk_light(id: vec3<u32>) {
         // the chord of a curve: exact where the samples are, too bright
         // everywhere between them, and worst where the curve bends hardest. A
         // slice is a fixed height, so the ray it stands for grows as the sun
-        // sets -- 1667 m of it once `SHEAR_FLOOR` had the lean, when a slice
+        // sets -- 1667 m of it once a floor on the lean had it, when a slice
         // was 250 m of height -- and 1667 m of cumulus is an optical depth of
         // thirty. The curve then falls from lit to black inside one slice, the
         // chord across it is a straight ramp with a corner at each end, and
